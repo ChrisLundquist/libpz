@@ -18,11 +18,11 @@ LINT_FILES = $(pz_SOURCES) $(libpz_la_SOURCES)
 LINTER_FLAGS ?= -- -I. $(AM_CPPFLAGS) $(DEFS)
 FORMATTER_FLAGS ?= -style=Chromium -i
 
-.c.lint:
+%.c.lint: %.c
 	- $(LINTER) $? $(LINTER_FLAGS) | tee $@
 # Select only C files
 # We have to abuse the auto rule above so that -j works
-lint: $(subst .c,.lint, $(filter %.c,$(LINT_FILES)))
+lint: $(subst .c,.c.lint, $(filter %.c,$(LINT_FILES)))
 
 format: $(LINT_FILES)
 	$(FORMATTER) $(FORMATTER_FLAGS) $?
