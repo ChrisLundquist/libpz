@@ -31,4 +31,5 @@ src/lz77.lo
 test/.libs/lz77_test
 test/lz77_ref
 test/lz77_test
+test/lz77_fuzz
 libtool

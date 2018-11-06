@@ -13,6 +13,9 @@ static Match FindMatch(const char* search,
                        unsigned int target_size) {
   /* assert search and target? */
   register Match best = {.offset = 0, .length = 0, .next = *target};
+  if (target_size == 1)
+    return best;
+
   for (unsigned i = 0; i < search_size;) {
     register unsigned temp_match_length = 0;
     register unsigned tail = i + temp_match_length;
@@ -33,11 +36,11 @@ static Match FindMatch(const char* search,
   }
   /* Ensure we don't point to garbage data */
   if (best.length < target_size)
-      best.next = target[best.length];
+    best.next = target[best.length];
   else
-      best.next = 0;
-  printf("got match offset: %d, length: %d, next: %c\n", best.offset,
-         best.length, best.next);
+    best.next = 0;
+  //  printf("got match offset: %d, length: %d, next: %c\n", best.offset,
+  //         best.length, best.next);
   return best;
 }
 
@@ -85,15 +88,20 @@ int LZ77_Decompress(const char* in,
   for (int i = 0; i < match_size; i++) {
     Match m = matches[i];
     char* seek = outpos - m.offset;
+    if (((outpos - out) + m.length) > (outsize)) {
+      fprintf(stderr, "not enough room in output buffer\n");
+      break;
+    }
     for (unsigned j = 0; j < m.length; j++) {
       /* TODO the "Do it again until it fits case" */
       *outpos = *seek;
       outpos++;
       seek++;
     }
-    if(m.next) { /* make sure we don't spew an extra garbage byte */
-        *outpos = m.next;
-        outpos++;
+    /* make sure we don't spew an extra garbage byte */
+    if (m.next) {
+      *outpos = m.next;
+      outpos++;
     }
   }
 

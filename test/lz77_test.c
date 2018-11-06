@@ -7,12 +7,14 @@
 #include "lz77.h"
 
 int test_empty() {
+   fprintf(stderr, "Test Empty\n");
    LZ77_Compress(NULL, 0, NULL, 0);
    LZ77_Decompress(NULL, 0, NULL, 0);
    return 0;
 }
 
 int test_simple() {
+    fprintf(stderr, "Test Simple\n");
     const char text[] = "This is the story of a girl, who destroyed the whole world";
     char* plain = malloc(2048);
     char* compressed = malloc(2048);
@@ -33,11 +35,12 @@ int test_simple() {
 #define ECOLI "../samples/E.coli"
 int test_ecoli() {
  struct stat sb;
+ fprintf(stderr, "Test ecoli\n");
  if(stat(ECOLI, &sb) != 0) {
      fprintf(stderr, "Failed opening E.Coli file. Skipping\n");
      return -1;
  }
- sb.st_size = 204800; /* XXX */
+ sb.st_size = 40960; /* XXX */
  char * original= malloc(sb.st_size);
  char * plain = malloc(sb.st_size);
  char * compressed = malloc(4 * sb.st_size);
@@ -51,8 +54,8 @@ int test_ecoli() {
  bytes = LZ77_Decompress(compressed, bytes, plain, sb.st_size);
  fprintf(stderr,"text strlen = %ld, wrote %d bytes\n", sb.st_size, bytes);
 
- if(memcmp(original,plain, sb.st_size) != 0) {
-     fprintf(stderr, "original differs from round trip!\n");
+ if(memcmp(original, plain, sb.st_size) != 0) {
+     fprintf(stderr, "* FAILURE: original differs from round trip!\n");
      return -1;
  }
 
@@ -63,11 +66,8 @@ int test_ecoli() {
 }
 
 int main() {
-    fprintf(stderr, "Test Empty\n");
     test_empty();
-    fprintf(stderr, "Test Simple\n");
     test_simple();
-    fprintf(stderr, "Test ecoli\n");
-    //test_ecoli();
+    test_ecoli();
     return 0;
 }
