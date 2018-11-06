@@ -18,7 +18,7 @@ lz77_test_LDADD = ../src/libpz.la
 #lz77_fuzz_LDADD = ../src/libpz.la
 
 lz77_fuzz: lz77_fuzz.c
-	clang -g -O0 -fsanitize=fuzzer lz77_fuzz.c -o lz77_fuzz -I../src -L../src ../src/libpz.a
+	clang -g -O0 -fsanitize=fuzzer lz77_fuzz.c -o lz77_fuzz -I../src -L../src -lpz --static
 
 fuzz: lz77_fuzz
 	./lz77_fuzz -runs=100000
