@@ -13,14 +13,20 @@ int test_empty() {
 }
 
 int test_simple() {
-    const char text[1024] = "This is the story of a girl, who destroyed the whole world";
-    char* out = malloc(2048);
-    int bytes = LZ77_Compress(text, strlen(text), out, 2048);
-    printf("text strlen = %d, wrote %d bytes\n", strlen(text), bytes);
+    const char text[] = "This is the story of a girl, who destroyed the whole world";
+    char* plain = malloc(2048);
+    char* compressed = malloc(2048);
+    memcpy(plain, text, sizeof(text));
 
-    bytes = LZ77_Decompress(out, bytes, &text, strlen(text));
-    printf("text strlen = %d, decompressed %d bytes\n", strlen(text), bytes);
-    free(out);
+    int bytes = LZ77_Compress(plain, sizeof(text), compressed, 2048);
+    fprintf(stderr, "text strlen = %ld, wrote %d bytes\n", strlen(plain), bytes);
+
+    memset(plain, 0, 2048);
+    bytes = LZ77_Decompress(compressed, bytes, plain, 2048);
+    fprintf(stderr,"text strlen = %ld, decompressed %d bytes\n", strlen(text), bytes);
+    fprintf(stderr, "%s\n", plain);
+    free(plain);
+    free(compressed);
     return 0;
 }
 
@@ -31,33 +37,37 @@ int test_ecoli() {
      fprintf(stderr, "Failed opening E.Coli file. Skipping\n");
      return -1;
  }
- sb.st_size = 4096; /* XXX */
- char * in = malloc(sb.st_size);
- if(in == NULL) {
-     fprintf(stderr, "Failed malloc. Skipping\n");
-     return -1;
- }
- char * out = malloc(4 * sb.st_size);
- if(out == NULL) {
-     free(in);
-     fprintf(stderr, "Failed malloc. Skipping\n");
-     return -1;
- }
+ sb.st_size = 204800; /* XXX */
+ char * original= malloc(sb.st_size);
+ char * plain = malloc(sb.st_size);
+ char * compressed = malloc(4 * sb.st_size);
+
  FILE * file = fopen(ECOLI, "r");
- fread(in, 1, sb.st_size, file);
+ fread(original, 1, sb.st_size, file);
  fclose(file);
+ memcpy(plain, original, sb.st_size);
 
- int bytes = LZ77_Compress(in, strlen(in), out, 4 *sb.st_size);
- printf("text strlen = %d, wrote %d bytes\n", strlen(in), bytes);
+ int bytes = LZ77_Compress(plain, sb.st_size, compressed, 4 *sb.st_size);
+ bytes = LZ77_Decompress(compressed, bytes, plain, sb.st_size);
+ fprintf(stderr,"text strlen = %ld, wrote %d bytes\n", sb.st_size, bytes);
 
- free(in);
- free(out);
+ if(memcmp(original,plain, sb.st_size) != 0) {
+     fprintf(stderr, "original differs from round trip!\n");
+     return -1;
+ }
 
+ free(original);
+ free(plain);
+ free(compressed);
+ return 0;
 }
 
 int main() {
+    fprintf(stderr, "Test Empty\n");
     test_empty();
+    fprintf(stderr, "Test Simple\n");
     test_simple();
+    fprintf(stderr, "Test ecoli\n");
     //test_ecoli();
     return 0;
 }
