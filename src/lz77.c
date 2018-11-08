@@ -16,12 +16,16 @@ static Match FindMatch(const char* search,
   if (target_size == 1)
     return best;
 
+  // unsigned window = search_size > 4096 ? (search + search_size - 4096) :
+  // search_size;
   for (unsigned i = 0; i < search_size; ++i) {
     register unsigned temp_match_length = 0;
     register unsigned tail = i + temp_match_length;
 
-    while (search[tail] == target[temp_match_length] && (tail < target_size) &&
-           (tail < search_size)) {
+    while (search[tail] == target[temp_match_length] && (tail < target_size))
+    //&& (tail < search_size)) { /* removing this allows us to match into the
+    // future */
+    {
       ++temp_match_length;
       ++tail;
     }
@@ -34,14 +38,12 @@ static Match FindMatch(const char* search,
     }
   }
   /* Ensure we don't point to garbage data */
-  if (best.length < target_size)
-    best.next = target[best.length];
-  else { /* best.length >= target_size */
-    /* We have to truncate our match so that next points to valid bytes */
-    best.length--;
-    best.next = target[best.length];
-  }
-  // printf("got match offset: %d, length: %d, next: %02x\n", best.offset,
+  /* in the "abcabc" case we can only match ab next: c */
+  /* We have to truncate our match so that next points to valid bytes */
+  while (best.length >= target_size - 1)
+    --best.length;
+  best.next = target[best.length];
+  //printf("got match offset: %d, length: %d, next: %02x\n", best.offset,
   //       best.length, best.next & 0xff);
   return best;
 }
@@ -57,7 +59,7 @@ int LZ77_Compress(const char* in,
                   unsigned int outsize) {
   if (insize == 0 || outsize == 0) {
     fprintf(stderr, "insize or outsize is 0\n");
-    return -1;
+    return 0;
   }
   const char* pos = in;
   char* out_pos = out;

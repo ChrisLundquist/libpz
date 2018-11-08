@@ -13,6 +13,22 @@ int test_empty() {
   return 0;
 }
 
+int test_endmatch() {
+  const char text[] = "abcabcabc";
+  char* plain = malloc(2048);
+  char* compressed = malloc(2048);
+  memcpy(plain, text, sizeof(text));
+  int bytes = LZ77_Compress(plain, sizeof(text), compressed, 2048);
+  fprintf(stderr, "text size = %ld, wrote %d bytes\n", sizeof(text), bytes);
+
+  memset(plain, 0, 2048);
+  bytes = LZ77_Decompress(compressed, bytes, plain, 2048);
+  fprintf(stderr, "%s\n", plain);
+
+  free(plain);
+  free(compressed);
+}
+
 int test_simple() {
   fprintf(stderr, "Test Simple\n");
   const char text[] =
@@ -41,7 +57,8 @@ static int test_file(const char* filepath) {
     return -1;
   }
 
-  sb.st_size = 40960; /* XXX */
+  if(sb.st_size > 40960 * 4)
+      sb.st_size = 40960 * 4; /* XXX */
   char* original = malloc(sb.st_size);
   char* plain = malloc(sb.st_size);
   char* compressed = malloc(4 * sb.st_size);
@@ -59,13 +76,20 @@ static int test_file(const char* filepath) {
           bytes);
 
   if (memcmp(original, plain, sb.st_size) != 0) {
-    fprintf(stderr, "* FAILURE: original differs from round trip!\n");
+    fprintf(stderr, "!!! FAILURE: original differs from round trip!\n");
+    free(original);
+    free(plain);
+    free(compressed);
     return -1;
+  }
+  else{
+      fprintf(stderr, "* SUCCESS: original and round trip match\n");
   }
 
   free(original);
   free(plain);
   free(compressed);
+  return 0;
 }
 
 #define ECOLI "../samples/E.coli"
@@ -84,6 +108,7 @@ int test_ptt5() {
 
 int main() {
   test_empty();
+  test_endmatch();
   test_simple();
   test_ecoli();
   test_ptt5();
