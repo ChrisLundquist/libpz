@@ -13,7 +13,7 @@ int LLVMFuzzerTestOneInput(const char *Data, int Size) {
   //fprintf(stderr, "Compressed size: %d\n", bytes);
   bytes = LZ77_Decompress(compressed, bytes, plain, outsize);
   //fprintf(stderr, "Decompressed size: %d\n", bytes);
-  if(memcmp(Data, plain, bytes) != 0) {
+  if(memcmp(Data, plain, Size) != 0) {
       fprintf(stderr, "* Error input roundtrip is not equal\n");
       //fprintf(stderr, "Input: '%s', Round Trip: '%s',\n", Data, plain);
   }

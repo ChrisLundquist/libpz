@@ -7,10 +7,10 @@ typedef struct Match {
   char next;
 } Match;
 
-static Match FindMatch(const char* search,
-                       unsigned int search_size,
-                       const char* target,
-                       unsigned int target_size) {
+static Match FindMatchClassic(const char* search,
+                              unsigned search_size,
+                              const char* target,
+                              unsigned target_size) {
   /* assert search and target? */
   register Match best = {.offset = 0, .length = 0, .next = *target};
   if (target_size == 1)
@@ -18,7 +18,7 @@ static Match FindMatch(const char* search,
 
   // unsigned window = search_size > 4096 ? (search + search_size - 4096) :
   // search_size;
-  for (unsigned i = 0; i < search_size; ++i) {
+  for (register unsigned i = 0; i < search_size; ++i) {
     register unsigned temp_match_length = 0;
     register unsigned tail = i + temp_match_length;
 
@@ -40,11 +40,41 @@ static Match FindMatch(const char* search,
   /* Ensure we don't point to garbage data */
   /* in the "abcabc" case we can only match ab next: c */
   /* We have to truncate our match so that next points to valid bytes */
-  while (best.length >= target_size - 1)
+  while (best.length >= target_size)
     --best.length;
   best.next = target[best.length];
-  //printf("got match offset: %d, length: %d, next: %02x\n", best.offset,
-  //       best.length, best.next & 0xff);
+  return best;
+}
+
+static Match FindMatchTrivial(const char* search,
+                              unsigned search_size,
+                              const char* target,
+                              unsigned target_size) {
+  register Match best = {.offset = 0, .length = 0, .next = *target};
+  return best;
+}
+
+static Match FindMatchMemcmp(const char* search,
+                             unsigned search_size,
+                             const char* target,
+                             unsigned target_size) {
+  register Match best = {.offset = 0, .length = 0, .next = *target};
+  if (target_size == 1)
+    return best;
+
+  for (register unsigned i = 0; i < target_size; ++i) {
+    register unsigned cur_len = 1;
+    while ((i + cur_len) < target_size && (i + cur_len) < search_size &&
+           memcmp(search + i, target, cur_len) == 0) {
+      ++cur_len;
+    }
+    if (cur_len - 1 > best.length) {
+      best.length = cur_len - 1;
+      best.offset = search_size - i;
+      best.next = target[best.length];
+    }
+  }
+
   return best;
 }
 
@@ -52,6 +82,13 @@ inline static void WriteMatch(const Match* match, char* out) {
   memcpy(out, match, sizeof(Match));
   return;
 }
+
+// Match (*FindMatch)(const char*, unsigned, const char*, unsigned) =
+// FindMatchClassic;
+Match (*FindMatch)(const char*,
+                   unsigned,
+                   const char*,
+                   unsigned) = FindMatchClassic;
 
 int LZ77_Compress(const char* in,
                   unsigned int insize,
@@ -68,6 +105,8 @@ int LZ77_Compress(const char* in,
   while (pos < end) {
     int window = (pos - in);
     Match match = FindMatch(in, window, pos, insize - window);
+    // fprintf(stderr, "got match offset: %d, length: %d, next: %02x\n",
+    //        match.offset, match.length, match.next & 0xff);
 
     if ((out_pos - out + sizeof(Match)) > outsize) {
       fprintf(stderr, "not enough room in output buffer\n");
@@ -87,16 +126,16 @@ int LZ77_Decompress(const char* in,
                     unsigned int outsize) {
   Match* matches = (Match*)in;
   int match_size = insize / sizeof(Match);
-  char* outpos = out;
+  register char* outpos = out;
 
   for (int i = 0; i < match_size; i++) {
-    Match m = matches[i];
+    register Match m = matches[i];
     if (((outpos - out) + m.length) > (outsize)) {
       fprintf(stderr, "not enough room in output buffer\n");
       break;
     }
-    char* seek = outpos - m.offset;
-    for (unsigned j = 0; j < m.length; j++) {
+    register char* seek = outpos - m.offset;
+    for (register unsigned j = 0; j < m.length; j++) {
       /* TODO the "Do it again until it fits case" */
       *outpos = *seek;
       outpos++;

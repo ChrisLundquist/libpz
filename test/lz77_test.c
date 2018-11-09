@@ -27,6 +27,7 @@ int test_endmatch() {
 
   free(plain);
   free(compressed);
+  return 0;
 }
 
 int test_simple() {
@@ -107,10 +108,10 @@ int test_ptt5() {
 }
 
 int main() {
-  test_empty();
+  //test_empty();
   test_endmatch();
   test_simple();
-  test_ecoli();
-  test_ptt5();
+  //test_ecoli();
+  //test_ptt5();
   return 0;
 }
