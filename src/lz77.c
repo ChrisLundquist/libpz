@@ -21,7 +21,6 @@ static Match FindMatchClassic(const char* search,
   for (register unsigned i = 0; i < search_size; ++i) {
     register unsigned temp_match_length = 0;
     register unsigned tail = i + temp_match_length;
-
     while (search[tail] == target[temp_match_length] && (tail < target_size))
     //&& (tail < search_size)) { /* removing this allows us to match into the
     // future */
@@ -45,7 +44,7 @@ static Match FindMatchClassic(const char* search,
   best.next = target[best.length];
   return best;
 }
-
+/*
 static Match FindMatchTrivial(const char* search,
                               unsigned search_size,
                               const char* target,
@@ -77,10 +76,15 @@ static Match FindMatchMemcmp(const char* search,
 
   return best;
 }
-
+*/
 inline static void WriteMatch(const Match* match, char* out) {
   memcpy(out, match, sizeof(Match));
   return;
+}
+
+inline static void PrintMatch(const Match* match) {
+  fprintf(stderr, "{offset: %d, length: %d, next: %02x}\n", match->offset,
+          match->length, match->next & 0xff);
 }
 
 // Match (*FindMatch)(const char*, unsigned, const char*, unsigned) =
@@ -103,19 +107,28 @@ int LZ77_Compress(const char* in,
   const char* end = in + insize;
 
   while (pos < end) {
-    int window = (pos - in);
+    const int window = (pos - in);
     Match match = FindMatch(in, window, pos, insize - window);
-    // fprintf(stderr, "got match offset: %d, length: %d, next: %02x\n",
-    //        match.offset, match.length, match.next & 0xff);
 
     if ((out_pos - out + sizeof(Match)) > outsize) {
       fprintf(stderr, "not enough room in output buffer\n");
       break;
     }
+    // PrintMatch(&match);
     WriteMatch(&match, out_pos);
     out_pos += sizeof(Match);
     pos += match.length + 1;
   }
+  /*
+  for (Match match; pos < end; pos += match.length + 1) {
+    const unsigned window = (pos - in);
+    match = FindMatch(in, window, pos, insize - window);
+    if ((out_pos - out + sizeof(Match)) > outsize) {
+      fprintf(stderr, "not enough room in output buffer\n");
+      break;
+    }
+    out_pos += sizeof(Match);
+  }*/
 
   return out_pos - out;
 }
@@ -136,7 +149,6 @@ int LZ77_Decompress(const char* in,
     }
     register char* seek = outpos - m.offset;
     for (register unsigned j = 0; j < m.length; j++) {
-      /* TODO the "Do it again until it fits case" */
       *outpos = *seek;
       outpos++;
       seek++;
