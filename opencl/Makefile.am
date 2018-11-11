@@ -11,6 +11,7 @@ AM_CPPFLAGS=-I$(top_builddir)/include
 CHECK_PROGRAMS = opencl_test
 opencl_test_SOURCES = test.c
 opencl_test_LDADD = libpz-opencl.la $(OPENCL_LIBS)
+opencl_test_LDFLAGS = -static
 
 LINT_FILES = $(libpz_opencl_la_SOURCES)
 
