@@ -1,16 +1,14 @@
 SUFFIXES = .lint
-bin_PROGRAMS = pz
-#noinst_LIBRARIES = libpz.a#libpz.so
-lib_LTLIBRARIES = libpz.la
+lib_LTLIBRARIES = libpz-opencl.la
 
-libpz_la_SOURCES = lz77.c
-include_HEADERS = lz77.h
+libpz_opencl_la_SOURCES = engine.c
+#include_HEADERS = engine.h
 
-pz_SOURCES = main.c
-#pz_LDFLAGS = -L.
-pz_LDADD = libpz.la $(OPENCL_LIBS)
+OPENCL_LIBS=-lOpenCL
 
-LINT_FILES = $(pz_SOURCES) $(libpz_la_SOURCES)
+AM_CPPFLAGS=-I$(top_builddir)/include
+
+LINT_FILES = $(libpz_opencl_la_SOURCES)
 
 # Make this OK to fail, tee our lint to the file as well.
 LINTER_FLAGS ?= -- -I. $(AM_CPPFLAGS) $(DEFS)

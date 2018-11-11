@@ -7,6 +7,7 @@ AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_FILES([
  Makefile
  src/Makefile
+ opencl/Makefile
  test/Makefile
  samples/Makefile
 ])
@@ -42,7 +43,6 @@ AC_LANG_CASE([C], [
         AX_APPEND_FLAG(-Wextra, [])
     ])
 ])
-
 # TODO AC_SEARCH_LIB OpenCL
 #AX_COMPILER_FLAGS()
 AC_OUTPUT
