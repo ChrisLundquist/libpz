@@ -6,6 +6,12 @@
 //}
 //
 typedef enum {
+    INVALID,
+    READY,
+    RELEASED
+} codec_state_t;
+
+typedef enum {
     Huffman,
     Golomb,
     Arithmetic,

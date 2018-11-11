@@ -1,3 +1,8 @@
+#ifdef __APPLE__
+#include <OpenCL/opencl.h>
+#else
+#include <CL/cl.h>
+#endif
 #include "codec.h"
 
 typedef struct {
@@ -8,6 +13,7 @@ typedef struct {
 
 typedef struct {
     codec_name_t name;
+    codec_state_t state;
     cl_program program; // compute program
     cl_kernel kernel;   // compute kernel
     int (*Encode)(const char* plain, unsigned plain_len, const char* out, unsigned out_len);
@@ -15,7 +21,7 @@ typedef struct {
 } opencl_codec_t;
 
 opencl_engine_t CreateEngine();
-opencl_codec_t GetCodec(codec_name_t name);
+opencl_codec_t GetCodec(opencl_engine_t *engine, codec_name_t name);
 
 void DestroyEngine(opencl_engine_t *engine);
 

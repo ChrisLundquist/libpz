@@ -1,11 +1,6 @@
+#include "engine.h"
 #include <stdio.h>
 #include <sys/stat.h>
-#ifdef __APPLE__
-#include <OpenCL/opencl.h>
-#else
-#include <CL/cl.h>
-#endif
-#include "engine.h"
 
 static inline int FindDevice(opencl_engine_t* engine) {
   cl_platform_id platforms[2];
@@ -16,7 +11,6 @@ static inline int FindDevice(opencl_engine_t* engine) {
   }
 
   // Connect to a compute device
-  //
   int gpu = 1;
   err = clGetDeviceIDs(platforms[0],
                        gpu ? CL_DEVICE_TYPE_GPU : CL_DEVICE_TYPE_CPU, 1,
@@ -37,7 +31,6 @@ static inline int CreateContext(opencl_engine_t* engine) {
   }
 
   // Create a command commands
-  //
   engine->commands =
       clCreateCommandQueue(engine->context, engine->device_id, 0, &err);
   if (!engine->commands) {
@@ -45,6 +38,23 @@ static inline int CreateContext(opencl_engine_t* engine) {
     return -2;
   }
   return 0;
+}
+
+opencl_engine_t CreateEngine() {
+  opencl_engine_t engine;
+  FindDevice(&engine);
+  CreateContext(&engine);
+  return engine;
+}
+
+void DestroyEngine(opencl_engine_t* engine) {
+  clReleaseCommandQueue(engine->commands);
+  clReleaseContext(engine->context);
+}
+
+void DestroyCodec(opencl_codec_t* codec) {
+  clReleaseProgram(codec->program);
+  clReleaseKernel(codec->kernel);
 }
 
 static char* ReadProgramFile(const char* filepath) {
@@ -104,4 +114,33 @@ static int BuildProgram(opencl_engine_t* engine,
     return -4;
   }
   return 0;
+}
+
+int EncodeLZ77(const char* in, unsigned in_len, char* out, unsigned out_len) {
+  return 0;
+}
+
+int DecodeLZ77(const char* in, unsigned in_len, char* out, unsigned out_len) {
+  return 0;
+}
+
+opencl_codec_t GetCodec(opencl_engine_t* engine, codec_name_t name) {
+  opencl_codec_t codec = {.state = INVALID, .Encode = NULL, .Decode = NULL};
+  fprintf(stderr, "Loading Codec %d\n", name);
+  switch (name) {
+    case LZ77: {
+      int err = BuildProgram(engine, &codec, "lz77.cl", "Encode");
+      if (err != 0) {
+        fprintf(stderr, "Failed Building Codec\n");
+        return codec;
+      }
+      codec.Encode = EncodeLZ77;
+      codec.Decode = DecodeLZ77;
+      break;
+    }
+    default:
+      fprintf(stderr, "Unknown codec %d\n", name);
+  }
+  codec.state = READY;
+  return codec;
 }
