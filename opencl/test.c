@@ -24,10 +24,10 @@ static int test_file(opencl_codec_t *codec, const char* filepath) {
   fclose(file);
   memcpy(plain, original, sb.st_size);
 
-  int bytes = codec->Encode(plain, sb.st_size, compressed, 4 * sb.st_size);
+  int bytes = codec->Encode(codec, plain, sb.st_size, compressed, 4 * sb.st_size);
   fprintf(stderr, "text strlen = %ld, wrote %d compressed bytes\n", sb.st_size,
           bytes);
-  bytes = codec->Decode(compressed, bytes, plain, sb.st_size);
+  bytes = codec->Decode(codec, compressed, bytes, plain, sb.st_size);
   fprintf(stderr, "text strlen = %ld, wrote %d plain bytes\n", sb.st_size,
           bytes);
 
@@ -56,11 +56,11 @@ int test_simple(opencl_codec_t *codec) {
   char* compressed = malloc(2048);
   memcpy(plain, text, sizeof(text));
 
-  int bytes = codec->Encode(plain, sizeof(text), compressed, 2048);
+  int bytes = codec->Encode(codec, plain, sizeof(text), compressed, 2048);
   fprintf(stderr, "text size = %ld, wrote %d bytes\n", sizeof(text), bytes);
 
   memset(plain, 0, 2048);
-  bytes = codec->Decode(compressed, bytes, plain, 2048);
+  bytes = codec->Decode(codec, compressed, bytes, plain, 2048);
   fprintf(stderr, "text strlen = %ld, decompressed %d bytes\n", strlen(text) + 1 /*null*/,
           bytes);
   fprintf(stderr, "%s\n", plain);
