@@ -174,19 +174,20 @@ static int EncodeLZ77(struct opencl_codec* codec,
   // for very small groups we need to clamp this
   if (local > global)
     local = global;
-  const size_t step_size = local * 32;
-  //printf("global size: %ld, local size: %ld, step size: %ld\n", global, local, step_size);
+  const size_t step_size = local;
+  printf("global size: %ld, local size: %ld, step size: %ld\n", global, local,
+         step_size);
   // Execute the kernel over the entire range of our 1d input data set
   // using the maximum number of work group items for this device
-  for(unsigned i = 0; i < global; i += step_size) {
-      /* TODO readback chunks of results after a kernel finishes */
-      printf("enqueue kernel global: %ld, offset: %ld\n", global, i);
-      err = clEnqueueNDRangeKernel(codec->engine->commands, codec->kernel, 1, &i,
-              &step_size, &local, 0, NULL, NULL);
-      if (err) {
-          printf("Error: Failed to execute kernel! Error: %d\n", err);
-          return -5;
-      }
+  for (size_t i = step_size * 0; i < global; i += step_size) {
+    /* TODO readback chunks of results after a kernel finishes */
+    printf("enqueue kernel global: %ld, step_size: %d, local: %d, offset: %d\n", global, step_size, local, i);
+    err = clEnqueueNDRangeKernel(codec->engine->commands, codec->kernel, 1, &i,
+                                 &step_size, &local, 0, NULL, NULL);
+    if (err) {
+      printf("Error: Failed to execute kernel! Error: %d\n", err);
+      return -5;
+    }
   }
 
   printf("Waiting for commands to finish\n");
@@ -212,7 +213,7 @@ static int EncodeLZ77(struct opencl_codec* codec,
   int match_count = readback_size / sizeof(lz77_match_t);
   for (int i = 0; i < match_count; i++) {
     lz77_match_t match = ((lz77_match_t*)out)[i];
-    //PrintMatch(&match);
+    // PrintMatch(&match);
   }
 
   return 0;

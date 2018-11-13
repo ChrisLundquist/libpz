@@ -95,6 +95,7 @@ static int test_file(const char* filepath) {
 
 #define ECOLI "../samples/E.coli"
 #define PTT5 "../samples/ptt5"
+#define BIBLE "../samples/bible.txt"
 int test_ecoli() {
   fprintf(stderr, "Test ecoli\n");
   test_file(ECOLI);
@@ -107,11 +108,19 @@ int test_ptt5() {
   return 0;
 }
 
+int test_bible() {
+  fprintf(stderr, "Test bible\n");
+  test_file(BIBLE);
+  return 0;
+}
+
+
 int main() {
   //test_empty();
   //test_endmatch();
   //test_simple();
-  test_ecoli();
+  //test_ecoli();
+  test_bible();
   //test_ptt5();
   return 0;
 }

@@ -1,6 +1,7 @@
 #include "lz77.h"
+#define MAX_WINDOW 32
 
-inline lz77_match_t FindMatchClassic(__global char* search,
+lz77_match_t FindMatchClassic(__global char* search,
                               unsigned search_size,
                               __global char* target,
                               unsigned target_size) {
@@ -21,16 +22,12 @@ inline lz77_match_t FindMatchClassic(__global char* search,
       best.length = temp_match_length;
     }
   }
-  /* Ensure we don't point to garbage data */
-  /* in the "abcabc" case we can only match ab next: c */
-  /* We have to truncate our match so that next points to valid bytes */
   while (best.length >= target_size)
     --best.length;
   best.next = target[best.length];
   return best;
 }
 
-#define MAX_WINDOW 4096
 
 __kernel void Encode(__global char *in,
                      __global lz77_match_t *out,
