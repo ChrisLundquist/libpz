@@ -13,8 +13,8 @@ static int test_file(opencl_codec_t *codec, const char* filepath) {
     return -1;
   }
 
-//  if(sb.st_size > 40960 * 4)
-//      sb.st_size = 40960 * 4; /* XXX */
+  //if(sb.st_size > 40960 * 16)
+  //    sb.st_size = 40960 * 16; /* XXX */
   char* original = malloc(sb.st_size);
   char* plain = malloc(sb.st_size);
   char* compressed = malloc(4 * sb.st_size);
@@ -95,7 +95,7 @@ int main() {
     //lz77.Encode();
     test_simple(&lz77);
     test_ecoli(&lz77);
-    test_ptt5(&lz77);
+    //test_ptt5(&lz77);
 
     //DestroyCodec(&lz77);
     //DestroyEngine(&engine);

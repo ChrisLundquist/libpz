@@ -58,8 +58,8 @@ static int test_file(const char* filepath) {
     return -1;
   }
 
-  if(sb.st_size > 40960 * 4)
-      sb.st_size = 40960 * 4; /* XXX */
+  //if(sb.st_size > 40960 * 4)
+  //    sb.st_size = 40960 * 4; /* XXX */
   char* original = malloc(sb.st_size);
   char* plain = malloc(sb.st_size);
   char* compressed = malloc(4 * sb.st_size);
@@ -109,9 +109,9 @@ int test_ptt5() {
 
 int main() {
   //test_empty();
-  test_endmatch();
-  test_simple();
-  //test_ecoli();
+  //test_endmatch();
+  //test_simple();
+  test_ecoli();
   //test_ptt5();
   return 0;
 }

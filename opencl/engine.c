@@ -101,7 +101,7 @@ static int BuildProgram(opencl_engine_t* engine,
   }
 
   // Build the program executable
-  err = clBuildProgram(codec->program, 0, NULL, NULL, NULL, NULL);
+  err = clBuildProgram(codec->program, 0, NULL, "-Werror", NULL, NULL);
   if (err != CL_SUCCESS) {
     size_t len;
     char buffer[2048];
@@ -174,18 +174,25 @@ static int EncodeLZ77(struct opencl_codec* codec,
   // for very small groups we need to clamp this
   if (local > global)
     local = global;
-  printf("global size: %ld, local size: %ld\n", global, local);
+  const size_t step_size = local * 32;
+  //printf("global size: %ld, local size: %ld, step size: %ld\n", global, local, step_size);
   // Execute the kernel over the entire range of our 1d input data set
   // using the maximum number of work group items for this device
-  err = clEnqueueNDRangeKernel(codec->engine->commands, codec->kernel, 1, NULL,
-                               &global, &local, 0, NULL, NULL);
-  if (err) {
-    printf("Error: Failed to execute kernel! Error: %d\n", err);
-    return -5;
+  for(unsigned i = 0; i < global; i += step_size) {
+      /* TODO readback chunks of results after a kernel finishes */
+      printf("enqueue kernel global: %ld, offset: %ld\n", global, i);
+      err = clEnqueueNDRangeKernel(codec->engine->commands, codec->kernel, 1, &i,
+              &step_size, &local, 0, NULL, NULL);
+      if (err) {
+          printf("Error: Failed to execute kernel! Error: %d\n", err);
+          return -5;
+      }
   }
 
+  printf("Waiting for commands to finish\n");
   // Wait for the command commands to get serviced before reading back results
   clFinish(codec->engine->commands);
+  printf("Reading Results\n");
 
   // Read back the results from the device to verify the output
   /* TODO XXX readback size and out_len need to be reconciled */
@@ -198,13 +205,14 @@ static int EncodeLZ77(struct opencl_codec* codec,
     printf("Error: Failed to read output array! %d\n", err);
     return -6;
   }
+  printf("Releasing memory\n");
   clReleaseMemObject(input);
   clReleaseMemObject(output);
 
   int match_count = readback_size / sizeof(lz77_match_t);
   for (int i = 0; i < match_count; i++) {
     lz77_match_t match = ((lz77_match_t*)out)[i];
-    PrintMatch(&match);
+    //PrintMatch(&match);
   }
 
   return 0;

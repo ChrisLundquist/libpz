@@ -107,8 +107,12 @@ int LZ77_Compress(const char* in,
   const char* end = in + insize;
 
   while (pos < end) {
-    const int window = (pos - in);
-    Match match = FindMatch(in, window, pos, insize - window);
+    const int i = (pos - in);
+    // Match match = FindMatch(in, window, pos, insize - window);
+#define MAX_WINDOW 4096
+    const char* window_start = i > MAX_WINDOW ? in + i - MAX_WINDOW : in;
+    const unsigned search_size = i > MAX_WINDOW ? MAX_WINDOW : i;
+    Match match = FindMatch(window_start, search_size, pos, insize - i);
 
     if ((out_pos - out + sizeof(Match)) > outsize) {
       fprintf(stderr, "not enough room in output buffer\n");
