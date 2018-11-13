@@ -8,6 +8,7 @@ AC_CONFIG_FILES([
  Makefile
  src/Makefile
  opencl/Makefile
+ reference/Makefile
  test/Makefile
  samples/Makefile
 ])

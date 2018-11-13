@@ -1,30 +1,29 @@
+#include "lz77.h"
 #include <stdio.h>
 #include <string.h>
 
-typedef struct Match {
-  unsigned offset;
-  unsigned length;
-  char next;
-} Match;
+#define MAX_WINDOW 4096
+inline void PrintMatch(const lz77_match_t* match) {
+  fprintf(stderr, "{offset: %d, length: %d, next: %02x}\n", match->offset,
+          match->length, match->next & 0xff);
+}
 
-static Match FindMatchClassic(const char* search,
-                              unsigned search_size,
-                              const char* target,
-                              unsigned target_size) {
+static lz77_match_t FindMatchClassic(const char* search,
+                                     unsigned search_size,
+                                     const char* target,
+                                     unsigned target_size) {
   /* assert search and target? */
-  register Match best = {.offset = 0, .length = 0, .next = *target};
-  if (target_size == 1)
-    return best;
+  register lz77_match_t best = {.offset = 0, .length = 0, .next = *target};
 
-  // unsigned window = search_size > 4096 ? (search + search_size - 4096) :
-  // search_size;
   for (register unsigned i = 0; i < search_size; ++i) {
+    /* Spot check if this could be at least as long as our current best */
+    if (search[i + best.length] != target[best.length])
+      continue;
+
     register unsigned temp_match_length = 0;
     register unsigned tail = i + temp_match_length;
-    while (search[tail] == target[temp_match_length] && (tail < target_size))
-    //&& (tail < search_size)) { /* removing this allows us to match into the
-    // future */
-    {
+
+    while (search[tail] == target[temp_match_length] && (tail < target_size)) {
       ++temp_match_length;
       ++tail;
     }
@@ -44,20 +43,21 @@ static Match FindMatchClassic(const char* search,
   best.next = target[best.length];
   return best;
 }
+
 /*
-static Match FindMatchTrivial(const char* search,
+static lz77_match_t FindMatchTrivial(const char* search,
                               unsigned search_size,
                               const char* target,
                               unsigned target_size) {
-  register Match best = {.offset = 0, .length = 0, .next = *target};
+  register lz77_match_t best = {.offset = 0, .length = 0, .next = *target};
   return best;
 }
 
-static Match FindMatchMemcmp(const char* search,
+static lz77_match_t FindMatchMemcmp(const char* search,
                              unsigned search_size,
                              const char* target,
                              unsigned target_size) {
-  register Match best = {.offset = 0, .length = 0, .next = *target};
+  register lz77_match_t best = {.offset = 0, .length = 0, .next = *target};
   if (target_size == 1)
     return best;
 
@@ -77,22 +77,17 @@ static Match FindMatchMemcmp(const char* search,
   return best;
 }
 */
-inline static void WriteMatch(const Match* match, char* out) {
-  memcpy(out, match, sizeof(Match));
+inline static void WriteMatch(const lz77_match_t* match, char* out) {
+  memcpy(out, match, sizeof(lz77_match_t));
   return;
 }
 
-inline static void PrintMatch(const Match* match) {
-  fprintf(stderr, "{offset: %d, length: %d, next: %02x}\n", match->offset,
-          match->length, match->next & 0xff);
-}
-
-// Match (*FindMatch)(const char*, unsigned, const char*, unsigned) =
+// lz77_match_t (*FindMatch)(const char*, unsigned, const char*, unsigned) =
 // FindMatchClassic;
-Match (*FindMatch)(const char*,
-                   unsigned,
-                   const char*,
-                   unsigned) = FindMatchClassic;
+lz77_match_t (*FindMatch)(const char*,
+                          unsigned,
+                          const char*,
+                          unsigned) = FindMatchClassic;
 
 int LZ77_Compress(const char* in,
                   unsigned int insize,
@@ -108,19 +103,18 @@ int LZ77_Compress(const char* in,
 
   while (pos < end) {
     const int i = (pos - in);
-    // Match match = FindMatch(in, window, pos, insize - window);
-#define MAX_WINDOW 4096
+    // lz77_match_t match = FindMatch(in, window, pos, insize - window);
     const char* window_start = i > MAX_WINDOW ? in + i - MAX_WINDOW : in;
     const unsigned search_size = i > MAX_WINDOW ? MAX_WINDOW : i;
-    Match match = FindMatch(window_start, search_size, pos, insize - i);
+    lz77_match_t match = FindMatch(window_start, search_size, pos, insize - i);
 
-    if ((out_pos - out + sizeof(Match)) > outsize) {
+    if ((out_pos - out + sizeof(lz77_match_t)) > outsize) {
       fprintf(stderr, "not enough room in output buffer\n");
       break;
     }
     // PrintMatch(&match);
     WriteMatch(&match, out_pos);
-    out_pos += sizeof(Match);
+    out_pos += sizeof(lz77_match_t);
     pos += match.length + 1;
   }
   /*
@@ -141,12 +135,12 @@ int LZ77_Decompress(const char* in,
                     unsigned int insize,
                     char* out,
                     unsigned int outsize) {
-  Match* matches = (Match*)in;
-  int match_size = insize / sizeof(Match);
+  lz77_match_t* matches = (lz77_match_t*)in;
+  int match_size = insize / sizeof(lz77_match_t);
   register char* outpos = out;
 
   for (int i = 0; i < match_size; i++) {
-    register Match m = matches[i];
+    register lz77_match_t m = matches[i];
     if (((outpos - out) + m.length) > (outsize)) {
       fprintf(stderr, "not enough room in output buffer\n");
       break;

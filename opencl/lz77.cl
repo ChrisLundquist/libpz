@@ -1,4 +1,4 @@
-#include "lz77.h"
+#include "../include/lz77.h"
 #define MAX_WINDOW 32
 
 lz77_match_t FindMatchClassic(__global char* search,

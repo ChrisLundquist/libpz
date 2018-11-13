@@ -3,11 +3,6 @@
 #include <sys/stat.h>
 #include "lz77.h"
 
-inline static void PrintMatch(const lz77_match_t* match) {
-  fprintf(stderr, "{offset: %d, length: %d, next: %02x}\n", match->offset,
-          match->length, match->next & 0xff);
-}
-
 static inline int FindDevice(opencl_engine_t* engine) {
   cl_platform_id platforms[2];
   int err = clGetPlatformIDs(2, &platforms, NULL);
