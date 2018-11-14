@@ -26,6 +26,7 @@ samples/*
 test/lz77
 !samples/large.tar.gz
 !samples/cantrbry.tar.gz
+!samples/Makefile.am
 src/libpz.la
 src/lz77.lo
 test/.libs/lz77_test
