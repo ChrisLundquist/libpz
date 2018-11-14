@@ -72,6 +72,7 @@ int test_simple(opencl_codec_t *codec) {
 #define ECOLI "../samples/E.coli"
 #define PTT5 "../samples/ptt5"
 #define BIBLE "../samples/bible.txt"
+#define LIKE "../samples/asyoulik.txt"
 
 int test_ecoli(opencl_codec_t *codec) {
   fprintf(stderr, "Test ecoli\n");
@@ -87,7 +88,13 @@ int test_ptt5(opencl_codec_t *codec) {
 
 int test_bible(opencl_codec_t *codec) {
   fprintf(stderr, "Test bible\n");
-  test_file(codec, PTT5);
+  test_file(codec, BIBLE);
+  return 0;
+}
+
+int test_like(opencl_codec_t *codec) {
+  fprintf(stderr, "Test asyoulik\n");
+  test_file(codec, LIKE);
   return 0;
 }
 
@@ -102,9 +109,10 @@ int main() {
 
     //lz77.Encode();
     //test_simple(&lz77);
-   // test_ecoli(&lz77);
+    test_ecoli(&lz77);
     //test_ptt5(&lz77);
-    test_bible(&lz77);
+    //test_bible(&lz77);
+    //test_like(&lz77);
 
     //DestroyCodec(&lz77);
     //DestroyEngine(&engine);

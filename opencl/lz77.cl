@@ -1,15 +1,17 @@
 #include "../include/lz77.h"
-#define MAX_WINDOW 32
+
+#define MAX_WINDOW 262144
 
 lz77_match_t FindMatchClassic(__global char* search,
                               unsigned search_size,
                               __global char* target,
                               unsigned target_size) {
   lz77_match_t best = {.offset = 0, .length = 0, .next = *target};
-  if (target_size == 1)
-    return best;
 
   for (unsigned i = 0; i < search_size; ++i) {
+    if (search[i + best.length] != target[best.length])
+      continue;
+
     unsigned temp_match_length = 0;
     unsigned tail = i + temp_match_length;
     while (search[tail] == target[temp_match_length] && (tail < target_size))

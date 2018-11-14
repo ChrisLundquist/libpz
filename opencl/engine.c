@@ -1,6 +1,8 @@
-#include "engine.h"
 #include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
+
+#include "engine.h"
 #include "lz77.h"
 
 static inline int FindDevice(opencl_engine_t* engine) {
@@ -82,7 +84,7 @@ static int BuildProgram(opencl_engine_t* engine,
                         opencl_codec_t* codec,
                         const char* path,
                         const char* kernel_name) {
-  char* source = ReadProgramFile(path);
+  char* source = (char*)ReadProgramFile(path);
   if (source == NULL)
     return -1;
 
@@ -117,11 +119,32 @@ static int BuildProgram(opencl_engine_t* engine,
   return 0;
 }
 
+// In OpenCL we will calculate a number of redundant matches.
+// This happens when at index I we get a match len of 7 then at I+1 we get 6
+// at I + 2 we get 5, etc.
+// This finds the number of matches if we skipped by match length
+static int DedupeMatches(lz77_match_t* matches, unsigned match_count) {
+  unsigned count =
+      1; /* the first match will always be a literal so we can skip it */
+  for (unsigned index = 1; index < match_count; ++count) {
+    matches[count] = matches[index];
+    index += matches[index].length + 1;
+  }
+  // printf("Only need %u matches (%d bytes) %g%\n", count, count *
+  // sizeof(lz77_match_t), 100 * (float)count / match_count);
+  return count;
+}
+
 static int EncodeLZ77(struct opencl_codec* codec,
                       const char* in,
                       unsigned in_len,
                       char* out,
                       unsigned out_len) {
+  if (in_len == 0 || out_len == 0) {
+    printf("Called Encode with 0 len in or out!\n");
+    return 0;
+  }
+
   // Create the input and output arrays in device memory for our calculation
   cl_mem input = clCreateBuffer(codec->engine->context, CL_MEM_READ_ONLY,
                                 in_len, NULL, NULL);
@@ -140,7 +163,6 @@ static int EncodeLZ77(struct opencl_codec* codec,
   }
 
   // Set the arguments to our compute kernel
-  err = 0;
   err = clSetKernelArg(codec->kernel, 0, sizeof(cl_mem), &input);
   err |= clSetKernelArg(codec->kernel, 1, sizeof(cl_mem), &output);
   err |= clSetKernelArg(codec->kernel, 2, sizeof(unsigned int), &in_len);
@@ -169,14 +191,16 @@ static int EncodeLZ77(struct opencl_codec* codec,
   // for very small groups we need to clamp this
   if (local > global)
     local = global;
-  const size_t step_size = local;
+  const size_t step_size = local * 128;
   printf("global size: %ld, local size: %ld, step size: %ld\n", global, local,
          step_size);
   // Execute the kernel over the entire range of our 1d input data set
   // using the maximum number of work group items for this device
   for (size_t i = step_size * 0; i < global; i += step_size) {
     /* TODO readback chunks of results after a kernel finishes */
-    printf("enqueue kernel global: %ld, step_size: %d, local: %d, offset: %d\n", global, step_size, local, i);
+    printf(
+        "enqueue kernel global: %ld, step_size: %ld, local: %ld, offset: %ld\n",
+        global, step_size, local, i);
     err = clEnqueueNDRangeKernel(codec->engine->commands, codec->kernel, 1, &i,
                                  &step_size, &local, 0, NULL, NULL);
     if (err) {
@@ -189,37 +213,71 @@ static int EncodeLZ77(struct opencl_codec* codec,
   // Wait for the command commands to get serviced before reading back results
   clFinish(codec->engine->commands);
   printf("Reading Results\n");
-
-  // Read back the results from the device to verify the output
-  /* TODO XXX readback size and out_len need to be reconciled */
-  int readback_size = in_len * sizeof(lz77_match_t) > out_len
-                          ? out_len
-                          : in_len * sizeof(lz77_match_t);
-  err = clEnqueueReadBuffer(codec->engine->commands, output, CL_TRUE, 0,
-                            readback_size, out, 0, NULL, NULL);
-  if (err != CL_SUCCESS) {
-    printf("Error: Failed to read output array! %d\n", err);
+  lz77_match_t* tmp_matches = malloc(in_len * sizeof(lz77_match_t));
+  if (tmp_matches == NULL) {
+    printf("Error: allocating temp buffer!\n");
+    clReleaseMemObject(input);
+    clReleaseMemObject(output);
     return -6;
   }
+
+  // Read back the results from the device to verify the output
+  /* TODO zero copy and remove tmp */
+  int readback_size = in_len * sizeof(lz77_match_t);
+  err = clEnqueueReadBuffer(codec->engine->commands, output, CL_TRUE, 0,
+                            readback_size, tmp_matches, 0, NULL, NULL);
+  if (err != CL_SUCCESS) {
+    printf("Error: Failed to read output array! %d\n", err);
+    return -7;
+  }
+
+  unsigned deduped_count = DedupeMatches(tmp_matches, in_len);
+  if (deduped_count * sizeof(lz77_match_t) > out_len) {
+    printf("Error: output buffer doesn't have enough room need %ld, have %d!\n",
+           deduped_count * sizeof(lz77_match_t), out_len);
+    free(tmp_matches);
+    clReleaseMemObject(input);
+    clReleaseMemObject(output);
+    return -7;
+  }
+
+  memcpy(out, tmp_matches, deduped_count * sizeof(lz77_match_t));
+
   printf("Releasing memory\n");
+  free(tmp_matches);
   clReleaseMemObject(input);
   clReleaseMemObject(output);
 
-  int match_count = readback_size / sizeof(lz77_match_t);
-  for (int i = 0; i < match_count; i++) {
-    lz77_match_t match = ((lz77_match_t*)out)[i];
-    // PrintMatch(&match);
-  }
-
-  return 0;
+  return deduped_count * sizeof(lz77_match_t);
 }
 
+/* FIXME copy paste form reference */
 static int DecodeLZ77(struct opencl_codec* codec,
                       const char* in,
-                      unsigned in_len,
+                      unsigned insize,
                       char* out,
-                      unsigned out_len) {
-  return 0;
+                      unsigned outsize) {
+  lz77_match_t* matches = (lz77_match_t*)in;
+  int match_size = insize / sizeof(lz77_match_t);
+  register char* outpos = out;
+
+  for (int i = 0; i < match_size; i++) {
+    register lz77_match_t m = matches[i];
+    if (((outpos - out) + m.length) > (outsize)) {
+      fprintf(stderr, "not enough room in output buffer\n");
+      break;
+    }
+    register char* seek = outpos - m.offset;
+    for (register unsigned j = 0; j < m.length; j++) {
+      *outpos = *seek;
+      outpos++;
+      seek++;
+    }
+    *outpos = m.next;
+    outpos++;
+  }
+
+  return outpos - out;
 }
 
 opencl_codec_t GetCodec(opencl_engine_t* engine, codec_name_t name) {

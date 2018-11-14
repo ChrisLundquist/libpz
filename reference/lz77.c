@@ -1,6 +1,7 @@
-#include "lz77.h"
 #include <stdio.h>
 #include <string.h>
+
+#include "include/lz77.h"
 
 #define MAX_WINDOW 4096
 inline void PrintMatch(const lz77_match_t* match) {
@@ -112,7 +113,7 @@ int LZ77_Compress(const char* in,
       fprintf(stderr, "not enough room in output buffer\n");
       break;
     }
-    // PrintMatch(&match);
+    PrintMatch(&match);
     WriteMatch(&match, out_pos);
     out_pos += sizeof(lz77_match_t);
     pos += match.length + 1;

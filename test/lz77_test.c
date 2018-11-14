@@ -1,10 +1,12 @@
-#include "lz77.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#include "lz77.h"
+#include "reference/lz77.h"
 
 int test_empty() {
   fprintf(stderr, "Test Empty\n");

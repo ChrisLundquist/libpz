@@ -10,7 +10,7 @@ AM_CPPFLAGS=-I$(top_builddir)/include
 LINT_FILES = $(pz_SOURCES) $(libpz_la_SOURCES)
 
 # Make this OK to fail, tee our lint to the file as well.
-LINTER_FLAGS ?= -- -I. $(AM_CPPFLAGS) $(DEFS)
+LINTER_FLAGS ?= -- -I. -I.. $(AM_CPPFLAGS) $(DEFS)
 FORMATTER_FLAGS ?= -style=Chromium -i
 
 %.c.lint: %.c
