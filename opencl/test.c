@@ -108,11 +108,11 @@ int main() {
 
 
     //lz77.Encode();
-    //test_simple(&lz77);
-    test_ecoli(&lz77);
+    test_simple(&lz77);
+    //test_ecoli(&lz77);
     //test_ptt5(&lz77);
     //test_bible(&lz77);
-    //test_like(&lz77);
+    test_like(&lz77);
 
     //DestroyCodec(&lz77);
     //DestroyEngine(&engine);

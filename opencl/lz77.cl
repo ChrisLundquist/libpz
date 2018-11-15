@@ -1,11 +1,12 @@
 #include "../include/lz77.h"
 
-#define MAX_WINDOW 262144
+#define MAX_WINDOW 131072
 
 lz77_match_t FindMatchClassic(__global char* search,
                               unsigned search_size,
                               __global char* target,
                               unsigned target_size) {
+
   lz77_match_t best = {.offset = 0, .length = 0, .next = *target};
 
   for (unsigned i = 0; i < search_size; ++i) {

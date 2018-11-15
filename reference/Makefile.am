@@ -2,7 +2,8 @@ SUFFIXES = .lint
 #noinst_LIBRARIES = libpz.a#libpz.so
 lib_LTLIBRARIES = libpz.la
 
-libpz_la_SOURCES = lz77.c
+libpz_la_SOURCES = lz77.c frequency.c
+libpz_la_LDFLAGS = -lm
 
 AM_CPPFLAGS=-I$(top_builddir)/include
 #pz_LDFLAGS = -L.

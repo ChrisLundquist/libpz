@@ -34,10 +34,16 @@ static inline int CreateContext(opencl_engine_t* engine) {
   }
 
   // Create a command commands
+  // XXX TODO check OOQ is supported
+  const cl_queue_properties props[] = {CL_QUEUE_PROPERTIES, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, 0};
+  //const cl_queue_properties props[] = {CL_QUEUE_PROPERTIES, 0};
   engine->commands =
-      clCreateCommandQueue(engine->context, engine->device_id, 0, &err);
+      clCreateCommandQueueWithProperties(engine->context, engine->device_id, &props, &err);
+  // TODO fallback to OCL 1.2
+  //engine->commands =
+  //    clCreateCommandQueue(engine->context, engine->device_id, 0, &err);
   if (!engine->commands) {
-    printf("Error: Failed to create a command commands!\n");
+    printf("Error: Failed to create a command commands! Err: %d\n", err);
     return -2;
   }
   return 0;
@@ -191,27 +197,32 @@ static int EncodeLZ77(struct opencl_codec* codec,
   // for very small groups we need to clamp this
   if (local > global)
     local = global;
-  const size_t step_size = local * 128;
+  const size_t step_size = local * 32;
   printf("global size: %ld, local size: %ld, step size: %ld\n", global, local,
          step_size);
   // Execute the kernel over the entire range of our 1d input data set
   // using the maximum number of work group items for this device
-  for (size_t i = step_size * 0; i < global; i += step_size) {
+  size_t loops = 0;
+  for (size_t i = step_size * 0; i < global; i += step_size, ++loops) {
     /* TODO readback chunks of results after a kernel finishes */
-    printf(
-        "enqueue kernel global: %ld, step_size: %ld, local: %ld, offset: %ld\n",
-        global, step_size, local, i);
+    //printf(
+    //    "enqueue kernel global: %ld, step_size: %ld, local: %ld, offset: %ld\n",
+    //    global, step_size, local, i);
     err = clEnqueueNDRangeKernel(codec->engine->commands, codec->kernel, 1, &i,
                                  &step_size, &local, 0, NULL, NULL);
     if (err) {
       printf("Error: Failed to execute kernel! Error: %d\n", err);
       return -5;
     }
+    if(loops % 16 == 0) {
+        clFlush(codec->engine->commands);
+    }
   }
 
   printf("Waiting for commands to finish\n");
   // Wait for the command commands to get serviced before reading back results
-  clFinish(codec->engine->commands);
+  clFinish(codec->engine->commands); /* In Order Queue */
+  //clEnqueueBarrier(codec->engine->commands); /*XXX Out of Order */
   printf("Reading Results\n");
   lz77_match_t* tmp_matches = malloc(in_len * sizeof(lz77_match_t));
   if (tmp_matches == NULL) {
