@@ -26,6 +26,7 @@ static frequency_t test_file(const char* filepath) {
   free(original);
   return table;
 }
+#define LARGE "../samples/large.tar.gz"
 #define ECOLI "../samples/E.coli"
 #define PTT5 "../samples/ptt5"
 #define BIBLE "../samples/bible.txt"
@@ -62,6 +63,17 @@ int test_bible() { // 4047392
   return 0;
 }
 
+int test_large() { // 4047392
+  fprintf(stderr, "Test large.tar.gz\n");
+  frequency_t table = test_file(LARGE);
+  if(table.total != 3258648) {
+      fprintf(stderr, "Incorrect total\n");
+      return -1;
+  }
+    printf("Entropy: %g\n", get_entropy(&table));
+  return 0;
+}
+
 int test_simple() {
     frequency_t table = new_table();
     unsigned char test[256];
@@ -78,5 +90,6 @@ int main() {
   test_ecoli();
   test_bible();
   test_ptt5();
+  test_large();
   return 0;
 }

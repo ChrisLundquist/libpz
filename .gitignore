@@ -54,3 +54,4 @@ libtool
 *~
 opencl/test
 opencl/opencl_test
+test/frequency_test
