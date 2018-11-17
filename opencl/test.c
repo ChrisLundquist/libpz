@@ -6,6 +6,14 @@
 #include <unistd.h>
 
 #include "engine.h"
+
+static int find_difference(const unsigned char* expected, const unsigned char* actual, unsigned len) {
+    for(unsigned i = 0; i < len; ++i) {
+        if(expected[i] != actual[i])
+            return i;
+    }
+    return len;
+}
 static int test_file(opencl_codec_t *codec, const char* filepath) {
   struct stat sb;
   if (stat(filepath, &sb) != 0) {
@@ -33,6 +41,7 @@ static int test_file(opencl_codec_t *codec, const char* filepath) {
 
   if (memcmp(original, plain, sb.st_size) != 0) {
     fprintf(stderr, "!!! FAILURE: original differs from round trip!\n");
+    fprintf(stderr, "Diff index: %d\n", find_difference(original, plain, bytes));
     free(original);
     free(plain);
     free(compressed);
@@ -109,9 +118,9 @@ int main() {
 
     //lz77.Encode();
     test_simple(&lz77);
-    //test_ecoli(&lz77);
+    test_ecoli(&lz77);
     //test_ptt5(&lz77);
-    //test_bible(&lz77);
+    test_bible(&lz77);
     test_like(&lz77);
 
     //DestroyCodec(&lz77);

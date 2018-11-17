@@ -1,10 +1,8 @@
-bin_PROGRAMS = lz77_ref #lz77_fuzz
+#bin_PROGRAMS = lz77_ref #lz77_fuzz
 check_PROGRAMS = lz77_test lz77_fuzz frequency_test
 SUFFIXES = .lint
 
 AM_CPPFLAGS=-I$(top_builddir)/include
-
-lz77_ref_SOURCES = lz77-reference.c
 
 frequency_test_SOURCES = frequency_test.c
 frequency_test_CFLAGS = $(AM_CPPFLAGS)

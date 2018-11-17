@@ -120,9 +120,9 @@ int test_bible() {
 int main() {
   //test_empty();
   //test_endmatch();
-  //test_simple();
+  test_simple();
   //test_ecoli();
-  test_bible();
+  //test_bible();
   //test_ptt5();
   return 0;
 }

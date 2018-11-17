@@ -35,13 +35,17 @@ static inline int CreateContext(opencl_engine_t* engine) {
 
   // Create a command commands
   // XXX TODO check OOQ is supported
-  const cl_queue_properties props[] = {CL_QUEUE_PROPERTIES, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, 0};
-  //const cl_queue_properties props[] = {CL_QUEUE_PROPERTIES, 0};
+  const cl_queue_properties ooq[] = {CL_QUEUE_PROPERTIES, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, 0};
+  //const cl_queue_properties iiq[] = {CL_QUEUE_PROPERTIES, 0};
   engine->commands =
-      clCreateCommandQueueWithProperties(engine->context, engine->device_id, &props, &err);
-  // TODO fallback to OCL 1.2
-  //engine->commands =
-  //    clCreateCommandQueue(engine->context, engine->device_id, 0, &err);
+      clCreateCommandQueueWithProperties(engine->context, engine->device_id, &ooq, &err);
+
+  if (!engine->commands || err < 0) { /* doesn't support OOQ */
+      printf("Falling back to In-Order-Queue\n");
+      engine->commands =
+          clCreateCommandQueueWithProperties(engine->context, engine->device_id, 0, &err);
+  }
+
   if (!engine->commands) {
     printf("Error: Failed to create a command commands! Err: %d\n", err);
     return -2;
@@ -104,10 +108,11 @@ static int BuildProgram(opencl_engine_t* engine,
   }
 
   // Build the program executable
+  // -cl-std=CL1.2
   err = clBuildProgram(codec->program, 0, NULL, "-Werror", NULL, NULL);
   if (err != CL_SUCCESS) {
     size_t len;
-    char buffer[2048];
+    char buffer[4096];
 
     fprintf(stderr, "Error: Failed to build program executable!\n");
     clGetProgramBuildInfo(codec->program, engine->device_id,
@@ -125,14 +130,29 @@ static int BuildProgram(opencl_engine_t* engine,
   return 0;
 }
 
+
+inline void PrintMatch(const lz77_match_t* match) {
+  fprintf(stderr, "{offset: %u, length: %u, next: %02x}\n", match->offset,
+          match->length, match->next & 0xff);
+}
+
+inline void PrintMatches(const lz77_match_t *matches, unsigned match_len) {
+    for(unsigned i = 0; i < match_len; ++i) {
+        fprintf(stderr, "index: %u ", i);
+        PrintMatch(&matches[i]);
+    }
+}
+
 // In OpenCL we will calculate a number of redundant matches.
 // This happens when at index I we get a match len of 7 then at I+1 we get 6
 // at I + 2 we get 5, etc.
 // This finds the number of matches if we skipped by match length
 static int DedupeMatches(lz77_match_t* matches, unsigned match_count) {
-  unsigned count =
-      1; /* the first match will always be a literal so we can skip it */
+ /* the first match will always be a literal so we can skip it */
+  unsigned count = 1;
   for (unsigned index = 1; index < match_count; ++count) {
+    //fprintf(stderr, "choosing match %d ", index);
+    //PrintMatch(&matches[index]);
     matches[count] = matches[index];
     index += matches[index].length + 1;
   }
@@ -190,20 +210,23 @@ static int EncodeLZ77(struct opencl_codec* codec,
   // Tweaks for edge cases
   // global has to be a multiple of local, so make sure it lines up.
   // we must protected aginst extra opencl device threads in the kernel)
-  size_t global = in_len;
-  if (global % local != 0)
+  const int worker_window = 32;
+  size_t global = in_len / worker_window;
+  if (global % local != 0) {
     global = global - (global % local) + local;
+    //global /= worker_window; // how many bytes each worker looks at
+  }
 
   // for very small groups we need to clamp this
   if (local > global)
     local = global;
-  const size_t step_size = local * 32;
+  const size_t step_size = local;
   printf("global size: %ld, local size: %ld, step size: %ld\n", global, local,
          step_size);
   // Execute the kernel over the entire range of our 1d input data set
   // using the maximum number of work group items for this device
   size_t loops = 0;
-  for (size_t i = step_size * 0; i < global; i += step_size, ++loops) {
+  for (size_t i = 0; i < global; i += step_size, ++loops) {
     /* TODO readback chunks of results after a kernel finishes */
     //printf(
     //    "enqueue kernel global: %ld, step_size: %ld, local: %ld, offset: %ld\n",
@@ -214,7 +237,7 @@ static int EncodeLZ77(struct opencl_codec* codec,
       printf("Error: Failed to execute kernel! Error: %d\n", err);
       return -5;
     }
-    if(loops % 16 == 0) {
+    if(loops % 8 == 0) {
         clFlush(codec->engine->commands);
     }
   }
@@ -224,7 +247,9 @@ static int EncodeLZ77(struct opencl_codec* codec,
   clFinish(codec->engine->commands); /* In Order Queue */
   //clEnqueueBarrier(codec->engine->commands); /*XXX Out of Order */
   printf("Reading Results\n");
-  lz77_match_t* tmp_matches = malloc(in_len * sizeof(lz77_match_t));
+  const unsigned readback_size = in_len * sizeof(lz77_match_t);
+  //const unsigned readback_size = 196 * sizeof(lz77_match_t); // XXX
+  lz77_match_t* tmp_matches = malloc(readback_size);
   if (tmp_matches == NULL) {
     printf("Error: allocating temp buffer!\n");
     clReleaseMemObject(input);
@@ -234,7 +259,6 @@ static int EncodeLZ77(struct opencl_codec* codec,
 
   // Read back the results from the device to verify the output
   /* TODO zero copy and remove tmp */
-  int readback_size = in_len * sizeof(lz77_match_t);
   err = clEnqueueReadBuffer(codec->engine->commands, output, CL_TRUE, 0,
                             readback_size, tmp_matches, 0, NULL, NULL);
   if (err != CL_SUCCESS) {
@@ -242,24 +266,27 @@ static int EncodeLZ77(struct opencl_codec* codec,
     return -7;
   }
 
-  unsigned deduped_count = DedupeMatches(tmp_matches, in_len);
-  if (deduped_count * sizeof(lz77_match_t) > out_len) {
-    printf("Error: output buffer doesn't have enough room need %ld, have %d!\n",
-           deduped_count * sizeof(lz77_match_t), out_len);
+  //PrintMatches(tmp_matches, readback_size / sizeof(lz77_match_t));
+
+  unsigned deduped_count = DedupeMatches(tmp_matches, readback_size / sizeof(lz77_match_t));
+  const unsigned deduped_size = deduped_count * sizeof(lz77_match_t);
+  if (deduped_size > out_len) {
+    printf("Error: output buffer doesn't have enough room need %d, have %d!\n",
+           deduped_size, out_len);
     free(tmp_matches);
     clReleaseMemObject(input);
     clReleaseMemObject(output);
     return -7;
   }
 
-  memcpy(out, tmp_matches, deduped_count * sizeof(lz77_match_t));
+  memcpy(out, tmp_matches, deduped_size);
 
   printf("Releasing memory\n");
   free(tmp_matches);
   clReleaseMemObject(input);
   clReleaseMemObject(output);
 
-  return deduped_count * sizeof(lz77_match_t);
+  return deduped_size;
 }
 
 /* FIXME copy paste form reference */
@@ -297,7 +324,7 @@ opencl_codec_t GetCodec(opencl_engine_t* engine, codec_name_t name) {
   fprintf(stderr, "Loading Codec %d\n", name);
   switch (name) {
     case LZ77: {
-      int err = BuildProgram(engine, &codec, "lz77.cl", "Encode");
+      int err = BuildProgram(engine, &codec, "lz77-batch.cl", "Encode");
       if (err != 0) {
         fprintf(stderr, "Failed Building Codec\n");
         return codec;

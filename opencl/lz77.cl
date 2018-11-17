@@ -1,11 +1,11 @@
 #include "../include/lz77.h"
 
-#define MAX_WINDOW 131072
+#define MAX_WINDOW 131072u
 
 lz77_match_t FindMatchClassic(__global char* search,
-                              unsigned search_size,
+                              const unsigned search_size,
                               __global char* target,
-                              unsigned target_size) {
+                              const unsigned target_size) {
 
   lz77_match_t best = {.offset = 0, .length = 0, .next = *target};
 
@@ -35,12 +35,12 @@ lz77_match_t FindMatchClassic(__global char* search,
 __kernel void Encode(__global char *in,
                      __global lz77_match_t *out,
                               const unsigned count) {
-  int i = get_global_id(0);
+  unsigned i = get_global_id(0);
   if(i > count - 1)
     return;
 
   __global char *window_start = i > MAX_WINDOW ? in + i - MAX_WINDOW : in;
-  unsigned search_size = i > MAX_WINDOW ? MAX_WINDOW : i;
+  const unsigned search_size = min(i, MAX_WINDOW);
 
   out[i] = FindMatchClassic(window_start, search_size, in + i, count - i);
 }
