@@ -4,3 +4,4 @@ typedef struct lz77_match {
   char next;
 } lz77_match_t;
 
+void PrintMatch(const lz77_match_t* match);

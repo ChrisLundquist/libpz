@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "lz77.h"
+#include "reference/lz77.h"
 int LLVMFuzzerTestOneInput(const char *Data, int Size) {
     if(Size == 0)
         return 0;

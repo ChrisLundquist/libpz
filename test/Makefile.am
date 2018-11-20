@@ -1,5 +1,5 @@
 #bin_PROGRAMS = lz77_ref #lz77_fuzz
-check_PROGRAMS = lz77_test lz77_fuzz frequency_test
+check_PROGRAMS = lz77_test lz77_fuzz frequency_test huffman_fuzz
 SUFFIXES = .lint
 
 AM_CPPFLAGS=-I$(top_builddir)/include
@@ -20,6 +20,11 @@ lz77_fuzz_CFLAGS = -I../src -fsanitize=fuzzer,address -g -O0
 lz77_fuzz_LDFLAGS = -L../src -static
 lz77_fuzz_LDADD = ../reference/libpz.la
 
+huffman_fuzz_SOURCES = huffman_fuzz.c
+huffman_fuzz_CFLAGS = -I../src -fsanitize=fuzzer,address -g -O0
+huffman_fuzz_LDFLAGS = -L../src -static
+huffman_fuzz_LDADD = ../reference/libpz.la
+
 #lz77_fuzz: lz77_fuzz.c
 #	clang -g -O0 -fsanitize=fuzzer lz77_fuzz.c -o lz77_fuzz -I../src -L../src -lpz
 
@@ -30,7 +35,7 @@ check-local: lz77_test fuzz
 	./lz77_test
 	./frequency_test
 
-all-local: lz77_test lz77_fuzz frequency_test
+all-local: lz77_test lz77_fuzz frequency_test huffman_fuzz
 
 clean-local:
 	rm -rf lz77_fuzz
