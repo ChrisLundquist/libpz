@@ -17,6 +17,8 @@ huffman_tree_t* huff_new_16(const unsigned short* in, unsigned in_len);
 huffman_tree_t* huff_new_32(const unsigned int* in, unsigned in_len);
 
 void huff_free(huffman_tree_t* tree);
+void huff_print(const huffman_tree_t* tree);
 
 /* returns the number of bits decoded? bytes remaining? */
-unsigned huff_Decode(const char* in, unsigned in_len, char *out, unsigned out_len);
+unsigned huff_Decode(const huffman_tree_t* tree, const char* in, unsigned in_len, char *out, unsigned out_len);
+unsigned huff_Encode(const huffman_tree_t* tree, const char* in, unsigned in_len, char *out, unsigned out_len);

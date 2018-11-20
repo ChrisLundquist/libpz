@@ -47,6 +47,6 @@ void* pq_pop(heap_t* h) {
   return (void*)data;
 }
 
-void pq_free(heap_t *h) {
-    free(h->nodes);
+void pq_free(heap_t* h) {
+  free(h->nodes);
 }
