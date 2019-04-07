@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -6,9 +7,20 @@
 
 int test_simple() {
   const char in[] = "aaaabbbccd";
+  char* plain = malloc(2048);
+  char* compressed = malloc(2048);
   huffman_tree_t *tree = huff_new_8(&in, sizeof(in));
-  huff_print(tree);
+  unsigned bytes = huff_Encode(tree, &in, sizeof(in), compressed, 2048);
+  bytes = huff_Decode(tree, compressed, bytes, plain, 2048);
+
+  if (memcmp(in, plain, bytes) != 0) {
+    fprintf(stderr, "!!! FAILURE: original differs from round trip!\n");
+  }
+
+  huff_print(tree, 1);
   huff_free(tree);
+  free(plain);
+  free(compressed);
   return 0;
 }
 
@@ -25,6 +37,7 @@ static huffman_tree_t* test_file(const char* filepath) {
     fread(original, 1, sb.st_size, file);
     fclose(file);
     huffman_tree_t *tree = huff_new_8(original, sb.st_size);
+    huff_print(tree, 1);
     free(original);
     return tree;
 }
@@ -49,7 +62,6 @@ int test_ptt5() { // 513216
 int test_bible() { // 4047392
     fprintf(stderr, "Test bible\n");
     huffman_tree_t* tree = test_file(BIBLE);
-    huff_print(tree);
     huff_free(tree);
     return 0;
 }
