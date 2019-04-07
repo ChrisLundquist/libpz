@@ -35,15 +35,16 @@ static inline int CreateContext(opencl_engine_t* engine) {
 
   // Create a command commands
   // XXX TODO check OOQ is supported
-  const cl_queue_properties ooq[] = {CL_QUEUE_PROPERTIES, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, 0};
-  //const cl_queue_properties iiq[] = {CL_QUEUE_PROPERTIES, 0};
-  engine->commands =
-      clCreateCommandQueueWithProperties(engine->context, engine->device_id, &ooq, &err);
+  const cl_queue_properties ooq[] = {CL_QUEUE_PROPERTIES,
+                                     CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, 0};
+  // const cl_queue_properties iiq[] = {CL_QUEUE_PROPERTIES, 0};
+  engine->commands = clCreateCommandQueueWithProperties(
+      engine->context, engine->device_id, &ooq, &err);
 
   if (!engine->commands || err < 0) { /* doesn't support OOQ */
-      printf("Falling back to In-Order-Queue\n");
-      engine->commands =
-          clCreateCommandQueueWithProperties(engine->context, engine->device_id, 0, &err);
+    printf("Falling back to In-Order-Queue\n");
+    engine->commands = clCreateCommandQueueWithProperties(
+        engine->context, engine->device_id, 0, &err);
   }
 
   if (!engine->commands) {
@@ -130,17 +131,16 @@ static int BuildProgram(opencl_engine_t* engine,
   return 0;
 }
 
-
 inline void PrintMatch(const lz77_match_t* match) {
   fprintf(stderr, "{offset: %u, length: %u, next: %02x}\n", match->offset,
           match->length, match->next & 0xff);
 }
 
-inline void PrintMatches(const lz77_match_t *matches, unsigned match_len) {
-    for(unsigned i = 0; i < match_len; ++i) {
-        fprintf(stderr, "index: %u ", i);
-        PrintMatch(&matches[i]);
-    }
+inline void PrintMatches(const lz77_match_t* matches, unsigned match_len) {
+  for (unsigned i = 0; i < match_len; ++i) {
+    fprintf(stderr, "index: %u ", i);
+    PrintMatch(&matches[i]);
+  }
 }
 
 // In OpenCL we will calculate a number of redundant matches.
@@ -148,11 +148,11 @@ inline void PrintMatches(const lz77_match_t *matches, unsigned match_len) {
 // at I + 2 we get 5, etc.
 // This finds the number of matches if we skipped by match length
 static int DedupeMatches(lz77_match_t* matches, unsigned match_count) {
- /* the first match will always be a literal so we can skip it */
+  /* the first match will always be a literal so we can skip it */
   unsigned count = 1;
   for (unsigned index = 1; index < match_count; ++count) {
-    //fprintf(stderr, "choosing match %d ", index);
-    //PrintMatch(&matches[index]);
+    // fprintf(stderr, "choosing match %d ", index);
+    // PrintMatch(&matches[index]);
     matches[count] = matches[index];
     index += matches[index].length + 1;
   }
@@ -214,7 +214,7 @@ static int EncodeLZ77(struct opencl_codec* codec,
   size_t global = in_len / worker_window;
   if (global % local != 0) {
     global = global - (global % local) + local;
-    //global /= worker_window; // how many bytes each worker looks at
+    // global /= worker_window; // how many bytes each worker looks at
   }
 
   // for very small groups we need to clamp this
@@ -228,27 +228,27 @@ static int EncodeLZ77(struct opencl_codec* codec,
   size_t loops = 0;
   for (size_t i = 0; i < global; i += step_size, ++loops) {
     /* TODO readback chunks of results after a kernel finishes */
-    //printf(
-    //    "enqueue kernel global: %ld, step_size: %ld, local: %ld, offset: %ld\n",
-    //    global, step_size, local, i);
+    // printf(
+    //    "enqueue kernel global: %ld, step_size: %ld, local: %ld, offset:
+    //    %ld\n", global, step_size, local, i);
     err = clEnqueueNDRangeKernel(codec->engine->commands, codec->kernel, 1, &i,
                                  &step_size, &local, 0, NULL, NULL);
     if (err) {
       printf("Error: Failed to execute kernel! Error: %d\n", err);
       return -5;
     }
-    if(loops % 8 == 0) {
-        clFlush(codec->engine->commands);
+    if (loops % 8 == 0) {
+      clFlush(codec->engine->commands);
     }
   }
 
   printf("Waiting for commands to finish\n");
   // Wait for the command commands to get serviced before reading back results
   clFinish(codec->engine->commands); /* In Order Queue */
-  //clEnqueueBarrier(codec->engine->commands); /*XXX Out of Order */
+  // clEnqueueBarrier(codec->engine->commands); /*XXX Out of Order */
   printf("Reading Results\n");
   const unsigned readback_size = in_len * sizeof(lz77_match_t);
-  //const unsigned readback_size = 196 * sizeof(lz77_match_t); // XXX
+  // const unsigned readback_size = 196 * sizeof(lz77_match_t); // XXX
   lz77_match_t* tmp_matches = malloc(readback_size);
   if (tmp_matches == NULL) {
     printf("Error: allocating temp buffer!\n");
@@ -266,9 +266,10 @@ static int EncodeLZ77(struct opencl_codec* codec,
     return -7;
   }
 
-  //PrintMatches(tmp_matches, readback_size / sizeof(lz77_match_t));
+  // PrintMatches(tmp_matches, readback_size / sizeof(lz77_match_t));
 
-  unsigned deduped_count = DedupeMatches(tmp_matches, readback_size / sizeof(lz77_match_t));
+  unsigned deduped_count =
+      DedupeMatches(tmp_matches, readback_size / sizeof(lz77_match_t));
   const unsigned deduped_size = deduped_count * sizeof(lz77_match_t);
   if (deduped_size > out_len) {
     printf("Error: output buffer doesn't have enough room need %d, have %d!\n",
