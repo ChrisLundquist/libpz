@@ -21,8 +21,11 @@ static void node_print(const huffman_node_t* node) {
   if (node->right)
     right = node->right->weight;
 
-  fprintf(stderr, "weight: %u, value: %u, codeword: %u, code_bits: %u, parent: %u, left: %u, right: %u\n",
-          node->weight, node->value, node->codeword, node->code_bits, parent, left, right);
+  fprintf(stderr,
+          "weight: %u, value: %u, codeword: %u, code_bits: %u, parent: %u, "
+          "left: %u, right: %u\n",
+          node->weight, node->value, node->codeword, node->code_bits, parent,
+          left, right);
 
   if (node->left)
     node_print(node->left);
@@ -31,28 +34,28 @@ static void node_print(const huffman_node_t* node) {
 }
 
 void huff_print(const huffman_tree_t* tree, int leaves_only) {
-    if (tree == NULL)
-        return;
+  if (tree == NULL)
+    return;
 
-    if(leaves_only) {
-        for(unsigned i = 0; i < tree->leave_count; ++i) {
-            node_print(tree->leaves + i);
-        }
-    }else
-        node_print(tree->root);
+  if (leaves_only) {
+    for (unsigned i = 0; i < tree->leave_count; ++i) {
+      node_print(tree->leaves + i);
+    }
+  } else
+    node_print(tree->root);
 }
 
 /* makes a new internal node for our huffman tree */
 inline static huffman_node_t* merge_nodes(huffman_node_t* left,
                                           huffman_node_t* right) {
-  /*if (left == NULL || right == NULL) {
+  if (left == NULL || right == NULL) {
     fprintf(stderr, "%s: left and right nodes are required\n", __func__);
     return NULL;
-  }*/
-  if(left && !right)
-      return left;
-  if(right && !left)
-      return right;
+  }
+  if (left && !right)
+    return left;
+  if (right && !left)
+    return right;
 
   huffman_node_t* new = calloc(1, sizeof(huffman_node_t));
   if (new == NULL) {
@@ -74,8 +77,10 @@ inline static huffman_node_t* merge_nodes(huffman_node_t* left,
       .left = left,
       .right = right,
   };
-  left->parent = new;
-  right->parent = new;
+  if (left)
+    left->parent = new;
+  if (right)
+    right->parent = new;
   return new;
 }
 
@@ -103,7 +108,8 @@ inline static huffman_node_t* generate_leaves(frequency_t* table) {
   return nodes;
 }
 
-static inline huffman_node_t* build_tree(frequency_t* table, huffman_node_t* leaves) {
+static inline huffman_node_t* build_tree(frequency_t* table,
+                                         huffman_node_t* leaves) {
   heap_t queue = {.nodes = NULL, .len = 0, .size = 0};
   for (unsigned i = 0; i < table->used; i++) {
     pq_push(&queue, leaves[i].weight, leaves + i);
@@ -121,19 +127,21 @@ static inline huffman_node_t* build_tree(frequency_t* table, huffman_node_t* lea
   return root;
 }
 
-static void generate_lookup_table(huffman_node_t *node, unsigned prefix, unsigned depth) {
-  if(node == NULL)
-      return;
+static void generate_lookup_table(huffman_node_t* node,
+                                  unsigned prefix,
+                                  unsigned depth) {
+  if (node == NULL)
+    return;
   node->code_bits = depth;
   node->codeword = prefix;
-  if(node->left) {
-      const unsigned left_prefix = prefix << 1;
-      generate_lookup_table(node->left, left_prefix, depth + 1);
+  if (node->left) {
+    const unsigned left_prefix = prefix << 1;
+    generate_lookup_table(node->left, left_prefix, depth + 1);
   }
 
-  if(node->right) {
-      const unsigned right_prefix = (prefix << 1) + 1;
-      generate_lookup_table(node->right, right_prefix, depth + 1);
+  if (node->right) {
+    const unsigned right_prefix = (prefix << 1) + 1;
+    generate_lookup_table(node->right, right_prefix, depth + 1);
   }
 }
 
@@ -145,9 +153,10 @@ huffman_tree_t* huff_new_8(const unsigned char* in, unsigned in_len) {
   huffman_node_t* leaves = generate_leaves(&table);
   huffman_node_t* root = build_tree(&table, leaves);
   huffman_tree_t* tree = calloc(1, sizeof(huffman_tree_t));
-  if(tree == NULL) {
-      fprintf(stderr, "%S failed allocating tree\n", __func__);
-      return NULL;
+  if (tree == NULL) {
+    free(root);
+    fprintf(stderr, "%s failed allocating tree\n", __func__);
+    return NULL;
   }
   tree->root = root;
   tree->leaves = leaves;

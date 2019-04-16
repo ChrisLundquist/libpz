@@ -125,7 +125,7 @@ int main() {
   test_bible(&lz77);
   test_like(&lz77);
 
-   DestroyCodec(&lz77);
-   DestroyEngine(&engine);
+  DestroyCodec(&lz77);
+  DestroyEngine(&engine);
   return 0;
 }
