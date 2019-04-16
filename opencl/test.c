@@ -7,21 +7,23 @@
 
 #include "engine.h"
 
-static int find_difference(const unsigned char* expected, const unsigned char* actual, unsigned len) {
-    for(unsigned i = 0; i < len; ++i) {
-        if(expected[i] != actual[i])
-            return i;
-    }
-    return len;
+static int find_difference(const unsigned char* expected,
+                           const unsigned char* actual,
+                           unsigned len) {
+  for (unsigned i = 0; i < len; ++i) {
+    if (expected[i] != actual[i])
+      return i;
+  }
+  return len;
 }
-static int test_file(opencl_codec_t *codec, const char* filepath) {
+static int test_file(opencl_codec_t* codec, const char* filepath) {
   struct stat sb;
   if (stat(filepath, &sb) != 0) {
     fprintf(stderr, "Failed opening %s. Skipping\n", filepath);
     return -1;
   }
 
-  //if(sb.st_size > 40960 * 16)
+  // if(sb.st_size > 40960 * 16)
   //    sb.st_size = 40960 * 16; /* XXX */
   char* original = malloc(sb.st_size);
   char* plain = malloc(sb.st_size);
@@ -32,7 +34,8 @@ static int test_file(opencl_codec_t *codec, const char* filepath) {
   fclose(file);
   memcpy(plain, original, sb.st_size);
 
-  int bytes = codec->Encode(codec, plain, sb.st_size, compressed, 4 * sb.st_size);
+  int bytes =
+      codec->Encode(codec, plain, sb.st_size, compressed, 4 * sb.st_size);
   fprintf(stderr, "text strlen = %ld, wrote %d compressed bytes\n", sb.st_size,
           bytes);
   bytes = codec->Decode(codec, compressed, bytes, plain, sb.st_size);
@@ -41,14 +44,14 @@ static int test_file(opencl_codec_t *codec, const char* filepath) {
 
   if (memcmp(original, plain, sb.st_size) != 0) {
     fprintf(stderr, "!!! FAILURE: original differs from round trip!\n");
-    fprintf(stderr, "Diff index: %d\n", find_difference(original, plain, bytes));
+    fprintf(stderr, "Diff index: %d\n",
+            find_difference(original, plain, bytes));
     free(original);
     free(plain);
     free(compressed);
     return -1;
-  }
-  else{
-      fprintf(stderr, "* SUCCESS: original and round trip match\n");
+  } else {
+    fprintf(stderr, "* SUCCESS: original and round trip match\n");
   }
 
   free(original);
@@ -57,7 +60,7 @@ static int test_file(opencl_codec_t *codec, const char* filepath) {
   return 0;
 }
 
-int test_simple(opencl_codec_t *codec) {
+int test_simple(opencl_codec_t* codec) {
   fprintf(stderr, "Test Simple\n");
   const char text[] =
       "This is the story of a girl, who destroyed the whole world";
@@ -70,8 +73,8 @@ int test_simple(opencl_codec_t *codec) {
 
   memset(plain, 0, 2048);
   bytes = codec->Decode(codec, compressed, bytes, plain, 2048);
-  fprintf(stderr, "text strlen = %ld, decompressed %d bytes\n", strlen(text) + 1 /*null*/,
-          bytes);
+  fprintf(stderr, "text strlen = %ld, decompressed %d bytes\n",
+          strlen(text) + 1 /*null*/, bytes);
   fprintf(stderr, "%s\n", plain);
   free(plain);
   free(compressed);
@@ -83,47 +86,46 @@ int test_simple(opencl_codec_t *codec) {
 #define BIBLE "../samples/bible.txt"
 #define LIKE "../samples/asyoulik.txt"
 
-int test_ecoli(opencl_codec_t *codec) {
+int test_ecoli(opencl_codec_t* codec) {
   fprintf(stderr, "Test ecoli\n");
   test_file(codec, ECOLI);
   return 0;
 }
 
-int test_ptt5(opencl_codec_t *codec) {
+int test_ptt5(opencl_codec_t* codec) {
   fprintf(stderr, "Test ptt5\n");
   test_file(codec, PTT5);
   return 0;
 }
 
-int test_bible(opencl_codec_t *codec) {
+int test_bible(opencl_codec_t* codec) {
   fprintf(stderr, "Test bible\n");
   test_file(codec, BIBLE);
   return 0;
 }
 
-int test_like(opencl_codec_t *codec) {
+int test_like(opencl_codec_t* codec) {
   fprintf(stderr, "Test asyoulik\n");
   test_file(codec, LIKE);
   return 0;
 }
 
 int main() {
-    opencl_engine_t engine = CreateEngine();
-    opencl_codec_t lz77 = GetCodec(&engine, LZ77);
-    if(lz77.state != READY) {
-        fprintf(stderr, "Codec not ready\n");
-        return -1;
-    }
+  opencl_engine_t engine = CreateEngine();
+  opencl_codec_t lz77 = GetCodec(&engine, LZ77);
+  if (lz77.state != READY) {
+    fprintf(stderr, "Codec not ready\n");
+    return -1;
+  }
 
+  // lz77.Encode();
+  test_simple(&lz77);
+  test_ecoli(&lz77);
+  // test_ptt5(&lz77);
+  test_bible(&lz77);
+  test_like(&lz77);
 
-    //lz77.Encode();
-    test_simple(&lz77);
-    test_ecoli(&lz77);
-    //test_ptt5(&lz77);
-    test_bible(&lz77);
-    test_like(&lz77);
-
-    //DestroyCodec(&lz77);
-    //DestroyEngine(&engine);
-    return 0;
+   DestroyCodec(&lz77);
+   DestroyEngine(&engine);
+  return 0;
 }

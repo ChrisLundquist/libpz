@@ -15,7 +15,7 @@ opencl_test_LDADD = libpz-opencl.la $(OPENCL_LIBS)
 opencl_test_LDFLAGS = -static
 opencl_test_CFLAGS = $(AM_CPPFLAGS)
 
-LINT_FILES = $(libpz_opencl_la_SOURCES)
+LINT_FILES = $(libpz_opencl_la_SOURCES) $(opencl_test_SOURCES)
 
 # Make this OK to fail, tee our lint to the file as well.
 LINTER_FLAGS ?= -- -I. $(AM_CPPFLAGS) $(DEFS)
