@@ -210,6 +210,18 @@ static int EncodeLZ77(struct opencl_codec* codec,
   // Tweaks for edge cases
   // global has to be a multiple of local, so make sure it lines up.
   // we must protected aginst extra opencl device threads in the kernel)
+  //
+  // TODO We really just want to launch groups of threads that we know will
+  // finish before the watchdog kills us. The "Local Work Group" Size seems like
+  // a good number to pick.
+  //
+  // This means we only care about a few things:
+  // - The total number of threads to launch
+  // - The Offset we're at.
+  //
+  // FIXME The below code pretends to want to launch local work groups, but
+  // really our threads currently don't talk to one another, they just chunk
+  // up the work.
   const int worker_window = 32;
   size_t global = in_len / worker_window;
   if (global % local != 0) {
@@ -221,18 +233,17 @@ static int EncodeLZ77(struct opencl_codec* codec,
   if (local > global)
     local = global;
   const size_t step_size = local;
-  printf("global size: %ld, local size: %ld, step size: %ld\n", global, local,
-         step_size);
+  printf("Total Work: %ld, Task Size: %ld\n", global, local);
   // Execute the kernel over the entire range of our 1d input data set
   // using the maximum number of work group items for this device
   size_t loops = 0;
-  for (size_t i = 0; i < global; i += step_size, ++loops) {
+  for (size_t offset = 0; offset < global; offset += step_size, ++loops) {
     /* TODO readback chunks of results after a kernel finishes */
     // printf(
     //    "enqueue kernel global: %ld, step_size: %ld, local: %ld, offset:
     //    %ld\n", global, step_size, local, i);
-    err = clEnqueueNDRangeKernel(codec->engine->commands, codec->kernel, 1, &i,
-                                 &step_size, &local, 0, NULL, NULL);
+    err = clEnqueueNDRangeKernel(codec->engine->commands, codec->kernel, 1, &offset,
+                                 &step_size, NULL, 0, NULL, NULL);
     if (err) {
       printf("Error: Failed to execute kernel! Error: %d\n", err);
       return -5;
