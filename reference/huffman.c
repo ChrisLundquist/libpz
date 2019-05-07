@@ -96,7 +96,6 @@ inline static huffman_node_t* generate_leaves(frequency_t* table) {
   /* here the total alphabet possibilities are 256,
    * however not ever character could be used.
    * we only want to generate leaves for the used alphabet characters */
-  unsigned node_count = 0;
   for (unsigned i = 0; i < 256; ++i) {
     if (table->byte[i] == 0)  // unused, skip it
       continue;
@@ -104,18 +103,6 @@ inline static huffman_node_t* generate_leaves(frequency_t* table) {
         .value = i,
         .weight = table->byte[i],
     };
-
-    /* Before we put them all at the front of the list but I can't remember why
-     * If we space them out and index them as char values, encoding is trivial
-     * as this can be used as a lookup table
-     */
-    /*
-    nodes[node_count] = (huffman_node_t){
-        .value = i,
-        .weight = table->byte[i],
-    };
-    node_count++;
-    */
   }
   return nodes;
 }

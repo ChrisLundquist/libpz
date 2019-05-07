@@ -9,8 +9,8 @@ int test_simple() {
   const char in[] = "aaaabbbccd";
   char* plain = malloc(2048);
   char* compressed = malloc(2048);
-  huffman_tree_t *tree = huff_new_8(&in, sizeof(in));
-  unsigned bytes = huff_Encode(tree, &in, sizeof(in), compressed, 2048);
+  huffman_tree_t *tree = huff_new_8(&in[0], sizeof(in));
+  unsigned bytes = huff_Encode(tree, &in[0], sizeof(in), compressed, 2048) / 8;
   bytes = huff_Decode(tree, compressed, bytes, plain, 2048);
 
   if (memcmp(in, plain, bytes) != 0) {
@@ -31,14 +31,26 @@ static huffman_tree_t* test_file(const char* filepath) {
         return NULL;
     }
 
-    unsigned char* original = malloc(sb.st_size);
+    char* original = malloc(sb.st_size);
+    char* compressed = malloc(sb.st_size);
 
     FILE* file = fopen(filepath, "r");
-    fread(original, 1, sb.st_size, file);
+    fread(original, sizeof(char), sb.st_size, file);
     fclose(file);
     huffman_tree_t *tree = huff_new_8(original, sb.st_size);
+
+    unsigned bits = huff_Encode(tree, original, sb.st_size, compressed, sb.st_size);
+    unsigned approx_bytes = bits / 8;
+    fprintf(stdout, "original_bytes: %ld, approx_encoded_bytes: %d\n", sb.st_size, approx_bytes);
+
+    //bytes = huff_Decode(tree, compressed, bytes, plain, 2048);
+
+    //if (memcmp(in, plain, bytes) != 0) {
+    //    fprintf(stderr, "!!! FAILURE: original differs from round trip!\n");
+    //}
     huff_print(tree, 1);
     free(original);
+    free(compressed);
     return tree;
 }
 

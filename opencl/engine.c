@@ -242,8 +242,8 @@ static int EncodeLZ77(struct opencl_codec* codec,
     // printf(
     //    "enqueue kernel global: %ld, step_size: %ld, local: %ld, offset:
     //    %ld\n", global, step_size, local, i);
-    err = clEnqueueNDRangeKernel(codec->engine->commands, codec->kernel, 1, &offset,
-                                 &step_size, NULL, 0, NULL, NULL);
+    err = clEnqueueNDRangeKernel(codec->engine->commands, codec->kernel, 1,
+                                 &offset, &step_size, NULL, 0, NULL, NULL);
     if (err) {
       printf("Error: Failed to execute kernel! Error: %d\n", err);
       return -5;

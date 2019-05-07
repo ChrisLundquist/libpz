@@ -9,10 +9,10 @@ typedef struct huffman_node {
     unsigned weight;
     unsigned value;
     unsigned int codeword;
-    char code_bits;
-    const struct huffman_node *left;
-    const struct huffman_node *right;
-    const struct huffman_node *parent;
+    unsigned char code_bits;
+    struct huffman_node *left;
+    struct huffman_node *right;
+    struct huffman_node *parent;
 } huffman_node_t;
 
 typedef struct huffman_tree {
@@ -22,9 +22,9 @@ typedef struct huffman_tree {
 } huffman_tree_t;
 
 /* returns the root of the constructed tree */
-huffman_tree_t* huff_new_8(const unsigned char* in, unsigned in_len);
-huffman_tree_t* huff_new_16(const unsigned short* in, unsigned in_len);
-huffman_tree_t* huff_new_32(const unsigned int* in, unsigned in_len);
+huffman_tree_t* huff_new_8(const char* in, unsigned in_len);
+huffman_tree_t* huff_new_16(const short* in, unsigned in_len);
+huffman_tree_t* huff_new_32(const int* in, unsigned in_len);
 
 void huff_free(huffman_tree_t* tree);
 void huff_print(const huffman_tree_t* tree, int leaves_only);
