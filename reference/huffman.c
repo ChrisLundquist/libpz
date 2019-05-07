@@ -38,8 +38,9 @@ void huff_print(const huffman_tree_t* tree, int leaves_only) {
     return;
 
   if (leaves_only) {
-    for (unsigned i = 0; i < tree->leave_count; ++i) {
-      node_print(tree->leaves + i);
+    for (unsigned i = 0; i < 256; ++i) {
+      if (tree->leaves[i].weight)
+        node_print(tree->leaves + i);
     }
   } else
     node_print(tree->root);
@@ -83,9 +84,10 @@ inline static huffman_node_t* merge_nodes(huffman_node_t* left,
     right->parent = new;
   return new;
 }
-
+/* makes an array of 256 leaf nodes, that align with byte patterns
+ * to allow easy frequency and code lookups */
 inline static huffman_node_t* generate_leaves(frequency_t* table) {
-  huffman_node_t* nodes = calloc(table->used, sizeof(huffman_node_t));
+  huffman_node_t* nodes = calloc(256, sizeof(huffman_node_t));
   if (nodes == NULL) {
     fprintf(stderr, "%s: malloc failed\n", __func__);
     return NULL;
@@ -98,12 +100,22 @@ inline static huffman_node_t* generate_leaves(frequency_t* table) {
   for (unsigned i = 0; i < 256; ++i) {
     if (table->byte[i] == 0)  // unused, skip it
       continue;
+    nodes[i] = (huffman_node_t){
+        .value = i,
+        .weight = table->byte[i],
+    };
 
+    /* Before we put them all at the front of the list but I can't remember why
+     * If we space them out and index them as char values, encoding is trivial
+     * as this can be used as a lookup table
+     */
+    /*
     nodes[node_count] = (huffman_node_t){
         .value = i,
         .weight = table->byte[i],
     };
     node_count++;
+    */
   }
   return nodes;
 }
@@ -111,8 +123,9 @@ inline static huffman_node_t* generate_leaves(frequency_t* table) {
 static inline huffman_node_t* build_tree(frequency_t* table,
                                          huffman_node_t* leaves) {
   heap_t queue = {.nodes = NULL, .len = 0, .size = 0};
-  for (unsigned i = 0; i < table->used; i++) {
-    pq_push(&queue, leaves[i].weight, leaves + i);
+  for (unsigned i = 0; i < 256; i++) {
+    if (leaves[i].weight)
+      pq_push(&queue, leaves[i].weight, &leaves[i]);
   }
 
   huffman_node_t *left, *right, *root;
@@ -146,7 +159,7 @@ static void generate_lookup_table(huffman_node_t* node,
 }
 
 /* make a new huffman tree where the alphabet is 8 bits */
-huffman_tree_t* huff_new_8(const unsigned char* in, unsigned in_len) {
+huffman_tree_t* huff_new_8(const char* in, unsigned in_len) {
   frequency_t table = new_table();
   get_frequency(&table, in, in_len);
 
@@ -171,14 +184,16 @@ static void free_node(huffman_node_t* node) {
     return;
 
   if (node->right)
-    free_node((huffman_node_t*)node->right);
+    free_node(node->right);
   if (node->left)
-    free_node((huffman_node_t*)node->left);  // discard const
-  if (node->left || node->right)             // internal node
+    free_node(node->left);        // discard const
+  if (node->left || node->right)  // internal node
     free(node);
 }
 
 void huff_free(huffman_tree_t* tree) {
+  if (tree == NULL)
+    return;
   if (tree->leaves) {
     free(tree->leaves);
     tree->leaves = NULL;
@@ -194,7 +209,23 @@ unsigned huff_Encode(const huffman_tree_t* tree,
                      unsigned in_len,
                      char* out,
                      unsigned out_len) {
-  return 0;
+  unsigned bits_encoded = 0;
+  unsigned bit_offset = 0;
+
+  /* TODO/FIXME check output size has room */
+  for (unsigned index = 0; index < in_len; index++) {
+    const char current_byte = in[index];
+    const huffman_node_t node = tree->leaves[current_byte];
+    const unsigned int codeword = node.codeword;
+    const char code_bits = node.code_bits;
+
+    // Track how many bits we used.
+    bits_encoded += code_bits;
+    bit_offset = bits_encoded % 8;
+    // TODO write to output
+  }
+
+  return bits_encoded;
 }
 
 /* returns the number of bits decoded? bytes remaining? */
