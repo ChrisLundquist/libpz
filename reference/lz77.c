@@ -24,7 +24,7 @@ static lz77_match_t FindMatchClassic(const char* search,
     register unsigned temp_match_length = 0;
     register unsigned tail = i + temp_match_length;
 
-    while (search[tail] == target[temp_match_length] && (tail < target_size)) {
+    while (tail < target_size && search[tail] == target[temp_match_length]) {
       ++temp_match_length;
       ++tail;
     }
@@ -113,7 +113,7 @@ int LZ77_Compress(const char* in,
       fprintf(stderr, "not enough room in output buffer\n");
       break;
     }
-    PrintMatch(&match);
+    // PrintMatch(&match);
     WriteMatch(&match, out_pos);
     out_pos += sizeof(lz77_match_t);
     pos += match.length + 1;
