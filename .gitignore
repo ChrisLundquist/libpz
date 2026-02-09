@@ -57,3 +57,6 @@ opencl/opencl_test
 test/frequency_test
 test/huffman_fuzz
 test/huffman_test
+
+# Rust build artifacts
+libpz-rs/target/
