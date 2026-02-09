@@ -161,6 +161,165 @@ Standard pipelines combining the above stages:
 
 ---
 
+## Phase 1B Status: Reference Implementation Complete
+
+The Rust reference implementation of all core algorithms is complete in `libpz-rs/`.
+This serves as the correctness oracle for future GPU and multi-threaded backends.
+
+### Completed Modules
+
+| Module | File | Description | Tests |
+|--------|------|-------------|-------|
+| **Priority Queue** | `pqueue.rs` | Min-heap for Huffman tree construction | Unit tests |
+| **Frequency** | `frequency.rs` | Byte frequency counting and entropy calculation | Unit tests |
+| **Huffman** | `huffman.rs` | Tree construction, canonical codes, bit-packed encode/decode | Unit tests |
+| **LZ77** | `lz77.rs` | Brute-force, hash-chain (O(n)), and lazy matching | Unit tests |
+| **RLE** | `rle.rs` | bzip2-style run-length encoding (4+count format) | Unit tests |
+| **MTF** | `mtf.rs` | Move-to-Front transform | Unit tests |
+| **BWT** | `bwt.rs` | Burrows-Wheeler Transform (prefix-doubling suffix array) | Unit tests |
+| **Range Coder** | `rangecoder.rs` | Subbotin carryless range coder with adaptive model | Unit tests |
+| **Pipeline** | `pipeline.rs` | Orchestrator with self-describing container format | Unit tests |
+| **FFI** | `ffi.rs` | C-callable API (`pz_compress` / `pz_decompress`) | Integration tests |
+
+### Compression Pipelines Implemented
+
+| Pipeline | ID | Stages | Similar to |
+|----------|----|--------|------------|
+| `Deflate` | 0 | LZ77 → Huffman | gzip |
+| `Bw` | 1 | BWT → MTF → RLE → RangeCoder | bzip2 |
+| `Lza` | 2 | LZ77 → RangeCoder | lzma-like |
+
+### Container Format
+
+Self-describing binary format for compressed data:
+```
+[2B magic "PZ"] [1B version=1] [1B pipeline_id] [4B original_len LE] [pipeline metadata...] [compressed data...]
+```
+- Deflate pipeline includes Huffman frequency table in metadata (~1KB)
+- Bw pipeline includes BWT primary_index (4 bytes) in metadata
+- Decompression auto-detects pipeline from header
+
+### Modular Algorithm Composition
+
+Each algorithm module is an independent building block with `encode`/`decode` pairs
+that can be chained arbitrarily. This modular design enables:
+
+1. **Mix-and-match experimentation**: Any transform/entropy coder combination can be
+   tested (e.g., BWT→MTF→Huffman, LZ77→RangeCoder, BWT→RLE→Huffman)
+2. **Algorithm comparison**: Multiple implementations of the same stage (e.g., three
+   LZ77 match finders: brute-force, hash-chain, lazy) can be benchmarked head-to-head
+3. **Future extensibility**: New algorithms (FSE/tANS, optimal LZ77 parsing, GPU
+   backends) slot in as new modules without changing existing code
+4. **Backend validation**: When GPU/pthread backends are added, they must produce
+   output that round-trips identically through the same decode path
+
+---
+
+## Reference Implementation Validation Strategy
+
+### Validation Test Infrastructure (`validation.rs`)
+
+The validation test module provides comprehensive correctness testing across all
+algorithm modules and their compositions. Tests are organized in layers:
+
+#### 1. Per-Algorithm Round-Trip Tests
+A `round_trip_test!` macro generates tests for every algorithm against a standard
+set of test vectors:
+- **all_zeros**: 1000 bytes of zeros (worst case for some, best for others)
+- **uniform**: All 256 byte values (uniform distribution)
+- **skewed**: Heavily biased toward zeros with rare other values
+- **repeating_text**: Natural language with repetition
+- **sawtooth**: Repeating 0..63 pattern
+- **runs**: Alternating run lengths of different bytes
+- **binary_pattern**: Pseudo-random binary data
+- **single_byte**: Degenerate single-byte input
+- **two_bytes**: Minimal non-trivial input
+
+Algorithms tested: LZ77 (brute-force, hash-chain, lazy), Huffman, RangeCoder,
+BWT, MTF, RLE — all must round-trip perfectly on every test vector.
+
+#### 2. Cross-Module Composition Tests
+Tests that chain multiple modules to validate they compose correctly:
+- BWT → MTF
+- BWT → MTF → RLE
+- BWT → MTF → RLE → RangeCoder (full Bw chain)
+- LZ77 → Huffman (Deflate chain)
+- LZ77 → RangeCoder (Lza chain)
+- MTF → RLE → Huffman (arbitrary composition)
+
+#### 3. Pipeline Integration Tests
+All three pipelines tested against all test vectors via `pipeline::compress`
+and `pipeline::decompress`, validating the container format, metadata handling,
+and end-to-end round-trip.
+
+#### 4. Algorithmic Property Validation
+Tests that verify expected mathematical/algorithmic properties:
+- **Entropy bounds**: Huffman/RangeCoder output size ≤ Shannon entropy + overhead
+- **BWT clustering**: BWT output has more same-byte adjacencies than input
+- **MTF locality**: After BWT+MTF, >30% of output bytes are small (< 4)
+- **RLE compression**: RLE compresses data with long runs
+- **RangeCoder vs Huffman**: RangeCoder achieves better compression on skewed data
+- **LZ77 match finding**: All three strategies find matches and decompress identically
+- **Compression effectiveness**: Huffman beats uniform, RangeCoder beats Huffman on skewed
+
+#### 5. Corpus Tests
+Real-world file testing using standard compression benchmarks:
+
+**Canterbury Corpus** (`samples/cantrbry/`):
+- alice29.txt, asyoulik.txt, cp.html, fields.c, grammar.lsp, xargs.1
+- Full round-trip through all three pipelines
+- Individual algorithm tests on representative files (alice29.txt)
+
+**Large Corpus** (`samples/large/`):
+- bible.txt (4MB), E.coli genome (4.6MB), world192.txt (2.5MB)
+- Tested on 64KB slices (full files too slow for BWT in test suite)
+
+#### 6. Edge Cases
+Adversarial and boundary-condition inputs:
+- Two-byte input, alternating bytes, all 256 byte values
+- Maximum RLE runs (259+ bytes), descending sequences
+- Repeated short patterns, LZ77 window boundary patterns
+
+### Future Validation Work
+
+#### Sample File Test Infrastructure (Phase 1C)
+Create a standalone test harness that:
+1. Compresses each corpus file with all pipelines at all settings
+2. Records compressed sizes in a results table
+3. Verifies round-trip correctness
+4. Compares compression ratios against known-good baselines (gzip, bzip2)
+5. Generates a benchmark report (`BENCHMARK-REPORT.md`)
+
+**Planned corpus expansion:**
+- Silesia corpus (212MB, diverse file types)
+- enwik8 (100MB Wikipedia dump)
+- Larger Canterbury files (kennedy.xls, lcet10.txt, plrabn12.txt)
+  currently skipped due to BWT O(n log² n) cost on large inputs
+
+#### Cross-Implementation Validation (Phase 1C)
+When C bug fixes are complete:
+1. Compress with C reference, decompress with Rust — must match
+2. Compress with Rust, decompress with C reference — must match
+3. Byte-for-byte comparison of compressed output where formats match
+4. Performance comparison (throughput MB/s, compression ratio)
+
+#### Fuzz Testing (Phase 1C)
+Set up continuous fuzz testing:
+1. `cargo-fuzz` targets for each encode/decode function
+2. Round-trip fuzz: `decode(encode(input)) == input` for all algorithms
+3. Malformed input fuzz: decode functions must return `Err`, never panic
+4. Pipeline fuzz: random bytes to `decompress()` must not panic
+5. Run under ASan for memory safety validation
+
+#### Regression Test Suite
+Maintain a set of known-good compressed files:
+1. For each corpus file × pipeline, store the compressed output
+2. After any code change, verify compressed output is bit-identical
+3. If intentional format changes occur, update baselines and document why
+4. This catches accidental behavioral changes in the encoder
+
+---
+
 ## Phase 2: Optimal LZ77 Match Selection
 
 This is the core research contribution of libpz. The GPU finds all matches;
@@ -343,17 +502,21 @@ without sidecar metadata).
 
 ## Milestones
 
-| Milestone | Description | Depends On |
-|-----------|-------------|------------|
-| **M1** | All BUGS.md fixes landed, existing tests pass | - |
-| **M2** | LZ77 + Huffman reference round-trip working | M1 |
-| **M3** | Arithmetic coder reference working | M1 |
-| **M4** | BWT + MTF + RLE reference working | M1 |
-| **M5** | Full pipeline round-trips (DEFLATE-like, BW-like) | M2, M3, M4 |
-| **M6** | OpenCL LZ77 produces top-K match table | M1 |
-| **M7** | Optimal parse DP selects minimum-cost chain from GPU matches | M6 |
-| **M8** | OpenCL backend outperforms reference on large inputs | M7 |
-| **M9** | pthread block-parallel compression | M5 |
-| **M10** | File format defined, CLI tool works end-to-end | M5 |
-| **M11** | Benchmark suite vs gzip/zstd/bzip2/lz4 | M8, M9, M10 |
-| **M12** | Vulkan compute backend | M8 |
+| Milestone | Description | Depends On | Status |
+|-----------|-------------|------------|--------|
+| **M1** | All BUGS.md fixes landed, existing tests pass | - | Pending (C code) |
+| **M2** | LZ77 + Huffman reference round-trip working | M1 | **Done** (Rust) |
+| **M3** | Arithmetic coder reference working | M1 | **Done** (Rust) |
+| **M4** | BWT + MTF + RLE reference working | M1 | **Done** (Rust) |
+| **M5** | Full pipeline round-trips (DEFLATE-like, BW-like, LZA-like) | M2, M3, M4 | **Done** (Rust) |
+| **M5.1** | Validation test suite with corpus tests | M5 | **Done** |
+| **M5.2** | Cross-implementation validation (Rust vs C) | M1, M5 | Pending |
+| **M5.3** | Fuzz testing infrastructure | M5 | Pending |
+| **M5.4** | Benchmark suite and regression baselines | M5.1 | Pending |
+| **M6** | OpenCL LZ77 produces top-K match table | M1 | Pending |
+| **M7** | Optimal parse DP selects minimum-cost chain from GPU matches | M6 | Pending |
+| **M8** | OpenCL backend outperforms reference on large inputs | M7 | Pending |
+| **M9** | pthread block-parallel compression | M5 | Pending |
+| **M10** | File format defined, CLI tool works end-to-end | M5 | Pending |
+| **M11** | Benchmark suite vs gzip/zstd/bzip2/lz4 | M8, M9, M10 | Pending |
+| **M12** | Vulkan compute backend | M8 | Pending |

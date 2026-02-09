@@ -10,6 +10,9 @@ pub mod rle;
 
 pub mod ffi;
 
+#[cfg(test)]
+mod validation;
+
 /// Error types for libpz operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PzError {
