@@ -8,6 +8,9 @@ pub mod pqueue;
 pub mod rangecoder;
 pub mod rle;
 
+#[cfg(feature = "opencl")]
+pub mod opencl;
+
 pub mod ffi;
 
 #[cfg(test)]

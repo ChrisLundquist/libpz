@@ -9,5 +9,10 @@ name = "pz"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
+opencl3 = { version = "0.9", optional = true }
 
 [dev-dependencies]
+
+[features]
+default = []
+opencl = ["dep:opencl3"]
