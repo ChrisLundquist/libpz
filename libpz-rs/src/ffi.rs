@@ -16,6 +16,7 @@ use std::slice;
 
 use crate::huffman::HuffmanTree;
 use crate::lz77;
+use crate::pipeline;
 
 // Error codes matching the C API design
 const PZ_OK: i32 = 0;
@@ -117,24 +118,30 @@ pub unsafe extern "C" fn pz_compress(
     let input_slice = slice::from_raw_parts(input, input_len);
     let output_slice = slice::from_raw_parts_mut(output, output_len);
 
-    // For Phase 1, only DEFLATE-like pipeline (LZ77) is implemented
-    match pipeline {
-        0 => {
-            // PZ_DEFLATE: LZ77 + Huffman
-            // For now, just LZ77 (Huffman integration in future)
-            match lz77::compress_to_buf(input_slice, output_slice) {
-                Ok(bytes_written) => bytes_written as i32,
-                Err(crate::PzError::BufferTooSmall) => PZ_ERROR_BUFFER_TOO_SMALL,
-                Err(crate::PzError::InvalidInput) => PZ_ERROR_INVALID_INPUT,
-                Err(crate::PzError::Unsupported) => PZ_ERROR_UNSUPPORTED,
+    let pipe = match pipeline {
+        0 => pipeline::Pipeline::Deflate,
+        1 => pipeline::Pipeline::Bw,
+        2 => pipeline::Pipeline::Lza,
+        _ => return PZ_ERROR_UNSUPPORTED,
+    };
+
+    match pipeline::compress(input_slice, pipe) {
+        Ok(compressed) => {
+            if compressed.len() > output_slice.len() {
+                return PZ_ERROR_BUFFER_TOO_SMALL;
             }
+            output_slice[..compressed.len()].copy_from_slice(&compressed);
+            compressed.len() as i32
         }
-        _ => PZ_ERROR_UNSUPPORTED,
+        Err(crate::PzError::BufferTooSmall) => PZ_ERROR_BUFFER_TOO_SMALL,
+        Err(crate::PzError::InvalidInput) => PZ_ERROR_INVALID_INPUT,
+        Err(crate::PzError::Unsupported) => PZ_ERROR_UNSUPPORTED,
     }
 }
 
-/// Decompress data.
+/// Decompress data produced by pz_compress.
 ///
+/// Automatically detects the pipeline from the stream header.
 /// Returns bytes written on success, or a negative error code on failure.
 #[no_mangle]
 pub unsafe extern "C" fn pz_decompress(
@@ -155,8 +162,14 @@ pub unsafe extern "C" fn pz_decompress(
     let input_slice = slice::from_raw_parts(input, input_len);
     let output_slice = slice::from_raw_parts_mut(output, output_len);
 
-    match lz77::decompress_to_buf(input_slice, output_slice) {
-        Ok(bytes_written) => bytes_written as i32,
+    match pipeline::decompress(input_slice) {
+        Ok(decompressed) => {
+            if decompressed.len() > output_slice.len() {
+                return PZ_ERROR_BUFFER_TOO_SMALL;
+            }
+            output_slice[..decompressed.len()].copy_from_slice(&decompressed);
+            decompressed.len() as i32
+        }
         Err(crate::PzError::BufferTooSmall) => PZ_ERROR_BUFFER_TOO_SMALL,
         Err(crate::PzError::InvalidInput) => PZ_ERROR_INVALID_INPUT,
         Err(crate::PzError::Unsupported) => PZ_ERROR_UNSUPPORTED,
@@ -361,8 +374,13 @@ mod tests {
     fn test_compress_decompress_ffi() {
         unsafe {
             let ctx = pz_init();
-            let input = b"hello, world! hello, world!";
-            let mut compressed = vec![0u8; pz_compress_bound(input.len())];
+            // Use longer input to overcome Deflate pipeline overhead (~1KB freq table)
+            let pattern = b"hello, world! this is a test of compression. ";
+            let mut input = Vec::new();
+            for _ in 0..50 {
+                input.extend_from_slice(pattern);
+            }
+            let mut compressed = vec![0u8; input.len() * 2 + 2048];
             let mut decompressed = vec![0u8; input.len() + 1024];
 
             let comp_size = pz_compress(
@@ -384,7 +402,57 @@ mod tests {
                 decompressed.len(),
             );
             assert!(decomp_size > 0, "decompression failed: {}", decomp_size);
-            assert_eq!(&decompressed[..decomp_size as usize], input);
+            assert_eq!(&decompressed[..decomp_size as usize], &input[..]);
+
+            pz_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_compress_decompress_all_pipelines_ffi() {
+        unsafe {
+            let ctx = pz_init();
+            let pattern = b"The quick brown fox jumps over the lazy dog. ";
+            let mut input = Vec::new();
+            for _ in 0..50 {
+                input.extend_from_slice(pattern);
+            }
+
+            for pipeline_id in 0..3i32 {
+                let mut compressed = vec![0u8; input.len() * 2 + 2048];
+                let mut decompressed = vec![0u8; input.len() + 1024];
+
+                let comp_size = pz_compress(
+                    ctx,
+                    input.as_ptr(),
+                    input.len(),
+                    compressed.as_mut_ptr(),
+                    compressed.len(),
+                    PzLevel::Default as i32,
+                    pipeline_id,
+                );
+                assert!(
+                    comp_size > 0,
+                    "compression failed for pipeline {}: {}",
+                    pipeline_id,
+                    comp_size
+                );
+
+                let decomp_size = pz_decompress(
+                    ctx,
+                    compressed.as_ptr(),
+                    comp_size as usize,
+                    decompressed.as_mut_ptr(),
+                    decompressed.len(),
+                );
+                assert!(
+                    decomp_size > 0,
+                    "decompression failed for pipeline {}: {}",
+                    pipeline_id,
+                    decomp_size
+                );
+                assert_eq!(&decompressed[..decomp_size as usize], &input[..]);
+            }
 
             pz_destroy(ctx);
         }

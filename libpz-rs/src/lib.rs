@@ -1,7 +1,12 @@
+pub mod bwt;
 pub mod frequency;
 pub mod huffman;
 pub mod lz77;
+pub mod mtf;
+pub mod pipeline;
 pub mod pqueue;
+pub mod rangecoder;
+pub mod rle;
 
 pub mod ffi;
 
