@@ -1,6 +1,15 @@
 /// Huffman coding: tree construction, encoding, and decoding.
 ///
-/// This is a complete implementation, fixing bugs from the C reference:
+/// Provides two complementary Huffman primitives:
+///
+/// - [`HuffmanTree`]: Full encoder/decoder built from byte frequency data.
+///   Used by the library's own compression pipelines (PZ format).
+///
+/// - [`HuffTable`]: Decode-only canonical Huffman table built from code
+///   lengths. Used for standard formats like DEFLATE/gzip where the
+///   bitstream transmits code lengths rather than frequencies.
+///
+/// Bug fixes from the C reference:
 /// - BUG-01: Priority queue sift-down (fixed in pqueue module)
 /// - BUG-05: Signed char as array index (Rust uses u8, no issue)
 /// - BUG-08: Encode actually writes to output buffer (implemented)
@@ -402,6 +411,94 @@ impl HuffmanTree {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HuffTable – canonical Huffman decoder from code lengths
+// ---------------------------------------------------------------------------
+
+/// Maximum code length for canonical Huffman tables.
+///
+/// DEFLATE allows up to 15 bits. This limit is suitable for most
+/// canonical Huffman applications.
+pub const MAX_CODE_BITS: usize = 15;
+
+/// Canonical Huffman decode table built from code lengths.
+///
+/// This is the standard approach used by formats that transmit code
+/// lengths in the bitstream (DEFLATE, PNG, etc.) rather than
+/// frequencies. Supports arbitrary symbol counts (not limited to 256).
+///
+/// Decoding uses the count-based canonical algorithm — no tree
+/// structure is needed, just a sorted symbol list and per-length
+/// counts.
+pub struct HuffTable {
+    /// Number of codes of each length (index 0 unused).
+    counts: [u16; MAX_CODE_BITS + 1],
+    /// Symbols sorted by (code_length, canonical_order).
+    symbols: Vec<u16>,
+}
+
+impl HuffTable {
+    /// Build a decode table from an array of code lengths (one per symbol).
+    ///
+    /// Symbols with length 0 are not coded. Returns an error if any
+    /// code length exceeds [`MAX_CODE_BITS`].
+    pub fn from_lengths(lengths: &[u8]) -> PzResult<Self> {
+        let mut counts = [0u16; MAX_CODE_BITS + 1];
+        for &len in lengths {
+            if len as usize > MAX_CODE_BITS {
+                return Err(PzError::InvalidInput);
+            }
+            counts[len as usize] += 1;
+        }
+
+        // Compute offsets for sorting.
+        let mut offsets = [0u16; MAX_CODE_BITS + 1];
+        for i in 1..MAX_CODE_BITS {
+            offsets[i + 1] = offsets[i] + counts[i];
+        }
+
+        let num_symbols: usize = counts[1..].iter().map(|&c| c as usize).sum();
+        let mut symbols = vec![0u16; num_symbols];
+        for (sym, &len) in lengths.iter().enumerate() {
+            if len > 0 {
+                let idx = offsets[len as usize] as usize;
+                symbols[idx] = sym as u16;
+                offsets[len as usize] += 1;
+            }
+        }
+
+        Ok(HuffTable { counts, symbols })
+    }
+
+    /// Decode one symbol by reading bits via the provided closure.
+    ///
+    /// `read_bit` must return the next bit (0 or 1) from the
+    /// bitstream each time it is called. This keeps the table
+    /// independent of any particular bit-reader implementation.
+    pub fn decode(&self, read_bit: &mut impl FnMut() -> PzResult<u32>) -> PzResult<u16> {
+        let mut code: u32 = 0;
+        let mut first: u32 = 0;
+        let mut index: usize = 0;
+
+        for len in 1..=MAX_CODE_BITS {
+            code = (code << 1) | read_bit()?;
+            let count = self.counts[len] as u32;
+            if code < first + count {
+                return Ok(self.symbols[index + (code - first) as usize]);
+            }
+            index += count as usize;
+            first = (first + count) << 1;
+        }
+
+        Err(PzError::InvalidInput)
+    }
+
+    /// Number of coded symbols in this table.
+    pub fn symbol_count(&self) -> usize {
+        self.symbols.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +701,44 @@ mod tests {
         let (encoded, total_bits) = tree.encode(&input).unwrap();
         let decoded = tree.decode(&encoded, total_bits).unwrap();
         assert_eq!(decoded, input);
+    }
+
+    // --- HuffTable (canonical decode from code lengths) tests ---
+
+    #[test]
+    fn test_hufftable_from_lengths() {
+        // DEFLATE fixed literal table: 0-143 → 8 bits, 144-255 → 9 bits,
+        // 256-279 → 7 bits, 280-287 → 8 bits
+        let mut lengths = [0u8; 288];
+        for i in 0..=143 { lengths[i] = 8; }
+        for i in 144..=255 { lengths[i] = 9; }
+        for i in 256..=279 { lengths[i] = 7; }
+        for i in 280..=287 { lengths[i] = 8; }
+
+        let table = HuffTable::from_lengths(&lengths).unwrap();
+        assert_eq!(table.symbol_count(), 288);
+    }
+
+    #[test]
+    fn test_hufftable_decode_two_symbols() {
+        // Two symbols: A=0 (1 bit code "0"), B=1 (1 bit code "1")
+        let lengths = [1u8, 1];
+        let table = HuffTable::from_lengths(&lengths).unwrap();
+
+        // Decode symbol from bit 0 → should be symbol 0
+        let mut bits = [0u32].into_iter();
+        let sym = table.decode(&mut || bits.next().ok_or(PzError::InvalidInput)).unwrap();
+        assert_eq!(sym, 0);
+
+        // Decode symbol from bit 1 → should be symbol 1
+        let mut bits = [1u32].into_iter();
+        let sym = table.decode(&mut || bits.next().ok_or(PzError::InvalidInput)).unwrap();
+        assert_eq!(sym, 1);
+    }
+
+    #[test]
+    fn test_hufftable_reject_overlength() {
+        let lengths = [16u8]; // exceeds MAX_CODE_BITS
+        assert!(HuffTable::from_lengths(&lengths).is_err());
     }
 }

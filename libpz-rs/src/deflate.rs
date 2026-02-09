@@ -5,13 +5,16 @@
 /// - Type 1: Fixed Huffman codes
 /// - Type 2: Dynamic Huffman codes
 ///
-/// This is a from-scratch implementation that only handles decompression
-/// (inflate), which is what we need for reading gzip files.
+/// This module is intentionally thin glue: it combines the reusable
+/// [`HuffTable`](crate::huffman::HuffTable) primitive with
+/// DEFLATE-specific bit ordering, block framing, and LZ77
+/// length/distance tables per RFC 1951.
 
+use crate::huffman::HuffTable;
 use crate::{PzError, PzResult};
 
 // ---------------------------------------------------------------------------
-// Bit reader – reads bits LSB-first from a byte stream
+// Bit reader – DEFLATE-specific LSB-first bit stream
 // ---------------------------------------------------------------------------
 
 struct BitReader<'a> {
@@ -72,88 +75,21 @@ impl<'a> BitReader<'a> {
         self.pos += 2;
         Ok(val)
     }
+
+    /// Decode one Huffman symbol using the given table.
+    fn decode_symbol(&mut self, table: &HuffTable) -> PzResult<u16> {
+        table.decode(&mut || self.read_bits(1))
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Huffman decoder – builds from code lengths, decodes symbols
+// DEFLATE-specific constants (RFC 1951)
 // ---------------------------------------------------------------------------
 
-/// Maximum code length allowed by DEFLATE.
-const MAX_BITS: usize = 15;
 /// Maximum number of literal/length symbols.
 const MAX_LIT_CODES: usize = 288;
 /// Maximum number of distance symbols.
 const MAX_DIST_CODES: usize = 32;
-
-struct HuffTable {
-    /// For each code length 1..MAX_BITS, the number of codes of that length.
-    counts: [u16; MAX_BITS + 1],
-    /// Symbols sorted by (code_length, code_value).
-    symbols: Vec<u16>,
-}
-
-impl HuffTable {
-    /// Build a Huffman table from an array of code lengths (one per symbol).
-    /// Symbols with length 0 are not coded.
-    fn from_lengths(lengths: &[u8]) -> PzResult<Self> {
-        let mut counts = [0u16; MAX_BITS + 1];
-        for &len in lengths {
-            if len as usize > MAX_BITS {
-                return Err(PzError::InvalidInput);
-            }
-            counts[len as usize] += 1;
-        }
-
-        // Compute offsets for sorting.
-        let mut offsets = [0u16; MAX_BITS + 1];
-        for i in 1..MAX_BITS {
-            offsets[i + 1] = offsets[i] + counts[i];
-        }
-
-        let num_symbols: usize = counts[1..].iter().map(|&c| c as usize).sum();
-        let mut symbols = vec![0u16; num_symbols];
-        for (sym, &len) in lengths.iter().enumerate() {
-            if len > 0 {
-                let idx = offsets[len as usize] as usize;
-                symbols[idx] = sym as u16;
-                offsets[len as usize] += 1;
-            }
-        }
-
-        Ok(HuffTable { counts, symbols })
-    }
-
-    /// Decode one symbol from the bit reader.
-    fn decode(&self, reader: &mut BitReader) -> PzResult<u16> {
-        let mut code: u32 = 0;
-        let mut first: u32 = 0;
-        let mut index: usize = 0;
-
-        for len in 1..=MAX_BITS {
-            let bit = reader.read_bits(1)?;
-            code = (code << 1) | bit; // Note: DEFLATE Huffman is MSB within each step
-            // Actually, DEFLATE reads bits MSB-first for Huffman codes
-            // but our bit reader gives LSB-first bits. We need to reverse.
-            // Wait - the standard approach: we read one bit at a time and
-            // build the code MSB-first by shifting left and OR-ing.
-            // The bits from BitReader come LSB-first from the byte stream,
-            // which is correct for DEFLATE - each bit is the next bit of
-            // the Huffman code read MSB-to-LSB within the code.
-            let count = self.counts[len] as u32;
-            if code < first + count {
-                return Ok(self.symbols[index + (code - first) as usize]);
-            }
-            index += count as usize;
-            first = (first + count) << 1;
-        }
-
-        Err(PzError::InvalidInput)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Static tables for length / distance codes
-// ---------------------------------------------------------------------------
 
 /// Base lengths for length codes 257..285.
 static LENGTH_BASE: [u16; 29] = [
@@ -211,9 +147,9 @@ fn build_fixed_dist_table() -> PzResult<HuffTable> {
 // ---------------------------------------------------------------------------
 
 fn decode_dynamic_tables(reader: &mut BitReader) -> PzResult<(HuffTable, HuffTable)> {
-    let hlit = reader.read_bits(5)? as usize + 257;  // 257..288
-    let hdist = reader.read_bits(5)? as usize + 1;    // 1..32
-    let hclen = reader.read_bits(4)? as usize + 4;    // 4..19
+    let hlit = reader.read_bits(5)? as usize + 257;
+    let hdist = reader.read_bits(5)? as usize + 1;
+    let hclen = reader.read_bits(4)? as usize + 4;
 
     if hlit > MAX_LIT_CODES || hdist > MAX_DIST_CODES {
         return Err(PzError::InvalidInput);
@@ -233,14 +169,13 @@ fn decode_dynamic_tables(reader: &mut BitReader) -> PzResult<(HuffTable, HuffTab
     let mut i = 0;
 
     while i < total {
-        let sym = codelen_table.decode(reader)?;
+        let sym = reader.decode_symbol(&codelen_table)?;
         match sym {
             0..=15 => {
                 lengths[i] = sym as u8;
                 i += 1;
             }
             16 => {
-                // Repeat previous length 3..6 times
                 if i == 0 {
                     return Err(PzError::InvalidInput);
                 }
@@ -255,7 +190,6 @@ fn decode_dynamic_tables(reader: &mut BitReader) -> PzResult<(HuffTable, HuffTab
                 }
             }
             17 => {
-                // Repeat 0 for 3..10 times
                 let repeat = reader.read_bits(3)? as usize + 3;
                 for _ in 0..repeat {
                     if i >= total {
@@ -266,7 +200,6 @@ fn decode_dynamic_tables(reader: &mut BitReader) -> PzResult<(HuffTable, HuffTab
                 }
             }
             18 => {
-                // Repeat 0 for 11..138 times
                 let repeat = reader.read_bits(7)? as usize + 11;
                 for _ in 0..repeat {
                     if i >= total {
@@ -290,7 +223,6 @@ fn decode_dynamic_tables(reader: &mut BitReader) -> PzResult<(HuffTable, HuffTab
 // Block decompression
 // ---------------------------------------------------------------------------
 
-/// Decompress a stored block (type 0).
 fn inflate_stored(reader: &mut BitReader, output: &mut Vec<u8>) -> PzResult<()> {
     let len = reader.read_u16_aligned()?;
     let nlen = reader.read_u16_aligned()?;
@@ -310,7 +242,6 @@ fn inflate_stored(reader: &mut BitReader, output: &mut Vec<u8>) -> PzResult<()> 
     Ok(())
 }
 
-/// Decompress a compressed block using the given Huffman tables.
 fn inflate_huffman(
     reader: &mut BitReader,
     lit_table: &HuffTable,
@@ -318,19 +249,16 @@ fn inflate_huffman(
     output: &mut Vec<u8>,
 ) -> PzResult<()> {
     loop {
-        let sym = lit_table.decode(reader)?;
+        let sym = reader.decode_symbol(lit_table)?;
 
         match sym {
             0..=255 => {
-                // Literal byte
                 output.push(sym as u8);
             }
             256 => {
-                // End of block
                 return Ok(());
             }
             257..=285 => {
-                // Length/distance pair
                 let len_idx = (sym - 257) as usize;
                 if len_idx >= LENGTH_BASE.len() {
                     return Err(PzError::InvalidInput);
@@ -338,7 +266,7 @@ fn inflate_huffman(
                 let length = LENGTH_BASE[len_idx] as usize
                     + reader.read_bits(LENGTH_EXTRA[len_idx])? as usize;
 
-                let dist_sym = dist_table.decode(reader)? as usize;
+                let dist_sym = reader.decode_symbol(dist_table)? as usize;
                 if dist_sym >= DIST_BASE.len() {
                     return Err(PzError::InvalidInput);
                 }
@@ -349,7 +277,6 @@ fn inflate_huffman(
                     return Err(PzError::InvalidInput);
                 }
 
-                // Copy from back-reference (byte-by-byte for overlapping)
                 let start = output.len() - distance;
                 for i in 0..length {
                     let b = output[start + i];
@@ -366,9 +293,6 @@ fn inflate_huffman(
 // ---------------------------------------------------------------------------
 
 /// Decompress a raw DEFLATE stream (no gzip/zlib wrapper).
-///
-/// `data` should be the compressed DEFLATE bitstream.
-/// Returns the decompressed bytes.
 pub fn inflate(data: &[u8]) -> PzResult<Vec<u8>> {
     let mut reader = BitReader::new(data);
     let mut output = Vec::new();
@@ -378,25 +302,17 @@ pub fn inflate(data: &[u8]) -> PzResult<Vec<u8>> {
         let btype = reader.read_bits(2)?;
 
         match btype {
-            0 => {
-                // Stored block
-                inflate_stored(&mut reader, &mut output)?;
-            }
+            0 => inflate_stored(&mut reader, &mut output)?,
             1 => {
-                // Fixed Huffman codes
                 let lit_table = build_fixed_lit_table()?;
                 let dist_table = build_fixed_dist_table()?;
                 inflate_huffman(&mut reader, &lit_table, &dist_table, &mut output)?;
             }
             2 => {
-                // Dynamic Huffman codes
                 let (lit_table, dist_table) = decode_dynamic_tables(&mut reader)?;
                 inflate_huffman(&mut reader, &lit_table, &dist_table, &mut output)?;
             }
-            3 => {
-                // Reserved (error)
-                return Err(PzError::InvalidInput);
-            }
+            3 => return Err(PzError::InvalidInput),
             _ => unreachable!(),
         }
 
@@ -414,17 +330,14 @@ mod tests {
 
     #[test]
     fn test_inflate_stored_block() {
-        // A stored block: bfinal=1, btype=00, then LEN=5, NLEN=~5, "hello"
         let mut data = Vec::new();
-        // First byte: bfinal=1 (bit 0), btype=00 (bits 1-2) → 0b001 = 0x01
+        // bfinal=1, btype=00 → 0x01
         data.push(0x01);
-        // LEN = 5 (little-endian)
+        // LEN = 5, NLEN = !5
         data.push(0x05);
         data.push(0x00);
-        // NLEN = !5 = 0xFFFA (little-endian)
         data.push(0xFA);
         data.push(0xFF);
-        // Literal data
         data.extend_from_slice(b"hello");
 
         let result = inflate(&data).unwrap();
@@ -433,13 +346,11 @@ mod tests {
 
     #[test]
     fn test_inflate_fixed_huffman() {
-        // Use gzip to create a known compressed stream and test against it.
-        // For now, test that the fixed table builds correctly.
         let lit_table = build_fixed_lit_table().unwrap();
-        assert_eq!(lit_table.symbols.len(), 288);
+        assert_eq!(lit_table.symbol_count(), 288);
 
         let dist_table = build_fixed_dist_table().unwrap();
-        assert_eq!(dist_table.symbols.len(), 32);
+        assert_eq!(dist_table.symbol_count(), 32);
     }
 
     #[test]
@@ -447,11 +358,8 @@ mod tests {
         let data = [0b10110100u8, 0b01101001u8];
         let mut reader = BitReader::new(&data);
 
-        // Read 4 bits from first byte: should be 0b0100 = 4
         assert_eq!(reader.read_bits(4).unwrap(), 0b0100);
-        // Read 4 more bits: should be 0b1011 = 11
         assert_eq!(reader.read_bits(4).unwrap(), 0b1011);
-        // Read 8 bits from second byte: should be 0b01101001 = 0x69
         assert_eq!(reader.read_bits(8).unwrap(), 0b01101001);
     }
 
@@ -460,10 +368,8 @@ mod tests {
         let data = [0xFF, 0x00];
         let mut reader = BitReader::new(&data);
 
-        // Read 4 bits: 0b1111 = 15
         assert_eq!(reader.read_bits(4).unwrap(), 0x0F);
-        // Read 8 bits crossing byte boundary: bits 4-7 of 0xFF (=0xF) then
-        // bits 0-3 of 0x00 (=0x0), packed LSB-first → 0x0F
+        // bits 4-7 of 0xFF then bits 0-3 of 0x00, packed LSB-first → 0x0F
         assert_eq!(reader.read_bits(8).unwrap(), 0x0F);
     }
 }
