@@ -11,6 +11,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [dependencies]
 opencl3 = { version = "0.9", optional = true }
 
+[[bin]]
+name = "pz"
+path = "src/bin/pz.rs"
+
 [dev-dependencies]
 
 [features]
