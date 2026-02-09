@@ -30,6 +30,41 @@ use crate::rangecoder;
 use crate::rle;
 use crate::{PzError, PzResult};
 
+/// Compute backend selection for pipeline stages.
+///
+/// Each pipeline stage can run on different backends depending on
+/// hardware availability and input characteristics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Backend {
+    /// Single-threaded CPU reference implementation (always available).
+    #[default]
+    Cpu,
+    /// OpenCL GPU backend (requires `opencl` feature and a GPU device).
+    #[cfg(feature = "opencl")]
+    OpenCl,
+}
+
+/// Options controlling pipeline compression behavior.
+#[derive(Debug, Clone)]
+pub struct CompressOptions {
+    /// Which backend to use for GPU-amenable stages (LZ77 match finding,
+    /// BWT suffix array, Huffman encoding).
+    pub backend: Backend,
+    /// OpenCL engine handle, required when `backend` is `Backend::OpenCl`.
+    #[cfg(feature = "opencl")]
+    pub opencl_engine: Option<std::sync::Arc<crate::opencl::OpenClEngine>>,
+}
+
+impl Default for CompressOptions {
+    fn default() -> Self {
+        CompressOptions {
+            backend: Backend::Cpu,
+            #[cfg(feature = "opencl")]
+            opencl_engine: None,
+        }
+    }
+}
+
 /// Magic bytes for the libpz container format.
 const MAGIC: [u8; 2] = [b'P', b'Z'];
 /// Format version.
@@ -61,18 +96,31 @@ impl Pipeline {
     }
 }
 
-/// Compress data using the specified pipeline.
+/// Compress data using the specified pipeline (CPU backend).
 ///
 /// Returns a self-contained compressed stream including the header.
 pub fn compress(input: &[u8], pipeline: Pipeline) -> PzResult<Vec<u8>> {
+    compress_with_options(input, pipeline, &CompressOptions::default())
+}
+
+/// Compress data using the specified pipeline and backend options.
+///
+/// When `options.backend` is `Backend::OpenCl` and an engine is provided,
+/// GPU-amenable stages (e.g., LZ77 match finding) run on the GPU.
+/// Other stages and decompression always use the CPU.
+pub fn compress_with_options(
+    input: &[u8],
+    pipeline: Pipeline,
+    options: &CompressOptions,
+) -> PzResult<Vec<u8>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
 
     match pipeline {
-        Pipeline::Deflate => compress_deflate(input),
+        Pipeline::Deflate => compress_deflate_with_options(input, options),
         Pipeline::Bw => compress_bw(input),
-        Pipeline::Lza => compress_lza(input),
+        Pipeline::Lza => compress_lza_with_options(input, options),
     }
 }
 
@@ -121,11 +169,31 @@ fn write_header(output: &mut Vec<u8>, pipeline: Pipeline, orig_len: usize) {
     output.extend_from_slice(&(orig_len as u32).to_le_bytes());
 }
 
+// --- LZ77 helper: select GPU or CPU backend for match finding ---
+
+/// Run LZ77 compression using the configured backend.
+fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
+    #[cfg(feature = "opencl")]
+    {
+        if let Backend::OpenCl = options.backend {
+            if let Some(ref engine) = options.opencl_engine {
+                return engine.lz77_compress(input, crate::opencl::KernelVariant::Batch);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "opencl"))]
+    let _ = options;
+
+    // Fallback: CPU hash-chain
+    lz77::compress_hashchain(input)
+}
+
 // --- DEFLATE pipeline: LZ77 + Huffman ---
 
-fn compress_deflate(input: &[u8]) -> PzResult<Vec<u8>> {
-    // Stage 1: LZ77 compression (using hash-chain for speed)
-    let lz_data = lz77::compress_hashchain(input)?;
+fn compress_deflate_with_options(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
+    // Stage 1: LZ77 compression (GPU or CPU)
+    let lz_data = lz77_compress_with_backend(input, options)?;
 
     // Stage 2: Huffman encoding of the LZ77 output
     let tree = HuffmanTree::from_data(&lz_data).ok_or(PzError::InvalidInput)?;
@@ -253,9 +321,9 @@ fn decompress_bw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 
 // --- LZA pipeline: LZ77 + Range coder ---
 
-fn compress_lza(input: &[u8]) -> PzResult<Vec<u8>> {
-    // Stage 1: LZ77 compression (using hash-chain)
-    let lz_data = lz77::compress_hashchain(input)?;
+fn compress_lza_with_options(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
+    // Stage 1: LZ77 compression (GPU or CPU)
+    let lz_data = lz77_compress_with_backend(input, options)?;
 
     // Stage 2: Range coder
     let rc_data = rangecoder::encode(&lz_data);

@@ -50,17 +50,42 @@ pub struct PzDeviceInfo {
 
 /// Opaque context handle.
 pub struct PzContext {
-    /// Placeholder for future state (GPU devices, cached kernels, etc.)
+    /// Placeholder for future state (cached kernels, etc.)
     _initialized: bool,
+    /// OpenCL GPU engine, if available. Wrapped in Arc for sharing
+    /// with pipeline CompressOptions.
+    #[cfg(feature = "opencl")]
+    opencl_engine: Option<std::sync::Arc<crate::opencl::OpenClEngine>>,
+    /// Cached count of OpenCL devices found during init.
+    opencl_device_count: i32,
 }
 
 /// Initialize a libpz context.
 ///
+/// Probes for available compute devices (OpenCL GPUs, etc.) and
+/// initializes the best available backend. Falls back gracefully
+/// to CPU-only if no GPU is found.
+///
 /// Returns a pointer to a new context, or null on failure.
 #[no_mangle]
 pub extern "C" fn pz_init() -> *mut PzContext {
+    #[cfg(feature = "opencl")]
+    let (opencl_engine, opencl_device_count) = {
+        let count = crate::opencl::device_count() as i32;
+        let engine = crate::opencl::OpenClEngine::new()
+            .ok()
+            .map(std::sync::Arc::new);
+        (engine, count)
+    };
+
+    #[cfg(not(feature = "opencl"))]
+    let opencl_device_count = 0i32;
+
     let ctx = Box::new(PzContext {
         _initialized: true,
+        #[cfg(feature = "opencl")]
+        opencl_engine,
+        opencl_device_count,
     });
     Box::into_raw(ctx)
 }
@@ -74,6 +99,10 @@ pub unsafe extern "C" fn pz_destroy(ctx: *mut PzContext) {
 }
 
 /// Query available compute devices.
+///
+/// Reports the number of OpenCL devices found during `pz_init()`,
+/// the number of Vulkan devices (0 until Phase 5), and the number
+/// of CPU threads available.
 #[no_mangle]
 pub unsafe extern "C" fn pz_query_devices(
     ctx: *const PzContext,
@@ -83,15 +112,40 @@ pub unsafe extern "C" fn pz_query_devices(
         return PZ_ERROR_INVALID_INPUT;
     }
 
-    // For Phase 1, only CPU is available
+    let ctx = &*ctx;
     let info = &mut *info;
-    info.opencl_devices = 0;
-    info.vulkan_devices = 0;
+    info.opencl_devices = ctx.opencl_device_count;
+    info.vulkan_devices = 0; // Phase 5
     info.cpu_threads = std::thread::available_parallelism()
         .map(|n| n.get() as i32)
         .unwrap_or(1);
 
     PZ_OK
+}
+
+/// Build compression options from context, selecting GPU when appropriate.
+///
+/// Uses the GPU backend when:
+/// 1. The `opencl` feature is enabled
+/// 2. An OpenCL engine was successfully created at init time
+/// 3. The input is large enough to benefit from GPU acceleration
+fn build_compress_options(ctx: &PzContext, _input_len: usize) -> pipeline::CompressOptions {
+    #[cfg(feature = "opencl")]
+    {
+        if let Some(ref engine) = ctx.opencl_engine {
+            if _input_len >= crate::opencl::MIN_GPU_INPUT_SIZE {
+                return pipeline::CompressOptions {
+                    backend: pipeline::Backend::OpenCl,
+                    opencl_engine: Some(engine.clone()),
+                };
+            }
+        }
+    }
+
+    #[cfg(not(feature = "opencl"))]
+    let _ = ctx;
+
+    pipeline::CompressOptions::default()
 }
 
 /// Compress data using the specified pipeline.
@@ -118,6 +172,8 @@ pub unsafe extern "C" fn pz_compress(
     let input_slice = slice::from_raw_parts(input, input_len);
     let output_slice = slice::from_raw_parts_mut(output, output_len);
 
+    let ctx = &*ctx;
+
     let pipe = match pipeline {
         0 => pipeline::Pipeline::Deflate,
         1 => pipeline::Pipeline::Bw,
@@ -125,7 +181,11 @@ pub unsafe extern "C" fn pz_compress(
         _ => return PZ_ERROR_UNSUPPORTED,
     };
 
-    match pipeline::compress(input_slice, pipe) {
+    // Build compress options, selecting GPU backend if engine is available
+    // and the input is large enough to benefit.
+    let options = build_compress_options(ctx, input_len);
+
+    match pipeline::compress_with_options(input_slice, pipe, &options) {
         Ok(compressed) => {
             if compressed.len() > output_slice.len() {
                 return PZ_ERROR_BUFFER_TOO_SMALL;
@@ -363,7 +423,7 @@ mod tests {
             };
             let result = pz_query_devices(ctx, &mut info);
             assert_eq!(result, PZ_OK);
-            assert_eq!(info.opencl_devices, 0);
+            assert!(info.opencl_devices >= 0);
             assert_eq!(info.vulkan_devices, 0);
             assert!(info.cpu_threads >= 1);
             pz_destroy(ctx);
