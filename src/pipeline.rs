@@ -85,13 +85,15 @@ pub enum Pipeline {
     Lza = 2,
 }
 
-impl Pipeline {
-    fn from_u8(v: u8) -> Option<Self> {
+impl TryFrom<u8> for Pipeline {
+    type Error = PzError;
+
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
         match v {
-            0 => Some(Pipeline::Deflate),
-            1 => Some(Pipeline::Bw),
-            2 => Some(Pipeline::Lza),
-            _ => None,
+            0 => Ok(Self::Deflate),
+            1 => Ok(Self::Bw),
+            2 => Ok(Self::Lza),
+            _ => Err(PzError::Unsupported),
         }
     }
 }
@@ -145,7 +147,7 @@ pub fn decompress(input: &[u8]) -> PzResult<Vec<u8>> {
         return Err(PzError::Unsupported);
     }
 
-    let pipeline = Pipeline::from_u8(input[3]).ok_or(PzError::Unsupported)?;
+    let pipeline = Pipeline::try_from(input[3])?;
     let orig_len = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
 
     if orig_len == 0 {

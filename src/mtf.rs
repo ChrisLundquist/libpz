@@ -28,31 +28,21 @@ pub fn encode(input: &[u8]) -> Vec<u8> {
     }
 
     // Initialize the symbol list: [0, 1, 2, ..., 255]
-    let mut list = [0u8; 256];
-    for i in 0..256 {
-        list[i] = i as u8;
-    }
+    let mut list: [u8; 256] = std::array::from_fn(|i| i as u8);
 
     let mut output = Vec::with_capacity(input.len());
 
     for &byte in input {
         // Find the position of this byte in the list
-        let mut pos = 0;
-        while list[pos] != byte {
-            pos += 1;
-        }
+        let pos = list.iter().position(|&b| b == byte).unwrap();
 
         // Output the position
         output.push(pos as u8);
 
         // Move the byte to the front
         if pos > 0 {
-            let val = list[pos];
-            // Shift elements right to make room at front
-            for j in (1..=pos).rev() {
-                list[j] = list[j - 1];
-            }
-            list[0] = val;
+            list.copy_within(..pos, 1);
+            list[0] = byte;
         }
     }
 
@@ -70,25 +60,16 @@ pub fn encode_to_buf(input: &[u8], output: &mut [u8]) -> PzResult<usize> {
         return Err(PzError::BufferTooSmall);
     }
 
-    let mut list = [0u8; 256];
-    for i in 0..256 {
-        list[i] = i as u8;
-    }
+    let mut list: [u8; 256] = std::array::from_fn(|i| i as u8);
 
     for (idx, &byte) in input.iter().enumerate() {
-        let mut pos = 0;
-        while list[pos] != byte {
-            pos += 1;
-        }
+        let pos = list.iter().position(|&b| b == byte).unwrap();
 
         output[idx] = pos as u8;
 
         if pos > 0 {
-            let val = list[pos];
-            for j in (1..=pos).rev() {
-                list[j] = list[j - 1];
-            }
-            list[0] = val;
+            list.copy_within(..pos, 1);
+            list[0] = byte;
         }
     }
 
@@ -103,10 +84,7 @@ pub fn decode(input: &[u8]) -> Vec<u8> {
         return Vec::new();
     }
 
-    let mut list = [0u8; 256];
-    for i in 0..256 {
-        list[i] = i as u8;
-    }
+    let mut list: [u8; 256] = std::array::from_fn(|i| i as u8);
 
     let mut output = Vec::with_capacity(input.len());
 
@@ -117,9 +95,7 @@ pub fn decode(input: &[u8]) -> Vec<u8> {
 
         // Move to front
         if pos > 0 {
-            for j in (1..=pos).rev() {
-                list[j] = list[j - 1];
-            }
+            list.copy_within(..pos, 1);
             list[0] = byte;
         }
     }
@@ -138,10 +114,7 @@ pub fn decode_to_buf(input: &[u8], output: &mut [u8]) -> PzResult<usize> {
         return Err(PzError::BufferTooSmall);
     }
 
-    let mut list = [0u8; 256];
-    for i in 0..256 {
-        list[i] = i as u8;
-    }
+    let mut list: [u8; 256] = std::array::from_fn(|i| i as u8);
 
     for (idx, &index) in input.iter().enumerate() {
         let pos = index as usize;
@@ -149,9 +122,7 @@ pub fn decode_to_buf(input: &[u8], output: &mut [u8]) -> PzResult<usize> {
         output[idx] = byte;
 
         if pos > 0 {
-            for j in (1..=pos).rev() {
-                list[j] = list[j - 1];
-            }
+            list.copy_within(..pos, 1);
             list[0] = byte;
         }
     }

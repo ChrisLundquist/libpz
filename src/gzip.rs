@@ -43,24 +43,24 @@ pub enum Os {
     Unknown = 255,
 }
 
-impl Os {
-    fn from_u8(v: u8) -> Self {
+impl From<u8> for Os {
+    fn from(v: u8) -> Self {
         match v {
-            0 => Os::Fat,
-            1 => Os::Amiga,
-            2 => Os::Vms,
-            3 => Os::Unix,
-            4 => Os::VmCms,
-            5 => Os::AtariTos,
-            6 => Os::Hpfs,
-            7 => Os::Macintosh,
-            8 => Os::ZSystem,
-            9 => Os::CpM,
-            10 => Os::Tops20,
-            11 => Os::Ntfs,
-            12 => Os::Qdos,
-            13 => Os::AcornRiscos,
-            _ => Os::Unknown,
+            0 => Self::Fat,
+            1 => Self::Amiga,
+            2 => Self::Vms,
+            3 => Self::Unix,
+            4 => Self::VmCms,
+            5 => Self::AtariTos,
+            6 => Self::Hpfs,
+            7 => Self::Macintosh,
+            8 => Self::ZSystem,
+            9 => Self::CpM,
+            10 => Self::Tops20,
+            11 => Self::Ntfs,
+            12 => Self::Qdos,
+            13 => Self::AcornRiscos,
+            _ => Self::Unknown,
         }
     }
 }
@@ -68,21 +68,21 @@ impl Os {
 impl std::fmt::Display for Os {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Os::Fat => write!(f, "FAT"),
-            Os::Amiga => write!(f, "Amiga"),
-            Os::Vms => write!(f, "VMS"),
-            Os::Unix => write!(f, "Unix"),
-            Os::VmCms => write!(f, "VM/CMS"),
-            Os::AtariTos => write!(f, "Atari TOS"),
-            Os::Hpfs => write!(f, "HPFS"),
-            Os::Macintosh => write!(f, "Macintosh"),
-            Os::ZSystem => write!(f, "Z-System"),
-            Os::CpM => write!(f, "CP/M"),
-            Os::Tops20 => write!(f, "TOPS-20"),
-            Os::Ntfs => write!(f, "NTFS"),
-            Os::Qdos => write!(f, "QDOS"),
-            Os::AcornRiscos => write!(f, "Acorn RISCOS"),
-            Os::Unknown => write!(f, "unknown"),
+            Self::Fat => write!(f, "FAT"),
+            Self::Amiga => write!(f, "Amiga"),
+            Self::Vms => write!(f, "VMS"),
+            Self::Unix => write!(f, "Unix"),
+            Self::VmCms => write!(f, "VM/CMS"),
+            Self::AtariTos => write!(f, "Atari TOS"),
+            Self::Hpfs => write!(f, "HPFS"),
+            Self::Macintosh => write!(f, "Macintosh"),
+            Self::ZSystem => write!(f, "Z-System"),
+            Self::CpM => write!(f, "CP/M"),
+            Self::Tops20 => write!(f, "TOPS-20"),
+            Self::Ntfs => write!(f, "NTFS"),
+            Self::Qdos => write!(f, "QDOS"),
+            Self::AcornRiscos => write!(f, "Acorn RISCOS"),
+            Self::Unknown => write!(f, "unknown"),
         }
     }
 }
@@ -156,12 +156,11 @@ fn read_u32_le(data: &[u8], offset: usize) -> PzResult<u32> {
 
 /// Find the next zero byte starting at `offset`.
 fn find_zero(data: &[u8], offset: usize) -> PzResult<usize> {
-    for i in offset..data.len() {
-        if data[i] == 0 {
-            return Ok(i);
-        }
-    }
-    Err(PzError::InvalidInput)
+    data[offset..]
+        .iter()
+        .position(|&b| b == 0)
+        .map(|pos| offset + pos)
+        .ok_or(PzError::InvalidInput)
 }
 
 /// Parse gzip header fields from `data`.
@@ -184,7 +183,7 @@ pub fn parse_header(data: &[u8]) -> PzResult<(GzipHeader, usize)> {
     let flg = data[3];
     let mtime = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
     let extra_flags = data[8];
-    let os = Os::from_u8(data[9]);
+    let os = Os::from(data[9]);
 
     let is_text = flg & FTEXT != 0;
 

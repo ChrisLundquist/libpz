@@ -21,6 +21,7 @@ mod validation;
 
 /// Error types for libpz operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PzError {
     /// Output buffer is too small to hold the result.
     BufferTooSmall,
@@ -33,9 +34,9 @@ pub enum PzError {
 impl std::fmt::Display for PzError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PzError::BufferTooSmall => write!(f, "output buffer too small"),
-            PzError::InvalidInput => write!(f, "invalid input"),
-            PzError::Unsupported => write!(f, "unsupported operation"),
+            Self::BufferTooSmall => write!(f, "output buffer too small"),
+            Self::InvalidInput => write!(f, "invalid input"),
+            Self::Unsupported => write!(f, "unsupported operation"),
         }
     }
 }
