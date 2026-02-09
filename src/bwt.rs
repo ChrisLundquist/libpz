@@ -96,9 +96,9 @@ pub fn decode(bwt: &[u8], primary_index: u32) -> PzResult<Vec<u8>> {
     // Step 2: Compute cumulative counts (starting positions in F)
     let mut cumul = [0u32; 256];
     let mut sum = 0u32;
-    for i in 0..256 {
-        cumul[i] = sum;
-        sum += counts[i];
+    for (c, &count) in counts.iter().enumerate() {
+        cumul[c] = sum;
+        sum += count;
     }
 
     // Step 3: Build the LF-mapping (also called T-vector or transformation vector)
@@ -145,9 +145,9 @@ pub fn decode_to_buf(bwt: &[u8], primary_index: u32, output: &mut [u8]) -> PzRes
 
     let mut cumul = [0u32; 256];
     let mut sum = 0u32;
-    for i in 0..256 {
-        cumul[i] = sum;
-        sum += counts[i];
+    for (c, &count) in counts.iter().enumerate() {
+        cumul[c] = sum;
+        sum += count;
     }
 
     let mut lf = vec![0u32; n];

@@ -43,9 +43,15 @@ pub struct Crc32 {
     state: u32,
 }
 
+impl Default for Crc32 {
+    fn default() -> Self {
+        Self { state: 0xFFFF_FFFF }
+    }
+}
+
 impl Crc32 {
     pub fn new() -> Self {
-        Crc32 { state: 0xFFFF_FFFF }
+        Self::default()
     }
 
     pub fn update(&mut self, data: &[u8]) {

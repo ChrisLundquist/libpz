@@ -1,5 +1,5 @@
 # Rust build artifacts
-libpz-rs/target/
+/target/
 
 # Extracted test samples (from tar.gz archives)
 samples/cantrbry/

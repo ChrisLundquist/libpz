@@ -14,7 +14,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, ExitCode};
 
 use pz::gzip;
 use pz::pipeline::{self, Pipeline};
@@ -340,7 +340,7 @@ fn process_stdin_stdout(opts: &Opts) -> Result<(), String> {
     Ok(())
 }
 
-fn main() {
+fn run() -> Result<(), ()> {
     let opts = parse_args();
     let mut had_error = false;
 
@@ -348,13 +348,13 @@ fn main() {
         // stdin/stdout mode
         if opts.list {
             eprintln!("pz: -l requires a file argument");
-            process::exit(1);
+            return Err(());
         }
         if let Err(e) = process_stdin_stdout(&opts) {
             eprintln!("pz: {e}");
-            process::exit(1);
+            return Err(());
         }
-        return;
+        return Ok(());
     }
 
     // List mode
@@ -377,10 +377,7 @@ fn main() {
                 }
             }
         }
-        if had_error {
-            process::exit(1);
-        }
-        return;
+        return if had_error { Err(()) } else { Ok(()) };
     }
 
     for path in &opts.files {
@@ -396,7 +393,12 @@ fn main() {
         }
     }
 
-    if had_error {
-        process::exit(1);
+    if had_error { Err(()) } else { Ok(()) }
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(()) => ExitCode::FAILURE,
     }
 }

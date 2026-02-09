@@ -48,7 +48,7 @@ pub fn encode(input: &[u8]) -> Vec<u8> {
                 output.push(byte);
                 output.push(byte);
                 output.push(byte);
-                let extra = std::cmp::min(remaining - 4, MAX_RUN_EXTRA);
+                let extra = (remaining - 4).min(MAX_RUN_EXTRA);
                 output.push(extra as u8);
                 remaining -= 4 + extra;
             } else {
@@ -95,7 +95,7 @@ pub fn encode_to_buf(input: &[u8], output: &mut [u8]) -> PzResult<usize> {
                 output[out_pos + 1] = byte;
                 output[out_pos + 2] = byte;
                 output[out_pos + 3] = byte;
-                let extra = std::cmp::min(remaining - 4, MAX_RUN_EXTRA);
+                let extra = (remaining - 4).min(MAX_RUN_EXTRA);
                 output[out_pos + 4] = extra as u8;
                 out_pos += 5;
                 remaining -= 4 + extra;

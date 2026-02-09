@@ -17,7 +17,7 @@ pub struct FrequencyTable {
 impl FrequencyTable {
     /// Create a new, zeroed frequency table.
     pub fn new() -> Self {
-        FrequencyTable {
+        Self {
             byte: [0u32; 256],
             total: 0,
             used: 0,
@@ -29,20 +29,12 @@ impl FrequencyTable {
     /// Populates `self.byte` with per-byte counts, and computes
     /// `self.total` and `self.used`.
     pub fn count(&mut self, input: &[u8]) {
-        // Count each byte
         for &b in input {
             self.byte[b as usize] += 1;
         }
 
-        // Compute total and used
-        self.total = 0;
-        self.used = 0;
-        for i in 0..256 {
-            self.total += self.byte[i] as u64;
-            if self.byte[i] > 0 {
-                self.used += 1;
-            }
-        }
+        self.total = self.byte.iter().map(|&c| c as u64).sum();
+        self.used = self.byte.iter().filter(|&&c| c > 0).count() as u32;
     }
 
     /// Compute the Shannon entropy of the distribution (in bits per symbol).
@@ -53,15 +45,14 @@ impl FrequencyTable {
             return 0.0;
         }
         let total = self.total as f32;
-        let mut entropy = 0.0f32;
-        for i in 0..256 {
-            let count = self.byte[i] as f32;
-            if count > 0.0 {
-                let prob = count / total;
-                entropy -= prob * prob.log2();
-            }
-        }
-        entropy
+        self.byte
+            .iter()
+            .filter(|&&c| c > 0)
+            .map(|&c| {
+                let prob = c as f32 / total;
+                -prob * prob.log2()
+            })
+            .sum()
     }
 
     /// Get the count for a specific byte value.

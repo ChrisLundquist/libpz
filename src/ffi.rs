@@ -2,15 +2,6 @@
 //!
 //! Provides a stable C API that hides all Rust internals behind
 //! opaque handles and simple C types.
-//!
-//! # Safety
-//!
-//! All `unsafe extern "C"` functions in this module require:
-//! - Non-null pointers where documented
-//! - Valid pointer/length pairs (caller must ensure the pointed-to memory
-//!   is valid for the specified length)
-//! - Proper alignment for the pointed-to types
-#![allow(clippy::missing_safety_doc)]
 
 use std::slice;
 
@@ -23,6 +14,15 @@ const PZ_OK: i32 = 0;
 const PZ_ERROR_BUFFER_TOO_SMALL: i32 = -1;
 const PZ_ERROR_INVALID_INPUT: i32 = -2;
 const PZ_ERROR_UNSUPPORTED: i32 = -3;
+
+/// Convert a [`PzError`](crate::PzError) to an FFI error code.
+fn error_to_code(e: crate::PzError) -> i32 {
+    match e {
+        crate::PzError::BufferTooSmall => PZ_ERROR_BUFFER_TOO_SMALL,
+        crate::PzError::InvalidInput => PZ_ERROR_INVALID_INPUT,
+        crate::PzError::Unsupported => PZ_ERROR_UNSUPPORTED,
+    }
+}
 
 /// Compression levels.
 #[repr(C)]
@@ -91,6 +91,11 @@ pub extern "C" fn pz_init() -> *mut PzContext {
 }
 
 /// Destroy a libpz context and free associated resources.
+///
+/// # Safety
+///
+/// `ctx` must be a pointer returned by [`pz_init`], or null.
+/// After this call the pointer is invalid and must not be reused.
 #[no_mangle]
 pub unsafe extern "C" fn pz_destroy(ctx: *mut PzContext) {
     if !ctx.is_null() {
@@ -103,6 +108,11 @@ pub unsafe extern "C" fn pz_destroy(ctx: *mut PzContext) {
 /// Reports the number of OpenCL devices found during `pz_init()`,
 /// the number of Vulkan devices (0 until Phase 5), and the number
 /// of CPU threads available.
+///
+/// # Safety
+///
+/// - `ctx` must be a valid pointer returned by [`pz_init`].
+/// - `info` must point to a writable [`PzDeviceInfo`].
 #[no_mangle]
 pub unsafe extern "C" fn pz_query_devices(
     ctx: *const PzContext,
@@ -151,6 +161,12 @@ fn build_compress_options(ctx: &PzContext, _input_len: usize) -> pipeline::Compr
 /// Compress data using the specified pipeline.
 ///
 /// Returns bytes written on success, or a negative error code on failure.
+///
+/// # Safety
+///
+/// - `ctx` must be a valid pointer returned by [`pz_init`].
+/// - `input` must point to at least `input_len` readable bytes.
+/// - `output` must point to at least `output_len` writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn pz_compress(
     ctx: *mut PzContext,
@@ -193,9 +209,7 @@ pub unsafe extern "C" fn pz_compress(
             output_slice[..compressed.len()].copy_from_slice(&compressed);
             compressed.len() as i32
         }
-        Err(crate::PzError::BufferTooSmall) => PZ_ERROR_BUFFER_TOO_SMALL,
-        Err(crate::PzError::InvalidInput) => PZ_ERROR_INVALID_INPUT,
-        Err(crate::PzError::Unsupported) => PZ_ERROR_UNSUPPORTED,
+        Err(e) => error_to_code(e),
     }
 }
 
@@ -203,6 +217,12 @@ pub unsafe extern "C" fn pz_compress(
 ///
 /// Automatically detects the pipeline from the stream header.
 /// Returns bytes written on success, or a negative error code on failure.
+///
+/// # Safety
+///
+/// - `ctx` must be a valid pointer returned by [`pz_init`].
+/// - `input` must point to at least `input_len` readable bytes.
+/// - `output` must point to at least `output_len` writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn pz_decompress(
     ctx: *mut PzContext,
@@ -230,9 +250,7 @@ pub unsafe extern "C" fn pz_decompress(
             output_slice[..decompressed.len()].copy_from_slice(&decompressed);
             decompressed.len() as i32
         }
-        Err(crate::PzError::BufferTooSmall) => PZ_ERROR_BUFFER_TOO_SMALL,
-        Err(crate::PzError::InvalidInput) => PZ_ERROR_INVALID_INPUT,
-        Err(crate::PzError::Unsupported) => PZ_ERROR_UNSUPPORTED,
+        Err(e) => error_to_code(e),
     }
 }
 
@@ -252,6 +270,11 @@ pub extern "C" fn pz_compress_bound(input_len: usize) -> usize {
 /// Compress data using LZ77 only.
 ///
 /// Returns bytes written on success, or a negative error code.
+///
+/// # Safety
+///
+/// - `input` must point to at least `input_len` readable bytes.
+/// - `output` must point to at least `output_len` writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn pz_lz77_compress(
     input: *const u8,
@@ -271,15 +294,18 @@ pub unsafe extern "C" fn pz_lz77_compress(
 
     match lz77::compress_to_buf(input_slice, output_slice) {
         Ok(bytes_written) => bytes_written as i32,
-        Err(crate::PzError::BufferTooSmall) => PZ_ERROR_BUFFER_TOO_SMALL,
-        Err(crate::PzError::InvalidInput) => PZ_ERROR_INVALID_INPUT,
-        Err(crate::PzError::Unsupported) => PZ_ERROR_UNSUPPORTED,
+        Err(e) => error_to_code(e),
     }
 }
 
 /// Decompress LZ77-compressed data.
 ///
 /// Returns bytes written on success, or a negative error code.
+///
+/// # Safety
+///
+/// - `input` must point to at least `input_len` readable bytes.
+/// - `output` must point to at least `output_len` writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn pz_lz77_decompress(
     input: *const u8,
@@ -299,9 +325,7 @@ pub unsafe extern "C" fn pz_lz77_decompress(
 
     match lz77::decompress_to_buf(input_slice, output_slice) {
         Ok(bytes_written) => bytes_written as i32,
-        Err(crate::PzError::BufferTooSmall) => PZ_ERROR_BUFFER_TOO_SMALL,
-        Err(crate::PzError::InvalidInput) => PZ_ERROR_INVALID_INPUT,
-        Err(crate::PzError::Unsupported) => PZ_ERROR_UNSUPPORTED,
+        Err(e) => error_to_code(e),
     }
 }
 
@@ -310,6 +334,10 @@ pub unsafe extern "C" fn pz_lz77_decompress(
 /// Create a Huffman tree from input data.
 ///
 /// Returns an opaque handle to the tree, or null on failure.
+///
+/// # Safety
+///
+/// - `input` must point to at least `input_len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn pz_huffman_new(
     input: *const u8,
@@ -327,6 +355,11 @@ pub unsafe extern "C" fn pz_huffman_new(
 }
 
 /// Free a Huffman tree.
+///
+/// # Safety
+///
+/// `tree` must be a pointer returned by [`pz_huffman_new`], or null.
+/// After this call the pointer is invalid and must not be reused.
 #[no_mangle]
 pub unsafe extern "C" fn pz_huffman_free(tree: *mut HuffmanTree) {
     if !tree.is_null() {
@@ -338,6 +371,13 @@ pub unsafe extern "C" fn pz_huffman_free(tree: *mut HuffmanTree) {
 ///
 /// Returns the number of bits written, or a negative error code.
 /// The caller must provide `bits_out` to receive the total bit count.
+///
+/// # Safety
+///
+/// - `tree` must be a valid pointer returned by [`pz_huffman_new`].
+/// - `input` must point to at least `input_len` readable bytes.
+/// - `output` must point to at least `output_len` writable bytes.
+/// - `bits_out` must point to a writable `usize`.
 #[no_mangle]
 pub unsafe extern "C" fn pz_huffman_encode(
     tree: *const HuffmanTree,
@@ -356,24 +396,26 @@ pub unsafe extern "C" fn pz_huffman_encode(
     let output_slice = slice::from_raw_parts_mut(output, output_len);
 
     // Zero the output buffer first
-    for byte in output_slice.iter_mut() {
-        *byte = 0;
-    }
+    output_slice.fill(0);
 
     match tree.encode_to_buf(input_slice, output_slice) {
         Ok(bits) => {
             *bits_out = bits;
             PZ_OK
         }
-        Err(crate::PzError::BufferTooSmall) => PZ_ERROR_BUFFER_TOO_SMALL,
-        Err(crate::PzError::InvalidInput) => PZ_ERROR_INVALID_INPUT,
-        Err(crate::PzError::Unsupported) => PZ_ERROR_UNSUPPORTED,
+        Err(e) => error_to_code(e),
     }
 }
 
 /// Decode Huffman-encoded data.
 ///
 /// Returns the number of bytes written, or a negative error code.
+///
+/// # Safety
+///
+/// - `tree` must be a valid pointer returned by [`pz_huffman_new`].
+/// - `input` must point to at least `ceil(total_bits / 8)` readable bytes.
+/// - `output` must point to at least `output_len` writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn pz_huffman_decode(
     tree: *const HuffmanTree,
@@ -393,9 +435,7 @@ pub unsafe extern "C" fn pz_huffman_decode(
 
     match tree.decode_to_buf(input_slice, total_bits, output_slice) {
         Ok(bytes_written) => bytes_written as i32,
-        Err(crate::PzError::BufferTooSmall) => PZ_ERROR_BUFFER_TOO_SMALL,
-        Err(crate::PzError::InvalidInput) => PZ_ERROR_INVALID_INPUT,
-        Err(crate::PzError::Unsupported) => PZ_ERROR_UNSUPPORTED,
+        Err(e) => error_to_code(e),
     }
 }
 

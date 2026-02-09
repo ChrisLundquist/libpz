@@ -56,7 +56,7 @@ impl Match {
 
     /// Deserialize a match from bytes (little-endian).
     pub fn from_bytes(buf: &[u8; Self::SERIALIZED_SIZE]) -> Self {
-        Match {
+        Self {
             offset: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
             length: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
             next: buf[8],
@@ -201,20 +201,15 @@ pub fn decompress(input: &[u8]) -> PzResult<Vec<u8>> {
         return Ok(Vec::new());
     }
 
-    if !input.len().is_multiple_of(Match::SERIALIZED_SIZE) {
+    if input.len() % Match::SERIALIZED_SIZE != 0 {
         return Err(PzError::InvalidInput);
     }
 
-    let num_matches = input.len() / Match::SERIALIZED_SIZE;
     let mut output = Vec::new();
 
-    for i in 0..num_matches {
-        let start = i * Match::SERIALIZED_SIZE;
-        let buf: [u8; Match::SERIALIZED_SIZE] =
-            input[start..start + Match::SERIALIZED_SIZE]
-                .try_into()
-                .unwrap();
-        let m = Match::from_bytes(&buf);
+    for chunk in input.chunks_exact(Match::SERIALIZED_SIZE) {
+        let buf: &[u8; Match::SERIALIZED_SIZE] = chunk.try_into().unwrap();
+        let m = Match::from_bytes(buf);
 
         // Copy back-referenced bytes
         if m.length > 0 {
@@ -246,20 +241,15 @@ pub fn decompress_to_buf(input: &[u8], output: &mut [u8]) -> PzResult<usize> {
         return Ok(0);
     }
 
-    if !input.len().is_multiple_of(Match::SERIALIZED_SIZE) {
+    if input.len() % Match::SERIALIZED_SIZE != 0 {
         return Err(PzError::InvalidInput);
     }
 
-    let num_matches = input.len() / Match::SERIALIZED_SIZE;
     let mut out_pos: usize = 0;
 
-    for i in 0..num_matches {
-        let start = i * Match::SERIALIZED_SIZE;
-        let buf: [u8; Match::SERIALIZED_SIZE] =
-            input[start..start + Match::SERIALIZED_SIZE]
-                .try_into()
-                .unwrap();
-        let m = Match::from_bytes(&buf);
+    for chunk in input.chunks_exact(Match::SERIALIZED_SIZE) {
+        let buf: &[u8; Match::SERIALIZED_SIZE] = chunk.try_into().unwrap();
+        let m = Match::from_bytes(buf);
 
         // BUG-06 fix: check for length + 1 (match bytes + literal byte)
         if out_pos + m.length as usize + 1 > output.len() {
@@ -312,7 +302,7 @@ struct HashChainFinder {
 
 impl HashChainFinder {
     fn new() -> Self {
-        HashChainFinder {
+        Self {
             head: vec![0; HASH_SIZE],
             prev: vec![0; MAX_WINDOW],
         }
