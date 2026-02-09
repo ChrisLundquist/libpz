@@ -1,0 +1,13 @@
+[package]
+name = "libpz"
+version = "0.1.0"
+edition = "2021"
+description = "Lossless data compression library with GPU acceleration"
+
+[lib]
+name = "pz"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+
+[dev-dependencies]
