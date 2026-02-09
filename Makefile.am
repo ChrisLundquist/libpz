@@ -1,2 +1,2 @@
-SUBDIRS = src reference opencl samples test
+SUBDIRS = opencl samples
 
