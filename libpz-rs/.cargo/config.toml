@@ -1,0 +1,3 @@
+# OpenCL.lib search path when building with --features opencl on MSVC
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-L", "native=D:/opencl/OpenCL-SDK-v2025.07.23-Win-x64/lib"]
