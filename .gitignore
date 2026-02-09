@@ -1,6 +1,10 @@
 # Rust build artifacts
 libpz-rs/target/
 
+# Extracted test samples (from tar.gz archives)
+samples/cantrbry/
+samples/large/
+
 # Editor
 *.swp
 *~
