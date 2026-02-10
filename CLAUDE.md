@@ -9,8 +9,14 @@ cargo fmt                      # format code (must match CI)
 cargo clippy --all-targets     # lint (must pass with zero warnings)
 ```
 
+## Git hooks setup
+Enable the pre-commit hook (auto-formats and lints before each commit):
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Pre-commit checklist
-Before every commit, **always** run:
+Before every commit, **always** run (the pre-commit hook handles 1 and 2 automatically):
 1. `cargo fmt` — format all code
 2. `cargo clippy --all-targets` — fix all warnings, zero warnings policy
 3. `cargo test` — all tests must pass
