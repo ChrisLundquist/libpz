@@ -136,14 +136,22 @@ pub unsafe extern "C" fn pz_query_devices(ctx: *const PzContext, info: *mut PzDe
 /// 1. The `opencl` feature is enabled
 /// 2. An OpenCL engine was successfully created at init time
 /// 3. The input is large enough to benefit from GPU acceleration
-fn build_compress_options(ctx: &PzContext, _input_len: usize) -> pipeline::CompressOptions {
+///
+/// `threads`: 0 = auto, 1 = single-threaded, N = use N threads.
+fn build_compress_options(
+    ctx: &PzContext,
+    _input_len: usize,
+    threads: usize,
+) -> pipeline::CompressOptions {
     #[cfg(feature = "opencl")]
     {
         if let Some(ref engine) = ctx.opencl_engine {
             if _input_len >= crate::opencl::MIN_GPU_INPUT_SIZE {
                 return pipeline::CompressOptions {
                     backend: pipeline::Backend::OpenCl,
+                    threads,
                     opencl_engine: Some(engine.clone()),
+                    ..Default::default()
                 };
             }
         }
@@ -152,7 +160,10 @@ fn build_compress_options(ctx: &PzContext, _input_len: usize) -> pipeline::Compr
     #[cfg(not(feature = "opencl"))]
     let _ = ctx;
 
-    pipeline::CompressOptions::default()
+    pipeline::CompressOptions {
+        threads,
+        ..Default::default()
+    }
 }
 
 /// Compress data using the specified pipeline.
@@ -196,7 +207,64 @@ pub unsafe extern "C" fn pz_compress(
 
     // Build compress options, selecting GPU backend if engine is available
     // and the input is large enough to benefit.
-    let options = build_compress_options(ctx, input_len);
+    // Default to auto-threading (0 = use all available cores).
+    let options = build_compress_options(ctx, input_len, 0);
+
+    match pipeline::compress_with_options(input_slice, pipe, &options) {
+        Ok(compressed) => {
+            if compressed.len() > output_slice.len() {
+                return PZ_ERROR_BUFFER_TOO_SMALL;
+            }
+            output_slice[..compressed.len()].copy_from_slice(&compressed);
+            compressed.len() as i32
+        }
+        Err(e) => error_to_code(e),
+    }
+}
+
+/// Compress data with explicit thread count.
+///
+/// Like `pz_compress` but allows controlling the number of threads:
+/// - 0: auto-detect (use all available CPU cores)
+/// - 1: single-threaded (produces legacy single-block format)
+/// - N: use up to N threads
+///
+/// # Safety
+///
+/// Same requirements as [`pz_compress`].
+#[no_mangle]
+pub unsafe extern "C" fn pz_compress_mt(
+    ctx: *mut PzContext,
+    input: *const u8,
+    input_len: usize,
+    output: *mut u8,
+    output_len: usize,
+    _level: i32,
+    pipeline: i32,
+    threads: i32,
+) -> i32 {
+    if ctx.is_null() || input.is_null() || output.is_null() {
+        return PZ_ERROR_INVALID_INPUT;
+    }
+
+    if input_len == 0 {
+        return 0;
+    }
+
+    let input_slice = slice::from_raw_parts(input, input_len);
+    let output_slice = slice::from_raw_parts_mut(output, output_len);
+
+    let ctx = &*ctx;
+
+    let pipe = match pipeline {
+        0 => pipeline::Pipeline::Deflate,
+        1 => pipeline::Pipeline::Bw,
+        2 => pipeline::Pipeline::Lza,
+        _ => return PZ_ERROR_UNSUPPORTED,
+    };
+
+    let num_threads = if threads < 0 { 0 } else { threads as usize };
+    let options = build_compress_options(ctx, input_len, num_threads);
 
     match pipeline::compress_with_options(input_slice, pipe, &options) {
         Ok(compressed) => {
