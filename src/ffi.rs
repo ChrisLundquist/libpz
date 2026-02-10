@@ -702,7 +702,7 @@ mod tests {
             assert!(decoded_size > 0);
             assert_eq!(&decoded[..decoded_size as usize], input);
 
-            pz_huffman_free(tree as *mut HuffmanTree);
+            pz_huffman_free(tree);
         }
     }
 

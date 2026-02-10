@@ -1,0 +1,16 @@
+#!/bin/sh
+# Pre-commit hook: auto-format and lint before every commit.
+# Install: git config core.hooksPath .githooks
+set -e
+
+# 1. Auto-format staged Rust files and re-stage them.
+echo "[pre-commit] Running cargo fmt..."
+cargo fmt
+# Re-stage any files that cargo fmt modified.
+git diff --name-only --diff-filter=M | grep '\.rs$' | xargs -r git add
+
+# 2. Lint — must pass with zero warnings.
+echo "[pre-commit] Running cargo clippy..."
+cargo clippy --all-targets -- -D warnings
+
+echo "[pre-commit] All checks passed."

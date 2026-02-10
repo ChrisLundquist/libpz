@@ -7,7 +7,6 @@
 /// 4. **Algorithmic properties** - entropy bounds, BWT clustering, MTF locality
 /// 5. **Edge cases** - adversarial patterns, boundary conditions
 /// 6. **Equivalence** - different LZ77 strategies produce decompressible output
-
 #[cfg(test)]
 mod tests {
     use crate::bwt;

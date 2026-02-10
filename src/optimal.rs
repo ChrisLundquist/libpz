@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn test_all_same() {
-        round_trip(&vec![b'x'; 200]);
+        round_trip(&[b'x'; 200]);
     }
 
     #[test]

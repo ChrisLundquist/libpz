@@ -328,14 +328,11 @@ mod tests {
 
     #[test]
     fn test_inflate_stored_block() {
-        let mut data = Vec::new();
-        // bfinal=1, btype=00 → 0x01
-        data.push(0x01);
-        // LEN = 5, NLEN = !5
-        data.push(0x05);
-        data.push(0x00);
-        data.push(0xFA);
-        data.push(0xFF);
+        let mut data = vec![
+            0x01, // bfinal=1, btype=00
+            0x05, 0x00, // LEN = 5
+            0xFA, 0xFF, // NLEN = !5
+        ];
         data.extend_from_slice(b"hello");
 
         let result = inflate(&data).unwrap();

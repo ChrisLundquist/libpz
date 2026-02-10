@@ -167,7 +167,7 @@ mod tests {
     fn test_repeated_byte() {
         // After the first occurrence moves it to front, subsequent
         // occurrences should output 0.
-        let input = &[b'a', b'a', b'a', b'a'];
+        let input: &[u8] = b"aaaa";
         let encoded = encode(input);
         // First 'a' (97) is at position 97, then it's at position 0
         assert_eq!(encoded[0], 97);
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_two_alternating() {
-        let input = &[b'a', b'b', b'a', b'b'];
+        let input: &[u8] = b"abab";
         let encoded = encode(input);
         // 'a' at position 97
         assert_eq!(encoded[0], 97);

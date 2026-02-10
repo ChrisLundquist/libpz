@@ -1318,7 +1318,7 @@ mod tests {
 
     #[test]
     fn test_too_short_input() {
-        let result = decompress(&[b'P', b'Z']);
+        let result = decompress(b"PZ");
         assert_eq!(result, Err(PzError::InvalidInput));
     }
 
