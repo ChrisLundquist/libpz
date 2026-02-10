@@ -56,5 +56,5 @@ jobs:
       - name: Build benchmarks
         run: cargo bench --no-run
       - name: Run benchmark smoke test
-        run: cargo bench --bench throughput -- "compress/pz/Deflate" --sample-size 10
+        run: cargo bench --bench throughput -- "^compress/pz/Deflate$" --sample-size 10 --noplot
         timeout-minutes: 10
