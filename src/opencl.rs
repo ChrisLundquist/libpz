@@ -63,8 +63,14 @@ const LZ77_BATCH_KERNEL_SOURCE: &str = include_str!("../kernels/lz77_batch.cl");
 /// Embedded OpenCL kernel source: bitonic sort step for BWT suffix array.
 const BWT_SORT_KERNEL_SOURCE: &str = include_str!("../kernels/bwt_sort.cl");
 
+/// Embedded OpenCL kernel source: top-K match finding for optimal parsing.
+const LZ77_TOPK_KERNEL_SOURCE: &str = include_str!("../kernels/lz77_topk.cl");
+
 /// Step size used by the batch kernel (must match STEP_SIZE in lz77_batch.cl).
 const BATCH_STEP_SIZE: usize = 32;
+
+/// Number of candidates per position in the top-K kernel (must match K in lz77_topk.cl).
+const TOPK_K: usize = 4;
 
 /// Minimum input size below which GPU overhead exceeds benefit.
 /// For small inputs, the CPU reference implementation is faster.
@@ -83,6 +89,15 @@ struct GpuMatch {
     length: cl_uint,
     next: u8,
     _pad: [u8; 3],
+}
+
+/// GPU candidate struct matching the OpenCL kernel's `lz77_candidate_t` layout.
+/// Must match the struct definition in lz77_topk.cl exactly.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct GpuCandidate {
+    offset: u16,
+    length: u16,
 }
 
 /// Which LZ77 kernel variant to use.
@@ -169,6 +184,8 @@ pub struct OpenClEngine {
     kernel_batch: Kernel,
     /// Compiled BWT bitonic sort step kernel.
     kernel_bwt_sort_step: Kernel,
+    /// Compiled top-K LZ77 match finding kernel.
+    kernel_topk: Kernel,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum work-group size.
@@ -259,6 +276,14 @@ impl OpenClEngine {
         let kernel_bwt_sort_step =
             Kernel::create(&program_bwt, "bitonic_sort_step").map_err(|_| PzError::Unsupported)?;
 
+        // Compile top-K LZ77 kernel for optimal parsing
+        let program_topk =
+            Program::create_and_build_from_source(&context, LZ77_TOPK_KERNEL_SOURCE, "-Werror")
+                .map_err(|_| PzError::Unsupported)?;
+
+        let kernel_topk =
+            Kernel::create(&program_topk, "EncodeTopK").map_err(|_| PzError::Unsupported)?;
+
         Ok(OpenClEngine {
             _device: device,
             context,
@@ -266,6 +291,7 @@ impl OpenClEngine {
             kernel_per_pos,
             kernel_batch,
             kernel_bwt_sort_step,
+            kernel_topk,
             device_name,
             max_work_group_size,
         })
@@ -403,6 +429,82 @@ impl OpenClEngine {
             output.extend_from_slice(&m.to_bytes());
         }
         Ok(output)
+    }
+
+    /// GPU-accelerated top-K match finding for optimal parsing.
+    ///
+    /// For each input position, finds the K best match candidates using
+    /// the GPU. Returns a `MatchTable` ready for `optimal_parse()`.
+    pub fn find_topk_matches(&self, input: &[u8]) -> PzResult<crate::optimal::MatchTable> {
+        use crate::optimal::{MatchCandidate, MatchTable};
+
+        if input.is_empty() {
+            return Ok(MatchTable::new(0, TOPK_K));
+        }
+
+        let input_len = input.len();
+        let output_len = input_len * TOPK_K;
+
+        // Allocate device buffers
+        let mut input_buf = unsafe {
+            Buffer::<u8>::create(&self.context, CL_MEM_READ_ONLY, input_len, ptr::null_mut())
+                .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        let output_buf = unsafe {
+            Buffer::<GpuCandidate>::create(
+                &self.context,
+                CL_MEM_WRITE_ONLY,
+                output_len,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        // Write input to device
+        let write_event = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut input_buf, CL_BLOCKING, 0, input, &[])
+                .map_err(|_| PzError::InvalidInput)?
+        };
+        write_event.wait().map_err(|_| PzError::InvalidInput)?;
+
+        // Execute top-K kernel
+        let count = input_len as cl_uint;
+        let kernel_event = unsafe {
+            ExecuteKernel::new(&self.kernel_topk)
+                .set_arg(&input_buf)
+                .set_arg(&output_buf)
+                .set_arg(&count)
+                .set_global_work_size(input_len)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        kernel_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Read back results
+        let mut gpu_candidates = vec![GpuCandidate::default(); output_len];
+        let read_event = unsafe {
+            self.queue
+                .enqueue_read_buffer(&output_buf, CL_BLOCKING, 0, &mut gpu_candidates, &[])
+                .map_err(|_| PzError::InvalidInput)?
+        };
+        read_event.wait().map_err(|_| PzError::InvalidInput)?;
+
+        // Convert to MatchTable
+        let mut table = MatchTable::new(input_len, TOPK_K);
+        for pos in 0..input_len {
+            let slot = table.at_mut(pos);
+            for k in 0..TOPK_K {
+                let gc = &gpu_candidates[pos * TOPK_K + k];
+                slot[k] = MatchCandidate {
+                    offset: gc.offset,
+                    length: gc.length,
+                };
+            }
+        }
+
+        Ok(table)
     }
 
     /// GPU-accelerated BWT forward transform.
@@ -926,5 +1028,98 @@ mod tests {
 
         assert_eq!(gpu_result.data, cpu_result.data);
         assert_eq!(gpu_result.primary_index, cpu_result.primary_index);
+    }
+
+    // --- Top-K match finding tests ---
+
+    #[test]
+    fn test_gpu_candidate_struct_size() {
+        // GpuCandidate must be 4 bytes to match the OpenCL kernel struct layout
+        assert_eq!(std::mem::size_of::<GpuCandidate>(), 4);
+    }
+
+    #[test]
+    fn test_gpu_topk_empty_input() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let table = engine.find_topk_matches(b"").unwrap();
+        assert_eq!(table.input_len, 0);
+    }
+
+    #[test]
+    fn test_gpu_topk_produces_valid_candidates() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input = b"hello world hello world hello world";
+        let table = engine.find_topk_matches(input).unwrap();
+
+        assert_eq!(table.input_len, input.len());
+        assert_eq!(table.k, TOPK_K);
+
+        // Verify candidates are valid: offsets point to matching data
+        for pos in 0..input.len() {
+            for cand in table.at(pos) {
+                if cand.length == 0 {
+                    continue;
+                }
+                let offset = cand.offset as usize;
+                let length = cand.length as usize;
+                assert!(offset <= pos, "offset {} > pos {}", offset, pos);
+                let match_start = pos - offset;
+                for j in 0..length.min(input.len() - pos) {
+                    assert_eq!(
+                        input[match_start + j],
+                        input[pos + j],
+                        "mismatch at pos {} offset {} len {} byte {}",
+                        pos,
+                        offset,
+                        length,
+                        j
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_gpu_topk_optimal_round_trip() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input = b"the quick brown fox jumps over the lazy dog. the quick brown fox.";
+        let table = engine.find_topk_matches(input).unwrap();
+        let compressed = crate::optimal::compress_optimal_with_table(input, &table).unwrap();
+        let decompressed = crate::lz77::decompress(&compressed).unwrap();
+        assert_eq!(&decompressed, &input[..]);
+    }
+
+    #[test]
+    fn test_gpu_topk_optimal_large_round_trip() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let pattern = b"Hello, World! This is a test pattern. ";
+        let mut input = Vec::new();
+        for _ in 0..200 {
+            input.extend_from_slice(pattern);
+        }
+        let table = engine.find_topk_matches(&input).unwrap();
+        let compressed = crate::optimal::compress_optimal_with_table(&input, &table).unwrap();
+        let decompressed = crate::lz77::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
     }
 }

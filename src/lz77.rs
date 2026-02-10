@@ -18,17 +18,17 @@ use crate::{PzError, PzResult};
 /// Maximum sliding window size for match finding.
 /// 32KB matches the gzip standard and provides much better compression
 /// than the previous 4KB window, especially on repetitive data.
-const MAX_WINDOW: usize = 32768;
+pub(crate) const MAX_WINDOW: usize = 32768;
 
 /// Minimum match length to consider (shorter matches aren't worth encoding).
-const MIN_MATCH: u32 = 3;
+pub(crate) const MIN_MATCH: u32 = 3;
 
 /// Hash table size for hash-chain match finder (power of 2).
-const HASH_SIZE: usize = 1 << 15; // 32768
-const HASH_MASK: usize = HASH_SIZE - 1;
+pub(crate) const HASH_SIZE: usize = 1 << 15; // 32768
+pub(crate) const HASH_MASK: usize = HASH_SIZE - 1;
 
 /// Maximum number of chain links to follow per position.
-const MAX_CHAIN: usize = 64;
+pub(crate) const MAX_CHAIN: usize = 64;
 
 /// An LZ77 match: a (offset, length, next) triple.
 ///
@@ -281,7 +281,7 @@ pub fn decompress_to_buf(input: &[u8], output: &mut [u8]) -> PzResult<usize> {
 // --- Hash-chain match finder ---
 
 /// Compute a hash for 3 bytes at the given position.
-fn hash3(data: &[u8], pos: usize) -> usize {
+pub(crate) fn hash3(data: &[u8], pos: usize) -> usize {
     if pos + 2 >= data.len() {
         return 0;
     }
@@ -293,7 +293,7 @@ fn hash3(data: &[u8], pos: usize) -> usize {
 ///
 /// Maintains a hash table mapping 3-byte prefixes to positions,
 /// with chains for collision resolution. Average O(n) complexity.
-struct HashChainFinder {
+pub(crate) struct HashChainFinder {
     /// head[hash] = most recent position with this hash, or 0
     head: Vec<u32>,
     /// prev[pos % MAX_WINDOW] = previous position in the chain
@@ -301,7 +301,7 @@ struct HashChainFinder {
 }
 
 impl HashChainFinder {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             head: vec![0; HASH_SIZE],
             prev: vec![0; MAX_WINDOW],
@@ -309,7 +309,7 @@ impl HashChainFinder {
     }
 
     /// Find the best match at `pos` in `input`, looking back up to MAX_WINDOW bytes.
-    fn find_match(&self, input: &[u8], pos: usize) -> Match {
+    pub(crate) fn find_match(&self, input: &[u8], pos: usize) -> Match {
         let remaining = input.len() - pos;
         if remaining < 3 {
             // Not enough bytes for a match prefix
@@ -370,13 +370,76 @@ impl HashChainFinder {
     }
 
     /// Insert position `pos` into the hash chain.
-    fn insert(&mut self, input: &[u8], pos: usize) {
+    pub(crate) fn insert(&mut self, input: &[u8], pos: usize) {
         if pos + 2 >= input.len() {
             return;
         }
         let h = hash3(input, pos);
         self.prev[pos % MAX_WINDOW] = self.head[h];
         self.head[h] = pos as u32;
+    }
+
+    /// Find top-K match candidates at `pos`.
+    ///
+    /// For each distinct match length found (>= MIN_MATCH), keeps the
+    /// candidate with the smallest offset. Returns up to `k` candidates
+    /// sorted by length descending.
+    pub(crate) fn find_top_k(&self, input: &[u8], pos: usize, k: usize) -> Vec<(u16, u16)> {
+        let remaining = input.len() - pos;
+        if remaining < MIN_MATCH as usize {
+            return Vec::new();
+        }
+
+        let h = hash3(input, pos);
+        let mut chain_pos = self.head[h] as usize;
+        let min_pos = pos.saturating_sub(MAX_WINDOW);
+        let mut chain_count = 0;
+
+        // For each distinct length, keep the match with the smallest offset.
+        // Use a simple vec of (length, offset) pairs; K is small.
+        let mut found: Vec<(u16, u16)> = Vec::new();
+
+        while chain_pos >= min_pos && chain_pos < pos && chain_count < MAX_CHAIN {
+            let mut match_len = 0u32;
+            let max_len = remaining.min(pos - chain_pos) as u32;
+            while match_len < max_len
+                && input[chain_pos + match_len as usize] == input[pos + match_len as usize]
+            {
+                match_len += 1;
+            }
+
+            if match_len >= MIN_MATCH {
+                let offset = (pos - chain_pos) as u16;
+                let length = match_len as u16;
+
+                // Check if we already have a candidate with this length
+                let existing = found.iter_mut().find(|(l, _)| *l == length);
+                match existing {
+                    Some((_, ref mut o)) => {
+                        // Keep the smaller offset for this length
+                        if offset < *o {
+                            *o = offset;
+                        }
+                    }
+                    None => {
+                        found.push((length, offset));
+                    }
+                }
+            }
+
+            // Follow chain
+            let prev_pos = self.prev[chain_pos % MAX_WINDOW] as usize;
+            if prev_pos >= chain_pos || prev_pos < min_pos {
+                break;
+            }
+            chain_pos = prev_pos;
+            chain_count += 1;
+        }
+
+        // Sort by length descending, take top K
+        found.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        found.truncate(k);
+        found
     }
 }
 

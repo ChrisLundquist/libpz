@@ -6,6 +6,7 @@ pub mod gzip;
 pub mod huffman;
 pub mod lz77;
 pub mod mtf;
+pub mod optimal;
 pub mod pipeline;
 pub mod pqueue;
 pub mod rangecoder;

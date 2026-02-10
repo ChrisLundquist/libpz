@@ -281,48 +281,71 @@ Maintain a set of known-good compressed files:
 
 ---
 
-## Phase 2: Optimal LZ77 Match Selection
+## Phase 2: Optimal LZ77 Match Selection ✅
 
 This is the core research contribution of libpz. The GPU finds all matches;
 the CPU selects the minimum-cost chain.
 
-### 2.1 GPU Match Table Generation
-Current state: OpenCL kernel produces one match per input position. After
-deduplication, this gives the greedy parse.
+### 2.1 GPU Match Table Generation ✅
+**Implemented** in `kernels/lz77_topk.cl` and `src/opencl.rs`:
+- New kernel `EncodeTopK`: one work-item per position, K=4 candidates per position
+- `lz77_candidate_t { u16 offset, u16 length }` — 4 bytes per candidate
+- 32KB sliding window, brute-force scan with spot-check optimization
+- `OpenClEngine::find_topk_matches()` returns `MatchTable` for CPU DP
 
-Target: For each position, produce the **top-K matches** (varying offsets and
-lengths). Store as a match table:
-```c
-typedef struct {
-    uint16_t offset;
-    uint16_t length;
-} lz77_candidate_t;
+CPU fallback: `build_match_table_cpu()` uses `HashChainFinder::find_top_k()`
+to collect diverse candidates (distinct lengths, prefer smaller offsets).
 
-// match_table[position * K + k] = k-th best candidate at position
+### 2.2 Cost Model ✅
+**Implemented** in `src/optimal.rs::CostModel`:
+
+Token-based cost model reflecting the PZ format where every token (literal or
+match) serializes to exactly 9 bytes (`offset:u32 + length:u32 + next:u8`):
+
+- **Literal token cost:** `literal_overhead` (8 zero bytes ≈ 8 bits after entropy
+  coding) + Shannon cost of `next` byte
+- **Match token cost:** `match_overhead` (8 varied offset/length bytes ≈ 32 bits)
+  + Shannon cost of `next` byte
+- All costs in fixed-point (×256) to avoid float in DP inner loop
+- Uses `FrequencyTable` for Shannon entropy estimates of byte values
+
+The key insight is that both literals and matches are 9-byte tokens, but literals
+have 8 zero bytes (very cheap after entropy coding) while matches have varied
+offset/length bytes (more expensive). Matches amortize their overhead by covering
+`length + 1` input bytes per token.
+
+### 2.3 Backward DP Optimal Parse ✅
+**Implemented** in `src/optimal.rs::optimal_parse()`:
 ```
-
-### 2.2 Cost Model
-Define encoding cost for each match/literal:
-- **Literal cost:** `-log2(freq[byte] / total)` bits (Shannon entropy of the byte)
-- **Match cost:** `offset_bits(offset) + length_bits(length)` (depends on encoding format)
-- Shorter matches with common offsets can be cheaper than longer matches with rare offsets
-
-### 2.3 Backward DP Optimal Parse
-```
-cost[n] = 0  (end of input)
+cost[n] = 0
 for i = n-1 down to 0:
-    cost[i] = literal_cost(input[i]) + cost[i+1]     // literal option
-    for each match (offset, length) at position i:
-        match_price = match_cost(offset, length) + cost[i + length]
-        cost[i] = min(cost[i], match_price)
+    cost[i] = literal_cost(input[i]) + cost[i+1]
+    for each candidate at position i:
+        if i + length < n:
+            mcost = match_overhead + literal_cost(next_byte) + cost[i+length+1]
+            cost[i] = min(cost[i], mcost)
 ```
-Forward trace recovers the optimal sequence of matches/literals.
+Accounts for the mandatory `next` byte in the Match format (each token
+covers `length + 1` bytes). Forward trace recovers the optimal sequence.
 
-This is the approach used by zstd (levels 17+) and xz/lzma. The difference
-is that libpz gets the match candidates from the GPU rather than from
-hash chains on the CPU.
+Pipeline integration: `ParseStrategy::Optimal` in `CompressOptions`,
+`-O`/`--optimal` CLI flag. Works with both Deflate and Lza pipelines,
+single-threaded and multi-block parallel modes.
 
-### 2.4 Entropy Feedback
+### 2.4 Benchmark Results
+
+Optimal parsing vs greedy on Canterbury corpus (~2.8MB, via `cantrbry.tar.gz`):
+
+| Pipeline | Greedy (bytes) | Optimal (bytes) | Improvement |
+|----------|---------------|-----------------|-------------|
+| Deflate  | 1,290,991     | 1,234,738       | **-4.4%**   |
+| Lza      | 1,207,948     | 1,134,960       | **-6.0%**   |
+
+Speed trade-off: optimal parsing is ~4.5–7× slower than greedy (expected, due to
+DP pass and match table construction). On highly repetitive data, improvement is
+minimal since greedy already finds long matches.
+
+### 2.5 Entropy Feedback (Future)
 After an initial parse, update the frequency model with the actual
 match/literal distribution, then re-run the DP with updated costs. Converges
 in 2-3 iterations (diminishing returns after that). This is similar to
@@ -474,10 +497,10 @@ without sidecar metadata).
 | **M5.2** | Cross-implementation validation (Rust vs C) | M1, M5 | N/A (C code removed) |
 | **M5.3** | Fuzz testing infrastructure | M5 | Pending |
 | **M5.4** | Benchmark suite and regression baselines | M5.1 | **Done** (criterion, stages + throughput) |
-| **M6** | OpenCL LZ77 produces top-K match table | M1 | Pending (basic batch kernel done) |
-| **M7** | Optimal parse DP selects minimum-cost chain from GPU matches | M6 | Pending |
+| **M6** | OpenCL LZ77 produces top-K match table | M1 | **Done** (lz77_topk.cl, K=4 candidates/position) |
+| **M7** | Optimal parse DP selects minimum-cost chain from GPU matches | M6 | **Done** (backward DP in `optimal.rs`, `-O` CLI flag) |
 | **M8** | OpenCL backend outperforms reference on large inputs | M7 | Pending |
-| **M9** | pthread block-parallel compression | M5 | Pending |
+| **M9** | pthread block-parallel compression | M5 | **Done** (V2 container, `-t` flag, pipeline parallelism) |
 | **M10** | File format defined, CLI tool works end-to-end | M5 | **Done** (`pz` CLI with .pz format, `--gpu` flag) |
 | **M11** | Benchmark suite vs gzip/zstd/bzip2/lz4 | M8, M9, M10 | **Done** (throughput.rs compares gzip/pigz/zstd) |
 | **M12** | Vulkan compute backend | M8 | Pending |

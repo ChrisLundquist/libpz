@@ -43,6 +43,18 @@ pub enum Backend {
     OpenCl,
 }
 
+/// LZ77 match selection strategy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ParseStrategy {
+    /// Greedy: hash-chain match finder, pick the longest match.
+    #[default]
+    Greedy,
+    /// Lazy: check if the next position has a longer match (gzip-style).
+    Lazy,
+    /// Optimal: backward DP to minimize total encoding cost.
+    Optimal,
+}
+
 /// Default block size for multi-threaded compression (256KB).
 const DEFAULT_BLOCK_SIZE: usize = 256 * 1024;
 
@@ -58,6 +70,8 @@ pub struct CompressOptions {
     /// Block size for multi-threaded compression. Input is split into
     /// blocks of this size, each compressed independently.
     pub block_size: usize,
+    /// LZ77 match selection strategy (greedy, lazy, or optimal).
+    pub parse_strategy: ParseStrategy,
     /// OpenCL engine handle, required when `backend` is `Backend::OpenCl`.
     #[cfg(feature = "opencl")]
     pub opencl_engine: Option<std::sync::Arc<crate::opencl::OpenClEngine>>,
@@ -69,6 +83,7 @@ impl Default for CompressOptions {
             backend: Backend::Cpu,
             threads: 0,
             block_size: DEFAULT_BLOCK_SIZE,
+            parse_strategy: ParseStrategy::Greedy,
             #[cfg(feature = "opencl")]
             opencl_engine: None,
         }
@@ -915,22 +930,29 @@ fn decompress_pipeline_parallel(
 
 // --- LZ77 helper: select GPU or CPU backend for match finding ---
 
-/// Run LZ77 compression using the configured backend.
+/// Run LZ77 compression using the configured backend and parse strategy.
 fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
     #[cfg(feature = "opencl")]
     {
         if let Backend::OpenCl = options.backend {
             if let Some(ref engine) = options.opencl_engine {
+                if options.parse_strategy == ParseStrategy::Optimal {
+                    // GPU top-K match table + CPU optimal parse DP
+                    let table = engine.find_topk_matches(input)?;
+                    return crate::optimal::compress_optimal_with_table(input, &table);
+                }
+                // GPU greedy path
                 return engine.lz77_compress(input, crate::opencl::KernelVariant::Batch);
             }
         }
     }
 
-    #[cfg(not(feature = "opencl"))]
-    let _ = options;
-
-    // Fallback: CPU hash-chain
-    lz77::compress_hashchain(input)
+    // CPU paths
+    match options.parse_strategy {
+        ParseStrategy::Greedy => lz77::compress_hashchain(input),
+        ParseStrategy::Lazy => lz77::compress_lazy(input),
+        ParseStrategy::Optimal => crate::optimal::compress_optimal(input),
+    }
 }
 
 // --- DEFLATE pipeline: LZ77 + Huffman ---
@@ -1603,5 +1625,59 @@ mod tests {
                 // Expected: corruption detected
             }
         }
+    }
+
+    // --- Optimal parsing pipeline tests ---
+
+    #[test]
+    fn test_optimal_deflate_round_trip() {
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend_from_slice(pattern);
+        }
+        let opts = CompressOptions {
+            parse_strategy: ParseStrategy::Optimal,
+            threads: 1,
+            ..Default::default()
+        };
+        let compressed = compress_with_options(&input, Pipeline::Deflate, &opts).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_optimal_lza_round_trip() {
+        let pattern = b"abcdefghij abcdefghij ";
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend_from_slice(pattern);
+        }
+        let opts = CompressOptions {
+            parse_strategy: ParseStrategy::Optimal,
+            threads: 1,
+            ..Default::default()
+        };
+        let compressed = compress_with_options(&input, Pipeline::Lza, &opts).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_optimal_multiblock_round_trip() {
+        let pattern = b"Hello, World! This is a test pattern. ";
+        let mut input = Vec::new();
+        for _ in 0..500 {
+            input.extend_from_slice(pattern);
+        }
+        let opts = CompressOptions {
+            parse_strategy: ParseStrategy::Optimal,
+            threads: 2,
+            block_size: 4096,
+            ..Default::default()
+        };
+        let compressed = compress_with_options(&input, Pipeline::Deflate, &opts).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
     }
 }
