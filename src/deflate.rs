@@ -9,7 +9,6 @@
 /// [`HuffTable`](crate::huffman::HuffTable) primitive with
 /// DEFLATE-specific bit ordering, block framing, and LZ77
 /// length/distance tables per RFC 1951.
-
 use crate::huffman::HuffTable;
 use crate::{PzError, PzResult};
 
@@ -19,13 +18,17 @@ use crate::{PzError, PzResult};
 
 struct BitReader<'a> {
     data: &'a [u8],
-    pos: usize,  // byte position
-    bit: u8,     // bit position within current byte (0..8)
+    pos: usize, // byte position
+    bit: u8,    // bit position within current byte (0..8)
 }
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        BitReader { data, pos: 0, bit: 0 }
+        BitReader {
+            data,
+            pos: 0,
+            bit: 0,
+        }
     }
 
     /// Read `n` bits (1..=25) and return them as a u32, LSB first.
@@ -93,30 +96,25 @@ const MAX_DIST_CODES: usize = 32;
 
 /// Base lengths for length codes 257..285.
 static LENGTH_BASE: [u16; 29] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13,
-    15, 17, 19, 23, 27, 31, 35, 43, 51, 59,
-    67, 83, 99, 115, 131, 163, 195, 227, 258,
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
 ];
 
 /// Extra bits for length codes 257..285.
 static LENGTH_EXTRA: [u8; 29] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 1, 1,
-    1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
-    4, 4, 4, 4, 5, 5, 5, 5, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
 
 /// Base distances for distance codes 0..29.
 static DIST_BASE: [u16; 30] = [
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25,
-    33, 49, 65, 97, 129, 193, 257, 385, 513, 769,
-    1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
 ];
 
 /// Extra bits for distance codes 0..29.
 static DIST_EXTRA: [u8; 30] = [
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3,
-    4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
-    9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
 ];
 
 /// Order of code length alphabet codes (RFC 1951 section 3.2.7).
@@ -130,10 +128,10 @@ static CODELEN_ORDER: [usize; 19] = [
 
 fn build_fixed_lit_table() -> PzResult<HuffTable> {
     let mut lengths = [0u8; MAX_LIT_CODES];
-    for i in 0..=143 { lengths[i] = 8; }
-    for i in 144..=255 { lengths[i] = 9; }
-    for i in 256..=279 { lengths[i] = 7; }
-    for i in 280..=287 { lengths[i] = 8; }
+    lengths[..=143].fill(8);
+    lengths[144..=255].fill(9);
+    lengths[256..=279].fill(7);
+    lengths[280..=287].fill(8);
     HuffTable::from_lengths(&lengths)
 }
 
@@ -270,8 +268,8 @@ fn inflate_huffman(
                 if dist_sym >= DIST_BASE.len() {
                     return Err(PzError::InvalidInput);
                 }
-                let distance = DIST_BASE[dist_sym] as usize
-                    + reader.read_bits(DIST_EXTRA[dist_sym])? as usize;
+                let distance =
+                    DIST_BASE[dist_sym] as usize + reader.read_bits(DIST_EXTRA[dist_sym])? as usize;
 
                 if distance > output.len() {
                     return Err(PzError::InvalidInput);

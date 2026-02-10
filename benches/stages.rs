@@ -69,13 +69,9 @@ fn bench_lz77(c: &mut Criterion) {
             },
         );
 
-        group.bench_with_input(
-            BenchmarkId::new("compress_lazy", size),
-            &data,
-            |b, data| {
-                b.iter(|| pz::lz77::compress_lazy(data).unwrap());
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("compress_lazy", size), &data, |b, data| {
+            b.iter(|| pz::lz77::compress_lazy(data).unwrap());
+        });
 
         // Decompress benchmark
         let compressed = pz::lz77::compress_hashchain(&data).unwrap();
@@ -103,14 +99,10 @@ fn bench_huffman(c: &mut Criterion) {
         });
 
         let (encoded, total_bits) = tree.encode(&data).unwrap();
-        group.bench_with_input(
-            BenchmarkId::new("decode", size),
-            &encoded,
-            |b, encoded| {
-                let mut out = vec![0u8; size];
-                b.iter(|| tree.decode_to_buf(encoded, total_bits, &mut out).unwrap());
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("decode", size), &encoded, |b, encoded| {
+            let mut out = vec![0u8; size];
+            b.iter(|| tree.decode_to_buf(encoded, total_bits, &mut out).unwrap());
+        });
     }
     group.finish();
 }
@@ -162,13 +154,9 @@ fn bench_rangecoder(c: &mut Criterion) {
         });
 
         let encoded = pz::rangecoder::encode(&data);
-        group.bench_with_input(
-            BenchmarkId::new("decode", size),
-            &encoded,
-            |b, enc| {
-                b.iter(|| pz::rangecoder::decode(enc, size).unwrap());
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("decode", size), &encoded, |b, enc| {
+            b.iter(|| pz::rangecoder::decode(enc, size).unwrap());
+        });
     }
     group.finish();
 }
@@ -193,9 +181,13 @@ fn bench_bwt_gpu(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
 
         let eng = engine.clone();
-        group.bench_with_input(BenchmarkId::new("encode_gpu", size), &data, move |b, data| {
-            b.iter(|| eng.bwt_encode(data).unwrap());
-        });
+        group.bench_with_input(
+            BenchmarkId::new("encode_gpu", size),
+            &data,
+            move |b, data| {
+                b.iter(|| eng.bwt_encode(data).unwrap());
+            },
+        );
     }
     group.finish();
 }

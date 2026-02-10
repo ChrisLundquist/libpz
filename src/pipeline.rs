@@ -21,7 +21,6 @@
 /// - Original length: u32 little-endian (4 bytes)
 /// - Pipeline-specific metadata (variable)
 /// - Compressed data
-
 use crate::bwt;
 use crate::huffman::HuffmanTree;
 use crate::lz77;
@@ -227,8 +226,7 @@ fn decompress_deflate(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     }
 
     let lz_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-    let total_bits =
-        u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
+    let total_bits = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
 
     // Reconstruct frequency table
     let mut freq_table = crate::frequency::FrequencyTable::new();
@@ -247,8 +245,7 @@ fn decompress_deflate(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     let huffman_data = &payload[1032..];
 
     // Stage 1: Huffman decode
-    let tree =
-        HuffmanTree::from_frequency_table(&freq_table).ok_or(PzError::InvalidInput)?;
+    let tree = HuffmanTree::from_frequency_table(&freq_table).ok_or(PzError::InvalidInput)?;
     let mut lz_data = vec![0u8; lz_len];
     let decoded_len = tree.decode_to_buf(huffman_data, total_bits, &mut lz_data)?;
     if decoded_len != lz_len {
@@ -268,10 +265,7 @@ fn decompress_deflate(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 // --- BWT helper: select GPU or CPU backend for suffix array construction ---
 
 /// Run BWT encoding using the configured backend.
-fn bwt_encode_with_backend(
-    input: &[u8],
-    options: &CompressOptions,
-) -> PzResult<bwt::BwtResult> {
+fn bwt_encode_with_backend(input: &[u8], options: &CompressOptions) -> PzResult<bwt::BwtResult> {
     #[cfg(feature = "opencl")]
     {
         if let Backend::OpenCl = options.backend {
@@ -319,10 +313,8 @@ fn decompress_bw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
         return Err(PzError::InvalidInput);
     }
 
-    let primary_index =
-        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let rle_len =
-        u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
+    let primary_index = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let rle_len = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
 
     let rc_data = &payload[8..];
 
@@ -368,8 +360,7 @@ fn decompress_lza(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
         return Err(PzError::InvalidInput);
     }
 
-    let lz_len =
-        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let lz_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
     let rc_data = &payload[4..];
 
     // Stage 1: Range decode
@@ -565,11 +556,7 @@ mod tests {
         for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
             let compressed = compress(input, pipeline).unwrap();
             let decompressed = decompress(&compressed).unwrap();
-            assert_eq!(
-                decompressed, input,
-                "failed for pipeline {:?}",
-                pipeline
-            );
+            assert_eq!(decompressed, input, "failed for pipeline {:?}", pipeline);
         }
     }
 
@@ -582,11 +569,7 @@ mod tests {
         for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
             let compressed = compress(&input, pipeline).unwrap();
             let decompressed = decompress(&compressed).unwrap();
-            assert_eq!(
-                decompressed, input,
-                "failed for pipeline {:?}",
-                pipeline
-            );
+            assert_eq!(decompressed, input, "failed for pipeline {:?}", pipeline);
         }
     }
 }

@@ -201,8 +201,7 @@ impl OpenClEngine {
     /// of type.
     pub fn with_device_preference(prefer_gpu: bool) -> PzResult<Self> {
         // Discover devices
-        let all_ids = get_all_devices(CL_DEVICE_TYPE_ALL)
-            .map_err(|_| PzError::Unsupported)?;
+        let all_ids = get_all_devices(CL_DEVICE_TYPE_ALL).map_err(|_| PzError::Unsupported)?;
 
         if all_ids.is_empty() {
             return Err(PzError::Unsupported);
@@ -225,15 +224,11 @@ impl OpenClEngine {
         let max_work_group_size = device.max_work_group_size().unwrap_or(1);
 
         // Create context and command queue
-        let context = Context::from_device(&device)
-            .map_err(|_| PzError::Unsupported)?;
+        let context = Context::from_device(&device).map_err(|_| PzError::Unsupported)?;
 
-        let queue = CommandQueue::create_default_with_properties(
-            &context,
-            CL_QUEUE_PROFILING_ENABLE,
-            0,
-        )
-        .map_err(|_| PzError::Unsupported)?;
+        let queue =
+            CommandQueue::create_default_with_properties(&context, CL_QUEUE_PROFILING_ENABLE, 0)
+                .map_err(|_| PzError::Unsupported)?;
 
         // Compile both kernel variants
         let program_per_pos =
@@ -244,19 +239,19 @@ impl OpenClEngine {
             Program::create_and_build_from_source(&context, LZ77_BATCH_KERNEL_SOURCE, "-Werror")
                 .map_err(|_| PzError::Unsupported)?;
 
-        let kernel_per_pos = Kernel::create(&program_per_pos, "Encode")
-            .map_err(|_| PzError::Unsupported)?;
+        let kernel_per_pos =
+            Kernel::create(&program_per_pos, "Encode").map_err(|_| PzError::Unsupported)?;
 
-        let kernel_batch = Kernel::create(&program_batch, "Encode")
-            .map_err(|_| PzError::Unsupported)?;
+        let kernel_batch =
+            Kernel::create(&program_batch, "Encode").map_err(|_| PzError::Unsupported)?;
 
         // Compile BWT bitonic sort kernel
         let program_bwt =
             Program::create_and_build_from_source(&context, BWT_SORT_KERNEL_SOURCE, "-Werror")
                 .map_err(|_| PzError::Unsupported)?;
 
-        let kernel_bwt_sort_step = Kernel::create(&program_bwt, "bitonic_sort_step")
-            .map_err(|_| PzError::Unsupported)?;
+        let kernel_bwt_sort_step =
+            Kernel::create(&program_bwt, "bitonic_sort_step").map_err(|_| PzError::Unsupported)?;
 
         Ok(OpenClEngine {
             _device: device,
@@ -304,13 +299,8 @@ impl OpenClEngine {
         };
 
         let output_buf = unsafe {
-            Buffer::<GpuMatch>::create(
-                &self.context,
-                CL_MEM_WRITE_ONLY,
-                input_len,
-                ptr::null_mut(),
-            )
-            .map_err(|_| PzError::BufferTooSmall)?
+            Buffer::<GpuMatch>::create(&self.context, CL_MEM_WRITE_ONLY, input_len, ptr::null_mut())
+                .map_err(|_| PzError::BufferTooSmall)?
         };
 
         // Write input to device
@@ -466,23 +456,13 @@ impl OpenClEngine {
 
         // Allocate GPU buffers
         let mut sa_buf = unsafe {
-            Buffer::<cl_uint>::create(
-                &self.context,
-                CL_MEM_READ_WRITE,
-                padded_n,
-                ptr::null_mut(),
-            )
-            .map_err(|_| PzError::BufferTooSmall)?
+            Buffer::<cl_uint>::create(&self.context, CL_MEM_READ_WRITE, padded_n, ptr::null_mut())
+                .map_err(|_| PzError::BufferTooSmall)?
         };
 
         let mut rank_buf = unsafe {
-            Buffer::<cl_uint>::create(
-                &self.context,
-                CL_MEM_READ_WRITE,
-                padded_n,
-                ptr::null_mut(),
-            )
-            .map_err(|_| PzError::BufferTooSmall)?
+            Buffer::<cl_uint>::create(&self.context, CL_MEM_READ_WRITE, padded_n, ptr::null_mut())
+                .map_err(|_| PzError::BufferTooSmall)?
         };
 
         // Upload initial data
@@ -504,7 +484,13 @@ impl OpenClEngine {
         let mut k_step: usize = 1;
         while k_step < n {
             // Run bitonic sort on GPU
-            self.run_bitonic_sort(&mut sa_buf, &rank_buf, padded_n, n as cl_uint, k_step as cl_uint)?;
+            self.run_bitonic_sort(
+                &mut sa_buf,
+                &rank_buf,
+                padded_n,
+                n as cl_uint,
+                k_step as cl_uint,
+            )?;
 
             // Read back sorted sa
             let read_sa = unsafe {
@@ -708,12 +694,42 @@ mod tests {
         // a match of length 3, etc.
         let input = b"abcabc";
         let gpu_matches = vec![
-            GpuMatch { offset: 0, length: 0, next: b'a', _pad: [0; 3] },
-            GpuMatch { offset: 0, length: 0, next: b'b', _pad: [0; 3] },
-            GpuMatch { offset: 0, length: 0, next: b'c', _pad: [0; 3] },
-            GpuMatch { offset: 3, length: 2, next: b'c', _pad: [0; 3] },
-            GpuMatch { offset: 3, length: 1, next: b'c', _pad: [0; 3] }, // overlapping, skipped
-            GpuMatch { offset: 3, length: 0, next: b'c', _pad: [0; 3] }, // overlapping, skipped
+            GpuMatch {
+                offset: 0,
+                length: 0,
+                next: b'a',
+                _pad: [0; 3],
+            },
+            GpuMatch {
+                offset: 0,
+                length: 0,
+                next: b'b',
+                _pad: [0; 3],
+            },
+            GpuMatch {
+                offset: 0,
+                length: 0,
+                next: b'c',
+                _pad: [0; 3],
+            },
+            GpuMatch {
+                offset: 3,
+                length: 2,
+                next: b'c',
+                _pad: [0; 3],
+            },
+            GpuMatch {
+                offset: 3,
+                length: 1,
+                next: b'c',
+                _pad: [0; 3],
+            }, // overlapping, skipped
+            GpuMatch {
+                offset: 3,
+                length: 0,
+                next: b'c',
+                _pad: [0; 3],
+            }, // overlapping, skipped
         ];
 
         let result = dedupe_gpu_matches(&gpu_matches, input);
@@ -778,8 +794,7 @@ mod tests {
             .lz77_compress(input, KernelVariant::Batch)
             .expect("GPU compression failed");
 
-        let decompressed =
-            crate::lz77::decompress(&compressed).expect("decompression failed");
+        let decompressed = crate::lz77::decompress(&compressed).expect("decompression failed");
 
         assert_eq!(&decompressed, input);
     }
@@ -797,8 +812,7 @@ mod tests {
             .lz77_compress(input, KernelVariant::PerPosition)
             .expect("GPU compression failed");
 
-        let decompressed =
-            crate::lz77::decompress(&compressed).expect("decompression failed");
+        let decompressed = crate::lz77::decompress(&compressed).expect("decompression failed");
 
         assert_eq!(&decompressed, &input[..]);
     }
@@ -836,8 +850,7 @@ mod tests {
         );
 
         // Round-trip through CPU decode
-        let decoded =
-            crate::bwt::decode(&gpu_result.data, gpu_result.primary_index).unwrap();
+        let decoded = crate::bwt::decode(&gpu_result.data, gpu_result.primary_index).unwrap();
         assert_eq!(decoded, input);
     }
 
@@ -856,8 +869,7 @@ mod tests {
         assert_eq!(gpu_result.data, cpu_result.data);
         assert_eq!(gpu_result.primary_index, cpu_result.primary_index);
 
-        let decoded =
-            crate::bwt::decode(&gpu_result.data, gpu_result.primary_index).unwrap();
+        let decoded = crate::bwt::decode(&gpu_result.data, gpu_result.primary_index).unwrap();
         assert_eq!(decoded, input);
     }
 
@@ -876,8 +888,7 @@ mod tests {
         assert_eq!(gpu_result.data, cpu_result.data);
         assert_eq!(gpu_result.primary_index, cpu_result.primary_index);
 
-        let decoded =
-            crate::bwt::decode(&gpu_result.data, gpu_result.primary_index).unwrap();
+        let decoded = crate::bwt::decode(&gpu_result.data, gpu_result.primary_index).unwrap();
         assert_eq!(decoded, input);
     }
 

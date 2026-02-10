@@ -15,7 +15,6 @@
 /// - Maintain the same initial list.
 /// - For each input index, output the byte at that position.
 /// - Then move that byte to the front.
-
 use crate::{PzError, PzResult};
 
 /// Apply the Move-to-Front transform to input data.

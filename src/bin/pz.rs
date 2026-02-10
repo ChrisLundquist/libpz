@@ -9,7 +9,6 @@
 ///   pz -l file.txt.pz    → list info about compressed file
 ///   cat file | pz -c     → compress stdin to stdout
 ///   cat file | pz -dc    → decompress stdin to stdout
-
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -160,12 +159,8 @@ fn decompress_output_path(input: &str) -> Option<PathBuf> {
     let path = Path::new(input);
     if let Some(ext) = path.extension() {
         match ext.to_str() {
-            Some("pz") => {
-                Some(path.with_extension(""))
-            }
-            Some("gz") => {
-                Some(path.with_extension(""))
-            }
+            Some("pz") => Some(path.with_extension("")),
+            Some("gz") => Some(path.with_extension("")),
             _ => None,
         }
     } else {
@@ -225,8 +220,8 @@ fn decompress_data(data: &[u8]) -> Result<Vec<u8>, String> {
     match detect_format(data) {
         Format::Pz => pipeline::decompress(data).map_err(|e| format!("{e}")),
         Format::Gzip => {
-            let (decompressed, _header) = gzip::decompress(data)
-                .map_err(|e| format!("gzip: {e}"))?;
+            let (decompressed, _header) =
+                gzip::decompress(data).map_err(|e| format!("gzip: {e}"))?;
             Ok(decompressed)
         }
         Format::Unknown => Err("unrecognized file format (not .pz or .gz)".to_string()),
@@ -356,11 +351,7 @@ fn process_decompress(opts: &Opts, path: &str) -> Result<(), String> {
         fs::write(&out_path, &decompressed).map_err(|e| format!("{out_str}: {e}"))?;
 
         if opts.verbose {
-            eprintln!(
-                "{path}: {} → {} bytes",
-                data.len(),
-                decompressed.len()
-            );
+            eprintln!("{path}: {} → {} bytes", data.len(), decompressed.len());
         }
 
         if !opts.keep {
@@ -411,8 +402,8 @@ fn run() -> Result<(), ()> {
     // List mode
     if opts.list {
         println!(
-            "{:>12} {:>12} {:>6} {:>8} {}",
-            "original", "compressed", "ratio", "type", "name"
+            "{:>12} {:>12} {:>6} {:>8} name",
+            "original", "compressed", "ratio", "type"
         );
         for path in &opts.files {
             match fs::read(path) {
@@ -444,7 +435,11 @@ fn run() -> Result<(), ()> {
         }
     }
 
-    if had_error { Err(()) } else { Ok(()) }
+    if had_error {
+        Err(())
+    } else {
+        Ok(())
+    }
 }
 
 fn main() -> ExitCode {

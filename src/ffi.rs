@@ -114,10 +114,7 @@ pub unsafe extern "C" fn pz_destroy(ctx: *mut PzContext) {
 /// - `ctx` must be a valid pointer returned by [`pz_init`].
 /// - `info` must point to a writable [`PzDeviceInfo`].
 #[no_mangle]
-pub unsafe extern "C" fn pz_query_devices(
-    ctx: *const PzContext,
-    info: *mut PzDeviceInfo,
-) -> i32 {
+pub unsafe extern "C" fn pz_query_devices(ctx: *const PzContext, info: *mut PzDeviceInfo) -> i32 {
     if ctx.is_null() || info.is_null() {
         return PZ_ERROR_INVALID_INPUT;
     }
@@ -339,10 +336,7 @@ pub unsafe extern "C" fn pz_lz77_decompress(
 ///
 /// - `input` must point to at least `input_len` readable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn pz_huffman_new(
-    input: *const u8,
-    input_len: usize,
-) -> *mut HuffmanTree {
+pub unsafe extern "C" fn pz_huffman_new(input: *const u8, input_len: usize) -> *mut HuffmanTree {
     if input.is_null() || input_len == 0 {
         return std::ptr::null_mut();
     }

@@ -216,5 +216,10 @@ fn bench_compress_gpu(c: &mut Criterion) {
 #[cfg(not(feature = "opencl"))]
 fn bench_compress_gpu(_c: &mut Criterion) {}
 
-criterion_group!(benches, bench_compress, bench_decompress, bench_compress_gpu);
+criterion_group!(
+    benches,
+    bench_compress,
+    bench_decompress,
+    bench_compress_gpu
+);
 criterion_main!(benches);
