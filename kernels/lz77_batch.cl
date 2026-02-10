@@ -60,7 +60,7 @@ __kernel void Encode(__global char *in,
   if(i >= in_len)
     return;
 
-  __local unsigned last_step;
+  unsigned last_step;
   lz77_match_t last_match;
 
   for(unsigned step = 0; step < STEP_SIZE && (i + step < in_len); ) {

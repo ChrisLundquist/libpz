@@ -48,12 +48,13 @@ jobs:
         # GPU-dependent tests gracefully skip when no device is available
 
   bench:
-    name: Benchmark (CPU)
+    name: Benchmark (CPU, smoke test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build benchmarks
         run: cargo bench --no-run
-      - name: Run benchmarks
-        run: cargo bench
+      - name: Run benchmark smoke test
+        run: cargo bench --bench throughput -- "compress/pz/Deflate" --sample-size 10
+        timeout-minutes: 10
