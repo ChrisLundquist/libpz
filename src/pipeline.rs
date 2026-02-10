@@ -300,31 +300,30 @@ fn compress_parallel(
     let num_blocks = blocks.len();
 
     // Compress blocks in parallel using scoped threads
-    let compressed_blocks: Vec<PzResult<Vec<u8>>> =
-        std::thread::scope(|scope| {
-            // Launch threads in batches to cap concurrency
-            let max_concurrent = num_threads.min(num_blocks);
-            let mut handles: Vec<std::thread::ScopedJoinHandle<PzResult<Vec<u8>>>> =
-                Vec::with_capacity(max_concurrent);
-            let mut results: Vec<PzResult<Vec<u8>>> = Vec::with_capacity(num_blocks);
+    let compressed_blocks: Vec<PzResult<Vec<u8>>> = std::thread::scope(|scope| {
+        // Launch threads in batches to cap concurrency
+        let max_concurrent = num_threads.min(num_blocks);
+        let mut handles: Vec<std::thread::ScopedJoinHandle<PzResult<Vec<u8>>>> =
+            Vec::with_capacity(max_concurrent);
+        let mut results: Vec<PzResult<Vec<u8>>> = Vec::with_capacity(num_blocks);
 
-            for block in &blocks {
-                if handles.len() >= max_concurrent {
-                    // Wait for the earliest thread to finish
-                    let handle = handles.remove(0);
-                    results.push(handle.join().unwrap_or(Err(PzError::InvalidInput)));
-                }
-                let opts = options.clone();
-                handles.push(scope.spawn(move || compress_block(block, pipeline, &opts)));
-            }
-
-            // Collect remaining results
-            for handle in handles {
+        for block in &blocks {
+            if handles.len() >= max_concurrent {
+                // Wait for the earliest thread to finish
+                let handle = handles.remove(0);
                 results.push(handle.join().unwrap_or(Err(PzError::InvalidInput)));
             }
+            let opts = options.clone();
+            handles.push(scope.spawn(move || compress_block(block, pipeline, &opts)));
+        }
 
-            results
-        });
+        // Collect remaining results
+        for handle in handles {
+            results.push(handle.join().unwrap_or(Err(PzError::InvalidInput)));
+        }
+
+        results
+    });
 
     // Check for errors
     let mut block_data_vec: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
@@ -376,12 +375,18 @@ fn decompress_parallel(
     let mut total_orig = 0usize;
     for i in 0..num_blocks {
         let offset = table_start + i * BLOCK_HEADER_SIZE;
-        let comp_len =
-            u32::from_le_bytes([payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3]])
-                as usize;
-        let orig_block_len =
-            u32::from_le_bytes([payload[offset + 4], payload[offset + 5], payload[offset + 6], payload[offset + 7]])
-                as usize;
+        let comp_len = u32::from_le_bytes([
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+        ]) as usize;
+        let orig_block_len = u32::from_le_bytes([
+            payload[offset + 4],
+            payload[offset + 5],
+            payload[offset + 6],
+            payload[offset + 7],
+        ]) as usize;
         block_entries.push((comp_len, orig_block_len));
         total_orig += orig_block_len;
     }
@@ -414,9 +419,8 @@ fn decompress_parallel(
                 let handle = handles.remove(0);
                 results.push(handle.join().unwrap_or(Err(PzError::InvalidInput)));
             }
-            handles.push(
-                scope.spawn(move || decompress_block(comp_data, pipeline, orig_block_len)),
-            );
+            handles
+                .push(scope.spawn(move || decompress_block(comp_data, pipeline, orig_block_len)));
         }
 
         for handle in handles {
@@ -1330,7 +1334,12 @@ mod tests {
     // --- Multi-block parallel compression tests ---
 
     /// Helper: compress with explicit thread count and block size.
-    fn compress_mt(input: &[u8], pipeline: Pipeline, threads: usize, block_size: usize) -> PzResult<Vec<u8>> {
+    fn compress_mt(
+        input: &[u8],
+        pipeline: Pipeline,
+        threads: usize,
+        block_size: usize,
+    ) -> PzResult<Vec<u8>> {
         let options = CompressOptions {
             threads,
             block_size,

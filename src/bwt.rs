@@ -711,7 +711,8 @@ mod tests {
             let result = encode(input).unwrap();
             let decoded = decode(&result.data, result.primary_index).unwrap();
             assert_eq!(
-                decoded, input,
+                decoded,
+                input,
                 "SA-IS BWT round-trip failed on {:?}",
                 std::str::from_utf8(input).unwrap_or("<binary>")
             );
@@ -731,7 +732,8 @@ mod tests {
             }
             let naive_decoded = decode(&naive_bwt, naive_primary).unwrap();
             assert_eq!(
-                naive_decoded, input,
+                naive_decoded,
+                input,
                 "Naive BWT round-trip failed on {:?}",
                 std::str::from_utf8(input).unwrap_or("<binary>")
             );
@@ -745,7 +747,10 @@ mod tests {
         let input: Vec<u8> = (0..=255).collect();
         let sais = build_suffix_array(&input);
         let naive = build_suffix_array_naive(&input);
-        assert_eq!(sais, naive, "SA-IS and naive disagree on all-bytes (distinct rotations)");
+        assert_eq!(
+            sais, naive,
+            "SA-IS and naive disagree on all-bytes (distinct rotations)"
+        );
     }
 
     #[test]
