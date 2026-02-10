@@ -16,7 +16,9 @@
 use crate::{PzError, PzResult};
 
 /// Maximum sliding window size for match finding.
-const MAX_WINDOW: usize = 4096;
+/// 32KB matches the gzip standard and provides much better compression
+/// than the previous 4KB window, especially on repetitive data.
+const MAX_WINDOW: usize = 32768;
 
 /// Minimum match length to consider (shorter matches aren't worth encoding).
 const MIN_MATCH: u32 = 3;

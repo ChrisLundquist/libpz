@@ -30,6 +30,7 @@ fn usage() {
     eprintln!("  -f, --force        Overwrite existing output files");
     eprintln!("  -l, --list         List info about compressed file");
     eprintln!("  -p, --pipeline P   Compression pipeline: deflate (default), bw, lza");
+    eprintln!("  -t, --threads N    Number of threads (0=auto, 1=single-threaded)");
     #[cfg(feature = "opencl")]
     eprintln!("  -g, --gpu          Use GPU (OpenCL) for compression");
     eprintln!("  -q, --quiet        Suppress warnings");
@@ -51,6 +52,7 @@ struct Opts {
     verbose: bool,
     quiet: bool,
     gpu: bool,
+    threads: usize,
     pipeline: Pipeline,
     files: Vec<String>,
 }
@@ -66,6 +68,7 @@ fn parse_args() -> Opts {
         verbose: false,
         quiet: false,
         gpu: false,
+        threads: 0,
         pipeline: Pipeline::Deflate,
         files: Vec::new(),
     };
@@ -99,6 +102,20 @@ fn parse_args() -> Opts {
                     other => {
                         eprintln!("pz: unknown pipeline '{other}'");
                         eprintln!("pz: valid pipelines: deflate, bw, lza");
+                        process::exit(1);
+                    }
+                };
+            }
+            "-t" | "--threads" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("pz: missing argument for -t");
+                    process::exit(1);
+                }
+                opts.threads = match args[i].parse::<usize>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        eprintln!("pz: invalid thread count '{}'", args[i]);
                         process::exit(1);
                     }
                 };
@@ -188,7 +205,9 @@ fn build_cli_options(opts: &Opts) -> CompressOptions {
                     }
                     return CompressOptions {
                         backend: pipeline::Backend::OpenCl,
+                        threads: opts.threads,
                         opencl_engine: Some(std::sync::Arc::new(engine)),
+                        ..Default::default()
                     };
                 }
                 Err(_) => {
@@ -213,12 +232,15 @@ fn build_cli_options(opts: &Opts) -> CompressOptions {
         }
     }
 
-    CompressOptions::default()
+    CompressOptions {
+        threads: opts.threads,
+        ..Default::default()
+    }
 }
 
-fn decompress_data(data: &[u8]) -> Result<Vec<u8>, String> {
+fn decompress_data(data: &[u8], threads: usize) -> Result<Vec<u8>, String> {
     match detect_format(data) {
-        Format::Pz => pipeline::decompress(data).map_err(|e| format!("{e}")),
+        Format::Pz => pipeline::decompress_with_threads(data, threads).map_err(|e| format!("{e}")),
         Format::Gzip => {
             let (decompressed, _header) =
                 gzip::decompress(data).map_err(|e| format!("gzip: {e}"))?;
@@ -234,6 +256,7 @@ fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
             if data.len() < 8 {
                 return Err("truncated pz header".to_string());
             }
+            let version = data[2];
             let pipe = match data[3] {
                 0 => "deflate",
                 1 => "bw",
@@ -246,13 +269,20 @@ fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
             } else {
                 0.0
             };
+            let blocks_info = if version == 2 && data.len() >= 12 {
+                let num_blocks = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                format!(" [{} blocks]", num_blocks)
+            } else {
+                String::new()
+            };
             println!(
-                "{:>12} {:>12} {:5.1}% {:8} {}",
+                "{:>12} {:>12} {:5.1}% {:8} {}{}",
                 orig_len,
                 data.len(),
                 ratio,
                 pipe,
-                path
+                path,
+                blocks_info,
             );
         }
         Format::Gzip => {
@@ -333,7 +363,7 @@ fn process_compress(opts: &Opts, path: &str, options: &CompressOptions) -> Resul
 
 fn process_decompress(opts: &Opts, path: &str) -> Result<(), String> {
     let data = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    let decompressed = decompress_data(&data)?;
+    let decompressed = decompress_data(&data, opts.threads)?;
 
     if opts.to_stdout {
         io::stdout()
@@ -369,7 +399,7 @@ fn process_stdin_stdout(opts: &Opts, options: &CompressOptions) -> Result<(), St
         .map_err(|e| format!("stdin: {e}"))?;
 
     let output = if opts.decompress {
-        decompress_data(&data)?
+        decompress_data(&data, opts.threads)?
     } else {
         compress_data(&data, opts.pipeline, options)?
     };

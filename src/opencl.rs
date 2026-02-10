@@ -175,6 +175,12 @@ pub struct OpenClEngine {
     max_work_group_size: usize,
 }
 
+// SAFETY: OpenCL 1.2+ guarantees thread safety for context, command queue, kernel,
+// and memory objects. The raw pointers in opencl3 types are opaque handles to the
+// OpenCL runtime, which serializes access internally.
+unsafe impl Send for OpenClEngine {}
+unsafe impl Sync for OpenClEngine {}
+
 impl std::fmt::Debug for OpenClEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenClEngine")

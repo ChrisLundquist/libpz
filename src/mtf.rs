@@ -21,27 +21,36 @@ use crate::{PzError, PzResult};
 ///
 /// Returns the transformed data where each byte is replaced by its
 /// index in a dynamically reordered symbol list.
+///
+/// Uses an inverse index array for O(1) position lookup instead of
+/// O(256) linear search.
 pub fn encode(input: &[u8]) -> Vec<u8> {
     if input.is_empty() {
         return Vec::new();
     }
 
-    // Initialize the symbol list: [0, 1, 2, ..., 255]
+    // list[rank] = symbol at that rank
     let mut list: [u8; 256] = std::array::from_fn(|i| i as u8);
+    // inv[symbol] = rank of that symbol (inverse of list)
+    let mut inv: [u8; 256] = std::array::from_fn(|i| i as u8);
 
     let mut output = Vec::with_capacity(input.len());
 
     for &byte in input {
-        // Find the position of this byte in the list
-        let pos = list.iter().position(|&b| b == byte).unwrap();
+        // O(1) lookup of position
+        let pos = inv[byte as usize] as usize;
 
-        // Output the position
         output.push(pos as u8);
 
         // Move the byte to the front
         if pos > 0 {
+            // Update inverse index for all symbols that shift right by 1
+            for i in 0..pos {
+                inv[list[i] as usize] += 1;
+            }
             list.copy_within(..pos, 1);
             list[0] = byte;
+            inv[byte as usize] = 0;
         }
     }
 
@@ -60,15 +69,20 @@ pub fn encode_to_buf(input: &[u8], output: &mut [u8]) -> PzResult<usize> {
     }
 
     let mut list: [u8; 256] = std::array::from_fn(|i| i as u8);
+    let mut inv: [u8; 256] = std::array::from_fn(|i| i as u8);
 
     for (idx, &byte) in input.iter().enumerate() {
-        let pos = list.iter().position(|&b| b == byte).unwrap();
+        let pos = inv[byte as usize] as usize;
 
         output[idx] = pos as u8;
 
         if pos > 0 {
+            for i in 0..pos {
+                inv[list[i] as usize] += 1;
+            }
             list.copy_within(..pos, 1);
             list[0] = byte;
+            inv[byte as usize] = 0;
         }
     }
 
