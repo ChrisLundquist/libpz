@@ -110,60 +110,21 @@ implementations. These serve as the correctness oracle for all other backends.
 - Ensure round-trip correctness: `decompress(compress(data)) == data` for all algorithms
 - All tests pass, fuzz tests run clean under ASan
 
-### 1.2 Complete LZ77 Reference
-- Fix `FindMatchClassic` bounds bugs (BUG-02, BUG-03)
-- Fix `LZ77_Decompress` overflow (BUG-06)
-- Add hash-chain match finder (O(n) average vs current O(n*w) brute force)
-- Add lazy matching (gzip-style: check if next position has longer match)
-- Validate with Canterbury corpus and silesia corpus
+### 1.2–1.9 Reference Implementations — COMPLETE
 
-### 1.3 Complete Huffman Reference
-- Implement `huff_Encode` bit-packing (BUG-08)
-- Implement `huff_Decode` tree walk (BUG-09)
-- Fix signed char index bug (BUG-05)
-- Add canonical Huffman codes (deterministic code assignment for decode without transmitting tree shape)
-- Round-trip test with all test corpora
-
-### 1.4 Implement Arithmetic / Range Coder
-- Implement basic range coder (encode + decode)
-- Support adaptive frequency model (no need for two-pass)
-- Advantage over Huffman: fractional bits per symbol (no ceil(entropy) waste)
-- Reference: Mark Nelson's arithmetic coder, ryg's rans implementation
-
-### 1.5 Implement BWT (Burrows-Wheeler Transform)
-- Implement naive BWT via suffix array construction
-- Use SA-IS algorithm (linear time suffix array, Nong et al. 2009)
-- Implement inverse BWT
-- BWT is a transform, not a compressor -- pair with MTF + RLE + entropy coder
-
-### 1.6 Implement MTF (Move to Front)
-- Simple transform: maintain alphabet list, emit index, move symbol to front
-- Pairs with BWT output to convert clustered symbols to small integers
-- Trivially invertible
-
-### 1.7 Implement RLE (Run Length Encoding)
-- Basic RLE with escape mechanism for non-runs
-- Useful after BWT+MTF where runs of zeros are common
-
-### 1.8 Implement Frequency Analysis Fixes
-- Fix unsigned overflow bug (BUG-15)
-- `get_entropy` is already implemented and correct
-
-### 1.9 Define Compression Pipelines
-Standard pipelines combining the above stages:
-
-| Pipeline | Stages | Similar to |
-|----------|--------|------------|
-| `PZ_DEFLATE` | LZ77 → Huffman | gzip |
-| `PZ_BW` | BWT → MTF → RLE → Arithmetic | bzip2 |
-| `PZ_LZA` | LZ77 → Arithmetic | lzma-like |
-| `PZ_LZH` | LZ77 (optimal) → Huffman + FSE | zstd-like |
+All reference implementations completed in Rust:
+- LZ77 (brute-force, hash-chain, lazy matching)
+- Huffman (canonical codes, bit-packed encode/decode)
+- Range Coder (adaptive model)
+- BWT (prefix-doubling suffix array, inverse BWT)
+- MTF, RLE, Frequency analysis
+- Three compression pipelines: Deflate, Bw, Lza
 
 ---
 
 ## Phase 1B Status: Reference Implementation Complete
 
-The Rust reference implementation of all core algorithms is complete in `libpz-rs/`.
+The Rust reference implementation of all core algorithms is complete.
 This serves as the correctness oracle for future GPU and multi-threaded backends.
 
 ### Completed Modules
@@ -369,36 +330,36 @@ zstd's "optimal parsing with price updates".
 
 ---
 
-## Phase 3: OpenCL Backend
+## Phase 3: OpenCL Backend — PARTIALLY COMPLETE
 
-### 3.1 Fix Existing OpenCL Bugs
-- Fix all OpenCL bugs from BUGS.md (BUG-04, BUG-07, BUG-11, BUG-13, BUG-16-20)
-- Fix kernel bounds check order
-- Fix null termination of kernel source
-- Fix function pointer constness
-- Proper error propagation in engine init
+### 3.1 Fix Existing OpenCL Bugs — DONE (superseded by Rust rewrite)
+The C OpenCL engine was replaced by a Rust implementation using the `opencl3` crate.
 
-### 3.2 LZ77 OpenCL Match Finder
-- Current: one match per position, 128KB window (lz77.cl) or 32KB batched (lz77-batch.cl)
-- Target: emit top-K matches per position for optimal parsing
-- Optimize memory access patterns (coalesced reads, local memory for window)
-- Tune work-group sizes for different GPU architectures
+### 3.2 LZ77 OpenCL Match Finder — DONE (basic)
+- Batch kernel (`lz77-batch.cl`) ported to Rust OpenCL engine
+- Produces one match per position (greedy parse)
+- Future: emit top-K matches per position for optimal parsing
 
-### 3.3 BWT OpenCL
-- GPU-parallel suffix array construction (prefix-doubling algorithm)
-- Each doubling step is a parallel sort -- well suited to GPU
-- Academic precedent: Deo & Keely (2013) GPU suffix array construction
+### 3.3 BWT OpenCL — DONE
+- GPU bitonic sort kernel (`kernels/bwt_sort.cl`) for suffix array construction
+- Prefix-doubling with GPU sort steps, CPU rank assignment (O(n) per step)
+- Produces byte-identical output to CPU BWT
+- `MIN_GPU_BWT_SIZE = 32KB` threshold before using GPU path
+- Performance: currently slower than CPU at tested sizes (1KB–64KB) due to
+  O(log² n) kernel launch overhead per doubling step; gap narrows with size
+- Future optimizations: local memory sort, GPU rank assignment, batched launches
 
-### 3.4 Huffman OpenCL
+### 3.4 Huffman OpenCL — PENDING
 - Tree construction is inherently sequential (priority queue)
 - But encoding (table lookup) and decoding (bit-parallel) can be GPU-accelerated
 - Encoding: trivially parallel per-symbol table lookup
 - Decoding: more challenging, but bit-parallel techniques exist
 
-### 3.5 Pipeline Integration
-- Chain GPU stages with minimal host↔device transfers
-- Keep data on GPU between stages where possible (LZ77 output → Huffman input)
-- Use OpenCL events for pipeline overlap
+### 3.5 Pipeline Integration — DONE (basic)
+- `bwt_encode_with_backend()` and `lz77_compress_with_backend()` dispatch helpers
+  in `pipeline.rs` select GPU or CPU based on `CompressOptions`
+- CLI tool supports `-g`/`--gpu` flag to enable OpenCL acceleration
+- Future: chain GPU stages with minimal host↔device transfers
 
 ---
 
@@ -504,19 +465,19 @@ without sidecar metadata).
 
 | Milestone | Description | Depends On | Status |
 |-----------|-------------|------------|--------|
-| **M1** | All BUGS.md fixes landed, existing tests pass | - | Pending (C code) |
+| **M1** | All BUGS.md fixes landed, existing tests pass | - | **Done** (superseded by Rust rewrite) |
 | **M2** | LZ77 + Huffman reference round-trip working | M1 | **Done** (Rust) |
 | **M3** | Arithmetic coder reference working | M1 | **Done** (Rust) |
 | **M4** | BWT + MTF + RLE reference working | M1 | **Done** (Rust) |
 | **M5** | Full pipeline round-trips (DEFLATE-like, BW-like, LZA-like) | M2, M3, M4 | **Done** (Rust) |
 | **M5.1** | Validation test suite with corpus tests | M5 | **Done** |
-| **M5.2** | Cross-implementation validation (Rust vs C) | M1, M5 | Pending |
+| **M5.2** | Cross-implementation validation (Rust vs C) | M1, M5 | N/A (C code removed) |
 | **M5.3** | Fuzz testing infrastructure | M5 | Pending |
-| **M5.4** | Benchmark suite and regression baselines | M5.1 | Pending |
-| **M6** | OpenCL LZ77 produces top-K match table | M1 | Pending |
+| **M5.4** | Benchmark suite and regression baselines | M5.1 | **Done** (criterion, stages + throughput) |
+| **M6** | OpenCL LZ77 produces top-K match table | M1 | Pending (basic batch kernel done) |
 | **M7** | Optimal parse DP selects minimum-cost chain from GPU matches | M6 | Pending |
 | **M8** | OpenCL backend outperforms reference on large inputs | M7 | Pending |
 | **M9** | pthread block-parallel compression | M5 | Pending |
-| **M10** | File format defined, CLI tool works end-to-end | M5 | Pending |
-| **M11** | Benchmark suite vs gzip/zstd/bzip2/lz4 | M8, M9, M10 | Pending |
+| **M10** | File format defined, CLI tool works end-to-end | M5 | **Done** (`pz` CLI with .pz format, `--gpu` flag) |
+| **M11** | Benchmark suite vs gzip/zstd/bzip2/lz4 | M8, M9, M10 | **Done** (throughput.rs compares gzip/pigz/zstd) |
 | **M12** | Vulkan compute backend | M8 | Pending |

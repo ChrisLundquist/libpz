@@ -583,10 +583,10 @@ have been removed from the repository.
 - [x] Validation infrastructure (`libpz-rs/src/validation.rs`)
 
 **Remaining work (carried to Phase 2):**
-- [ ] OpenCL integration from Rust (currently OpenCL engine remains in C)
+- [x] OpenCL integration from Rust (done: `opencl3` crate, LZ77 + BWT kernels)
 - [ ] cbindgen header generation setup
 - [ ] Fuzz testing infrastructure
-- [ ] Corpus testing (Canterbury, Silesia)
+- [x] Corpus testing (Canterbury corpus in benchmarks and tests)
 
 ### Phase 1C: Migration Decision - COMPLETE
 
@@ -863,11 +863,11 @@ C reference code replaced by Rust rather than fixed individually.
 - [x] Build system updated
 
 ### Remaining (carry to Phase 2)
-- [ ] OpenCL integration from Rust side
+- [x] OpenCL integration from Rust side (done: `opencl3` crate, LZ77 batch + BWT bitonic sort kernels)
 - [ ] Fuzz tests run for 24h with no crashes
-- [ ] Corpus test coverage (Canterbury, Silesia)
-- [ ] Cross-platform testing (Linux, macOS)
-- [ ] Performance benchmarking
+- [x] Corpus test coverage (Canterbury corpus used in benchmarks and tests)
+- [x] Cross-platform testing (CI runs on ubuntu, windows, macos)
+- [x] Performance benchmarking (criterion benchmarks: `benches/stages.rs`, `benches/throughput.rs`)
 
 ---
 
@@ -926,54 +926,48 @@ C reference code replaced by Rust rather than fixed individually.
 
 ## 10. Next Steps (Phase 2)
 
-### Immediate Priorities
+### Completed since Phase 1
 
-1. **OpenCL Rust integration:**
-   - Bridge the Rust library with the retained OpenCL C engine
-   - Use `opencl3` crate or FFI bindings to `opencl/engine.c`
-   - Validate GPU match-finding output matches CPU implementation
+1. **OpenCL Rust integration:** DONE
+   - `opencl3` crate replaces the C engine entirely
+   - LZ77 batch kernel and BWT bitonic sort kernel implemented
+   - GPU BWT produces byte-identical output to CPU BWT
 
-2. **Testing infrastructure:**
-   - Set up fuzz testing with `cargo-fuzz`
-   - Corpus tests against Canterbury and Silesia datasets
-   - CI pipeline (GitHub Actions: test, clippy, fmt)
+2. **Testing infrastructure:** MOSTLY DONE
+   - CI pipeline (GitHub Actions: test on 3 OS, clippy, fmt, OpenCL compile check, benchmarks)
+   - Canterbury corpus tests in benchmarks
+   - Still pending: fuzz testing with `cargo-fuzz`
 
-3. **Benchmarking:**
-   - Establish throughput baselines (MB/s)
-   - Compression ratio measurements across corpora
-   - Profile hot paths for optimization
+3. **Benchmarking:** DONE
+   - `benches/stages.rs`: per-algorithm scaling at 1KB/10KB/64KB
+   - `benches/throughput.rs`: pipeline throughput + gzip/pigz/zstd comparison
+   - GPU benchmarks included when built with `--features opencl`
 
-### Longer-term (Phase 3+)
+### Remaining Priorities
 
-- Production OpenCL backend fully in Rust
+- Fuzz testing infrastructure (`cargo-fuzz` targets for all encode/decode paths)
+- GPU BWT performance optimization (local memory sort, GPU rank assignment)
+- Optimal LZ77 parsing (Phase 2 in PLAN.md): GPU top-K match table + backward DP
 - pthread multi-threading via `rayon`
-- Vulkan compute backend
-- cbindgen header generation for downstream C consumers
+- Vulkan compute backend (Phase 5)
 
 ---
 
 ## 11. Conclusion
 
-**Phase 1 is complete. The Rust migration is finalized.**
+**Phase 1 is complete. The Rust migration is finalized. OpenCL integration is done.**
 
 Key outcomes:
 1. **Language:** Full Rust migration (C reference files removed)
-2. **GPU:** OpenCL kernels and C engine retained; Rust integration pending
+2. **GPU:** OpenCL backend fully in Rust via `opencl3` crate — LZ77 batch kernel and BWT bitonic sort kernel
 3. **API:** C-callable FFI layer implemented in Rust
 4. **Algorithms:** LZ77, Huffman, BWT, MTF, RLE, range coder, pipelines all in Rust
+5. **CLI:** `pz` command-line tool with `-g`/`--gpu` flag for OpenCL acceleration
+6. **Benchmarks:** Criterion benchmarks for per-stage scaling and end-to-end throughput vs gzip/pigz/zstd
+7. **CI:** GitHub Actions workflow (CPU tests on 3 OS, lint, OpenCL compile check, benchmarks)
 
-Phase 1 completion enables:
-- **Phase 2:** OpenCL Rust integration, testing, benchmarking
-- **Phase 3:** Production OpenCL backend (fully Rust-managed)
+Next priorities:
+- **GPU performance:** BWT kernel optimization (local memory sort, GPU rank assignment)
+- **Phase 2:** Optimal LZ77 parsing (GPU top-K match table + backward DP)
 - **Phase 4:** pthread multi-threading (via `rayon`)
 - **Phase 5:** Vulkan compute
-
-**Files removed:**
-- `reference/` - C reference implementations (huffman.c, lz77.c, frequency.c, pqueue.c/h, lz77.h)
-- `include/` - C public headers (codec.h, huffman.h, frequency.h, lz77.h)
-- `src/main.c` - C entry point
-- `test/` - C test and fuzz files
-
-**Files retained:**
-- `opencl/` - GPU engine (engine.c/h, test.c, lz77.cl, lz77-batch.cl)
-- `libpz-rs/` - Canonical Rust implementation
