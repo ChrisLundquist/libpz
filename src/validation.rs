@@ -266,7 +266,8 @@ mod tests {
             let compressed = pipeline::compress(input, pipe).unwrap();
             let decompressed = pipeline::decompress(&compressed).unwrap();
             assert_eq!(
-                decompressed, input,
+                decompressed,
+                input,
                 "pipeline {:?} round-trip failed for {} bytes",
                 pipe,
                 input.len()
@@ -549,8 +550,7 @@ mod tests {
             let rle_data = rle::encode(&mtf_data);
             let inv_rle = rle::decode(&rle_data).unwrap();
             let inv_mtf = mtf::decode(&inv_rle);
-            let inv_bwt =
-                bwt::decode(&inv_mtf, bwt_result.primary_index).unwrap();
+            let inv_bwt = bwt::decode(&inv_mtf, bwt_result.primary_index).unwrap();
             assert_eq!(inv_bwt, input, "BWT+MTF+RLE chain failed on {}", path);
         }
 
@@ -590,9 +590,7 @@ mod tests {
         #[test]
         fn canterbury_algorithms_individual() {
             // Test individual algorithms on a representative text file
-            test_file_individual_algorithms(
-                &format!("{}/alice29.txt", CANTRBRY_DIR),
-            );
+            test_file_individual_algorithms(&format!("{}/alice29.txt", CANTRBRY_DIR));
         }
 
         // Large corpus files (longer running, test individual algos on smaller slices)
@@ -609,10 +607,8 @@ mod tests {
             let full = fs::read(p).unwrap();
             let input = &full[..full.len().min(65536)];
             for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
-                let compressed =
-                    pipeline::compress(input, pipe).unwrap();
-                let decompressed =
-                    pipeline::decompress(&compressed).unwrap();
+                let compressed = pipeline::compress(input, pipe).unwrap();
+                let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(
                     decompressed, input,
                     "large corpus round-trip failed: {:?}",
@@ -632,10 +628,8 @@ mod tests {
             let full = fs::read(p).unwrap();
             let input = &full[..full.len().min(65536)];
             for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
-                let compressed =
-                    pipeline::compress(input, pipe).unwrap();
-                let decompressed =
-                    pipeline::decompress(&compressed).unwrap();
+                let compressed = pipeline::compress(input, pipe).unwrap();
+                let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(
                     decompressed, input,
                     "large corpus round-trip failed: {:?}",

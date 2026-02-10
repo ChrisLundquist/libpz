@@ -56,4 +56,4 @@ jobs:
       - name: Build benchmarks
         run: cargo bench --no-run
       - name: Run benchmarks
-        run: cargo bench -- --output-format bencher
+        run: cargo bench

@@ -14,7 +14,6 @@
 /// - Start with uniform frequencies (count 1 for each byte value).
 /// - After encoding/decoding each symbol, increment its count.
 /// - Periodically halve all counts to adapt to local statistics.
-
 use crate::{PzError, PzResult};
 
 /// Maximum total frequency before rescaling.
@@ -75,7 +74,7 @@ impl AdaptiveModel {
     fn rescale(&mut self) {
         self.total = 0;
         for i in 0..NUM_SYMBOLS {
-            self.freq[i] = (self.freq[i] + 1) / 2;
+            self.freq[i] = self.freq[i].div_ceil(2);
             if self.freq[i] == 0 {
                 self.freq[i] = 1;
             }
@@ -267,11 +266,7 @@ pub fn decode(input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
 /// Decode range-coded data into a pre-allocated buffer.
 ///
 /// Returns the number of bytes written.
-pub fn decode_to_buf(
-    input: &[u8],
-    original_len: usize,
-    output: &mut [u8],
-) -> PzResult<usize> {
+pub fn decode_to_buf(input: &[u8], original_len: usize, output: &mut [u8]) -> PzResult<usize> {
     if original_len == 0 {
         return Ok(0);
     }
@@ -285,11 +280,11 @@ pub fn decode_to_buf(
     let mut model = AdaptiveModel::new();
     let mut dec = RangeDecoder::new(input);
 
-    for i in 0..original_len {
+    for slot in output.iter_mut().take(original_len) {
         let value = dec.get_freq(model.total);
         let (symbol, cum_low, cum_high) = model.find_symbol(value);
         dec.decode_symbol(cum_low, cum_high, model.total);
-        output[i] = symbol;
+        *slot = symbol;
         model.update(symbol);
     }
 

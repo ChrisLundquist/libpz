@@ -311,9 +311,7 @@ impl HuffmanTree {
                     // For the single-symbol tree, the root has only a left child
                     // which is the leaf. If we get None, it means the current
                     // node is a leaf.
-                    if self.nodes[node_idx].left.is_none()
-                        && self.nodes[node_idx].right.is_none()
-                    {
+                    if self.nodes[node_idx].left.is_none() && self.nodes[node_idx].right.is_none() {
                         output.push(self.nodes[node_idx].value);
                         node_idx = root_idx;
                     } else {
@@ -374,9 +372,7 @@ impl HuffmanTree {
                     }
                 }
                 None => {
-                    if self.nodes[node_idx].left.is_none()
-                        && self.nodes[node_idx].right.is_none()
-                    {
+                    if self.nodes[node_idx].left.is_none() && self.nodes[node_idx].right.is_none() {
                         if out_pos >= output.len() {
                             return Err(PzError::BufferTooSmall);
                         }
@@ -554,11 +550,7 @@ mod tests {
                 let (cw_j, bits_j) = codes[j];
                 if bits_i <= bits_j {
                     let shifted = cw_j >> (bits_j - bits_i);
-                    assert_ne!(
-                        shifted, cw_i,
-                        "code {} is prefix of code {}",
-                        i, j
-                    );
+                    assert_ne!(shifted, cw_i, "code {} is prefix of code {}", i, j);
                 }
             }
         }
@@ -694,9 +686,7 @@ mod tests {
     #[test]
     fn test_round_trip_binary_data() {
         // Pseudo-random binary data
-        let input: Vec<u8> = (0..500)
-            .map(|i| ((i * 17 + 31) % 256) as u8)
-            .collect();
+        let input: Vec<u8> = (0..500).map(|i| ((i * 17 + 31) % 256) as u8).collect();
         let tree = HuffmanTree::from_data(&input).unwrap();
         let (encoded, total_bits) = tree.encode(&input).unwrap();
         let decoded = tree.decode(&encoded, total_bits).unwrap();
@@ -710,10 +700,18 @@ mod tests {
         // DEFLATE fixed literal table: 0-143 → 8 bits, 144-255 → 9 bits,
         // 256-279 → 7 bits, 280-287 → 8 bits
         let mut lengths = [0u8; 288];
-        for i in 0..=143 { lengths[i] = 8; }
-        for i in 144..=255 { lengths[i] = 9; }
-        for i in 256..=279 { lengths[i] = 7; }
-        for i in 280..=287 { lengths[i] = 8; }
+        for i in 0..=143 {
+            lengths[i] = 8;
+        }
+        for i in 144..=255 {
+            lengths[i] = 9;
+        }
+        for i in 256..=279 {
+            lengths[i] = 7;
+        }
+        for i in 280..=287 {
+            lengths[i] = 8;
+        }
 
         let table = HuffTable::from_lengths(&lengths).unwrap();
         assert_eq!(table.symbol_count(), 288);
@@ -727,12 +725,16 @@ mod tests {
 
         // Decode symbol from bit 0 → should be symbol 0
         let mut bits = [0u32].into_iter();
-        let sym = table.decode(&mut || bits.next().ok_or(PzError::InvalidInput)).unwrap();
+        let sym = table
+            .decode(&mut || bits.next().ok_or(PzError::InvalidInput))
+            .unwrap();
         assert_eq!(sym, 0);
 
         // Decode symbol from bit 1 → should be symbol 1
         let mut bits = [1u32].into_iter();
-        let sym = table.decode(&mut || bits.next().ok_or(PzError::InvalidInput)).unwrap();
+        let sym = table
+            .decode(&mut || bits.next().ok_or(PzError::InvalidInput))
+            .unwrap();
         assert_eq!(sym, 1);
     }
 

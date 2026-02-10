@@ -18,7 +18,6 @@
 /// 2. Build the LF-mapping: for each position in the last column,
 ///    find the corresponding position in the first column.
 /// 3. Follow the mapping starting from the original index to recover the string.
-
 use crate::{PzError, PzResult};
 
 /// Result of a BWT forward transform.
@@ -360,8 +359,7 @@ mod tests {
         let input = b"banana";
         let result = encode(input).unwrap();
         let mut buf = vec![0u8; 100];
-        let size =
-            decode_to_buf(&result.data, result.primary_index, &mut buf).unwrap();
+        let size = decode_to_buf(&result.data, result.primary_index, &mut buf).unwrap();
         assert_eq!(&buf[..size], input);
     }
 

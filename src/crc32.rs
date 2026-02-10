@@ -2,7 +2,6 @@
 ///
 /// Uses the standard polynomial 0xEDB88320 (bit-reversed 0x04C11DB7)
 /// with a 256-entry lookup table for byte-at-a-time processing.
-
 const CRC32_POLY: u32 = 0xEDB8_8320;
 
 /// Pre-computed CRC32 lookup table (256 entries).

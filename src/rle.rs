@@ -13,7 +13,6 @@
 /// - Short runs (1-3) have zero overhead
 /// - Long runs are compactly represented
 /// - The format is unambiguous and simple to decode
-
 use crate::{PzError, PzResult};
 
 /// Maximum additional run length after the initial 4 bytes.
@@ -318,10 +317,10 @@ mod tests {
     #[test]
     fn test_mixed_runs_and_literals() {
         let mut input = Vec::new();
-        input.extend(b"abc");          // literals
-        input.extend(vec![b'd'; 7]);   // run of 7
-        input.extend(b"ef");           // literals
-        input.extend(vec![b'g'; 4]);   // run of 4
+        input.extend(b"abc"); // literals
+        input.extend(vec![b'd'; 7]); // run of 7
+        input.extend(b"ef"); // literals
+        input.extend(vec![b'g'; 4]); // run of 4
 
         let encoded = encode(&input);
         let decoded = decode(&encoded).unwrap();

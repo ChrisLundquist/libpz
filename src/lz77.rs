@@ -201,7 +201,7 @@ pub fn decompress(input: &[u8]) -> PzResult<Vec<u8>> {
         return Ok(Vec::new());
     }
 
-    if input.len() % Match::SERIALIZED_SIZE != 0 {
+    if !input.len().is_multiple_of(Match::SERIALIZED_SIZE) {
         return Err(PzError::InvalidInput);
     }
 
@@ -241,7 +241,7 @@ pub fn decompress_to_buf(input: &[u8], output: &mut [u8]) -> PzResult<usize> {
         return Ok(0);
     }
 
-    if input.len() % Match::SERIALIZED_SIZE != 0 {
+    if !input.len().is_multiple_of(Match::SERIALIZED_SIZE) {
         return Err(PzError::InvalidInput);
     }
 
@@ -283,9 +283,7 @@ fn hash3(data: &[u8], pos: usize) -> usize {
     if pos + 2 >= data.len() {
         return 0;
     }
-    let h = (data[pos] as usize) << 10
-        ^ (data[pos + 1] as usize) << 5
-        ^ (data[pos + 2] as usize);
+    let h = (data[pos] as usize) << 10 ^ (data[pos + 1] as usize) << 5 ^ (data[pos + 2] as usize);
     h & HASH_MASK
 }
 

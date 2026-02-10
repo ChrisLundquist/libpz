@@ -3,7 +3,6 @@
 /// Parses gzip headers including all optional fields (FEXTRA, FNAME,
 /// FCOMMENT, FHCRC), decompresses the DEFLATE payload, and verifies
 /// the CRC32 and original size in the trailer.
-
 use crate::crc32;
 use crate::deflate;
 use crate::{PzError, PzResult};
@@ -317,11 +316,11 @@ mod tests {
         // Minimal 10-byte gzip header + 8 bytes trailer (empty DEFLATE)
         let mut data = vec![
             0x1F, 0x8B, // ID1, ID2
-            0x08,       // CM = deflate
-            0x00,       // FLG = no flags
+            0x08, // CM = deflate
+            0x00, // FLG = no flags
             0x00, 0x00, 0x00, 0x00, // MTIME = 0
-            0x00,       // XFL
-            0x03,       // OS = Unix
+            0x00, // XFL
+            0x03, // OS = Unix
         ];
         // Pad with enough for trailer
         data.extend_from_slice(&[0u8; 8]);
@@ -342,11 +341,11 @@ mod tests {
     fn test_parse_header_with_filename() {
         let mut data = vec![
             0x1F, 0x8B, // ID
-            0x08,       // CM
-            0x08,       // FLG = FNAME
+            0x08, // CM
+            0x08, // FLG = FNAME
             0x00, 0x00, 0x00, 0x00, // MTIME
-            0x00,       // XFL
-            0x03,       // OS = Unix
+            0x00, // XFL
+            0x03, // OS = Unix
         ];
         // Filename: "test.txt\0"
         data.extend_from_slice(b"test.txt\0");
@@ -362,10 +361,9 @@ mod tests {
     fn test_parse_header_with_extra() {
         let mut data = vec![
             0x1F, 0x8B, // ID
-            0x08,       // CM
-            0x04,       // FLG = FEXTRA
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x03,
+            0x08, // CM
+            0x04, // FLG = FEXTRA
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
         ];
         // XLEN = 4
         data.push(0x04);
