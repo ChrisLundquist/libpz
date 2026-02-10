@@ -48,13 +48,14 @@ jobs:
         # GPU-dependent tests gracefully skip when no device is available
 
   bench:
-    name: Benchmark (CPU, smoke test)
+    name: Benchmark (compile check)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build benchmarks
         run: cargo bench --no-run
-      - name: Run benchmark smoke test
-        run: cargo bench --bench throughput -- "^compress/pz/Deflate$" --sample-size 10 --noplot
-        timeout-minutes: 10
+        # Full benchmark runs are for local development only — CI hardware
+        # is too variable for meaningful numbers, and Criterion eagerly
+        # pre-compresses data for all pipelines during group enumeration
+        # (including BWT/SA-IS which is very slow on large inputs).
