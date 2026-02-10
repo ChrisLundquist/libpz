@@ -700,17 +700,17 @@ mod tests {
         // DEFLATE fixed literal table: 0-143 → 8 bits, 144-255 → 9 bits,
         // 256-279 → 7 bits, 280-287 → 8 bits
         let mut lengths = [0u8; 288];
-        for i in 0..=143 {
-            lengths[i] = 8;
+        for len in &mut lengths[0..=143] {
+            *len = 8;
         }
-        for i in 144..=255 {
-            lengths[i] = 9;
+        for len in &mut lengths[144..=255] {
+            *len = 9;
         }
-        for i in 256..=279 {
-            lengths[i] = 7;
+        for len in &mut lengths[256..=279] {
+            *len = 7;
         }
-        for i in 280..=287 {
-            lengths[i] = 8;
+        for len in &mut lengths[280..=287] {
+            *len = 8;
         }
 
         let table = HuffTable::from_lengths(&lengths).unwrap();

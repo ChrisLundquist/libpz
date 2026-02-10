@@ -98,9 +98,7 @@ fn normalize_frequencies(raw: &FrequencyTable, accuracy_log: u8) -> PzResult<Nor
     let mut distributed = 0u32;
 
     // Indices of present symbols, sorted by raw count descending.
-    let mut present: Vec<usize> = (0..NUM_SYMBOLS)
-        .filter(|&i| raw.byte[i] > 0)
-        .collect();
+    let mut present: Vec<usize> = (0..NUM_SYMBOLS).filter(|&i| raw.byte[i] > 0).collect();
     present.sort_by(|&a, &b| raw.byte[b].cmp(&raw.byte[a]));
 
     // Proportional scaling with floor, ensuring minimum of 1.
@@ -132,12 +130,12 @@ fn normalize_frequencies(raw: &FrequencyTable, accuracy_log: u8) -> PzResult<Nor
         }
     }
 
-    debug_assert_eq!(
-        norm_freq.iter().map(|&f| f as u32).sum::<u32>(),
-        table_size
-    );
+    debug_assert_eq!(norm_freq.iter().map(|&f| f as u32).sum::<u32>(), table_size);
 
-    Ok(NormalizedFreqs { freq: norm_freq, accuracy_log })
+    Ok(NormalizedFreqs {
+        freq: norm_freq,
+        accuracy_log,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -626,7 +624,10 @@ pub fn decode(input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
         return Err(PzError::InvalidInput);
     }
 
-    let norm = NormalizedFreqs { freq: norm_freq, accuracy_log };
+    let norm = NormalizedFreqs {
+        freq: norm_freq,
+        accuracy_log,
+    };
 
     let header_end = 1 + FREQ_TABLE_BYTES;
     let initial_state = u16::from_le_bytes([input[header_end], input[header_end + 1]]);
@@ -901,8 +902,7 @@ mod tests {
 
     #[test]
     fn test_accuracy_log_12() {
-        let input =
-            b"the quick brown fox jumps over the lazy dog. test test test.";
+        let input = b"the quick brown fox jumps over the lazy dog. test test test.";
         let encoded = encode_with_accuracy(input, 12);
         let decoded = decode(&encoded, input.len()).unwrap();
         assert_eq!(decoded, input);

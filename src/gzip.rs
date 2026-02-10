@@ -307,7 +307,7 @@ mod tests {
     fn test_is_gzip() {
         assert!(is_gzip(&[0x1F, 0x8B, 0x08]));
         assert!(!is_gzip(&[0x1F, 0x8C]));
-        assert!(!is_gzip(&[b'P', b'Z']));
+        assert!(!is_gzip(b"PZ"));
         assert!(!is_gzip(&[0x1F]));
     }
 

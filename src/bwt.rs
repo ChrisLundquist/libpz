@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_single_byte() {
-        let result = encode(&[b'a']).unwrap();
+        let result = encode(b"a").unwrap();
         assert_eq!(result.data, vec![b'a']);
         assert_eq!(result.primary_index, 0);
         let decoded = decode(&result.data, result.primary_index).unwrap();
