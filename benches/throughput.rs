@@ -121,55 +121,39 @@ fn bench_decompress(c: &mut Criterion) {
     let mut group = c.benchmark_group("decompress");
     group.throughput(Throughput::Bytes(data.len() as u64));
 
-    // Pre-compress for each pipeline
+    // Pre-compress lazily so filtered-out benchmarks don't pay the cost.
+    // Criterion calls all group functions during enumeration even when a
+    // filter is active; eagerly compressing with BWT/SA-IS on large data
+    // would block for minutes.
     for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
-        let compressed = pipeline::compress(&data, pipeline).unwrap();
-        group.bench_with_input(
-            BenchmarkId::new("pz", format!("{:?}", pipeline)),
-            &compressed,
-            |b, compressed| {
-                b.iter(|| pipeline::decompress(compressed).unwrap());
-            },
-        );
+        group.bench_function(BenchmarkId::new("pz", format!("{:?}", pipeline)), |b| {
+            let compressed = pipeline::compress(&data, pipeline).unwrap();
+            b.iter(|| pipeline::decompress(&compressed).unwrap());
+        });
     }
 
     // External: gzip decompress
     if command_exists("gzip") {
-        if let Some(gz_data) = shell_compress(&data, "gzip", &["-c"]) {
-            group.bench_with_input(
-                BenchmarkId::new("external", "gzip"),
-                &gz_data,
-                |b, gz_data| {
-                    b.iter(|| shell_decompress(gz_data, "gzip", &["-dc"]).unwrap());
-                },
-            );
-        }
+        group.bench_function(BenchmarkId::new("external", "gzip"), |b| {
+            let gz_data = shell_compress(&data, "gzip", &["-c"]).unwrap();
+            b.iter(|| shell_decompress(&gz_data, "gzip", &["-dc"]).unwrap());
+        });
     }
 
     // External: pigz decompress
     if command_exists("pigz") {
-        if let Some(gz_data) = shell_compress(&data, "pigz", &["-c"]) {
-            group.bench_with_input(
-                BenchmarkId::new("external", "pigz"),
-                &gz_data,
-                |b, gz_data| {
-                    b.iter(|| shell_decompress(gz_data, "pigz", &["-dc"]).unwrap());
-                },
-            );
-        }
+        group.bench_function(BenchmarkId::new("external", "pigz"), |b| {
+            let gz_data = shell_compress(&data, "pigz", &["-c"]).unwrap();
+            b.iter(|| shell_decompress(&gz_data, "pigz", &["-dc"]).unwrap());
+        });
     }
 
     // External: zstd decompress
     if command_exists("zstd") {
-        if let Some(zst_data) = shell_compress(&data, "zstd", &["-c", "-"]) {
-            group.bench_with_input(
-                BenchmarkId::new("external", "zstd"),
-                &zst_data,
-                |b, zst_data| {
-                    b.iter(|| shell_decompress(zst_data, "zstd", &["-dc"]).unwrap());
-                },
-            );
-        }
+        group.bench_function(BenchmarkId::new("external", "zstd"), |b| {
+            let zst_data = shell_compress(&data, "zstd", &["-c", "-"]).unwrap();
+            b.iter(|| shell_decompress(&zst_data, "zstd", &["-dc"]).unwrap());
+        });
     }
 
     group.finish();
