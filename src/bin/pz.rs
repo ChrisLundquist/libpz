@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 
 use pz::gzip;
-use pz::pipeline::{self, CompressOptions, Pipeline};
+use pz::pipeline::{self, CompressOptions, ParseStrategy, Pipeline};
 
 fn usage() {
     eprintln!("pz - lossless data compression tool");
@@ -33,6 +33,7 @@ fn usage() {
     eprintln!("  -t, --threads N    Number of threads (0=auto, 1=single-threaded)");
     #[cfg(feature = "opencl")]
     eprintln!("  -g, --gpu          Use GPU (OpenCL) for compression");
+    eprintln!("  -O, --optimal      Use optimal parsing (better compression, slower)");
     eprintln!("  -q, --quiet        Suppress warnings");
     eprintln!("  -v, --verbose      Verbose output");
     eprintln!("  -h, --help         Show this help");
@@ -52,6 +53,7 @@ struct Opts {
     verbose: bool,
     quiet: bool,
     gpu: bool,
+    optimal: bool,
     threads: usize,
     pipeline: Pipeline,
     files: Vec<String>,
@@ -68,6 +70,7 @@ fn parse_args() -> Opts {
         verbose: false,
         quiet: false,
         gpu: false,
+        optimal: false,
         threads: 0,
         pipeline: Pipeline::Deflate,
         files: Vec::new(),
@@ -85,6 +88,7 @@ fn parse_args() -> Opts {
             "-v" | "--verbose" => opts.verbose = true,
             "-q" | "--quiet" => opts.quiet = true,
             "-g" | "--gpu" | "--opencl" => opts.gpu = true,
+            "-O" | "--optimal" => opts.optimal = true,
             "-h" | "--help" => {
                 usage();
                 process::exit(0);
@@ -132,6 +136,7 @@ fn parse_args() -> Opts {
                         'v' => opts.verbose = true,
                         'q' => opts.quiet = true,
                         'g' => opts.gpu = true,
+                        'O' => opts.optimal = true,
                         _ => {
                             eprintln!("pz: unknown flag '-{ch}'");
                             process::exit(1);
@@ -195,6 +200,12 @@ fn compress_data(
 
 /// Build compression options from CLI flags.
 fn build_cli_options(opts: &Opts) -> CompressOptions {
+    let parse_strategy = if opts.optimal {
+        ParseStrategy::Optimal
+    } else {
+        ParseStrategy::Greedy
+    };
+
     #[cfg(feature = "opencl")]
     {
         if opts.gpu {
@@ -206,6 +217,7 @@ fn build_cli_options(opts: &Opts) -> CompressOptions {
                     return CompressOptions {
                         backend: pipeline::Backend::OpenCl,
                         threads: opts.threads,
+                        parse_strategy,
                         opencl_engine: Some(std::sync::Arc::new(engine)),
                         ..Default::default()
                     };
@@ -234,6 +246,7 @@ fn build_cli_options(opts: &Opts) -> CompressOptions {
 
     CompressOptions {
         threads: opts.threads,
+        parse_strategy,
         ..Default::default()
     }
 }
