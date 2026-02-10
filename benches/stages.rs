@@ -161,6 +161,24 @@ fn bench_rangecoder(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_fse(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fse");
+    for &size in &[1024, 10240, 65536] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("encode", size), &data, |b, data| {
+            b.iter(|| pz::fse::encode(data));
+        });
+
+        let encoded = pz::fse::encode(&data);
+        group.bench_with_input(BenchmarkId::new("decode", size), &encoded, |b, enc| {
+            b.iter(|| pz::fse::decode(enc, size).unwrap());
+        });
+    }
+    group.finish();
+}
+
 #[cfg(feature = "opencl")]
 fn bench_bwt_gpu(c: &mut Criterion) {
     use pz::opencl::OpenClEngine;
@@ -232,6 +250,7 @@ criterion_group!(
     bench_mtf,
     bench_rle,
     bench_rangecoder,
+    bench_fse,
     bench_bwt_gpu,
     bench_lz77_gpu
 );
