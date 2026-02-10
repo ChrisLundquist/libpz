@@ -40,15 +40,17 @@ pub fn encode(input: &[u8]) -> Option<BwtResult> {
 
     let n = input.len();
 
-    // Build suffix array using prefix-doubling O(n log^2 n)
-    let sa = build_suffix_array(input);
-
-    // The BWT of input is constructed from the suffix array:
-    // For the BWT, we need rotations, not suffixes. We treat the input as
-    // circular by conceptually doubling it.
+    // Build rotation suffix array using SA-IS O(n).
     //
-    // BWT[i] = input[(sa[i] + n - 1) % n]
-    // Primary index = position where sa[i] == 0
+    // SA-IS builds the suffix array of `text$` where `$` is a sentinel
+    // smaller than all input bytes. The suffix array has n+1 entries.
+    // Entry sa[0] == n (the sentinel suffix) is skipped.
+    // The remaining n entries give the rotation order needed for BWT.
+    //
+    // For rotation i, the last character of the rotation is input[(i + n - 1) % n],
+    // which equals input[i - 1] for i > 0, or input[n - 1] for i == 0.
+    // The primary index is where sa[j] == 0.
+    let sa = build_suffix_array(input);
 
     let mut bwt = Vec::with_capacity(n);
     let mut primary_index = 0u32;
@@ -165,14 +167,16 @@ pub fn decode_to_buf(bwt: &[u8], primary_index: u32, output: &mut [u8]) -> PzRes
     Ok(n)
 }
 
-/// Build a suffix array for the input using prefix-doubling.
+/// Build a rotation suffix array for the input using SA-IS.
 ///
 /// Returns an array where sa[i] is the starting position of the i-th
-/// smallest suffix of `input` (treating input as circular/doubled).
+/// smallest rotation of `input` (for BWT use).
 ///
-/// Uses the prefix-doubling algorithm: O(n log^2 n) time, O(n) space.
-/// This is suitable for a reference implementation and is the approach
-/// that maps well to GPU parallelization (Phase 3).
+/// Strategy: Build suffix array of `text + text + $` using SA-IS O(n),
+/// then keep only entries where sa[i] < n. This gives the rotation
+/// order because any suffix starting in the first copy of text has
+/// enough characters to represent the full rotation, and the sentinel
+/// breaks ties for equal rotations consistently.
 fn build_suffix_array(input: &[u8]) -> Vec<usize> {
     let n = input.len();
     if n == 0 {
@@ -182,18 +186,281 @@ fn build_suffix_array(input: &[u8]) -> Vec<usize> {
         return vec![0];
     }
 
-    // For BWT we need to sort rotations, not suffixes.
-    // We do this by doubling the input and building a suffix array
-    // on the doubled text, then filtering to keep only the first n suffixes.
-    //
-    // Alternative: treat suffixes as circular using modular indexing.
-    // We use the circular approach for memory efficiency.
+    // Build text+text+$ by mapping bytes to 1..257 and appending sentinel 0.
+    let mut doubled: Vec<usize> = Vec::with_capacity(2 * n + 1);
+    for &b in input {
+        doubled.push(b as usize + 1);
+    }
+    for &b in input {
+        doubled.push(b as usize + 1);
+    }
+    doubled.push(0); // sentinel
 
-    // Initial ranking based on single characters
+    let alphabet_size = 257;
+    let sa = sais_core(&doubled, alphabet_size);
+
+    // Keep only entries where sa[i] < n (first copy of text).
+    // Skip sa[0] which is the sentinel position (2*n).
+    let mut result = Vec::with_capacity(n);
+    for &s in &sa {
+        if s < n {
+            result.push(s);
+        }
+    }
+    result
+}
+
+/// SA-IS core: build suffix array of integer array `text` with alphabet [0, alpha_size).
+///
+/// text must end with a unique sentinel (value 0) that is the smallest character.
+fn sais_core(text: &[usize], alpha_size: usize) -> Vec<usize> {
+    let n = text.len();
+    if n <= 2 {
+        if n == 0 {
+            return Vec::new();
+        }
+        if n == 1 {
+            return vec![0];
+        }
+        // n == 2: sentinel is at [1], so SA = [1, 0]
+        if text[0] > text[1] {
+            return vec![1, 0];
+        } else {
+            return vec![0, 1];
+        }
+    }
+
+    // Step 1: Classify each suffix as S-type or L-type.
+    // A suffix i is S-type if text[i..] < text[i+1..], L-type otherwise.
+    // The sentinel (last position) is always S-type.
+    let mut is_s = vec![false; n];
+    is_s[n - 1] = true; // sentinel is S-type
+    for i in (0..n - 1).rev() {
+        is_s[i] = if text[i] < text[i + 1] {
+            true
+        } else if text[i] > text[i + 1] {
+            false
+        } else {
+            is_s[i + 1]
+        };
+    }
+
+    // Step 2: Find LMS (Leftmost S-type) positions.
+    // Position i is LMS if is_s[i] && !is_s[i-1] (i.e., S-type preceded by L-type).
+    let mut lms_positions: Vec<usize> = Vec::new();
+    for i in 1..n {
+        if is_s[i] && !is_s[i - 1] {
+            lms_positions.push(i);
+        }
+    }
+
+    // Step 3: Compute bucket boundaries.
+    let get_buckets = |alpha_size: usize, text: &[usize], end: bool| -> Vec<usize> {
+        let mut buckets = vec![0usize; alpha_size];
+        for &c in text {
+            buckets[c] += 1;
+        }
+        let mut sum = 0;
+        for b in buckets.iter_mut() {
+            sum += *b;
+            if end {
+                *b = sum;
+            } else {
+                *b = sum - *b;
+            }
+        }
+        buckets
+    };
+
+    // Step 4: Induced sort LMS suffixes.
+    let mut sa = vec![usize::MAX; n];
+
+    // Place LMS suffixes at the ends of their buckets (right to left).
+    {
+        let mut bucket_tails = get_buckets(alpha_size, text, true);
+        for &lms in lms_positions.iter().rev() {
+            let c = text[lms];
+            bucket_tails[c] -= 1;
+            sa[bucket_tails[c]] = lms;
+        }
+    }
+
+    // Induce L-type suffixes (left to right scan).
+    {
+        let mut bucket_heads = get_buckets(alpha_size, text, false);
+        for i in 0..n {
+            if sa[i] == usize::MAX || sa[i] == 0 {
+                continue;
+            }
+            let j = sa[i] - 1;
+            if !is_s[j] {
+                let c = text[j];
+                sa[bucket_heads[c]] = j;
+                bucket_heads[c] += 1;
+            }
+        }
+    }
+
+    // Induce S-type suffixes (right to left scan).
+    {
+        let mut bucket_tails = get_buckets(alpha_size, text, true);
+        for i in (0..n).rev() {
+            if sa[i] == usize::MAX || sa[i] == 0 {
+                continue;
+            }
+            let j = sa[i] - 1;
+            if is_s[j] {
+                let c = text[j];
+                bucket_tails[c] -= 1;
+                sa[bucket_tails[c]] = j;
+            }
+        }
+    }
+
+    // Step 5: Compact sorted LMS suffixes and name them.
+    // Extract sorted LMS positions from SA.
+    let mut sorted_lms: Vec<usize> = Vec::with_capacity(lms_positions.len());
+    for &s in &sa {
+        if s != usize::MAX && s > 0 && is_s[s] && !is_s[s - 1] {
+            sorted_lms.push(s);
+        }
+    }
+    // Also include the sentinel if it's LMS (position 0 is never LMS by definition,
+    // but position n-1 can be if n >= 2 and text[n-2] > text[n-1]).
+    // Actually, the sentinel at n-1 is S-type, but is it LMS?
+    // LMS requires i > 0 and is_s[i] && !is_s[i-1].
+    // We already handled this in the loop above.
+
+    // Assign names to LMS substrings.
+    // Two LMS substrings are equal if they have the same characters
+    // between their LMS positions (inclusive of both endpoints' LMS status).
+    let mut name = 0usize;
+    let mut lms_names = vec![usize::MAX; n]; // name for LMS position i
+    let mut prev_lms = usize::MAX;
+
+    for &pos in &sorted_lms {
+        if prev_lms == usize::MAX || !lms_substrings_equal(text, &is_s, prev_lms, pos) {
+            name += 1;
+        }
+        lms_names[pos] = name - 1;
+        prev_lms = pos;
+    }
+
+    // Step 6: If names are not unique, recurse.
+    if name < sorted_lms.len() {
+        // Build the reduced string from LMS names in original text order.
+        let mut reduced: Vec<usize> = Vec::with_capacity(lms_positions.len());
+        for &lms in &lms_positions {
+            reduced.push(lms_names[lms]);
+        }
+
+        // Recurse
+        let reduced_sa = sais_core(&reduced, name);
+
+        // Use reduced_sa to place LMS suffixes in the correct order.
+        sa.fill(usize::MAX);
+        {
+            let mut bucket_tails = get_buckets(alpha_size, text, true);
+            for i in (0..reduced_sa.len()).rev() {
+                let lms = lms_positions[reduced_sa[i]];
+                let c = text[lms];
+                bucket_tails[c] -= 1;
+                sa[bucket_tails[c]] = lms;
+            }
+        }
+    } else {
+        // Names are unique; we can directly place LMS suffixes.
+        sa.fill(usize::MAX);
+        {
+            let mut bucket_tails = get_buckets(alpha_size, text, true);
+            for &lms in lms_positions.iter().rev() {
+                let c = text[lms];
+                bucket_tails[c] -= 1;
+                sa[bucket_tails[c]] = lms;
+            }
+        }
+    }
+
+    // Step 7: Final induced sort.
+    // Induce L-type.
+    {
+        let mut bucket_heads = get_buckets(alpha_size, text, false);
+        for i in 0..n {
+            if sa[i] == usize::MAX || sa[i] == 0 {
+                continue;
+            }
+            let j = sa[i] - 1;
+            if !is_s[j] {
+                let c = text[j];
+                sa[bucket_heads[c]] = j;
+                bucket_heads[c] += 1;
+            }
+        }
+    }
+    // Induce S-type.
+    {
+        let mut bucket_tails = get_buckets(alpha_size, text, true);
+        for i in (0..n).rev() {
+            if sa[i] == usize::MAX || sa[i] == 0 {
+                continue;
+            }
+            let j = sa[i] - 1;
+            if is_s[j] {
+                let c = text[j];
+                bucket_tails[c] -= 1;
+                sa[bucket_tails[c]] = j;
+            }
+        }
+    }
+
+    sa
+}
+
+/// Check if two LMS substrings starting at positions `a` and `b` are equal.
+///
+/// An LMS substring is the substring from one LMS position to the next (inclusive).
+fn lms_substrings_equal(text: &[usize], is_s: &[bool], a: usize, b: usize) -> bool {
+    let n = text.len();
+    let mut i = 0;
+    loop {
+        let ai = a + i;
+        let bi = b + i;
+        if ai >= n || bi >= n {
+            return ai >= n && bi >= n;
+        }
+        if text[ai] != text[bi] || is_s[ai] != is_s[bi] {
+            return false;
+        }
+        if i > 0 {
+            // Check if we've reached the end of the LMS substring
+            // (next LMS position or end of string).
+            let a_is_lms = ai > 0 && is_s[ai] && !is_s[ai - 1];
+            let b_is_lms = bi > 0 && is_s[bi] && !is_s[bi - 1];
+            if a_is_lms || b_is_lms {
+                return a_is_lms && b_is_lms;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Build suffix array using prefix-doubling (O(n log²n)).
+///
+/// Kept for cross-validation in tests. This was the original implementation
+/// and produces the same rotation order as SA-IS for BWT.
+#[cfg(test)]
+fn build_suffix_array_naive(input: &[u8]) -> Vec<usize> {
+    let n = input.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![0];
+    }
+
     let mut rank = vec![0i64; n];
     let mut sa: Vec<usize> = (0..n).collect();
 
-    // Assign initial ranks based on byte value
     for i in 0..n {
         rank[i] = input[i] as i64;
     }
@@ -202,7 +469,6 @@ fn build_suffix_array(input: &[u8]) -> Vec<usize> {
     let mut k = 1;
 
     while k < n {
-        // Sort by (rank[i], rank[(i + k) % n])
         let r = &rank;
         sa.sort_by(|&a, &b| {
             let ra = (r[a], r[(a + k) % n]);
@@ -210,7 +476,6 @@ fn build_suffix_array(input: &[u8]) -> Vec<usize> {
             ra.cmp(&rb)
         });
 
-        // Reassign ranks
         tmp_rank[sa[0]] = 0;
         for i in 1..n {
             let prev = sa[i - 1];
@@ -224,7 +489,6 @@ fn build_suffix_array(input: &[u8]) -> Vec<usize> {
 
         rank.copy_from_slice(&tmp_rank);
 
-        // If all ranks are unique, we're done
         if rank[sa[n - 1]] as usize == n - 1 {
             break;
         }
@@ -425,5 +689,74 @@ mod tests {
         // For circular rotations of "banana":
         // Sorted: abanan(5), anaban(3), ananab(1), banana(0), nabana(4), nanaba(2)
         assert_eq!(sa, vec![5, 3, 1, 0, 4, 2]);
+    }
+
+    #[test]
+    fn test_sais_and_naive_both_produce_valid_bwt() {
+        // SA-IS (doubled+sentinel) and naive (circular) may produce different
+        // suffix array orderings for texts with repeated substrings, but both
+        // must produce valid BWT outputs that round-trip correctly.
+        let test_cases: Vec<&[u8]> = vec![
+            b"banana",
+            b"abcabc",
+            b"aaaaaa",
+            b"abcdefghijklmnopqrstuvwxyz",
+            b"the quick brown fox",
+            b"abababababab",
+            b"abracadabra",
+            b"mississippi",
+        ];
+        for input in test_cases {
+            // Test with SA-IS (current build_suffix_array)
+            let result = encode(input).unwrap();
+            let decoded = decode(&result.data, result.primary_index).unwrap();
+            assert_eq!(
+                decoded, input,
+                "SA-IS BWT round-trip failed on {:?}",
+                std::str::from_utf8(input).unwrap_or("<binary>")
+            );
+
+            // Test with naive (old build_suffix_array_naive)
+            let naive_sa = build_suffix_array_naive(input);
+            let n = input.len();
+            let mut naive_bwt = Vec::with_capacity(n);
+            let mut naive_primary = 0u32;
+            for (i, &sa_val) in naive_sa.iter().enumerate() {
+                if sa_val == 0 {
+                    naive_primary = i as u32;
+                    naive_bwt.push(input[n - 1]);
+                } else {
+                    naive_bwt.push(input[sa_val - 1]);
+                }
+            }
+            let naive_decoded = decode(&naive_bwt, naive_primary).unwrap();
+            assert_eq!(
+                naive_decoded, input,
+                "Naive BWT round-trip failed on {:?}",
+                std::str::from_utf8(input).unwrap_or("<binary>")
+            );
+        }
+    }
+
+    #[test]
+    fn test_sais_matches_naive_on_distinct_text() {
+        // For texts where all rotations are distinct, SA-IS and naive
+        // must produce the exact same suffix array.
+        let input: Vec<u8> = (0..=255).collect();
+        let sais = build_suffix_array(&input);
+        let naive = build_suffix_array_naive(&input);
+        assert_eq!(sais, naive, "SA-IS and naive disagree on all-bytes (distinct rotations)");
+    }
+
+    #[test]
+    fn test_round_trip_large() {
+        // Test with a larger input to exercise SA-IS performance
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend(b"The quick brown fox jumps over the lazy dog. ");
+        }
+        let result = encode(&input).unwrap();
+        let decoded = decode(&result.data, result.primary_index).unwrap();
+        assert_eq!(decoded, input);
     }
 }
