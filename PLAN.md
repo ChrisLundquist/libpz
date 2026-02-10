@@ -504,3 +504,89 @@ without sidecar metadata).
 | **M10** | File format defined, CLI tool works end-to-end | M5 | **Done** (`pz` CLI with .pz format, `--gpu` flag) |
 | **M11** | Benchmark suite vs gzip/zstd/bzip2/lz4 | M8, M9, M10 | **Done** (throughput.rs compares gzip/pigz/zstd) |
 | **M12** | Vulkan compute backend | M8 | Pending |
+| **M13** | zstd (.zst) format support | M7, FSE | Pending |
+
+---
+
+## zstd (.zst) Support — Gap Analysis
+
+libpz already has most of the algorithmic building blocks needed for zstd:
+
+### What we have
+
+| Component | Module | Notes |
+|-----------|--------|-------|
+| FSE (tANS) entropy coder | `fse.rs` | GPU-friendly decode, table-driven |
+| Huffman coding | `huffman.rs` | Canonical codes, bit-packed encode/decode |
+| LZ77 (hash-chain, lazy) | `lz77.rs` | 32KB window, greedy/lazy/hash-chain strategies |
+| Optimal parsing (backward DP) | `optimal.rs` | zstd levels 17+ style, top-K candidates |
+| CRC32 | `crc32.rs` | Table-driven, used in gzip verification |
+| Multi-block parallel compress | `pipeline.rs` | V2 container, block table, thread pool |
+| GPU match finding | `opencl.rs` | Top-K match table for optimal parsing |
+
+### What's missing
+
+1. **zstd frame format (RFC 8878)** — Magic number `0xFD2FB528`, frame header
+   with descriptor byte, window size, optional content size, optional
+   dictionary ID, and frame checksum. Skippable frames.
+
+2. **zstd block format** — Block header (last-block flag, block type, block
+   size). Three block types: raw, RLE, compressed. Each compressed block
+   contains a literals section and a sequences section.
+
+3. **Sequence encoding** — zstd encodes LZ77 output as (literal_length,
+   match_offset, match_length) triples using three interleaved FSE
+   bitstreams. This is the core innovation: separate FSE tables for
+   literal lengths, match lengths, and offsets, all interleaved into a
+   single bitstream read in alternating order.
+
+4. **Literals section** — Four types: raw (uncompressed), RLE (single byte
+   repeated), Huffman-compressed (with embedded tree), and treeless
+   (reuses previous block's Huffman tree).
+
+5. **Large-window LZ77** — zstd supports windows up to 128MB (current
+   libpz: 32KB). Requires extended offset encoding and larger hash
+   tables. The `lz77.rs` window size constants and hash table would need
+   to be parameterized.
+
+6. **Repeat offset tracking** — zstd maintains 3 most-recent match offsets.
+   Offset codes 1-3 reuse these without transmitting the full offset,
+   significantly improving compression on structured data.
+
+7. **xxHash64** — zstd uses xxHash64 for frame checksums (libpz has CRC32
+   but not xxHash64). Could add as a new module or use an external crate.
+
+8. **Predefined FSE tables** — When a compressed block omits custom
+   frequency tables, zstd falls back to predefined default distributions
+   for literal lengths, match lengths, and offsets. These are fixed
+   tables defined in the spec.
+
+9. **Dictionary support** — Optional pre-trained dictionaries with a
+   dictionary ID and CRC. The LZ77 window is pre-filled with dictionary
+   content, giving immediate match references for small inputs.
+
+10. **Compression level mapping** — zstd defines 22 compression levels
+    mapping to different strategies (greedy, lazy, double-lazy, optimal)
+    with tuned parameters. libpz has the strategies but not the level
+    mapping or parameter tuning.
+
+### Implementation strategy
+
+The recommended approach is to build zstd support as a new pipeline
+(`Pipeline::Zstd`) that reuses existing modules where possible:
+
+- **Reuse:** `fse.rs` for entropy coding, `huffman.rs` for literal
+  compression, `lz77.rs` core match-finding logic, `optimal.rs` for
+  high-level parsing.
+- **New module `zstd.rs`:** Frame/block format parsing and serialization,
+  sequence encoding/decoding, repeat offset tracking, predefined tables.
+- **Extend `lz77.rs`:** Parameterize window size, add large-window support.
+- **New module `xxhash.rs`:** xxHash64 implementation for frame checksums.
+- **Extend `pipeline.rs`:** Add `Pipeline::Zstd` variant with zstd-specific
+  stage sequence.
+
+The largest effort is item 3 (sequence encoding with interleaved FSE
+streams) — this is architecturally distinct from how libpz currently uses
+entropy coders (one coder for the entire byte stream). zstd's approach
+requires three coordinated FSE state machines operating on different
+symbol alphabets within the same bitstream.
