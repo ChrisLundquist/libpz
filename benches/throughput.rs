@@ -126,13 +126,10 @@ fn bench_decompress(c: &mut Criterion) {
     // filter is active; eagerly compressing with BWT/SA-IS on large data
     // would block for minutes.
     for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
-        group.bench_function(
-            BenchmarkId::new("pz", format!("{:?}", pipeline)),
-            |b| {
-                let compressed = pipeline::compress(&data, pipeline).unwrap();
-                b.iter(|| pipeline::decompress(&compressed).unwrap());
-            },
-        );
+        group.bench_function(BenchmarkId::new("pz", format!("{:?}", pipeline)), |b| {
+            let compressed = pipeline::compress(&data, pipeline).unwrap();
+            b.iter(|| pipeline::decompress(&compressed).unwrap());
+        });
     }
 
     // External: gzip decompress
