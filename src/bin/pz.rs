@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 
 use pz::gzip;
-use pz::pipeline::{self, Pipeline};
+use pz::pipeline::{self, CompressOptions, Pipeline};
 
 fn usage() {
     eprintln!("pz - lossless data compression tool");
@@ -31,6 +31,8 @@ fn usage() {
     eprintln!("  -f, --force        Overwrite existing output files");
     eprintln!("  -l, --list         List info about compressed file");
     eprintln!("  -p, --pipeline P   Compression pipeline: deflate (default), bw, lza");
+    #[cfg(feature = "opencl")]
+    eprintln!("  -g, --gpu          Use GPU (OpenCL) for compression");
     eprintln!("  -q, --quiet        Suppress warnings");
     eprintln!("  -v, --verbose      Verbose output");
     eprintln!("  -h, --help         Show this help");
@@ -49,6 +51,7 @@ struct Opts {
     list: bool,
     verbose: bool,
     quiet: bool,
+    gpu: bool,
     pipeline: Pipeline,
     files: Vec<String>,
 }
@@ -63,6 +66,7 @@ fn parse_args() -> Opts {
         list: false,
         verbose: false,
         quiet: false,
+        gpu: false,
         pipeline: Pipeline::Deflate,
         files: Vec::new(),
     };
@@ -78,6 +82,7 @@ fn parse_args() -> Opts {
             "-l" | "--list" => opts.list = true,
             "-v" | "--verbose" => opts.verbose = true,
             "-q" | "--quiet" => opts.quiet = true,
+            "-g" | "--gpu" | "--opencl" => opts.gpu = true,
             "-h" | "--help" => {
                 usage();
                 process::exit(0);
@@ -110,6 +115,7 @@ fn parse_args() -> Opts {
                         'l' => opts.list = true,
                         'v' => opts.verbose = true,
                         'q' => opts.quiet = true,
+                        'g' => opts.gpu = true,
                         _ => {
                             eprintln!("pz: unknown flag '-{ch}'");
                             process::exit(1);
@@ -167,8 +173,52 @@ fn decompress_output_path(input: &str) -> Option<PathBuf> {
     }
 }
 
-fn compress_data(data: &[u8], pipe: Pipeline) -> Result<Vec<u8>, String> {
-    pipeline::compress(data, pipe).map_err(|e| format!("{e}"))
+fn compress_data(
+    data: &[u8],
+    pipe: Pipeline,
+    options: &CompressOptions,
+) -> Result<Vec<u8>, String> {
+    pipeline::compress_with_options(data, pipe, options).map_err(|e| format!("{e}"))
+}
+
+/// Build compression options from CLI flags.
+fn build_cli_options(opts: &Opts) -> CompressOptions {
+    #[cfg(feature = "opencl")]
+    {
+        if opts.gpu {
+            match pz::opencl::OpenClEngine::new() {
+                Ok(engine) => {
+                    if opts.verbose {
+                        eprintln!("pz: using GPU device: {}", engine.device_name());
+                    }
+                    return CompressOptions {
+                        backend: pipeline::Backend::OpenCl,
+                        opencl_engine: Some(std::sync::Arc::new(engine)),
+                    };
+                }
+                Err(_) => {
+                    if !opts.quiet {
+                        eprintln!(
+                            "pz: warning: GPU requested but OpenCL not available, \
+                             falling back to CPU"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "opencl"))]
+    {
+        if opts.gpu && !opts.quiet {
+            eprintln!(
+                "pz: warning: --gpu requires the opencl feature \
+                 (build with --features opencl)"
+            );
+        }
+    }
+
+    CompressOptions::default()
 }
 
 fn decompress_data(data: &[u8]) -> Result<Vec<u8>, String> {
@@ -246,9 +296,9 @@ fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn process_compress(opts: &Opts, path: &str) -> Result<(), String> {
+fn process_compress(opts: &Opts, path: &str, options: &CompressOptions) -> Result<(), String> {
     let data = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    let compressed = compress_data(&data, opts.pipeline)?;
+    let compressed = compress_data(&data, opts.pipeline, options)?;
 
     if opts.to_stdout {
         io::stdout()
@@ -321,7 +371,7 @@ fn process_decompress(opts: &Opts, path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn process_stdin_stdout(opts: &Opts) -> Result<(), String> {
+fn process_stdin_stdout(opts: &Opts, options: &CompressOptions) -> Result<(), String> {
     let mut data = Vec::new();
     io::stdin()
         .read_to_end(&mut data)
@@ -330,7 +380,7 @@ fn process_stdin_stdout(opts: &Opts) -> Result<(), String> {
     let output = if opts.decompress {
         decompress_data(&data)?
     } else {
-        compress_data(&data, opts.pipeline)?
+        compress_data(&data, opts.pipeline, options)?
     };
 
     io::stdout()
@@ -342,6 +392,7 @@ fn process_stdin_stdout(opts: &Opts) -> Result<(), String> {
 
 fn run() -> Result<(), ()> {
     let opts = parse_args();
+    let compress_options = build_cli_options(&opts);
     let mut had_error = false;
 
     if opts.files.is_empty() {
@@ -350,7 +401,7 @@ fn run() -> Result<(), ()> {
             eprintln!("pz: -l requires a file argument");
             return Err(());
         }
-        if let Err(e) = process_stdin_stdout(&opts) {
+        if let Err(e) = process_stdin_stdout(&opts, &compress_options) {
             eprintln!("pz: {e}");
             return Err(());
         }
@@ -384,7 +435,7 @@ fn run() -> Result<(), ()> {
         let result = if opts.decompress {
             process_decompress(&opts, path)
         } else {
-            process_compress(&opts, path)
+            process_compress(&opts, path, &compress_options)
         };
 
         if let Err(e) = result {

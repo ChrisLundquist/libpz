@@ -121,7 +121,7 @@ pub fn compress_with_options(
 
     match pipeline {
         Pipeline::Deflate => compress_deflate_with_options(input, options),
-        Pipeline::Bw => compress_bw(input),
+        Pipeline::Bw => compress_bw_with_options(input, options),
         Pipeline::Lza => compress_lza_with_options(input, options),
     }
 }
@@ -265,11 +265,35 @@ fn decompress_deflate(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     Ok(output)
 }
 
+// --- BWT helper: select GPU or CPU backend for suffix array construction ---
+
+/// Run BWT encoding using the configured backend.
+fn bwt_encode_with_backend(
+    input: &[u8],
+    options: &CompressOptions,
+) -> PzResult<bwt::BwtResult> {
+    #[cfg(feature = "opencl")]
+    {
+        if let Backend::OpenCl = options.backend {
+            if let Some(ref engine) = options.opencl_engine {
+                if input.len() >= crate::opencl::MIN_GPU_BWT_SIZE {
+                    return engine.bwt_encode(input);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "opencl"))]
+    let _ = options;
+
+    bwt::encode(input).ok_or(PzError::InvalidInput)
+}
+
 // --- BW pipeline: BWT + MTF + RLE + Range coder ---
 
-fn compress_bw(input: &[u8]) -> PzResult<Vec<u8>> {
-    // Stage 1: BWT
-    let bwt_result = bwt::encode(input).ok_or(PzError::InvalidInput)?;
+fn compress_bw_with_options(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
+    // Stage 1: BWT (GPU or CPU)
+    let bwt_result = bwt_encode_with_backend(input, options)?;
 
     // Stage 2: MTF
     let mtf_data = mtf::encode(&bwt_result.data);

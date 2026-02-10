@@ -26,7 +26,7 @@
 //!
 //! ```rust,no_run
 //! # #[cfg(feature = "opencl")]
-//! # {
+//! # fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! use pz::opencl::{OpenClEngine, KernelVariant};
 //!
 //! let engine = OpenClEngine::new()?;
@@ -34,9 +34,11 @@
 //!
 //! let input = b"hello world hello world";
 //! let matches = engine.find_matches(input, KernelVariant::Batch)?;
+//! # Ok(())
 //! # }
 //! ```
 
+use crate::bwt::BwtResult;
 use crate::lz77::Match;
 use crate::{PzError, PzResult};
 
@@ -44,7 +46,7 @@ use opencl3::command_queue::{CommandQueue, CL_QUEUE_PROFILING_ENABLE};
 use opencl3::context::Context;
 use opencl3::device::{get_all_devices, Device, CL_DEVICE_TYPE_ALL, CL_DEVICE_TYPE_GPU};
 use opencl3::kernel::{ExecuteKernel, Kernel};
-use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_WRITE_ONLY};
+use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE, CL_MEM_WRITE_ONLY};
 use opencl3::program::Program;
 use opencl3::types::{cl_device_type, cl_uint, CL_BLOCKING};
 
@@ -58,12 +60,19 @@ const LZ77_KERNEL_SOURCE: &str = include_str!("../kernels/lz77.cl");
 /// processes STEP_SIZE (32) consecutive positions with a 32KB window.
 const LZ77_BATCH_KERNEL_SOURCE: &str = include_str!("../kernels/lz77_batch.cl");
 
+/// Embedded OpenCL kernel source: bitonic sort step for BWT suffix array.
+const BWT_SORT_KERNEL_SOURCE: &str = include_str!("../kernels/bwt_sort.cl");
+
 /// Step size used by the batch kernel (must match STEP_SIZE in lz77_batch.cl).
 const BATCH_STEP_SIZE: usize = 32;
 
 /// Minimum input size below which GPU overhead exceeds benefit.
 /// For small inputs, the CPU reference implementation is faster.
 pub const MIN_GPU_INPUT_SIZE: usize = 64 * 1024; // 64KB
+
+/// Minimum BWT input size for GPU acceleration.
+/// Below this, GPU memory transfer overhead exceeds the sort speedup.
+pub const MIN_GPU_BWT_SIZE: usize = 32 * 1024; // 32KB
 
 /// GPU match struct matching the OpenCL kernel's `lz77_match_t` layout.
 /// Must match the struct definition in the .cl files exactly.
@@ -158,6 +167,8 @@ pub struct OpenClEngine {
     kernel_per_pos: Kernel,
     /// Compiled batched LZ77 kernel.
     kernel_batch: Kernel,
+    /// Compiled BWT bitonic sort step kernel.
+    kernel_bwt_sort_step: Kernel,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum work-group size.
@@ -239,12 +250,21 @@ impl OpenClEngine {
         let kernel_batch = Kernel::create(&program_batch, "Encode")
             .map_err(|_| PzError::Unsupported)?;
 
+        // Compile BWT bitonic sort kernel
+        let program_bwt =
+            Program::create_and_build_from_source(&context, BWT_SORT_KERNEL_SOURCE, "-Werror")
+                .map_err(|_| PzError::Unsupported)?;
+
+        let kernel_bwt_sort_step = Kernel::create(&program_bwt, "bitonic_sort_step")
+            .map_err(|_| PzError::Unsupported)?;
+
         Ok(OpenClEngine {
             _device: device,
             context,
             queue,
             kernel_per_pos,
             kernel_batch,
+            kernel_bwt_sort_step,
             device_name,
             max_work_group_size,
         })
@@ -387,6 +407,220 @@ impl OpenClEngine {
             output.extend_from_slice(&m.to_bytes());
         }
         Ok(output)
+    }
+
+    /// GPU-accelerated BWT forward transform.
+    ///
+    /// Uses the GPU for the expensive suffix array sort steps (bitonic sort),
+    /// with CPU handling rank assignment (cheap O(n) sequential scan).
+    /// Produces output identical to the CPU `bwt::encode()`.
+    pub fn bwt_encode(&self, input: &[u8]) -> PzResult<BwtResult> {
+        if input.is_empty() {
+            return Err(PzError::InvalidInput);
+        }
+
+        let sa = self.bwt_build_suffix_array(input)?;
+
+        // Extract BWT from suffix array (same logic as CPU bwt::encode)
+        let n = input.len();
+        let mut bwt = Vec::with_capacity(n);
+        let mut primary_index = 0u32;
+
+        for (i, &sa_val) in sa.iter().enumerate() {
+            if sa_val == 0 {
+                primary_index = i as u32;
+                bwt.push(input[n - 1]);
+            } else {
+                bwt.push(input[sa_val - 1]);
+            }
+        }
+
+        Ok(BwtResult {
+            data: bwt,
+            primary_index,
+        })
+    }
+
+    /// Build suffix array on the GPU using prefix-doubling with bitonic sort.
+    ///
+    /// Each doubling step sorts sa[] by (rank[sa[i]], rank[(sa[i]+k) % n]).
+    /// The sort is done on the GPU via bitonic sort; rank assignment is done
+    /// on the CPU (cheap O(n) scan after each sort).
+    fn bwt_build_suffix_array(&self, input: &[u8]) -> PzResult<Vec<usize>> {
+        let n = input.len();
+        if n <= 1 {
+            return Ok(if n == 0 { Vec::new() } else { vec![0] });
+        }
+
+        // Bitonic sort requires power-of-2 size. We pad sa with sentinel
+        // values that sort to the end (max rank).
+        let padded_n = n.next_power_of_two();
+
+        // Initialize sa and rank arrays (as u32 for GPU)
+        let mut sa_host: Vec<cl_uint> = (0..padded_n as cl_uint).collect();
+        let mut rank_host: Vec<cl_uint> = vec![cl_uint::MAX; padded_n];
+        for i in 0..n {
+            rank_host[i] = input[i] as cl_uint;
+        }
+        // Sentinel entries: sa values >= n, rank = MAX so they sort to the end
+
+        // Allocate GPU buffers
+        let mut sa_buf = unsafe {
+            Buffer::<cl_uint>::create(
+                &self.context,
+                CL_MEM_READ_WRITE,
+                padded_n,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        let mut rank_buf = unsafe {
+            Buffer::<cl_uint>::create(
+                &self.context,
+                CL_MEM_READ_WRITE,
+                padded_n,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        // Upload initial data
+        let write_sa = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut sa_buf, CL_BLOCKING, 0, &sa_host, &[])
+                .map_err(|_| PzError::InvalidInput)?
+        };
+        write_sa.wait().map_err(|_| PzError::InvalidInput)?;
+
+        let write_rank = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut rank_buf, CL_BLOCKING, 0, &rank_host, &[])
+                .map_err(|_| PzError::InvalidInput)?
+        };
+        write_rank.wait().map_err(|_| PzError::InvalidInput)?;
+
+        // Prefix-doubling loop
+        let mut k_step: usize = 1;
+        while k_step < n {
+            // Run bitonic sort on GPU
+            self.run_bitonic_sort(&mut sa_buf, &rank_buf, padded_n, n as cl_uint, k_step as cl_uint)?;
+
+            // Read back sorted sa
+            let read_sa = unsafe {
+                self.queue
+                    .enqueue_read_buffer(&sa_buf, CL_BLOCKING, 0, &mut sa_host, &[])
+                    .map_err(|_| PzError::InvalidInput)?
+            };
+            read_sa.wait().map_err(|_| PzError::InvalidInput)?;
+
+            // CPU rank assignment (O(n) sequential scan)
+            let mut new_rank = vec![cl_uint::MAX; padded_n];
+            // First real entry gets rank 0
+            if (sa_host[0] as usize) < n {
+                new_rank[sa_host[0] as usize] = 0;
+            }
+
+            let mut current_rank: cl_uint = 0;
+            for i in 1..padded_n {
+                let curr_sa = sa_host[i] as usize;
+                let prev_sa = sa_host[i - 1] as usize;
+
+                // Sentinel entries keep MAX rank
+                if curr_sa >= n {
+                    continue;
+                }
+
+                if prev_sa >= n {
+                    // Previous was sentinel, this is a real entry
+                    current_rank += 1;
+                    new_rank[curr_sa] = current_rank;
+                    continue;
+                }
+
+                // Compare composite keys
+                let r1_curr = rank_host[curr_sa];
+                let r2_curr = rank_host[(curr_sa + k_step) % n];
+                let r1_prev = rank_host[prev_sa];
+                let r2_prev = rank_host[(prev_sa + k_step) % n];
+
+                if r1_curr != r1_prev || r2_curr != r2_prev {
+                    current_rank += 1;
+                }
+                new_rank[curr_sa] = current_rank;
+            }
+
+            rank_host = new_rank;
+
+            // Check convergence: all ranks unique when max_rank == n-1
+            if current_rank as usize == n - 1 {
+                break;
+            }
+
+            // Upload new ranks to GPU
+            let write_rank = unsafe {
+                self.queue
+                    .enqueue_write_buffer(&mut rank_buf, CL_BLOCKING, 0, &rank_host, &[])
+                    .map_err(|_| PzError::InvalidInput)?
+            };
+            write_rank.wait().map_err(|_| PzError::InvalidInput)?;
+
+            k_step *= 2;
+        }
+
+        // Extract the real suffix array (filter out sentinel entries)
+        let sa: Vec<usize> = sa_host
+            .iter()
+            .filter(|&&v| (v as usize) < n)
+            .map(|&v| v as usize)
+            .collect();
+
+        if sa.len() != n {
+            return Err(PzError::InvalidInput);
+        }
+
+        Ok(sa)
+    }
+
+    /// Run a complete bitonic sort on the sa buffer.
+    ///
+    /// Executes O(log^2 padded_n) kernel launches to fully sort the array.
+    fn run_bitonic_sort(
+        &self,
+        sa_buf: &mut Buffer<cl_uint>,
+        rank_buf: &Buffer<cl_uint>,
+        padded_n: usize,
+        n: cl_uint,
+        k_doubling: cl_uint,
+    ) -> PzResult<()> {
+        let padded_n_arg = padded_n as cl_uint;
+
+        // Bitonic sort: for each stage (power of 2 block size),
+        // run sub-stages that halve the comparison distance.
+        let mut k_sort: usize = 2;
+        while k_sort <= padded_n {
+            let mut j: usize = k_sort / 2;
+            while j >= 1 {
+                let kernel_event = unsafe {
+                    ExecuteKernel::new(&self.kernel_bwt_sort_step)
+                        .set_arg(sa_buf)
+                        .set_arg(rank_buf)
+                        .set_arg(&n)
+                        .set_arg(&padded_n_arg)
+                        .set_arg(&k_doubling)
+                        .set_arg(&(j as cl_uint))
+                        .set_arg(&(k_sort as cl_uint))
+                        .set_global_work_size(padded_n)
+                        .enqueue_nd_range(&self.queue)
+                        .map_err(|_| PzError::Unsupported)?
+                };
+                kernel_event.wait().map_err(|_| PzError::Unsupported)?;
+
+                j /= 2;
+            }
+            k_sort *= 2;
+        }
+        Ok(())
     }
 }
 
@@ -579,5 +813,101 @@ mod tests {
 
         let result = engine.lz77_compress(b"", KernelVariant::Batch).unwrap();
         assert!(result.is_empty());
+    }
+
+    // --- BWT GPU tests ---
+
+    #[test]
+    fn test_gpu_bwt_banana() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input = b"banana";
+        let gpu_result = engine.bwt_encode(input).unwrap();
+        let cpu_result = crate::bwt::encode(input).unwrap();
+
+        assert_eq!(gpu_result.data, cpu_result.data, "BWT data mismatch");
+        assert_eq!(
+            gpu_result.primary_index, cpu_result.primary_index,
+            "primary_index mismatch"
+        );
+
+        // Round-trip through CPU decode
+        let decoded =
+            crate::bwt::decode(&gpu_result.data, gpu_result.primary_index).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_gpu_bwt_round_trip() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input = b"hello world hello world hello world";
+        let gpu_result = engine.bwt_encode(input).unwrap();
+        let cpu_result = crate::bwt::encode(input).unwrap();
+
+        assert_eq!(gpu_result.data, cpu_result.data);
+        assert_eq!(gpu_result.primary_index, cpu_result.primary_index);
+
+        let decoded =
+            crate::bwt::decode(&gpu_result.data, gpu_result.primary_index).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_gpu_bwt_binary_data() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input: Vec<u8> = (0..=255).collect();
+        let gpu_result = engine.bwt_encode(&input).unwrap();
+        let cpu_result = crate::bwt::encode(&input).unwrap();
+
+        assert_eq!(gpu_result.data, cpu_result.data);
+        assert_eq!(gpu_result.primary_index, cpu_result.primary_index);
+
+        let decoded =
+            crate::bwt::decode(&gpu_result.data, gpu_result.primary_index).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_gpu_bwt_single_byte() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input = b"x";
+        let gpu_result = engine.bwt_encode(input).unwrap();
+        assert_eq!(gpu_result.data, vec![b'x']);
+        assert_eq!(gpu_result.primary_index, 0);
+    }
+
+    #[test]
+    fn test_gpu_bwt_all_same() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input = vec![b'a'; 64];
+        let gpu_result = engine.bwt_encode(&input).unwrap();
+        let cpu_result = crate::bwt::encode(&input).unwrap();
+
+        assert_eq!(gpu_result.data, cpu_result.data);
+        assert_eq!(gpu_result.primary_index, cpu_result.primary_index);
     }
 }

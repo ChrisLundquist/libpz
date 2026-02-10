@@ -16,6 +16,15 @@ name = "pz"
 path = "src/bin/pz.rs"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[bench]]
+name = "stages"
+harness = false
 
 [features]
 default = []
