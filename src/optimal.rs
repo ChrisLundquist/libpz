@@ -81,24 +81,24 @@ impl MatchTable {
 /// Estimates the bit cost of encoding literals and matches.
 ///
 /// In the PZ format, every token (literal or match) serializes to exactly
-/// 9 bytes: `offset:u32 + length:u32 + next:u8`. These 9 bytes are then
+/// 5 bytes: `offset:u16 + length:u16 + next:u8`. These 5 bytes are then
 /// entropy-coded by Huffman or Range Coder.
 ///
-/// A **literal** token has offset=0, length=0, so 8 of its 9 bytes are
+/// A **literal** token has offset=0, length=0, so 4 of its 5 bytes are
 /// always zero (very cheap after entropy coding). Only the `next` byte varies.
 ///
 /// A **match** token has non-zero offset and length fields, whose bytes
 /// are more expensive to encode. But the match covers `length+1` input
-/// bytes with a single 9-byte token, amortizing the cost.
+/// bytes with a single 5-byte token, amortizing the cost.
 ///
 /// All costs are in fixed-point (scaled by [`COST_SCALE`]).
 pub struct CostModel {
     /// Cost of each literal byte value, in scaled bits.
     literal_cost: [u32; 256],
-    /// Cost of the 8 zero bytes in a literal token (offset=0, length=0).
+    /// Cost of the 4 zero bytes in a literal token (offset=0, length=0).
     /// This is cheap because 0x00 is very common in the LZ77 output stream.
     literal_overhead: u32,
-    /// Cost of the 8 offset+length bytes in a match token.
+    /// Cost of the 4 offset+length bytes in a match token.
     /// Estimated from the average entropy of typical offset/length values.
     match_overhead: u32,
 }
@@ -123,13 +123,13 @@ impl CostModel {
         // Estimate overhead costs:
         // In a typical LZ77 output, ~50% of tokens are literals (offset=0, length=0).
         // The 0x00 byte thus appears very frequently, making it cheap to encode.
-        // Estimate: 0x00 costs ~1 bit after entropy coding, so 8 zero bytes ≈ 8 bits.
-        let literal_overhead = 8 * COST_SCALE;
+        // Estimate: 0x00 costs ~1 bit after entropy coding, so 4 zero bytes ≈ 4 bits.
+        let literal_overhead = 4 * COST_SCALE;
 
         // Match offset/length fields contain varied byte values.
         // Typical entropy: ~4-5 bits/byte for offset, ~3-4 bits/byte for length.
-        // Conservative estimate: 8 bytes × 4 bits/byte = 32 bits overhead.
-        let match_overhead = 32 * COST_SCALE;
+        // Conservative estimate: 4 bytes × 4 bits/byte = 16 bits overhead.
+        let match_overhead = 16 * COST_SCALE;
 
         Self {
             literal_cost,
@@ -140,8 +140,8 @@ impl CostModel {
 
     /// Full cost of emitting a literal token (in scaled bits).
     ///
-    /// A literal token is `Match { offset:0, length:0, next:byte }` — 9 bytes.
-    /// Cost = overhead of 8 zero bytes + entropy of the `next` byte.
+    /// A literal token is `Match { offset:0, length:0, next:byte }` — 5 bytes.
+    /// Cost = overhead of 4 zero bytes + entropy of the `next` byte.
     #[inline]
     pub fn literal_token(&self, byte: u8) -> u32 {
         self.literal_overhead
@@ -150,7 +150,7 @@ impl CostModel {
 
     /// Full cost of emitting a match token (in scaled bits).
     ///
-    /// A match token is `Match { offset, length, next }` — 9 bytes.
+    /// A match token is `Match { offset, length, next }` — 5 bytes.
     /// Cost = overhead of offset+length bytes + entropy of the `next` byte.
     #[inline]
     pub fn match_token(&self, next_byte: u8) -> u32 {
@@ -216,7 +216,7 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
 
         // Option 2: each match candidate at this position
         for cand in table.at(i) {
-            if cand.length < MIN_MATCH as u16 {
+            if cand.length < MIN_MATCH {
                 break; // candidates are sorted by length desc; rest are empty
             }
             let match_end = i + cand.length as usize; // position of 'next' byte
@@ -225,7 +225,7 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
             }
             let next_pos = match_end + 1;
             // Token: Match { offset, length, next:input[match_end] }
-            // Covers (length + 1) input bytes with one 9-byte token
+            // Covers (length + 1) input bytes with one 5-byte token
             let mcost = cost_model
                 .match_token(input[match_end])
                 .saturating_add(cost[next_pos]);
@@ -241,7 +241,7 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
     let mut matches = Vec::new();
     let mut pos = 0;
     while pos < n {
-        let len = choice_len[pos] as u32;
+        let len = choice_len[pos];
         if len == 0 {
             // Literal
             matches.push(Match {
@@ -251,7 +251,7 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
             });
             pos += 1;
         } else {
-            let offset = choice_offset[pos] as u32;
+            let offset = choice_offset[pos];
             let match_end = pos + len as usize;
             let next = input[match_end]; // safe: DP ensured match_end < n
             matches.push(Match {

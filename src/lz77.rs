@@ -21,7 +21,7 @@ use crate::{PzError, PzResult};
 pub(crate) const MAX_WINDOW: usize = 32768;
 
 /// Minimum match length to consider (shorter matches aren't worth encoding).
-pub(crate) const MIN_MATCH: u32 = 3;
+pub(crate) const MIN_MATCH: u16 = 3;
 
 /// Hash table size for hash-chain match finder (power of 2).
 pub(crate) const HASH_SIZE: usize = 1 << 15; // 32768
@@ -38,30 +38,30 @@ pub(crate) const MAX_CHAIN: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct Match {
-    pub offset: u32,
-    pub length: u32,
+    pub offset: u16,
+    pub length: u16,
     pub next: u8,
 }
 
 impl Match {
     /// Size of a serialized match in bytes.
-    pub const SERIALIZED_SIZE: usize = 9; // 4 + 4 + 1
+    pub const SERIALIZED_SIZE: usize = 5; // 2 + 2 + 1
 
     /// Serialize this match to bytes (little-endian).
     pub fn to_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
         let mut buf = [0u8; Self::SERIALIZED_SIZE];
-        buf[0..4].copy_from_slice(&self.offset.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.length.to_le_bytes());
-        buf[8] = self.next;
+        buf[0..2].copy_from_slice(&self.offset.to_le_bytes());
+        buf[2..4].copy_from_slice(&self.length.to_le_bytes());
+        buf[4] = self.next;
         buf
     }
 
     /// Deserialize a match from bytes (little-endian).
     pub fn from_bytes(buf: &[u8; Self::SERIALIZED_SIZE]) -> Self {
         Self {
-            offset: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-            length: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
-            next: buf[8],
+            offset: u16::from_le_bytes([buf[0], buf[1]]),
+            length: u16::from_le_bytes([buf[2], buf[3]]),
+            next: buf[4],
         }
     }
 }
@@ -130,8 +130,8 @@ fn find_best_match(search: &[u8], target: &[u8]) -> Match {
     };
 
     Match {
-        offset: best_offset,
-        length: best_length,
+        offset: best_offset as u16,
+        length: best_length as u16,
         next,
     }
 }
@@ -337,7 +337,7 @@ impl HashChainFinder {
             let match_len = dispatcher.compare_bytes(&input[chain_pos..], &input[pos..]) as u32;
             let match_len = match_len.min(max_len as u32);
 
-            if match_len > best_length && match_len >= MIN_MATCH {
+            if match_len > best_length && match_len >= MIN_MATCH as u32 {
                 best_length = match_len;
                 best_offset = (pos - chain_pos) as u32;
             }
@@ -363,8 +363,8 @@ impl HashChainFinder {
         };
 
         Match {
-            offset: best_offset,
-            length: best_length,
+            offset: best_offset as u16,
+            length: best_length as u16,
             next,
         }
     }
@@ -407,7 +407,7 @@ impl HashChainFinder {
             let match_len = dispatcher.compare_bytes(&input[chain_pos..], &input[pos..]) as u32;
             let match_len = match_len.min(max_len as u32);
 
-            if match_len >= MIN_MATCH {
+            if match_len >= MIN_MATCH as u32 {
                 let offset = (pos - chain_pos) as u16;
                 let length = match_len as u16;
 
@@ -544,8 +544,8 @@ const MIN_SEGMENT_SIZE: usize = 128 * 1024;
 /// offset=0 means no match found (literal).
 #[derive(Clone, Copy)]
 struct PreMatch {
-    offset: u32,
-    length: u32,
+    offset: u16,
+    length: u16,
 }
 
 /// Compress input using parallel match finding with lazy evaluation.
@@ -1039,7 +1039,7 @@ mod tests {
     fn test_lazy_correctness_vs_greedy() {
         // Both greedy and lazy should produce correct (decompressible) output.
         // Note: In our fixed-size match format, lazy may produce more output
-        // bytes (each literal emits a full 9-byte Match struct). The benefit
+        // bytes (each literal emits a full 5-byte Match struct). The benefit
         // of lazy matching appears when combined with entropy coding (Huffman
         // or arithmetic), where a literal + longer match can be cheaper.
         let pattern = b"abcdefg abcxyz abcdefg abcxyz ";
