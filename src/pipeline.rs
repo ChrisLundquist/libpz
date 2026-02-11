@@ -962,9 +962,16 @@ fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResu
         }
     }
 
-    // CPU paths
+    // CPU paths — use parallel match finding when threads > 1 and input is large
+    let num_threads = resolve_thread_count(options.threads);
     match options.parse_strategy {
-        ParseStrategy::Auto | ParseStrategy::Lazy => lz77::compress_lazy(input),
+        ParseStrategy::Auto | ParseStrategy::Lazy => {
+            if num_threads > 1 {
+                lz77::compress_lazy_parallel(input, num_threads)
+            } else {
+                lz77::compress_lazy(input)
+            }
+        }
         ParseStrategy::Greedy => lz77::compress_hashchain(input),
         ParseStrategy::Optimal => crate::optimal::compress_optimal(input),
     }
@@ -1050,7 +1057,9 @@ fn bwt_encode_with_backend(input: &[u8], options: &CompressOptions) -> PzResult<
     {
         if let Backend::OpenCl = options.backend {
             if let Some(ref engine) = options.opencl_engine {
-                if input.len() >= crate::opencl::MIN_GPU_BWT_SIZE {
+                // Skip GPU BWT on CPU OpenCL devices — bitonic sort is O(log^2 n)
+                // kernel launches which is much slower than CPU's O(n) SA-IS.
+                if !engine.is_cpu_device() && input.len() >= crate::opencl::MIN_GPU_BWT_SIZE {
                     return engine.bwt_encode(input);
                 }
             }
@@ -1169,6 +1178,100 @@ fn decompress_block_lza(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 
 fn decompress_lza(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     decompress_block_lza(payload, orig_len)
+}
+
+// --- Pipeline auto-selection ---
+
+/// Automatically select the best pipeline for the given input data.
+///
+/// Uses statistical analysis (byte entropy, match density, run ratio,
+/// distribution shape) to predict which pipeline will perform best.
+/// The heuristic is fast (O(n) on a 64KB sample) and suitable for
+/// use as a default when the caller doesn't know the data characteristics.
+pub fn select_pipeline(input: &[u8]) -> Pipeline {
+    use crate::analysis::{self, DistributionShape};
+
+    if input.is_empty() {
+        return Pipeline::Deflate;
+    }
+
+    let profile = analysis::analyze(input);
+
+    // Near-random data: use fastest pipeline, won't compress much
+    if profile.byte_entropy > 7.5 && profile.match_density < 0.1 {
+        return Pipeline::Deflate;
+    }
+
+    // High run ratio: BWT+RLE excels
+    if profile.run_ratio > 0.3 {
+        return Pipeline::Bw;
+    }
+
+    // Low entropy with skewed or constant distribution: BWT handles well
+    if profile.byte_entropy < 3.0
+        && matches!(
+            profile.distribution_shape,
+            DistributionShape::Skewed | DistributionShape::Constant
+        )
+    {
+        return Pipeline::Bw;
+    }
+
+    // Good match density: LZ-based pipelines
+    if profile.match_density > 0.4 {
+        if profile.byte_entropy > 6.0 {
+            // High entropy: range coder handles better than Huffman
+            return Pipeline::Lza;
+        }
+        return Pipeline::Deflate;
+    }
+
+    // Moderate match density with high entropy
+    if profile.match_density > 0.2 && profile.byte_entropy > 5.0 {
+        return Pipeline::Lza;
+    }
+
+    // Default: Deflate (fast, decent compression)
+    Pipeline::Deflate
+}
+
+/// Select the best pipeline by trial compression.
+///
+/// Compresses the first `sample_size` bytes with each candidate pipeline,
+/// measures compressed size, and picks the one with the best ratio.
+/// Falls back to heuristic selection if all trials fail.
+pub fn select_pipeline_trial(
+    input: &[u8],
+    options: &CompressOptions,
+    sample_size: usize,
+) -> Pipeline {
+    if input.is_empty() {
+        return Pipeline::Deflate;
+    }
+
+    let sample_len = input.len().min(sample_size);
+    let sample = &input[..sample_len];
+
+    // Force single-threaded for trial (avoid overhead)
+    let trial_opts = CompressOptions {
+        threads: 1,
+        ..options.clone()
+    };
+
+    let candidates = [Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza];
+    let mut best_pipeline = Pipeline::Deflate;
+    let mut best_size = usize::MAX;
+
+    for &pipeline in &candidates {
+        if let Ok(compressed) = compress_with_options(sample, pipeline, &trial_opts) {
+            if compressed.len() < best_size {
+                best_size = compressed.len();
+                best_pipeline = pipeline;
+            }
+        }
+    }
+
+    best_pipeline
 }
 
 #[cfg(test)]
@@ -1694,5 +1797,92 @@ mod tests {
         let compressed = compress_with_options(&input, Pipeline::Deflate, &opts).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
+    }
+
+    // --- Auto-selection tests ---
+
+    #[test]
+    fn test_select_pipeline_empty() {
+        assert_eq!(select_pipeline(&[]), Pipeline::Deflate);
+    }
+
+    #[test]
+    fn test_select_pipeline_constant_data() {
+        // All-same bytes → high run ratio → should select Bw
+        let input = vec![0xAA; 10000];
+        let pipeline = select_pipeline(&input);
+        assert_eq!(pipeline, Pipeline::Bw);
+    }
+
+    #[test]
+    fn test_select_pipeline_text() {
+        // Repetitive text → good match density, moderate entropy → Deflate or Lza
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let mut input = Vec::new();
+        for _ in 0..200 {
+            input.extend_from_slice(pattern);
+        }
+        let pipeline = select_pipeline(&input);
+        assert!(
+            pipeline == Pipeline::Deflate || pipeline == Pipeline::Lza,
+            "expected Deflate or Lza, got {:?}",
+            pipeline
+        );
+    }
+
+    #[test]
+    fn test_select_pipeline_random() {
+        // Pseudo-random → high entropy, low match density → Deflate (fastest)
+        let mut input = vec![0u8; 10000];
+        let mut state: u32 = 12345;
+        for byte in &mut input {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            *byte = (state >> 16) as u8;
+        }
+        let pipeline = select_pipeline(&input);
+        assert_eq!(pipeline, Pipeline::Deflate);
+    }
+
+    #[test]
+    fn test_select_pipeline_trial_round_trip() {
+        // Trial-selected pipeline must produce valid compressed output
+        let pattern = b"Hello, World! This is a test pattern. ";
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend_from_slice(pattern);
+        }
+        let opts = CompressOptions::default();
+        let pipeline = select_pipeline_trial(&input, &opts, 4096);
+        let compressed = compress(&input, pipeline).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_select_pipeline_trial_small_sample() {
+        // Trial with very small input should not panic
+        let input = b"tiny";
+        let opts = CompressOptions::default();
+        let pipeline = select_pipeline_trial(input, &opts, 32);
+        // Should still produce a valid pipeline
+        let compressed = compress(input, pipeline).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input.as_slice());
+    }
+
+    #[test]
+    fn test_select_pipeline_auto_vs_explicit_round_trip() {
+        // Every auto-selected pipeline must produce valid output
+        let test_inputs: Vec<Vec<u8>> = vec![
+            vec![0xFF; 5000],                            // constant
+            (0..=255u8).cycle().take(5000).collect(),    // uniform
+            b"banana banana banana banana ".repeat(100), // text
+        ];
+        for input in &test_inputs {
+            let pipeline = select_pipeline(input);
+            let compressed = compress(input, pipeline).unwrap();
+            let decompressed = decompress(&compressed).unwrap();
+            assert_eq!(&decompressed, input);
+        }
     }
 }

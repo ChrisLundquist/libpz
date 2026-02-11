@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod bwt;
 pub mod crc32;
 pub mod deflate;

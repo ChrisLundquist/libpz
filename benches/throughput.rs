@@ -231,6 +231,46 @@ fn bench_compress_gpu(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_compress_parallel(c: &mut Criterion) {
+    use pz::pipeline::CompressOptions;
+
+    let data = get_test_data();
+    let mut group = c.benchmark_group("compress_parallel");
+    group.throughput(Throughput::Bytes(data.len() as u64));
+
+    // Single-threaded baseline
+    for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+        group.bench_with_input(
+            BenchmarkId::new("pz_1t", format!("{:?}", pipe)),
+            &data,
+            |b, data| {
+                let opts = CompressOptions {
+                    threads: 1,
+                    ..Default::default()
+                };
+                b.iter(|| pipeline::compress_with_options(data, pipe, &opts).unwrap());
+            },
+        );
+    }
+
+    // Multi-threaded (auto thread count)
+    for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+        group.bench_with_input(
+            BenchmarkId::new("pz_mt", format!("{:?}", pipe)),
+            &data,
+            |b, data| {
+                let opts = CompressOptions {
+                    threads: 0, // auto
+                    ..Default::default()
+                };
+                b.iter(|| pipeline::compress_with_options(data, pipe, &opts).unwrap());
+            },
+        );
+    }
+
+    group.finish();
+}
+
 #[cfg(not(feature = "opencl"))]
 fn bench_compress_gpu(_c: &mut Criterion) {}
 
@@ -323,6 +363,7 @@ criterion_group!(
     benches,
     bench_compress,
     bench_decompress,
+    bench_compress_parallel,
     bench_compress_large,
     bench_decompress_large,
     bench_compress_gpu,

@@ -295,6 +295,76 @@ fn bench_lz77_gpu(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_lz77_parallel(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lz77_parallel");
+    for &size in &[65536, 262144, 1048576] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // Baseline: single-threaded lazy
+        group.bench_with_input(
+            BenchmarkId::new("compress_lazy_1t", size),
+            &data,
+            |b, data| {
+                b.iter(|| pz::lz77::compress_lazy(data).unwrap());
+            },
+        );
+
+        // Parallel with various thread counts
+        for &threads in &[2, 4, 8] {
+            group.bench_with_input(
+                BenchmarkId::new(format!("compress_lazy_{}t", threads), size),
+                &data,
+                |b, data| {
+                    b.iter(|| pz::lz77::compress_lazy_parallel(data, threads).unwrap());
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+fn bench_analysis(c: &mut Criterion) {
+    let mut group = c.benchmark_group("analysis");
+    for &size in &[1024, 10240, 65536, 262144] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("analyze", size), &data, |b, data| {
+            b.iter(|| pz::analysis::analyze(data));
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("analyze_sample_4k", size),
+            &data,
+            |b, data| {
+                b.iter(|| pz::analysis::analyze_with_sample(data, 4096));
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_auto_select(c: &mut Criterion) {
+    use pz::pipeline::{self, CompressOptions};
+
+    let mut group = c.benchmark_group("auto_select");
+    for &size in &[10240, 65536, 262144] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("heuristic", size), &data, |b, data| {
+            b.iter(|| pipeline::select_pipeline(data));
+        });
+
+        group.bench_with_input(BenchmarkId::new("trial_4k", size), &data, |b, data| {
+            let opts = CompressOptions::default();
+            b.iter(|| pipeline::select_pipeline_trial(data, &opts, 4096));
+        });
+    }
+    group.finish();
+}
+
 #[cfg(not(feature = "opencl"))]
 fn bench_bwt_gpu(_c: &mut Criterion) {}
 
@@ -311,6 +381,9 @@ criterion_group!(
     bench_rle,
     bench_rangecoder,
     bench_fse,
+    bench_lz77_parallel,
+    bench_analysis,
+    bench_auto_select,
     bench_bwt_gpu,
     bench_lz77_gpu
 );

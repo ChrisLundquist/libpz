@@ -30,6 +30,8 @@ fn usage() {
     eprintln!("  -f, --force        Overwrite existing output files");
     eprintln!("  -l, --list         List info about compressed file");
     eprintln!("  -p, --pipeline P   Compression pipeline: deflate (default), bw, lza");
+    eprintln!("  -a, --auto         Auto-select best pipeline based on data analysis");
+    eprintln!("  --trial            Auto-select by trial compression (slower, more accurate)");
     eprintln!("  -t, --threads N    Number of threads (0=auto, 1=single-threaded)");
     #[cfg(feature = "opencl")]
     eprintln!("  -g, --gpu          Use GPU (OpenCL) for compression");
@@ -55,6 +57,8 @@ struct Opts {
     verbose: bool,
     quiet: bool,
     gpu: bool,
+    auto_select: bool,
+    trial_mode: bool,
     parse_strategy: ParseStrategy,
     threads: usize,
     pipeline: Pipeline,
@@ -72,6 +76,8 @@ fn parse_args() -> Opts {
         verbose: false,
         quiet: false,
         gpu: false,
+        auto_select: false,
+        trial_mode: false,
         parse_strategy: ParseStrategy::Auto,
         threads: 0,
         pipeline: Pipeline::Deflate,
@@ -90,6 +96,11 @@ fn parse_args() -> Opts {
             "-v" | "--verbose" => opts.verbose = true,
             "-q" | "--quiet" => opts.quiet = true,
             "-g" | "--gpu" | "--opencl" => opts.gpu = true,
+            "-a" | "--auto" => opts.auto_select = true,
+            "--trial" => {
+                opts.auto_select = true;
+                opts.trial_mode = true;
+            }
             "-O" | "--optimal" => opts.parse_strategy = ParseStrategy::Optimal,
             "--lazy" => opts.parse_strategy = ParseStrategy::Lazy,
             "--greedy" => opts.parse_strategy = ParseStrategy::Greedy,
@@ -140,6 +151,7 @@ fn parse_args() -> Opts {
                         'v' => opts.verbose = true,
                         'q' => opts.quiet = true,
                         'g' => opts.gpu = true,
+                        'a' => opts.auto_select = true,
                         'O' => opts.parse_strategy = ParseStrategy::Optimal,
                         _ => {
                             eprintln!("pz: unknown flag '-{ch}'");
@@ -334,9 +346,26 @@ fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+fn resolve_pipeline(opts: &Opts, data: &[u8], options: &CompressOptions) -> Pipeline {
+    if opts.auto_select {
+        let pipeline = if opts.trial_mode {
+            pipeline::select_pipeline_trial(data, options, 65536)
+        } else {
+            pipeline::select_pipeline(data)
+        };
+        if opts.verbose {
+            eprintln!("pz: auto-selected pipeline: {:?}", pipeline);
+        }
+        pipeline
+    } else {
+        opts.pipeline
+    }
+}
+
 fn process_compress(opts: &Opts, path: &str, options: &CompressOptions) -> Result<(), String> {
     let data = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    let compressed = compress_data(&data, opts.pipeline, options)?;
+    let pipe = resolve_pipeline(opts, &data, options);
+    let compressed = compress_data(&data, pipe, options)?;
 
     if opts.to_stdout {
         io::stdout()
@@ -414,7 +443,8 @@ fn process_stdin_stdout(opts: &Opts, options: &CompressOptions) -> Result<(), St
     let output = if opts.decompress {
         decompress_data(&data, opts.threads)?
     } else {
-        compress_data(&data, opts.pipeline, options)?
+        let pipe = resolve_pipeline(opts, &data, options);
+        compress_data(&data, pipe, options)?
     };
 
     io::stdout()

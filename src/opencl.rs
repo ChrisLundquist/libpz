@@ -74,6 +74,10 @@ const BWT_RANK_KERNEL_SOURCE: &str = include_str!("../kernels/bwt_rank.cl");
 /// Embedded OpenCL kernel source: radix sort for BWT prefix-doubling.
 const BWT_RADIX_KERNEL_SOURCE: &str = include_str!("../kernels/bwt_radix.cl");
 
+/// Embedded OpenCL kernel source: GPU Huffman encoding.
+/// Two-pass: ComputeBitLengths + WriteCodes, plus a ByteHistogram helper.
+const HUFFMAN_ENCODE_KERNEL_SOURCE: &str = include_str!("../kernels/huffman_encode.cl");
+
 /// Step size used by the batch kernel (must match STEP_SIZE in lz77_batch.cl).
 const BATCH_STEP_SIZE: usize = 32;
 
@@ -224,10 +228,18 @@ pub struct OpenClEngine {
     kernel_inclusive_to_exclusive: Kernel,
     /// Workgroup size for prefix sum kernels (power of 2, capped at 256).
     scan_workgroup_size: usize,
+    /// Compiled Huffman bit-length computation kernel.
+    kernel_huffman_bit_lengths: Kernel,
+    /// Compiled Huffman codeword writing kernel.
+    kernel_huffman_write_codes: Kernel,
+    /// Compiled byte histogram kernel.
+    kernel_byte_histogram: Kernel,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum work-group size.
     max_work_group_size: usize,
+    /// Whether the selected device is a CPU (vs GPU/accelerator).
+    is_cpu: bool,
 }
 
 // SAFETY: OpenCL 1.2+ guarantees thread safety for context, command queue, kernel,
@@ -283,6 +295,8 @@ impl OpenClEngine {
         let device = Device::new(selected_id);
         let device_name = device.name().unwrap_or_default().trim().to_string();
         let max_work_group_size = device.max_work_group_size().unwrap_or(1);
+        let dev_type: cl_device_type = device.dev_type().unwrap_or(0);
+        let is_cpu = (dev_type & CL_DEVICE_TYPE_GPU) == 0;
 
         // Create context and command queue
         let context = Context::from_device(&device).map_err(|_| PzError::Unsupported)?;
@@ -325,6 +339,7 @@ impl OpenClEngine {
         let kernel_hash_find =
             Kernel::create(&program_hash, "FindMatches").map_err(|_| PzError::Unsupported)?;
 
+<<<<<<< HEAD
         // Compile BWT rank assignment kernels with workgroup size define.
         // Cap at 256 and round down to the nearest power of 2 for portability.
         let capped = max_work_group_size.clamp(1, 256);
@@ -358,6 +373,23 @@ impl OpenClEngine {
             Kernel::create(&program_bwt_radix, "inclusive_to_exclusive")
                 .map_err(|_| PzError::Unsupported)?;
 
+        // Compile Huffman encoding kernels
+        let program_huffman = Program::create_and_build_from_source(
+            &context,
+            HUFFMAN_ENCODE_KERNEL_SOURCE,
+            "-Werror",
+        )
+        .map_err(|_| PzError::Unsupported)?;
+
+        let kernel_huffman_bit_lengths = Kernel::create(&program_huffman, "ComputeBitLengths")
+            .map_err(|_| PzError::Unsupported)?;
+
+        let kernel_huffman_write_codes =
+            Kernel::create(&program_huffman, "WriteCodes").map_err(|_| PzError::Unsupported)?;
+
+        let kernel_byte_histogram =
+            Kernel::create(&program_huffman, "ByteHistogram").map_err(|_| PzError::Unsupported)?;
+
         Ok(OpenClEngine {
             _device: device,
             context,
@@ -376,8 +408,12 @@ impl OpenClEngine {
             kernel_radix_scatter,
             kernel_inclusive_to_exclusive,
             scan_workgroup_size,
+            kernel_huffman_bit_lengths,
+            kernel_huffman_write_codes,
+            kernel_byte_histogram,
             device_name,
             max_work_group_size,
+            is_cpu,
         })
     }
 
@@ -389,6 +425,14 @@ impl OpenClEngine {
     /// Return the maximum work-group size for the device.
     pub fn max_work_group_size(&self) -> usize {
         self.max_work_group_size
+    }
+
+    /// Check if the selected device is a CPU (not a GPU or accelerator).
+    ///
+    /// Useful for skipping GPU-optimized algorithms (like BWT bitonic sort)
+    /// that perform poorly on CPU OpenCL devices.
+    pub fn is_cpu_device(&self) -> bool {
+        self.is_cpu
     }
 
     /// Find LZ77 matches for the entire input using the GPU.
@@ -1350,6 +1394,231 @@ impl OpenClEngine {
         };
         Ok(kernel_event)
     }
+
+    /// Compute a byte histogram of the input data on the GPU.
+    ///
+    /// Returns a 256-element array of byte frequencies. This can be used
+    /// to build a Huffman tree without downloading the full data to the CPU.
+    pub fn byte_histogram(&self, input: &[u8]) -> PzResult<[u32; 256]> {
+        if input.is_empty() {
+            return Ok([0u32; 256]);
+        }
+
+        let n = input.len();
+
+        // Create input buffer
+        let mut input_buf = unsafe {
+            Buffer::<u8>::create(&self.context, CL_MEM_READ_ONLY, n, ptr::null_mut())
+                .map_err(|_| PzError::Unsupported)?
+        };
+
+        // Create histogram buffer (256 uints, zeroed)
+        let mut hist_buf = unsafe {
+            Buffer::<cl_uint>::create(&self.context, CL_MEM_READ_WRITE, 256, ptr::null_mut())
+                .map_err(|_| PzError::Unsupported)?
+        };
+
+        // Upload input
+        let write_event = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut input_buf, CL_BLOCKING, 0, input, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        write_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Zero the histogram buffer
+        let zeros = vec![0u32; 256];
+        let zero_event = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut hist_buf, CL_BLOCKING, 0, &zeros, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        zero_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Run histogram kernel
+        let n_arg = n as cl_uint;
+        let kernel_event = unsafe {
+            ExecuteKernel::new(&self.kernel_byte_histogram)
+                .set_arg(&input_buf)
+                .set_arg(&hist_buf)
+                .set_arg(&n_arg)
+                .set_global_work_size(n)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        kernel_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Download histogram
+        let mut histogram = vec![0u32; 256];
+        let read_event = unsafe {
+            self.queue
+                .enqueue_read_buffer(&hist_buf, CL_BLOCKING, 0, &mut histogram, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        read_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        let mut result = [0u32; 256];
+        result.copy_from_slice(&histogram);
+        Ok(result)
+    }
+
+    /// Encode data using Huffman coding on the GPU.
+    ///
+    /// Takes a code lookup table (from a HuffmanTree) and the input symbols.
+    /// Returns the encoded bytes and the total number of bits.
+    ///
+    /// The lookup table format: for each byte value 0-255,
+    /// `code_lut[byte] = (bits << 24) | codeword` where codeword is at most 24 bits.
+    pub fn huffman_encode(
+        &self,
+        input: &[u8],
+        code_lut: &[u32; 256],
+    ) -> PzResult<(Vec<u8>, usize)> {
+        if input.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let n = input.len();
+
+        // Create buffers
+        let mut input_buf = unsafe {
+            Buffer::<u8>::create(&self.context, CL_MEM_READ_ONLY, n, ptr::null_mut())
+                .map_err(|_| PzError::Unsupported)?
+        };
+
+        let mut lut_buf = unsafe {
+            Buffer::<cl_uint>::create(&self.context, CL_MEM_READ_ONLY, 256, ptr::null_mut())
+                .map_err(|_| PzError::Unsupported)?
+        };
+
+        let bit_lengths_buf = unsafe {
+            Buffer::<cl_uint>::create(&self.context, CL_MEM_READ_WRITE, n, ptr::null_mut())
+                .map_err(|_| PzError::Unsupported)?
+        };
+
+        // Upload input and LUT
+        let write_input = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut input_buf, CL_BLOCKING, 0, input, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        write_input.wait().map_err(|_| PzError::Unsupported)?;
+
+        let write_lut = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut lut_buf, CL_BLOCKING, 0, code_lut, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        write_lut.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Pass 1: compute bit lengths per symbol
+        let n_arg = n as cl_uint;
+        let pass1_event = unsafe {
+            ExecuteKernel::new(&self.kernel_huffman_bit_lengths)
+                .set_arg(&input_buf)
+                .set_arg(&lut_buf)
+                .set_arg(&bit_lengths_buf)
+                .set_arg(&n_arg)
+                .set_global_work_size(n)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        pass1_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Download bit lengths and compute prefix sum on CPU
+        // (GPU prefix sum would be faster for very large inputs, but adds complexity)
+        let mut bit_lengths = vec![0u32; n];
+        let read_event = unsafe {
+            self.queue
+                .enqueue_read_buffer(&bit_lengths_buf, CL_BLOCKING, 0, &mut bit_lengths, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        read_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // CPU prefix sum: bit_offsets[i] = sum of bit_lengths[0..i)
+        let mut bit_offsets = vec![0u32; n];
+        let mut running_sum: u64 = 0;
+        for i in 0..n {
+            bit_offsets[i] = running_sum as u32;
+            running_sum += bit_lengths[i] as u64;
+        }
+        let total_bits = running_sum as usize;
+
+        // Allocate output buffer (as uint array for atomic OR)
+        let output_uints = total_bits.div_ceil(32);
+        if output_uints == 0 {
+            return Ok((Vec::new(), 0));
+        }
+
+        let mut output_buf = unsafe {
+            Buffer::<cl_uint>::create(
+                &self.context,
+                CL_MEM_READ_WRITE,
+                output_uints,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::Unsupported)?
+        };
+
+        // Zero the output buffer
+        let zeros = vec![0u32; output_uints];
+        let zero_event = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut output_buf, CL_BLOCKING, 0, &zeros, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        zero_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Upload bit offsets
+        let mut offsets_buf = unsafe {
+            Buffer::<cl_uint>::create(&self.context, CL_MEM_READ_ONLY, n, ptr::null_mut())
+                .map_err(|_| PzError::Unsupported)?
+        };
+        let write_offsets = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut offsets_buf, CL_BLOCKING, 0, &bit_offsets, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        write_offsets.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Pass 2: write codewords at computed offsets
+        let pass2_event = unsafe {
+            ExecuteKernel::new(&self.kernel_huffman_write_codes)
+                .set_arg(&input_buf)
+                .set_arg(&lut_buf)
+                .set_arg(&offsets_buf)
+                .set_arg(&output_buf)
+                .set_arg(&n_arg)
+                .set_global_work_size(n)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        pass2_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Download output as uint array
+        let mut output_data = vec![0u32; output_uints];
+        let read_out = unsafe {
+            self.queue
+                .enqueue_read_buffer(&output_buf, CL_BLOCKING, 0, &mut output_data, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        read_out.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Convert uint array to bytes (big-endian within each uint to match MSB-first packing)
+        let output_bytes_len = total_bits.div_ceil(8);
+        let mut output_bytes = vec![0u8; output_bytes_len];
+        for (i, &val) in output_data.iter().enumerate() {
+            let base = i * 4;
+            let bytes = val.to_be_bytes();
+            for (j, &b) in bytes.iter().enumerate() {
+                if base + j < output_bytes_len {
+                    output_bytes[base + j] = b;
+                }
+            }
+        }
+
+        Ok((output_bytes, total_bits))
+    }
 }
 
 /// Deduplicate raw GPU match output into a non-overlapping match sequence.
@@ -1893,5 +2162,110 @@ mod tests {
         let compressed = crate::optimal::compress_optimal_with_table(&input, &table).unwrap();
         let decompressed = crate::lz77::decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
+    }
+
+    // --- GPU Huffman encoding tests ---
+
+    #[test]
+    fn test_gpu_byte_histogram() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input = b"aabbccdd";
+        let hist = engine.byte_histogram(input).unwrap();
+        assert_eq!(hist[b'a' as usize], 2);
+        assert_eq!(hist[b'b' as usize], 2);
+        assert_eq!(hist[b'c' as usize], 2);
+        assert_eq!(hist[b'd' as usize], 2);
+        assert_eq!(hist[0], 0);
+    }
+
+    #[test]
+    fn test_gpu_byte_histogram_empty() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let hist = engine.byte_histogram(&[]).unwrap();
+        assert!(hist.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn test_gpu_huffman_encode_round_trip() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input = b"hello world hello world hello world!";
+        let tree = crate::huffman::HuffmanTree::from_data(input).unwrap();
+
+        // Build the packed LUT: (bits << 24) | codeword
+        let mut code_lut = [0u32; 256];
+        for byte in 0..=255u8 {
+            let (codeword, bits) = tree.get_code(byte);
+            code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+        }
+
+        let (gpu_encoded, gpu_bits) = engine.huffman_encode(input, &code_lut).unwrap();
+        let (cpu_encoded, cpu_bits) = tree.encode(input).unwrap();
+
+        assert_eq!(gpu_bits, cpu_bits, "bit counts differ");
+        // The byte representations should match
+        assert_eq!(
+            gpu_encoded,
+            cpu_encoded,
+            "encoded data differs: gpu {} bytes, cpu {} bytes",
+            gpu_encoded.len(),
+            cpu_encoded.len()
+        );
+
+        // Verify round-trip by decoding with CPU decoder
+        let decoded = tree.decode(&gpu_encoded, gpu_bits).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_gpu_huffman_encode_larger() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend_from_slice(pattern);
+        }
+
+        let tree = crate::huffman::HuffmanTree::from_data(&input).unwrap();
+        let mut code_lut = [0u32; 256];
+        for byte in 0..=255u8 {
+            let (codeword, bits) = tree.get_code(byte);
+            code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+        }
+
+        let (gpu_encoded, gpu_bits) = engine.huffman_encode(&input, &code_lut).unwrap();
+        let decoded = tree.decode(&gpu_encoded, gpu_bits).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_gpu_is_cpu_device() {
+        // Just verify the method doesn't panic
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+        // The value depends on hardware — just check it returns a bool
+        let _is_cpu = engine.is_cpu_device();
     }
 }
