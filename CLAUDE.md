@@ -33,10 +33,10 @@ Before every commit, **always** run (the pre-commit hook handles 1 and 2 automat
 
 ## Project layout
 - `src/lib.rs` — crate root, module declarations
-- `src/{algorithm}.rs` — one file per composable algorithm (bwt, deflate, fse, huffman, lz77, mtf, rangecoder, rle)
+- `src/{algorithm}.rs` — one file per composable algorithm (bwt, deflate, fse, huffman, lz77, mtf, rangecoder, rans, rle)
 - `src/analysis.rs` — data profiling for pipeline auto-selection (entropy, match density, etc.)
 - `src/optimal.rs` — optimal LZ77 parsing via backward DP (match table + cost model)
-- `src/pipeline.rs` — multi-stage compression pipelines (Deflate, Bw, Lza), auto-selection
+- `src/pipeline.rs` — multi-stage compression pipelines (Deflate, Bw, Lza, Lzr), auto-selection
 - `src/frequency.rs` — shared frequency table used by entropy coders (SIMD-accelerated counting)
 - `src/simd.rs` — SIMD-accelerated primitives (SSE2/AVX2 for x86_64, NEON stubs for aarch64)
 - `src/opencl.rs` — OpenCL GPU backend (feature-gated behind `opencl`)

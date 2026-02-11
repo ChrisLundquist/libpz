@@ -4,8 +4,8 @@ Detailed implementation notes, benchmarks, and roadmap for libpz.
 For day-to-day development instructions, see `CLAUDE.md`.
 
 ## Completed milestones (11/12)
-- **Algorithms:** LZ77 (brute, hashchain, lazy, parallel), Huffman, BWT (SA-IS), MTF, RLE, RangeCoder, FSE
-- **Pipelines:** Deflate (LZ77+Huffman), Bw (BWT+MTF+RLE+RC), Lza (LZ77+RC) — Deflate and Lza use multi-stream entropy coding for ~16-18% better compression
+- **Algorithms:** LZ77 (brute, hashchain, lazy, parallel), Huffman, BWT (SA-IS), MTF, RLE, RangeCoder, FSE, rANS
+- **Pipelines:** Deflate (LZ77+Huffman), Bw (BWT+MTF+RLE+RC), Lza (LZ77+RC), Lzr (LZ77+rANS) — Deflate, Lza, and Lzr use multi-stream entropy coding for ~16-18% better compression
 - **Auto-selection:** Heuristic (`select_pipeline`) and trial-based (`select_pipeline_trial`) pipeline selection using data analysis (entropy, match density, run ratio, autocorrelation)
 - **Data analysis:** `src/analysis.rs` — statistical profiling (Shannon entropy, autocorrelation, run ratio, match density, distribution shape) with sampling support
 - **Optimal parsing:** GPU top-K match table → CPU backward DP (4-6% better compression)
@@ -16,6 +16,11 @@ For day-to-day development instructions, see `CLAUDE.md`.
 ### Not started
 - M5.3: Fuzz testing (`cargo-fuzz`)
 - M12: Vulkan compute backend
+
+### Partially complete
+- **rANS SIMD decode paths** — N-way interleaved rANS decode in `src/simd.rs` (SSE2 4-way, AVX2 8-way). The scalar interleaved encoder/decoder is implemented; SIMD intrinsics for the hot decode loop are not yet wired.
+- **rANS OpenCL kernels** — GPU rANS encode/decode kernels (~200 lines). The CPU implementation and pipeline integration are done; GPU kernels are not yet written.
+- **rANS reciprocal multiplication** — Replace division in the encode loop with precomputed reciprocal multiply-shift for GPU/SIMD (avoids data-dependent division). Documented as future optimization due to u32 overflow edge cases with small frequencies.
 
 ## BWT implementation
 - **CPU:** Uses SA-IS (Suffix Array by Induced Sorting) — O(n) linear time via doubled-text-with-sentinel strategy.
@@ -78,6 +83,87 @@ gains are on big files (E.coli: -21% size, +11% decode throughput; bible.txt:
 -14% size, +16% decode throughput). Small files (< 4 KB) may see slight
 expansion due to the overhead of three separate stream headers — the encoder
 automatically falls back to single-stream when multi-stream would be larger.
+
+## rANS entropy coder
+
+`src/rans.rs` implements **range ANS (rANS)**, a streaming entropy coder that
+uses multiply-shift arithmetic instead of table lookups (FSE/tANS) or bit-level
+tree walks (Huffman). rANS approaches Shannon entropy like arithmetic/range
+coding but with a simpler, more parallelizable decode hot path.
+
+### Comparison with other entropy coders
+
+| Property          | Huffman | Range Coder | FSE (tANS) | rANS       |
+|-------------------|---------|-------------|------------|------------|
+| Decode operation  | Bit-level tree walk | Division | Table lookup | Multiply + lookup |
+| I/O granularity   | Bits    | Bytes       | Bits       | 16-bit words |
+| Branch predict    | Poor    | Moderate    | Good       | Good       |
+| State independence| N/A     | Fully serial| Awkward    | Interleave N states |
+| GPU shared memory | Large trees | Poor fit | Large tables | Small freq tables |
+
+### Variants
+
+- **Single-stream** (`encode` / `decode`): Reference scalar implementation.
+  32-bit state in `[2^16, 2^32)`, 16-bit word I/O.
+- **Interleaved N-way** (`encode_interleaved` / `decode_interleaved`): N
+  independent rANS states with round-robin symbol assignment. Default N=4
+  (maps to SSE2 lanes). All N decode chains run in parallel with zero data
+  dependencies between them.
+
+### Encoding format
+
+**Single-stream:**
+```
+[scale_bits: u8] [freq_table: 256 × u16 LE] [final_state: u32 LE]
+[num_words: u32 LE] [words: num_words × u16 LE]
+```
+
+**Interleaved N-way:**
+```
+[scale_bits: u8] [freq_table: 256 × u16 LE] [num_states: u8]
+[final_states: N × u32 LE] [num_words: N × u32 LE]
+[stream_0_words] [stream_1_words] ... [stream_N-1_words]
+```
+
+Header overhead is 521 bytes (1 + 512 + 4 + 4) for single-stream, making rANS
+most effective for inputs larger than ~1 KB.
+
+### Frequency normalization
+
+Frequencies are normalized to sum to `1 << scale_bits` (default 12 bits = 4096).
+Every symbol present in the input gets at least frequency 1. Excess is trimmed
+from the most-frequent symbol; deficit is added to it. The normalization code
+is shared conceptually with `src/fse.rs` (both operate on power-of-2 tables).
+
+### Pipeline: Lzr (LZ77 + rANS)
+
+`Pipeline::Lzr` (ID 3) reuses the existing multi-stream LZ77 architecture
+(offsets, lengths, literals) with rANS as the entropy coder instead of Huffman
+(Deflate) or Range Coder (Lza). It participates in auto-selection via
+`select_pipeline_trial()`.
+
+### Forward TODOs
+
+1. **SIMD decode paths** (~150 lines in `src/simd.rs`): Wire SSE2 4-way and
+   AVX2 8-way intrinsics into the interleaved decode loop. The scalar N-way
+   interleave already handles the data layout; SIMD replaces the per-state
+   multiply-shift with packed 32×32→64 multiplies (`_mm_mul_epu32` /
+   `_mm256_mul_epu32`).
+
+2. **OpenCL kernels** (~200 lines in `kernels/rans.cl`): GPU rANS encode and
+   decode. The interleaved format maps directly to GPU work-items (one state
+   per thread, 32–256 threads). Frequency tables fit in `__local` memory
+   (2 KB for 256×u16 + 256×u16 cumulative).
+
+3. **Reciprocal multiplication trick**: Replace `x / freq` and `x % freq` in
+   the encode loop with precomputed `ceil(2^(32+shift) / freq)` reciprocals.
+   This eliminates data-dependent divisions (critical for GPU throughput).
+   Not yet implemented due to u32 overflow edge cases when `freq` is small;
+   needs u64 intermediate arithmetic or per-frequency shift selection.
+
+4. **Benchmark integration**: Add rANS and Lzr pipeline to
+   `benches/throughput.rs` and `benches/stages.rs` for head-to-head comparison
+   with Huffman, Range Coder, and FSE.
 
 ## SIMD acceleration
 `src/simd.rs` provides runtime-dispatched SIMD for CPU hot paths:
@@ -172,6 +258,26 @@ GPU BWT radix sort is 7-14x faster than the old bitonic sort. Still slower than 
    is already done (ByteHistogram optimization), but the match download is unavoidable.
 
 ## Next steps
+
+### Priority 0: rANS SIMD + GPU completion
+Three pieces remain to complete the rANS integration (~350 lines total):
+
+1. **SIMD decode paths** (~150 lines in `src/simd.rs`): SSE2 4-way and AVX2 8-way
+   intrinsics for the interleaved rANS decode hot loop. The scalar N-way interleave
+   is implemented; SIMD replaces per-state multiply-shift with packed `_mm_mul_epu32` /
+   `_mm256_mul_epu32`. Expected 3-4x decode throughput improvement.
+
+2. **OpenCL rANS kernels** (~200 lines in `kernels/rans_decode.cl`): GPU decode
+   kernel mapping one rANS state per work-item. Frequency + cumulative tables in
+   `__local` memory (2 KB). The interleaved format maps directly: each work-item
+   independently decodes its symbol stream, then results are scattered to output
+   positions. Encode kernel is lower priority (CPU encode + GPU decode is the
+   typical asymmetric pattern).
+
+3. **Reciprocal multiplication trick**: Replace `x / freq` and `x % freq` with
+   precomputed `ceil(2^(32+shift) / freq)` reciprocals to eliminate data-dependent
+   division in encode. Needs u64 intermediate arithmetic or per-frequency adaptive
+   shift to handle overflow when `freq` is small. Critical for GPU encode throughput.
 
 ### Priority 1: Use local/shared memory in LZ77 hash kernel
 - Load hash buckets into `__local` memory for faster repeated access
