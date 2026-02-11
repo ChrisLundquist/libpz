@@ -1642,10 +1642,9 @@ impl OpenClEngine {
             if n == 1 {
                 // Single element: exclusive prefix sum is just 0
                 let zero = vec![0u32; 1];
-                let mut tmp_buf = buf;
                 let write_event = unsafe {
                     self.queue
-                        .enqueue_write_buffer(&mut tmp_buf, CL_BLOCKING, 0, &zero, &[])
+                        .enqueue_write_buffer(buf, CL_BLOCKING, 0, &zero, &[])
                         .map_err(|_| PzError::Unsupported)?
                 };
                 write_event.wait().map_err(|_| PzError::Unsupported)?;
@@ -1706,26 +1705,28 @@ impl OpenClEngine {
 
         let kernel_event = match block_sums_buf {
             Some(sums_buf) => unsafe {
+                let local_mem_bytes = block_size * std::mem::size_of::<cl_uint>();
                 ExecuteKernel::new(&self.kernel_prefix_sum_block)
                     .set_arg(data_buf)
                     .set_arg(sums_buf)
                     .set_arg(&n_arg)
+                    .set_arg_local_buffer(local_mem_bytes)
                     .set_local_work_size(local_size)
                     .set_global_work_size(global_size)
-                    .set_local_arg::<cl_uint>(block_size)
                     .enqueue_nd_range(&self.queue)
                     .map_err(|_| PzError::Unsupported)?
             },
             None => unsafe {
                 // Null block_sums pointer — kernel checks for NULL
                 let null_ptr: *const cl_uint = ptr::null();
+                let local_mem_bytes = block_size * std::mem::size_of::<cl_uint>();
                 ExecuteKernel::new(&self.kernel_prefix_sum_block)
                     .set_arg(data_buf)
                     .set_arg(&null_ptr)
                     .set_arg(&n_arg)
+                    .set_arg_local_buffer(local_mem_bytes)
                     .set_local_work_size(local_size)
                     .set_global_work_size(global_size)
-                    .set_local_arg::<cl_uint>(block_size)
                     .enqueue_nd_range(&self.queue)
                     .map_err(|_| PzError::Unsupported)?
             },
@@ -1743,17 +1744,22 @@ impl OpenClEngine {
         local_size: usize,
     ) -> PzResult<()> {
         let block_size = local_size * 2;
-        let num_blocks = n.div_ceil(block_size);
-        // Dispatch one work-item per element, grouped into the same block structure
-        let global_size = num_blocks * block_size;
         let n_arg = n as cl_uint;
+        let block_size_arg = block_size as cl_uint;
+
+        // Use a local_work_size that doesn't exceed the max work group size.
+        // The kernel computes block_id from gid / block_size, so any valid
+        // local_work_size works.
+        let apply_local = local_size.min(self.max_work_group_size);
+        let global_size = n.div_ceil(apply_local) * apply_local;
 
         let kernel_event = unsafe {
             ExecuteKernel::new(&self.kernel_prefix_sum_apply)
                 .set_arg(data_buf)
                 .set_arg(block_sums_buf)
                 .set_arg(&n_arg)
-                .set_local_work_size(block_size)
+                .set_arg(&block_size_arg)
+                .set_local_work_size(apply_local)
                 .set_global_work_size(global_size)
                 .enqueue_nd_range(&self.queue)
                 .map_err(|_| PzError::Unsupported)?

@@ -322,7 +322,7 @@ fn bench_huffman_gpu(c: &mut Criterion) {
 #[cfg(feature = "opencl")]
 fn bench_deflate_gpu_chained(c: &mut Criterion) {
     use pz::opencl::OpenClEngine;
-    use pz::pipeline::{Backend, CompressOptions, ParseStrategy};
+    use pz::pipeline::CompressOptions;
 
     let engine = match OpenClEngine::new() {
         Ok(e) => std::sync::Arc::new(e),

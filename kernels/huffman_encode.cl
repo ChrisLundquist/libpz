@@ -153,16 +153,18 @@ __kernel void PrefixSumBlock(
 
 // Apply block offsets to produce the final prefix sum.
 // After scanning block totals, add each block's offset to its elements.
+// block_size is passed explicitly so local_work_size can be any valid value.
 __kernel void PrefixSumApply(
     __global unsigned int *data,             // in/out: block-level prefix sums
     __global const unsigned int *block_sums, // scanned block totals
-    const unsigned int n)
+    const unsigned int n,
+    const unsigned int block_size)
 {
     unsigned int gid = get_global_id(0);
     if (gid >= n) return;
 
-    unsigned int group_id = get_group_id(0);
-    if (group_id > 0) {
-        data[gid] += block_sums[group_id];
+    unsigned int block_id = gid / block_size;
+    if (block_id > 0) {
+        data[gid] += block_sums[block_id];
     }
 }
