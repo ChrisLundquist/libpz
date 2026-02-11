@@ -35,6 +35,8 @@ fn usage() {
     eprintln!("  -t, --threads N    Number of threads (0=auto, 1=single-threaded)");
     #[cfg(feature = "opencl")]
     eprintln!("  -g, --gpu          Use GPU (OpenCL) for compression");
+    #[cfg(feature = "webgpu")]
+    eprintln!("  --webgpu           Use GPU (WebGPU/wgpu) for compression");
     eprintln!("  -O, --optimal      Use optimal parsing (best compression, slowest)");
     eprintln!("  --lazy             Use lazy matching (good compression, default)");
     eprintln!("  --greedy           Use greedy matching (fastest, least compression)");
@@ -57,6 +59,7 @@ struct Opts {
     verbose: bool,
     quiet: bool,
     gpu: bool,
+    webgpu: bool,
     auto_select: bool,
     trial_mode: bool,
     parse_strategy: ParseStrategy,
@@ -76,6 +79,7 @@ fn parse_args() -> Opts {
         verbose: false,
         quiet: false,
         gpu: false,
+        webgpu: false,
         auto_select: false,
         trial_mode: false,
         parse_strategy: ParseStrategy::Auto,
@@ -96,6 +100,7 @@ fn parse_args() -> Opts {
             "-v" | "--verbose" => opts.verbose = true,
             "-q" | "--quiet" => opts.quiet = true,
             "-g" | "--gpu" | "--opencl" => opts.gpu = true,
+            "--webgpu" => opts.webgpu = true,
             "-a" | "--auto" => opts.auto_select = true,
             "--trial" => {
                 opts.auto_select = true;
@@ -252,6 +257,46 @@ fn build_cli_options(opts: &Opts) -> CompressOptions {
             eprintln!(
                 "pz: warning: --gpu requires the opencl feature \
                  (build with --features opencl)"
+            );
+        }
+    }
+
+    #[cfg(feature = "webgpu")]
+    {
+        if opts.webgpu {
+            match pz::webgpu::WebGpuEngine::new() {
+                Ok(engine) => {
+                    if opts.verbose {
+                        eprintln!("pz: using WebGPU device: {}", engine.device_name());
+                    }
+                    return CompressOptions {
+                        backend: pipeline::Backend::WebGpu,
+                        threads: opts.threads,
+                        parse_strategy,
+                        #[cfg(feature = "opencl")]
+                        opencl_engine: None,
+                        webgpu_engine: Some(std::sync::Arc::new(engine)),
+                        ..Default::default()
+                    };
+                }
+                Err(_) => {
+                    if !opts.quiet {
+                        eprintln!(
+                            "pz: warning: --webgpu requested but no WebGPU device available, \
+                             falling back to CPU"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "webgpu"))]
+    {
+        if opts.webgpu && !opts.quiet {
+            eprintln!(
+                "pz: warning: --webgpu requires the webgpu feature \
+                 (build with --features webgpu)"
             );
         }
     }

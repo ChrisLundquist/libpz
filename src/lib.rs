@@ -18,6 +18,9 @@ pub mod simd;
 #[cfg(feature = "opencl")]
 pub mod opencl;
 
+#[cfg(feature = "webgpu")]
+pub mod webgpu;
+
 pub mod ffi;
 
 #[cfg(test)]
