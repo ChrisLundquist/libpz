@@ -234,6 +234,10 @@ pub struct OpenClEngine {
     kernel_huffman_write_codes: Kernel,
     /// Compiled byte histogram kernel.
     kernel_byte_histogram: Kernel,
+    /// Compiled block-level prefix sum kernel (Blelloch scan).
+    kernel_prefix_sum_block: Kernel,
+    /// Compiled prefix sum apply-offsets kernel.
+    kernel_prefix_sum_apply: Kernel,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum work-group size.
@@ -390,6 +394,12 @@ impl OpenClEngine {
         let kernel_byte_histogram =
             Kernel::create(&program_huffman, "ByteHistogram").map_err(|_| PzError::Unsupported)?;
 
+        let kernel_prefix_sum_block =
+            Kernel::create(&program_huffman, "PrefixSumBlock").map_err(|_| PzError::Unsupported)?;
+
+        let kernel_prefix_sum_apply =
+            Kernel::create(&program_huffman, "PrefixSumApply").map_err(|_| PzError::Unsupported)?;
+
         Ok(OpenClEngine {
             _device: device,
             context,
@@ -411,6 +421,8 @@ impl OpenClEngine {
             kernel_huffman_bit_lengths,
             kernel_huffman_write_codes,
             kernel_byte_histogram,
+            kernel_prefix_sum_block,
+            kernel_prefix_sum_apply,
             device_name,
             max_work_group_size,
             is_cpu,
@@ -1619,6 +1631,346 @@ impl OpenClEngine {
 
         Ok((output_bytes, total_bits))
     }
+
+    /// Perform an exclusive prefix sum on a GPU buffer in-place.
+    ///
+    /// Uses Blelloch scan (work-efficient parallel prefix sum) with
+    /// multi-level reduction for large arrays. Avoids downloading
+    /// the buffer to the host for CPU prefix sum.
+    pub fn prefix_sum_gpu(&self, buf: &mut Buffer<cl_uint>, n: usize) -> PzResult<()> {
+        if n <= 1 {
+            if n == 1 {
+                // Single element: exclusive prefix sum is just 0
+                let zero = vec![0u32; 1];
+                let mut tmp_buf = buf;
+                let write_event = unsafe {
+                    self.queue
+                        .enqueue_write_buffer(&mut tmp_buf, CL_BLOCKING, 0, &zero, &[])
+                        .map_err(|_| PzError::Unsupported)?
+                };
+                write_event.wait().map_err(|_| PzError::Unsupported)?;
+            }
+            return Ok(());
+        }
+
+        // Use a work-group size that processes 2 elements each (Blelloch scan)
+        let max_wg = self.max_work_group_size.min(256);
+        let block_size = max_wg * 2; // each work-item handles 2 elements
+
+        if n <= block_size {
+            // Single work-group: no need for multi-level scan
+            self.run_prefix_sum_block(buf, None, n, max_wg)?;
+            return Ok(());
+        }
+
+        // Multi-level: split into blocks, scan each, collect block totals
+        let num_blocks = n.div_ceil(block_size);
+
+        // Allocate block sums buffer
+        let mut block_sums_buf = unsafe {
+            Buffer::<cl_uint>::create(
+                &self.context,
+                CL_MEM_READ_WRITE,
+                num_blocks,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        // Level 1: scan each block, output block totals
+        self.run_prefix_sum_block(buf, Some(&mut block_sums_buf), n, max_wg)?;
+
+        // Level 2: recursively scan block totals
+        if num_blocks > 1 {
+            self.prefix_sum_gpu(&mut block_sums_buf, num_blocks)?;
+        }
+
+        // Level 3: apply block offsets to elements
+        self.run_prefix_sum_apply(buf, &block_sums_buf, n, max_wg)?;
+
+        Ok(())
+    }
+
+    /// Run the PrefixSumBlock kernel on a single level.
+    fn run_prefix_sum_block(
+        &self,
+        data_buf: &mut Buffer<cl_uint>,
+        block_sums_buf: Option<&mut Buffer<cl_uint>>,
+        n: usize,
+        local_size: usize,
+    ) -> PzResult<()> {
+        let block_size = local_size * 2;
+        let num_blocks = n.div_ceil(block_size);
+        let global_size = num_blocks * local_size;
+        let n_arg = n as cl_uint;
+
+        let kernel_event = match block_sums_buf {
+            Some(sums_buf) => unsafe {
+                ExecuteKernel::new(&self.kernel_prefix_sum_block)
+                    .set_arg(data_buf)
+                    .set_arg(sums_buf)
+                    .set_arg(&n_arg)
+                    .set_local_work_size(local_size)
+                    .set_global_work_size(global_size)
+                    .set_local_arg::<cl_uint>(block_size)
+                    .enqueue_nd_range(&self.queue)
+                    .map_err(|_| PzError::Unsupported)?
+            },
+            None => unsafe {
+                // Null block_sums pointer — kernel checks for NULL
+                let null_ptr: *const cl_uint = ptr::null();
+                ExecuteKernel::new(&self.kernel_prefix_sum_block)
+                    .set_arg(data_buf)
+                    .set_arg(&null_ptr)
+                    .set_arg(&n_arg)
+                    .set_local_work_size(local_size)
+                    .set_global_work_size(global_size)
+                    .set_local_arg::<cl_uint>(block_size)
+                    .enqueue_nd_range(&self.queue)
+                    .map_err(|_| PzError::Unsupported)?
+            },
+        };
+        kernel_event.wait().map_err(|_| PzError::Unsupported)?;
+        Ok(())
+    }
+
+    /// Run the PrefixSumApply kernel to add block offsets.
+    fn run_prefix_sum_apply(
+        &self,
+        data_buf: &mut Buffer<cl_uint>,
+        block_sums_buf: &Buffer<cl_uint>,
+        n: usize,
+        local_size: usize,
+    ) -> PzResult<()> {
+        let block_size = local_size * 2;
+        let num_blocks = n.div_ceil(block_size);
+        // Dispatch one work-item per element, grouped into the same block structure
+        let global_size = num_blocks * block_size;
+        let n_arg = n as cl_uint;
+
+        let kernel_event = unsafe {
+            ExecuteKernel::new(&self.kernel_prefix_sum_apply)
+                .set_arg(data_buf)
+                .set_arg(block_sums_buf)
+                .set_arg(&n_arg)
+                .set_local_work_size(block_size)
+                .set_global_work_size(global_size)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        kernel_event.wait().map_err(|_| PzError::Unsupported)?;
+        Ok(())
+    }
+
+    /// Encode data using Huffman coding entirely on the GPU with GPU prefix sum.
+    ///
+    /// Same as `huffman_encode` but uses the GPU Blelloch scan for the prefix
+    /// sum instead of downloading to host. Eliminates one host↔device round-trip.
+    pub fn huffman_encode_gpu_scan(
+        &self,
+        input: &[u8],
+        code_lut: &[u32; 256],
+    ) -> PzResult<(Vec<u8>, usize)> {
+        if input.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let n = input.len();
+
+        // Create buffers
+        let mut input_buf = unsafe {
+            Buffer::<u8>::create(&self.context, CL_MEM_READ_ONLY, n, ptr::null_mut())
+                .map_err(|_| PzError::Unsupported)?
+        };
+
+        let mut lut_buf = unsafe {
+            Buffer::<cl_uint>::create(&self.context, CL_MEM_READ_ONLY, 256, ptr::null_mut())
+                .map_err(|_| PzError::Unsupported)?
+        };
+
+        // bit_lengths_buf will also serve as bit_offsets_buf after prefix sum
+        let mut bit_lengths_buf = unsafe {
+            Buffer::<cl_uint>::create(&self.context, CL_MEM_READ_WRITE, n, ptr::null_mut())
+                .map_err(|_| PzError::Unsupported)?
+        };
+
+        // Upload input and LUT
+        let write_input = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut input_buf, CL_BLOCKING, 0, input, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        write_input.wait().map_err(|_| PzError::Unsupported)?;
+
+        let write_lut = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut lut_buf, CL_BLOCKING, 0, code_lut, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        write_lut.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Pass 1: compute bit lengths per symbol
+        let n_arg = n as cl_uint;
+        let pass1_event = unsafe {
+            ExecuteKernel::new(&self.kernel_huffman_bit_lengths)
+                .set_arg(&input_buf)
+                .set_arg(&lut_buf)
+                .set_arg(&bit_lengths_buf)
+                .set_arg(&n_arg)
+                .set_global_work_size(n)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        pass1_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // We need the total bits before doing the scan.
+        // Read the last element + its bit length to get the total.
+        // First, save the last element before the scan overwrites it.
+        let mut last_val = vec![0u32; 1];
+        let read_last = unsafe {
+            self.queue
+                .enqueue_read_buffer(
+                    &bit_lengths_buf,
+                    CL_BLOCKING,
+                    (n - 1) * std::mem::size_of::<cl_uint>(),
+                    &mut last_val,
+                    &[],
+                )
+                .map_err(|_| PzError::Unsupported)?
+        };
+        read_last.wait().map_err(|_| PzError::Unsupported)?;
+        let last_bit_length = last_val[0];
+
+        // GPU prefix sum (exclusive): bit_lengths → bit_offsets
+        self.prefix_sum_gpu(&mut bit_lengths_buf, n)?;
+
+        // Read the last offset to compute total_bits
+        let mut last_offset = vec![0u32; 1];
+        let read_offset = unsafe {
+            self.queue
+                .enqueue_read_buffer(
+                    &bit_lengths_buf,
+                    CL_BLOCKING,
+                    (n - 1) * std::mem::size_of::<cl_uint>(),
+                    &mut last_offset,
+                    &[],
+                )
+                .map_err(|_| PzError::Unsupported)?
+        };
+        read_offset.wait().map_err(|_| PzError::Unsupported)?;
+        let total_bits = (last_offset[0] + last_bit_length) as usize;
+
+        // Allocate output buffer
+        let output_uints = total_bits.div_ceil(32);
+        if output_uints == 0 {
+            return Ok((Vec::new(), 0));
+        }
+
+        let mut output_buf = unsafe {
+            Buffer::<cl_uint>::create(
+                &self.context,
+                CL_MEM_READ_WRITE,
+                output_uints,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::Unsupported)?
+        };
+
+        // Zero the output buffer
+        let zeros = vec![0u32; output_uints];
+        let zero_event = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut output_buf, CL_BLOCKING, 0, &zeros, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        zero_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Pass 2: write codewords at GPU-computed offsets
+        let pass2_event = unsafe {
+            ExecuteKernel::new(&self.kernel_huffman_write_codes)
+                .set_arg(&input_buf)
+                .set_arg(&lut_buf)
+                .set_arg(&bit_lengths_buf) // now contains bit_offsets
+                .set_arg(&output_buf)
+                .set_arg(&n_arg)
+                .set_global_work_size(n)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        pass2_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Download output
+        let mut output_data = vec![0u32; output_uints];
+        let read_out = unsafe {
+            self.queue
+                .enqueue_read_buffer(&output_buf, CL_BLOCKING, 0, &mut output_data, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        read_out.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Convert uint array to bytes (big-endian to match MSB-first packing)
+        let output_bytes_len = total_bits.div_ceil(8);
+        let mut output_bytes = vec![0u8; output_bytes_len];
+        for (i, &val) in output_data.iter().enumerate() {
+            let base = i * 4;
+            let bytes = val.to_be_bytes();
+            for (j, &b) in bytes.iter().enumerate() {
+                if base + j < output_bytes_len {
+                    output_bytes[base + j] = b;
+                }
+            }
+        }
+
+        Ok((output_bytes, total_bits))
+    }
+
+    /// GPU-chained Deflate compression: LZ77 + Huffman on GPU.
+    ///
+    /// Performs GPU LZ77 match finding followed by GPU Huffman encoding,
+    /// keeping data flow efficient. The LZ77 output is downloaded once
+    /// for the CPU Huffman tree construction, then the Huffman encoding
+    /// runs on GPU with GPU prefix sum.
+    ///
+    /// Returns the serialized Deflate block data (lz_len + total_bits +
+    /// freq_table + huffman_data), ready for the pipeline container.
+    pub fn deflate_chained(&self, input: &[u8]) -> PzResult<Vec<u8>> {
+        if input.is_empty() {
+            return Err(PzError::InvalidInput);
+        }
+
+        // Stage 1: GPU LZ77 compression
+        let lz_data = self.lz77_compress(input, KernelVariant::HashTable)?;
+        let lz_len = lz_data.len();
+
+        if lz_data.is_empty() {
+            return Err(PzError::InvalidInput);
+        }
+
+        // Stage 2: Build Huffman tree from LZ77 output (CPU — tree construction is fast)
+        let tree = crate::huffman::HuffmanTree::from_data(&lz_data).ok_or(PzError::InvalidInput)?;
+        let freq_table = tree.serialize_frequencies();
+
+        // Build the packed code LUT for GPU
+        let mut code_lut = [0u32; 256];
+        for byte in 0..=255u8 {
+            let (codeword, bits) = tree.get_code(byte);
+            code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+        }
+
+        // Stage 3: GPU Huffman encoding with GPU prefix sum
+        let (huffman_data, total_bits) = self.huffman_encode_gpu_scan(&lz_data, &code_lut)?;
+
+        // Serialize in the same format as the CPU Deflate block
+        let mut output = Vec::new();
+        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
+        output.extend_from_slice(&(total_bits as u32).to_le_bytes());
+        for &freq in &freq_table {
+            output.extend_from_slice(&freq.to_le_bytes());
+        }
+        output.extend_from_slice(&huffman_data);
+
+        Ok(output)
+    }
 }
 
 /// Deduplicate raw GPU match output into a non-overlapping match sequence.
@@ -2267,5 +2619,179 @@ mod tests {
         };
         // The value depends on hardware — just check it returns a bool
         let _is_cpu = engine.is_cpu_device();
+    }
+
+    // --- GPU prefix sum tests ---
+
+    #[test]
+    fn test_gpu_prefix_sum_small() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input = vec![1u32, 2, 3, 4, 5];
+        let n = input.len();
+
+        let mut buf = unsafe {
+            Buffer::<cl_uint>::create(&engine.context, CL_MEM_READ_WRITE, n, ptr::null_mut())
+                .unwrap()
+        };
+        unsafe {
+            engine
+                .queue
+                .enqueue_write_buffer(&mut buf, CL_BLOCKING, 0, &input, &[])
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
+
+        engine.prefix_sum_gpu(&mut buf, n).unwrap();
+
+        let mut result = vec![0u32; n];
+        unsafe {
+            engine
+                .queue
+                .enqueue_read_buffer(&buf, CL_BLOCKING, 0, &mut result, &[])
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
+
+        // Exclusive prefix sum: [0, 1, 3, 6, 10]
+        assert_eq!(result, vec![0, 1, 3, 6, 10]);
+    }
+
+    #[test]
+    fn test_gpu_prefix_sum_large() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        // Large enough to require multi-level scan
+        let n = 2048;
+        let input: Vec<u32> = (0..n as u32).map(|i| (i % 10) + 1).collect();
+
+        let mut buf = unsafe {
+            Buffer::<cl_uint>::create(&engine.context, CL_MEM_READ_WRITE, n, ptr::null_mut())
+                .unwrap()
+        };
+        unsafe {
+            engine
+                .queue
+                .enqueue_write_buffer(&mut buf, CL_BLOCKING, 0, &input, &[])
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
+
+        engine.prefix_sum_gpu(&mut buf, n).unwrap();
+
+        let mut result = vec![0u32; n];
+        unsafe {
+            engine
+                .queue
+                .enqueue_read_buffer(&buf, CL_BLOCKING, 0, &mut result, &[])
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
+
+        // Verify against CPU prefix sum
+        let mut expected = vec![0u32; n];
+        let mut sum: u64 = 0;
+        for i in 0..n {
+            expected[i] = sum as u32;
+            sum += input[i] as u64;
+        }
+
+        assert_eq!(result, expected);
+    }
+
+    // --- GPU Huffman with GPU scan tests ---
+
+    #[test]
+    fn test_gpu_huffman_encode_gpu_scan_round_trip() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input = b"hello world hello world hello world!";
+        let tree = crate::huffman::HuffmanTree::from_data(input).unwrap();
+
+        let mut code_lut = [0u32; 256];
+        for byte in 0..=255u8 {
+            let (codeword, bits) = tree.get_code(byte);
+            code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+        }
+
+        let (gpu_encoded, gpu_bits) = engine.huffman_encode_gpu_scan(input, &code_lut).unwrap();
+        let (cpu_encoded, cpu_bits) = tree.encode(input).unwrap();
+
+        assert_eq!(gpu_bits, cpu_bits, "bit counts differ");
+        assert_eq!(gpu_encoded, cpu_encoded, "encoded data differs");
+
+        let decoded = tree.decode(&gpu_encoded, gpu_bits).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    // --- GPU chained Deflate tests ---
+
+    #[test]
+    fn test_gpu_deflate_chained_round_trip() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input = b"the quick brown fox jumps over the lazy dog. the quick brown fox.";
+        let block_data = engine.deflate_chained(input).unwrap();
+
+        // Decompress using the standard CPU Deflate decoder
+        let decompressed = crate::pipeline::decompress(&{
+            // Build a proper PZ container around the block data
+            let mut container = Vec::new();
+            container.extend_from_slice(&[b'P', b'Z', 1, 0]); // magic + version + pipeline=Deflate
+            container.extend_from_slice(&(input.len() as u32).to_le_bytes());
+            container.extend_from_slice(&block_data);
+            container
+        })
+        .unwrap();
+
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_gpu_deflate_chained_larger() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let mut input = Vec::new();
+        for _ in 0..200 {
+            input.extend_from_slice(pattern);
+        }
+
+        let block_data = engine.deflate_chained(&input).unwrap();
+
+        let decompressed = crate::pipeline::decompress(&{
+            let mut container = Vec::new();
+            container.extend_from_slice(&[b'P', b'Z', 1, 0]);
+            container.extend_from_slice(&(input.len() as u32).to_le_bytes());
+            container.extend_from_slice(&block_data);
+            container
+        })
+        .unwrap();
+
+        assert_eq!(decompressed, input);
     }
 }

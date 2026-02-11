@@ -260,6 +260,109 @@ fn bench_bwt_gpu(c: &mut Criterion) {
 }
 
 #[cfg(feature = "opencl")]
+fn bench_huffman_gpu(c: &mut Criterion) {
+    use pz::opencl::OpenClEngine;
+
+    let engine = match OpenClEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => {
+            eprintln!("stages: no OpenCL device, skipping GPU Huffman benchmarks");
+            return;
+        }
+    };
+
+    let mut group = c.benchmark_group("huffman_gpu");
+    for &size in &[10240, 65536, 262144] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // Build tree and LUT
+        let tree = pz::huffman::HuffmanTree::from_data(&data).unwrap();
+        let mut code_lut = [0u32; 256];
+        for byte in 0..=255u8 {
+            let (codeword, bits) = tree.get_code(byte);
+            code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+        }
+
+        // CPU baseline
+        let tree_clone = tree.clone();
+        group.bench_with_input(
+            BenchmarkId::new("encode_cpu", size),
+            &data,
+            move |b, data| {
+                b.iter(|| tree_clone.encode(data).unwrap());
+            },
+        );
+
+        // GPU with CPU prefix sum
+        let eng1 = engine.clone();
+        let lut1 = code_lut;
+        group.bench_with_input(
+            BenchmarkId::new("encode_gpu_cpu_scan", size),
+            &data,
+            move |b, data| {
+                b.iter(|| eng1.huffman_encode(data, &lut1).unwrap());
+            },
+        );
+
+        // GPU with GPU prefix sum
+        let eng2 = engine.clone();
+        let lut2 = code_lut;
+        group.bench_with_input(
+            BenchmarkId::new("encode_gpu_gpu_scan", size),
+            &data,
+            move |b, data| {
+                b.iter(|| eng2.huffman_encode_gpu_scan(data, &lut2).unwrap());
+            },
+        );
+    }
+    group.finish();
+}
+
+#[cfg(feature = "opencl")]
+fn bench_deflate_gpu_chained(c: &mut Criterion) {
+    use pz::opencl::OpenClEngine;
+    use pz::pipeline::{Backend, CompressOptions, ParseStrategy};
+
+    let engine = match OpenClEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => {
+            eprintln!("stages: no OpenCL device, skipping GPU Deflate chained benchmarks");
+            return;
+        }
+    };
+
+    let mut group = c.benchmark_group("deflate_gpu_chained");
+    for &size in &[65536, 262144, 1048576] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // CPU Deflate (single-threaded)
+        group.bench_with_input(BenchmarkId::new("cpu_1t", size), &data, |b, data| {
+            let opts = CompressOptions {
+                threads: 1,
+                ..Default::default()
+            };
+            b.iter(|| {
+                pz::pipeline::compress_with_options(data, pz::pipeline::Pipeline::Deflate, &opts)
+                    .unwrap()
+            });
+        });
+
+        // GPU chained Deflate
+        let eng = engine.clone();
+        group.bench_with_input(
+            BenchmarkId::new("gpu_chained", size),
+            &data,
+            move |b, data| {
+                b.iter(|| eng.deflate_chained(data).unwrap());
+            },
+        );
+    }
+    group.finish();
+}
+
+#[cfg(feature = "opencl")]
 fn bench_lz77_gpu(c: &mut Criterion) {
     use pz::opencl::{KernelVariant, OpenClEngine};
 
@@ -371,6 +474,12 @@ fn bench_bwt_gpu(_c: &mut Criterion) {}
 #[cfg(not(feature = "opencl"))]
 fn bench_lz77_gpu(_c: &mut Criterion) {}
 
+#[cfg(not(feature = "opencl"))]
+fn bench_huffman_gpu(_c: &mut Criterion) {}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_deflate_gpu_chained(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_bwt,
@@ -385,6 +494,8 @@ criterion_group!(
     bench_analysis,
     bench_auto_select,
     bench_bwt_gpu,
-    bench_lz77_gpu
+    bench_lz77_gpu,
+    bench_huffman_gpu,
+    bench_deflate_gpu_chained
 );
 criterion_main!(benches);

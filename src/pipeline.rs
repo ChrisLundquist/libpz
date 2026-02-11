@@ -982,6 +982,18 @@ fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResu
 /// Compress a single block using the Deflate pipeline (no container header).
 /// Returns pipeline-specific metadata + compressed data.
 fn compress_block_deflate(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
+    // GPU chained path: LZ77 + Huffman on GPU without host round-trip
+    #[cfg(feature = "opencl")]
+    {
+        if let Backend::OpenCl = options.backend {
+            if let Some(ref engine) = options.opencl_engine {
+                if !engine.is_cpu_device() && input.len() >= crate::opencl::MIN_GPU_INPUT_SIZE {
+                    return engine.deflate_chained(input);
+                }
+            }
+        }
+    }
+
     let block = StageBlock {
         block_index: 0,
         original_len: input.len(),

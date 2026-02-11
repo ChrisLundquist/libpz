@@ -80,3 +80,89 @@ __kernel void ByteHistogram(
 
     atomic_inc(&histogram[data[gid]]);
 }
+
+// Block-level exclusive prefix sum using work-group local memory.
+// Processes one block of up to `block_size` elements per work-group.
+// Uses Blelloch scan (up-sweep + down-sweep) within each work-group.
+//
+// For inputs larger than one work-group, the host must:
+// 1. Run PrefixSumBlock on each block, collecting block totals
+// 2. Recursively scan block totals
+// 3. Run PrefixSumApply to add block offsets
+__kernel void PrefixSumBlock(
+    __global unsigned int *data,       // in/out: values to scan
+    __global unsigned int *block_sums, // out: total for each block (may be NULL for single-block)
+    const unsigned int n,              // total number of elements
+    __local unsigned int *temp)        // local memory: 2 * local_size uints
+{
+    unsigned int lid = get_local_id(0);
+    unsigned int gid = get_global_id(0);
+    unsigned int group_id = get_group_id(0);
+    unsigned int local_size = get_local_size(0);
+    unsigned int block_size = local_size * 2;
+
+    // Load two elements per work-item into local memory
+    unsigned int ai = lid;
+    unsigned int bi = lid + local_size;
+    unsigned int ga = group_id * block_size + ai;
+    unsigned int gb = group_id * block_size + bi;
+
+    temp[ai] = (ga < n) ? data[ga] : 0;
+    temp[bi] = (gb < n) ? data[gb] : 0;
+
+    // Up-sweep (reduce) phase
+    unsigned int offset = 1;
+    for (unsigned int d = block_size >> 1; d > 0; d >>= 1) {
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lid < d) {
+            unsigned int ai2 = offset * (2 * lid + 1) - 1;
+            unsigned int bi2 = offset * (2 * lid + 2) - 1;
+            temp[bi2] += temp[ai2];
+        }
+        offset <<= 1;
+    }
+
+    // Save block total and set last element to 0 for exclusive scan
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid == 0) {
+        if (block_sums != 0) {
+            block_sums[group_id] = temp[block_size - 1];
+        }
+        temp[block_size - 1] = 0;
+    }
+
+    // Down-sweep phase
+    for (unsigned int d = 1; d < block_size; d <<= 1) {
+        offset >>= 1;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lid < d) {
+            unsigned int ai2 = offset * (2 * lid + 1) - 1;
+            unsigned int bi2 = offset * (2 * lid + 2) - 1;
+            unsigned int t = temp[ai2];
+            temp[ai2] = temp[bi2];
+            temp[bi2] += t;
+        }
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Write results back to global memory
+    if (ga < n) data[ga] = temp[ai];
+    if (gb < n) data[gb] = temp[bi];
+}
+
+// Apply block offsets to produce the final prefix sum.
+// After scanning block totals, add each block's offset to its elements.
+__kernel void PrefixSumApply(
+    __global unsigned int *data,             // in/out: block-level prefix sums
+    __global const unsigned int *block_sums, // scanned block totals
+    const unsigned int n)
+{
+    unsigned int gid = get_global_id(0);
+    if (gid >= n) return;
+
+    unsigned int group_id = get_group_id(0);
+    if (group_id > 0) {
+        data[gid] += block_sums[group_id];
+    }
+}

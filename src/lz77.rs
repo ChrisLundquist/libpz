@@ -532,7 +532,14 @@ pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
 
 /// Minimum input size for parallel LZ77 match finding.
 /// Below this, thread overhead exceeds the benefit.
-const MIN_PARALLEL_SIZE: usize = 64 * 1024;
+/// Set high because each thread must warm up a MAX_WINDOW-sized hash chain,
+/// which is expensive. Need segments large enough to amortize warmup cost.
+const MIN_PARALLEL_SIZE: usize = 256 * 1024;
+
+/// Minimum per-thread segment size for parallel match finding.
+/// Each thread pays ~MAX_WINDOW warmup cost, so segments must be
+/// significantly larger than MAX_WINDOW to see benefit.
+const MIN_SEGMENT_SIZE: usize = 128 * 1024;
 
 /// Pre-computed match candidate at a position.
 /// offset=0 means no match found (literal).
@@ -557,6 +564,15 @@ pub fn compress_lazy_parallel(input: &[u8], num_threads: usize) -> PzResult<Vec<
 
     let threads = num_threads.max(1);
     if threads <= 1 || input.len() < MIN_PARALLEL_SIZE {
+        return compress_lazy(input);
+    }
+
+    // Limit threads so each segment is at least MIN_SEGMENT_SIZE.
+    // This ensures the warmup cost (MAX_WINDOW inserts per thread) is
+    // amortized over enough actual work.
+    let max_useful_threads = input.len() / MIN_SEGMENT_SIZE;
+    let threads = threads.min(max_useful_threads).max(1);
+    if threads <= 1 {
         return compress_lazy(input);
     }
 
@@ -607,9 +623,12 @@ fn build_match_table_parallel(input: &[u8], num_threads: usize) -> Vec<PreMatch>
 
                 // Warm-up: insert positions in the preceding window so the
                 // hash chains have context for positions near the segment start.
-                let warmup_start = seg_start.saturating_sub(MAX_WINDOW);
-                for pos in warmup_start..seg_start {
-                    finder.insert(input, pos);
+                // Skip warmup for the first segment (starts at 0, no prior context).
+                if seg_start > 0 {
+                    let warmup_start = seg_start.saturating_sub(MAX_WINDOW);
+                    for pos in warmup_start..seg_start {
+                        finder.insert(input, pos);
+                    }
                 }
 
                 // Process each position in this segment
@@ -1065,34 +1084,36 @@ mod tests {
     fn test_parallel_round_trip_large() {
         let pattern = b"The quick brown fox jumps over the lazy dog. ";
         let mut input = Vec::new();
-        for _ in 0..2000 {
+        for _ in 0..5830 {
             input.extend_from_slice(pattern);
         }
-        // Should be above MIN_PARALLEL_SIZE
+        // Should be above MIN_PARALLEL_SIZE (256KB = 262144)
         assert!(input.len() >= MIN_PARALLEL_SIZE);
 
-        let compressed = compress_lazy_parallel(&input, 4).unwrap();
+        let compressed = compress_lazy_parallel(&input, 2).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
 
     #[test]
     fn test_parallel_round_trip_binary() {
-        let input: Vec<u8> = (0..=255).cycle().take(100_000).collect();
-        let compressed = compress_lazy_parallel(&input, 4).unwrap();
+        // Just above MIN_PARALLEL_SIZE (256KB) — keeps debug-mode test fast
+        let input: Vec<u8> = (0..=255).cycle().take(260_000).collect();
+        let compressed = compress_lazy_parallel(&input, 2).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
 
     #[test]
     fn test_parallel_various_thread_counts() {
+        // Just above MIN_PARALLEL_SIZE (256KB), keeps debug-mode test fast
         let pattern = b"abcdefghij klmnopqrst uvwxyz 0123456789 ";
         let mut input = Vec::new();
-        for _ in 0..2000 {
+        for _ in 0..6600 {
             input.extend_from_slice(pattern);
         }
 
-        for threads in [1, 2, 4, 8] {
+        for threads in [1, 2, 4] {
             let compressed = compress_lazy_parallel(&input, threads).unwrap();
             let decompressed = decompress(&compressed).unwrap();
             assert_eq!(decompressed, input, "failed with {} threads", threads);
@@ -1101,8 +1122,9 @@ mod tests {
 
     #[test]
     fn test_parallel_all_same_bytes() {
-        let input = vec![0xAA; 100_000];
-        let compressed = compress_lazy_parallel(&input, 4).unwrap();
+        // Just above MIN_PARALLEL_SIZE (256KB)
+        let input = vec![0xAA; 260_000];
+        let compressed = compress_lazy_parallel(&input, 2).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
