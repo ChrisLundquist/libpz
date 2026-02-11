@@ -2202,8 +2202,8 @@ fn dedupe_gpu_matches(gpu_matches: &[GpuMatch], input: &[u8]) -> Vec<Match> {
         };
 
         result.push(Match {
-            offset: gm.offset,
-            length: match_length as u32,
+            offset: gm.offset as u16,
+            length: match_length as u16,
             next,
         });
 
