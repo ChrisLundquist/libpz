@@ -13,6 +13,7 @@ pub mod pipeline;
 pub mod pqueue;
 pub mod rangecoder;
 pub mod rle;
+pub mod simd;
 
 #[cfg(feature = "opencl")]
 pub mod opencl;

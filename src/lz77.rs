@@ -309,6 +309,9 @@ impl HashChainFinder {
     }
 
     /// Find the best match at `pos` in `input`, looking back up to MAX_WINDOW bytes.
+    ///
+    /// Uses SIMD-accelerated byte comparison (SSE2: 16 bytes/cycle,
+    /// AVX2: 32 bytes/cycle) for the inner match extension loop.
     pub(crate) fn find_match(&self, input: &[u8], pos: usize) -> Match {
         let remaining = input.len() - pos;
         if remaining < 3 {
@@ -320,6 +323,7 @@ impl HashChainFinder {
             };
         }
 
+        let dispatcher = crate::simd::Dispatcher::new();
         let h = hash3(input, pos);
         let mut chain_pos = self.head[h] as usize;
         let mut best_offset: u32 = 0;
@@ -328,14 +332,10 @@ impl HashChainFinder {
         let mut chain_count = 0;
 
         while chain_pos >= min_pos && chain_pos < pos && chain_count < MAX_CHAIN {
-            // Compare bytes
-            let mut match_len = 0u32;
-            let max_len = remaining.min(pos - chain_pos) as u32;
-            while match_len < max_len
-                && input[chain_pos + match_len as usize] == input[pos + match_len as usize]
-            {
-                match_len += 1;
-            }
+            // SIMD-accelerated byte comparison
+            let max_len = remaining.min(pos - chain_pos);
+            let match_len = dispatcher.compare_bytes(&input[chain_pos..], &input[pos..]) as u32;
+            let match_len = match_len.min(max_len as u32);
 
             if match_len > best_length && match_len >= MIN_MATCH {
                 best_length = match_len;
@@ -384,12 +384,15 @@ impl HashChainFinder {
     /// For each distinct match length found (>= MIN_MATCH), keeps the
     /// candidate with the smallest offset. Returns up to `k` candidates
     /// sorted by length descending.
+    ///
+    /// Uses SIMD-accelerated byte comparison for match extension.
     pub(crate) fn find_top_k(&self, input: &[u8], pos: usize, k: usize) -> Vec<(u16, u16)> {
         let remaining = input.len() - pos;
         if remaining < MIN_MATCH as usize {
             return Vec::new();
         }
 
+        let dispatcher = crate::simd::Dispatcher::new();
         let h = hash3(input, pos);
         let mut chain_pos = self.head[h] as usize;
         let min_pos = pos.saturating_sub(MAX_WINDOW);
@@ -400,13 +403,9 @@ impl HashChainFinder {
         let mut found: Vec<(u16, u16)> = Vec::new();
 
         while chain_pos >= min_pos && chain_pos < pos && chain_count < MAX_CHAIN {
-            let mut match_len = 0u32;
-            let max_len = remaining.min(pos - chain_pos) as u32;
-            while match_len < max_len
-                && input[chain_pos + match_len as usize] == input[pos + match_len as usize]
-            {
-                match_len += 1;
-            }
+            let max_len = remaining.min(pos - chain_pos);
+            let match_len = dispatcher.compare_bytes(&input[chain_pos..], &input[pos..]) as u32;
+            let match_len = match_len.min(max_len as u32);
 
             if match_len >= MIN_MATCH {
                 let offset = (pos - chain_pos) as u16;

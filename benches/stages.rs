@@ -272,7 +272,8 @@ fn bench_huffman_gpu(c: &mut Criterion) {
     };
 
     let mut group = c.benchmark_group("huffman_gpu");
-    for &size in &[10240, 65536, 262144] {
+    cap(&mut group);
+    for &size in &[10240, 65536, 262_144, 4_194_304, 16_777_216] {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -333,7 +334,8 @@ fn bench_deflate_gpu_chained(c: &mut Criterion) {
     };
 
     let mut group = c.benchmark_group("deflate_gpu_chained");
-    for &size in &[65536, 262144, 1048576] {
+    cap(&mut group);
+    for &size in &[65536, 262_144, 1_048_576, 4_194_304, 16_777_216] {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -448,6 +450,56 @@ fn bench_analysis(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_simd(c: &mut Criterion) {
+    use pz::simd::{scalar, Dispatcher};
+
+    let mut group = c.benchmark_group("simd");
+    for &size in &[1024, 10240, 65536, 262_144, 1_048_576] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // Byte frequency counting: scalar baseline
+        group.bench_with_input(
+            BenchmarkId::new("byte_freq_scalar", size),
+            &data,
+            |b, data| {
+                b.iter(|| scalar::byte_frequencies(data));
+            },
+        );
+
+        // Byte frequency counting: SIMD dispatch
+        group.bench_with_input(
+            BenchmarkId::new("byte_freq_simd", size),
+            &data,
+            |b, data| {
+                let d = Dispatcher::new();
+                b.iter(|| d.byte_frequencies(data));
+            },
+        );
+
+        // Match comparison: create two copies with a known mismatch
+        let mut data2 = data.clone();
+        let mismatch_pos = size / 2;
+        data2[mismatch_pos] ^= 0xFF;
+
+        // Compare bytes: scalar baseline
+        group.bench_with_input(
+            BenchmarkId::new("compare_scalar", size),
+            &data,
+            |b, data| {
+                b.iter(|| scalar::compare_bytes(data, &data2, data.len().min(258)));
+            },
+        );
+
+        // Compare bytes: SIMD dispatch
+        group.bench_with_input(BenchmarkId::new("compare_simd", size), &data, |b, data| {
+            let d = Dispatcher::new();
+            b.iter(|| d.compare_bytes(data, &data2));
+        });
+    }
+    group.finish();
+}
+
 fn bench_auto_select(c: &mut Criterion) {
     use pz::pipeline::{self, CompressOptions};
 
@@ -490,6 +542,7 @@ criterion_group!(
     bench_rle,
     bench_rangecoder,
     bench_fse,
+    bench_simd,
     bench_lz77_parallel,
     bench_analysis,
     bench_auto_select,

@@ -31,7 +31,8 @@ Before every commit, **always** run (the pre-commit hook handles 1 and 2 automat
 - `src/analysis.rs` — data profiling for pipeline auto-selection (entropy, match density, etc.)
 - `src/optimal.rs` — optimal LZ77 parsing via backward DP (match table + cost model)
 - `src/pipeline.rs` — multi-stage compression pipelines (Deflate, Bw, Lza), auto-selection
-- `src/frequency.rs` — shared frequency table used by entropy coders
+- `src/frequency.rs` — shared frequency table used by entropy coders (SIMD-accelerated counting)
+- `src/simd.rs` — SIMD-accelerated primitives (SSE2/AVX2 for x86_64, NEON stubs for aarch64)
 - `src/opencl.rs` — OpenCL GPU backend (feature-gated behind `opencl`)
 - `src/ffi.rs` — C FFI bindings
 - `src/validation.rs` — cross-module integration tests
@@ -63,12 +64,28 @@ Before every commit, **always** run (the pre-commit hook handles 1 and 2 automat
 - **CPU:** Uses SA-IS (Suffix Array by Induced Sorting) — O(n) linear time via doubled-text-with-sentinel strategy.
 - **GPU:** Uses LSB-first 8-bit radix sort with prefix-doubling for suffix array construction. Replaced earlier bitonic sort (PR #21). Features adaptive key width (skip zero-digit radix passes) and event chain batching (one host sync per doubling step). Rank assignment runs on GPU via Blelloch prefix sum + scatter. Still slower than CPU SA-IS at all sizes but dramatically improved from bitonic sort (7-14x faster). The GPU uses circular comparison `(sa[i]+k) % n` vs CPU SA-IS's doubled-text approach — both produce valid BWTs that round-trip correctly.
 
+### SIMD acceleration
+`src/simd.rs` provides runtime-dispatched SIMD for CPU hot paths:
+- **Byte frequency counting** — 4-bank histogramming with AVX2 merge, integrated into `FrequencyTable::count()`
+- **LZ77 match comparison** — SSE2 (16 bytes/cycle) or AVX2 (32 bytes/cycle) `compare_bytes`, integrated into `HashChainFinder::find_match()` and `find_top_k()`
+- **u32 array summation** — widened u64 accumulator lanes for overflow-safe SIMD sum
+
+| Architecture | Baseline | Extended | Status |
+|-------------|----------|----------|--------|
+| x86_64      | SSE2     | AVX2     | Implemented + integrated |
+| aarch64     | NEON     | SVE      | Stubs (dispatch to scalar) |
+
+Runtime detection via `Dispatcher::new()` caches the best ISA level at first call. All SIMD implementations are verified against scalar reference in tests.
+
 ### GPU stage chaining
-The Deflate GPU path now chains LZ77 → Huffman on the GPU:
-1. GPU: LZ77 hash-table kernel → download LZ77 output
-2. CPU: build Huffman tree from LZ77 output (fast)
-3. GPU: Huffman encode with Blelloch prefix sum (no host round-trip for scan)
-4. CPU: download final encoded data
+The Deflate GPU path chains LZ77 → Huffman on the GPU with minimized transfers:
+1. GPU: LZ77 hash-table kernel → download match array → CPU dedupe + serialize
+2. GPU: upload LZ77 bytes once → `ByteHistogram` kernel → download only 256×u32 (1KB)
+3. CPU: build Huffman tree from histogram, produce code LUT
+4. GPU: Huffman encode (reusing LZ77 buffer) with Blelloch prefix sum
+5. GPU: download final encoded bitstream
+
+The `ByteHistogram` kernel eliminates the need to scan LZ77 data on CPU for frequency counting — only 1KB of histogram data is transferred instead of the full LZ77 stream.
 
 This is activated automatically when `Backend::OpenCl` is selected and input ≥ `MIN_GPU_INPUT_SIZE`.
 
@@ -139,20 +156,13 @@ GPU BWT radix sort is 7-14x faster than the old bitonic sort. Still slower than 
 4. **Huffman WriteCodes atomic contention** — Per-bit atomic_or on the output
    buffer limits scaling. Chunk-based packing could reduce contention.
 
-5. **Deflate chained still downloads LZ77 output** — The `deflate_chained` path
-   downloads LZ77 data for CPU tree construction. Using `ByteHistogram` kernel
-   to compute frequencies on-device would reduce the transfer to 1KB (256 freqs).
+5. **LZ77 match array still downloaded for dedupe** — GPU match dedup is sequential
+   and runs on CPU. Keeping serialized LZ77 bytes on GPU for histogram+Huffman
+   is already done (ByteHistogram optimization), but the match download is unavoidable.
 
 ## Next steps
 
-### Priority 1: Eliminate LZ77 download in chained Deflate
-- Run `ByteHistogram` kernel on LZ77 output (already on device)
-- Download only the 256-entry histogram (1KB) instead of full LZ77 output
-- Build Huffman tree from histogram on CPU, upload code table
-- Run Huffman encode on already-on-device LZ77 data
-- Expected to improve Deflate chained throughput significantly at larger sizes
-
-### Priority 2: Use local/shared memory in LZ77 hash kernel
+### Priority 1: Use local/shared memory in LZ77 hash kernel
 - Load hash buckets into `__local` memory for faster repeated access
 - Could improve GPU LZ77 performance at mid-range sizes (64KB-256KB)
 - May lower the GPU crossover point from 256KB toward 64-128KB
@@ -171,3 +181,11 @@ GPU BWT radix sort is 7-14x faster than the old bitonic sort. Still slower than 
 - Run all 3 pipelines on Canterbury + Silesia corpora
 - Measure actual compression ratios vs analysis metrics
 - Tune heuristic decision tree thresholds empirically
+
+### Priority 6: aarch64 NEON/SVE SIMD implementation
+- Replace scalar stubs in `src/simd.rs` with actual NEON intrinsics
+- `compare_bytes`: `vceqq_u8` + `vmovn_u16` for 16-byte comparison
+- `byte_frequencies`: 4-bank unrolled (NEON lacks efficient gather/scatter)
+- `sum_u32`: `vld1q_u32` + `vaddq_u32` + `vaddvq_u32`
+- SVE for ARMv8.2+ (variable-length vectors, predicated operations)
+- Requires aarch64 hardware for benchmarking
