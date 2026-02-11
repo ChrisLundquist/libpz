@@ -26,6 +26,7 @@ use crate::huffman::HuffmanTree;
 use crate::lz77;
 use crate::mtf;
 use crate::rangecoder;
+use crate::rans;
 use crate::rle;
 use crate::{PzError, PzResult};
 
@@ -123,6 +124,8 @@ pub enum Pipeline {
     Bw = 1,
     /// LZ77 + Range coder (lzma-like)
     Lza = 2,
+    /// LZ77 + rANS (fast entropy coding, SIMD/GPU friendly)
+    Lzr = 3,
 }
 
 impl TryFrom<u8> for Pipeline {
@@ -133,6 +136,7 @@ impl TryFrom<u8> for Pipeline {
             0 => Ok(Self::Deflate),
             1 => Ok(Self::Bw),
             2 => Ok(Self::Lza),
+            3 => Ok(Self::Lzr),
             _ => Err(PzError::Unsupported),
         }
     }
@@ -173,6 +177,7 @@ pub fn compress_with_options(
             Pipeline::Deflate => compress_deflate_with_options(input, options),
             Pipeline::Bw => compress_bw_with_options(input, options),
             Pipeline::Lza => compress_lza_with_options(input, options),
+            Pipeline::Lzr => compress_lzr_with_options(input, options),
         };
     }
 
@@ -254,6 +259,7 @@ pub fn decompress_with_threads(input: &[u8], threads: usize) -> PzResult<Vec<u8>
         Pipeline::Deflate => decompress_deflate(payload, orig_len),
         Pipeline::Bw => decompress_bw(payload, orig_len),
         Pipeline::Lza => decompress_lza(payload, orig_len),
+        Pipeline::Lzr => decompress_lzr(payload, orig_len),
     }
 }
 
@@ -294,6 +300,7 @@ fn compress_block(
         Pipeline::Deflate => compress_block_deflate(input, options),
         Pipeline::Bw => compress_block_bw(input, options),
         Pipeline::Lza => compress_block_lza(input, options),
+        Pipeline::Lzr => compress_block_lzr(input, options),
     }
 }
 
@@ -303,6 +310,7 @@ fn decompress_block(payload: &[u8], pipeline: Pipeline, orig_len: usize) -> PzRe
         Pipeline::Deflate => decompress_block_deflate(payload, orig_len),
         Pipeline::Bw => decompress_block_bw(payload, orig_len),
         Pipeline::Lza => decompress_block_lza(payload, orig_len),
+        Pipeline::Lzr => decompress_block_lzr(payload, orig_len),
     }
 }
 
@@ -512,6 +520,7 @@ fn pipeline_stage_count(pipeline: Pipeline) -> usize {
         Pipeline::Deflate => 2,
         Pipeline::Bw => 4,
         Pipeline::Lza => 2,
+        Pipeline::Lzr => 2,
     }
 }
 
@@ -961,6 +970,8 @@ fn run_compress_stage(
         (Pipeline::Bw, 3) => stage_rangecoder_encode_bw(block),
         (Pipeline::Lza, 0) => stage_lz77_compress(block, options),
         (Pipeline::Lza, 1) => stage_rangecoder_encode_lza(block),
+        (Pipeline::Lzr, 0) => stage_lz77_compress(block, options),
+        (Pipeline::Lzr, 1) => stage_rans_encode(block),
         _ => Err(PzError::Unsupported),
     }
 }
@@ -983,6 +994,9 @@ fn run_decompress_stage(
         // Lza: RC decode(0) → LZ77 decompress(1)
         (Pipeline::Lza, 0) => stage_rangecoder_decode_lza(block),
         (Pipeline::Lza, 1) => stage_lz77_decompress(block),
+        // Lzr: rANS decode(0) → LZ77 decompress(1)
+        (Pipeline::Lzr, 0) => stage_rans_decode(block),
+        (Pipeline::Lzr, 1) => stage_lz77_decompress(block),
         _ => Err(PzError::Unsupported),
     }
 }
@@ -1474,6 +1488,152 @@ fn decompress_lza(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     decompress_block_lza(payload, orig_len)
 }
 
+// --- LZR pipeline: LZ77 + rANS ---
+
+/// Lzr stage 1: rANS encoding + serialization.
+///
+/// Multi-stream format (when `block.streams` is `Some`):
+///   [0u32: sentinel] [num_streams: u8] [lz_len: u32]
+///   For each stream:
+///     [original_stream_len: u32] [compressed_stream_len: u32] [rans_data]
+///
+/// Single-stream format (legacy, when `block.streams` is `None`):
+///   [lz_len: u32] [rans_data]
+fn stage_rans_encode(mut block: StageBlock) -> PzResult<StageBlock> {
+    let lz_len = block.metadata.lz_len.unwrap();
+
+    if let Some(streams) = block.streams.take() {
+        // Multi-stream encoding: encode each stream independently with rANS
+        let mut output = Vec::new();
+        output.extend_from_slice(&0u32.to_le_bytes()); // sentinel
+        output.push(streams.len() as u8);
+        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
+
+        for stream in &streams {
+            let rans_data = rans::encode(stream);
+            output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+            output.extend_from_slice(&(rans_data.len() as u32).to_le_bytes());
+            output.extend_from_slice(&rans_data);
+        }
+
+        block.data = output;
+    } else {
+        // Single-stream (legacy) path
+        let rans_data = rans::encode(&block.data);
+        let mut output = Vec::new();
+        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
+        output.extend_from_slice(&rans_data);
+        block.data = output;
+    }
+
+    Ok(block)
+}
+
+/// Lzr decompress stage 0: parse metadata + rANS decode.
+///
+/// Detects multi-stream vs single-stream format by checking the first u32:
+///   - 0 → multi-stream (sentinel)
+///   - non-zero → single-stream (legacy), first u32 is lz_len
+fn stage_rans_decode(mut block: StageBlock) -> PzResult<StageBlock> {
+    if block.data.len() < 4 {
+        return Err(PzError::InvalidInput);
+    }
+
+    let first_u32 =
+        u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]);
+
+    if first_u32 == 0 {
+        // Multi-stream format
+        if block.data.len() < 9 {
+            return Err(PzError::InvalidInput);
+        }
+        let num_streams = block.data[4] as usize;
+        let lz_len =
+            u32::from_le_bytes([block.data[5], block.data[6], block.data[7], block.data[8]])
+                as usize;
+        block.metadata.lz_len = Some(lz_len);
+
+        let mut pos = 9;
+        let mut decoded_streams = Vec::with_capacity(num_streams);
+
+        for _ in 0..num_streams {
+            if pos + 8 > block.data.len() {
+                return Err(PzError::InvalidInput);
+            }
+            let orig_stream_len = u32::from_le_bytes([
+                block.data[pos],
+                block.data[pos + 1],
+                block.data[pos + 2],
+                block.data[pos + 3],
+            ]) as usize;
+            let comp_stream_len = u32::from_le_bytes([
+                block.data[pos + 4],
+                block.data[pos + 5],
+                block.data[pos + 6],
+                block.data[pos + 7],
+            ]) as usize;
+            pos += 8;
+
+            if pos + comp_stream_len > block.data.len() {
+                return Err(PzError::InvalidInput);
+            }
+            let decoded = rans::decode(&block.data[pos..pos + comp_stream_len], orig_stream_len)?;
+            decoded_streams.push(decoded);
+            pos += comp_stream_len;
+        }
+
+        block.streams = Some(decoded_streams);
+        block.data.clear();
+    } else {
+        // Single-stream (legacy) format
+        let lz_len = first_u32 as usize;
+        block.metadata.lz_len = Some(lz_len);
+        block.data = rans::decode(&block.data[4..], lz_len)?;
+    }
+
+    Ok(block)
+}
+
+/// Compress a single block using the Lzr pipeline (no container header).
+fn compress_block_lzr(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
+    let block = StageBlock {
+        block_index: 0,
+        original_len: input.len(),
+        data: input.to_vec(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+    let block = stage_lz77_compress(block, options)?;
+    let block = stage_rans_encode(block)?;
+    Ok(block.data)
+}
+
+fn compress_lzr_with_options(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
+    let block_data = compress_block_lzr(input, options)?;
+    let mut output = Vec::new();
+    write_header(&mut output, Pipeline::Lzr, input.len());
+    output.extend_from_slice(&block_data);
+    Ok(output)
+}
+
+/// Decompress a single Lzr block (no container header).
+fn decompress_block_lzr(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    let block = StageBlock {
+        block_index: 0,
+        original_len: orig_len,
+        data: payload.to_vec(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+    let block = stage_rans_decode(block)?;
+    let block = stage_lz77_decompress(block)?;
+    Ok(block.data)
+}
+
+fn decompress_lzr(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    decompress_block_lzr(payload, orig_len)
+}
+
 // --- Pipeline auto-selection ---
 
 /// Automatically select the best pipeline for the given input data.
@@ -1552,7 +1712,12 @@ pub fn select_pipeline_trial(
         ..options.clone()
     };
 
-    let candidates = [Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza];
+    let candidates = [
+        Pipeline::Deflate,
+        Pipeline::Bw,
+        Pipeline::Lza,
+        Pipeline::Lzr,
+    ];
     let mut best_pipeline = Pipeline::Deflate;
     let mut best_size = usize::MAX;
 
@@ -2332,7 +2497,12 @@ mod tests {
         for _ in 0..100 {
             input.extend_from_slice(pattern);
         }
-        for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+        for &pipeline in &[
+            Pipeline::Deflate,
+            Pipeline::Bw,
+            Pipeline::Lza,
+            Pipeline::Lzr,
+        ] {
             let compressed = compress(&input, pipeline).unwrap();
             let decompressed = decompress(&compressed).unwrap();
             assert_eq!(decompressed, input, "round-trip failed for {:?}", pipeline);
@@ -2382,5 +2552,150 @@ mod tests {
         let block = stage_lz77_decompress(block).unwrap();
         assert!(block.streams.is_none());
         assert_eq!(block.data, input);
+    }
+
+    // --- Lzr pipeline tests ---
+
+    #[test]
+    fn test_lzr_empty() {
+        let result = compress(&[], Pipeline::Lzr).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_lzr_round_trip_hello() {
+        let input = b"hello, world! hello, world!";
+        let compressed = compress(input, Pipeline::Lzr).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lzr_round_trip_repeating() {
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = compress(&input, Pipeline::Lzr).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+        assert!(
+            compressed.len() < input.len(),
+            "compressed {} >= input {}",
+            compressed.len(),
+            input.len()
+        );
+    }
+
+    #[test]
+    fn test_lzr_round_trip_binary() {
+        let input: Vec<u8> = (0..=255).cycle().take(512).collect();
+        let compressed = compress(&input, Pipeline::Lzr).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lzr_round_trip_all_same() {
+        let input = vec![0xAA_u8; 500];
+        let compressed = compress(&input, Pipeline::Lzr).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lzr_multiblock_round_trip() {
+        let pattern = b"Lzr multi-block test data with repetition. ";
+        let mut input = Vec::new();
+        for _ in 0..200 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = compress_mt(&input, Pipeline::Lzr, 4, 1024).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lzr_multiblock_large() {
+        let mut input = Vec::with_capacity(1 << 20);
+        let pattern = b"Lzr multi-stream test data with some repetition. ";
+        while input.len() < (1 << 20) {
+            input.extend_from_slice(pattern);
+        }
+        input.truncate(1 << 20);
+
+        let compressed = compress(&input, Pipeline::Lzr).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lzr_multistream_deinterleave_reinterleave() {
+        // Verify LZ77 deinterleave → rANS encode → rANS decode → reinterleave
+        let input = b"The quick brown fox jumps over the lazy dog. The quick brown fox.";
+        let opts = CompressOptions::default();
+        let block = StageBlock {
+            block_index: 0,
+            original_len: input.len(),
+            data: input.to_vec(),
+            streams: None,
+            metadata: StageMetadata::default(),
+        };
+
+        // LZ77 compress → produces streams
+        let block = stage_lz77_compress(block, &opts).unwrap();
+        assert!(block.streams.is_some());
+        let streams = block.streams.as_ref().unwrap();
+        assert_eq!(streams.len(), 3);
+
+        // rANS encode → serializes streams into data
+        let block = stage_rans_encode(block).unwrap();
+        assert!(block.streams.is_none());
+        assert!(!block.data.is_empty());
+        // Verify multi-stream sentinel
+        let sentinel =
+            u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]);
+        assert_eq!(sentinel, 0, "expected multi-stream sentinel");
+        assert_eq!(block.data[4], 3, "expected 3 streams");
+
+        // rANS decode → restores streams
+        let block = stage_rans_decode(block).unwrap();
+        assert!(block.streams.is_some());
+        let streams = block.streams.as_ref().unwrap();
+        assert_eq!(streams.len(), 3);
+
+        // LZ77 decompress → reinterleaves and decompresses
+        let block = stage_lz77_decompress(block).unwrap();
+        assert!(block.streams.is_none());
+        assert_eq!(block.data, input);
+    }
+
+    #[test]
+    fn test_lzr_pipeline_parallel() {
+        let pattern = b"Lzr pipeline-parallel test data. ";
+        let mut input = Vec::new();
+        for _ in 0..300 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = compress_mt(&input, Pipeline::Lzr, 4, 512).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lzr_trial_selection_candidate() {
+        // Verify Lzr is included in trial selection
+        let pattern = b"Trial selection test data for rANS pipeline. ";
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend_from_slice(pattern);
+        }
+        let opts = CompressOptions {
+            threads: 1,
+            ..CompressOptions::default()
+        };
+        // Just verify it doesn't crash — Lzr may or may not win
+        let _pipeline = select_pipeline_trial(&input, &opts, 2048);
     }
 }
