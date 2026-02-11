@@ -40,13 +40,13 @@ fi
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-# time_ms CMD ARGS... → prints wall-clock milliseconds (float) to stdout
-# Uses /usr/bin/time or bash TIMEFORMAT as fallback
+# time_ns CMD ARGS... → prints wall-clock nanoseconds to stdout
+# macOS `date` lacks %N, so use perl for portable sub-ms precision
 time_ns() {
     local start end
-    start=$(date +%s%N)
+    start=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1e9')
     "$@" >/dev/null 2>&1
-    end=$(date +%s%N)
+    end=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1e9')
     echo $(( end - start ))
 }
 
