@@ -66,6 +66,10 @@ const BWT_SORT_KERNEL_SOURCE: &str = include_str!("../kernels/bwt_sort.cl");
 /// Embedded OpenCL kernel source: top-K match finding for optimal parsing.
 const LZ77_TOPK_KERNEL_SOURCE: &str = include_str!("../kernels/lz77_topk.cl");
 
+/// Embedded OpenCL kernel source: hash-table-based LZ77 match finding.
+/// Two-pass: BuildHashTable scatters positions, FindMatches searches buckets.
+const LZ77_HASH_KERNEL_SOURCE: &str = include_str!("../kernels/lz77_hash.cl");
+
 /// Step size used by the batch kernel (must match STEP_SIZE in lz77_batch.cl).
 const BATCH_STEP_SIZE: usize = 32;
 
@@ -100,6 +104,12 @@ struct GpuCandidate {
     length: u16,
 }
 
+/// Hash table bucket capacity (must match BUCKET_CAP in lz77_hash.cl).
+const HASH_BUCKET_CAP: usize = 64;
+
+/// Hash table size (must match HASH_SIZE in lz77_hash.cl).
+const HASH_TABLE_SIZE: usize = 1 << 15; // 32768
+
 /// Which LZ77 kernel variant to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelVariant {
@@ -109,6 +119,10 @@ pub enum KernelVariant {
     /// Batched: each work-item handles STEP_SIZE positions, 32KB window.
     /// Lower overhead, better for large inputs.
     Batch,
+    /// Hash-table-based: two-pass approach matching the CPU hash-chain
+    /// strategy. Pass 1 builds a hash table, Pass 2 searches buckets.
+    /// Much faster than brute-force for large inputs.
+    HashTable,
 }
 
 /// Information about a discovered OpenCL device.
@@ -186,6 +200,10 @@ pub struct OpenClEngine {
     kernel_bwt_sort_step: Kernel,
     /// Compiled top-K LZ77 match finding kernel.
     kernel_topk: Kernel,
+    /// Compiled hash-table build kernel.
+    kernel_hash_build: Kernel,
+    /// Compiled hash-table find-matches kernel.
+    kernel_hash_find: Kernel,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum work-group size.
@@ -284,6 +302,17 @@ impl OpenClEngine {
         let kernel_topk =
             Kernel::create(&program_topk, "EncodeTopK").map_err(|_| PzError::Unsupported)?;
 
+        // Compile hash-table-based LZ77 kernel (two entry points)
+        let program_hash =
+            Program::create_and_build_from_source(&context, LZ77_HASH_KERNEL_SOURCE, "-Werror")
+                .map_err(|_| PzError::Unsupported)?;
+
+        let kernel_hash_build =
+            Kernel::create(&program_hash, "BuildHashTable").map_err(|_| PzError::Unsupported)?;
+
+        let kernel_hash_find =
+            Kernel::create(&program_hash, "FindMatches").map_err(|_| PzError::Unsupported)?;
+
         Ok(OpenClEngine {
             _device: device,
             context,
@@ -292,6 +321,8 @@ impl OpenClEngine {
             kernel_batch,
             kernel_bwt_sort_step,
             kernel_topk,
+            kernel_hash_build,
+            kernel_hash_find,
             device_name,
             max_work_group_size,
         })
@@ -350,6 +381,9 @@ impl OpenClEngine {
             }
             KernelVariant::Batch => {
                 self.run_batch_kernel(&input_buf, &output_buf, input_len)?;
+            }
+            KernelVariant::HashTable => {
+                self.run_hash_kernel(&input_buf, &output_buf, input_len)?;
             }
         }
 
@@ -413,6 +447,81 @@ impl OpenClEngine {
         };
 
         kernel_event.wait().map_err(|_| PzError::Unsupported)?;
+        Ok(())
+    }
+
+    /// Execute the two-pass hash-table kernel.
+    ///
+    /// Pass 1: BuildHashTable — each work-item hashes its 3-byte prefix
+    /// and atomically appends its position to a bucket.
+    /// Pass 2: FindMatches — each work-item searches its hash bucket
+    /// for the best match (bounded by MAX_CHAIN).
+    fn run_hash_kernel(
+        &self,
+        input_buf: &Buffer<u8>,
+        output_buf: &Buffer<GpuMatch>,
+        input_len: usize,
+    ) -> PzResult<()> {
+        let count = input_len as cl_uint;
+        let table_entries = HASH_TABLE_SIZE * HASH_BUCKET_CAP;
+
+        // Allocate hash table buffers on the device
+        let mut hash_counts_buf = unsafe {
+            Buffer::<cl_uint>::create(
+                &self.context,
+                CL_MEM_READ_WRITE,
+                HASH_TABLE_SIZE,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        let hash_table_buf = unsafe {
+            Buffer::<cl_uint>::create(
+                &self.context,
+                CL_MEM_READ_WRITE,
+                table_entries,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        // Zero the hash counts
+        let zeros = vec![0u32; HASH_TABLE_SIZE];
+        let write_event = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut hash_counts_buf, CL_BLOCKING, 0, &zeros, &[])
+                .map_err(|_| PzError::InvalidInput)?
+        };
+        write_event.wait().map_err(|_| PzError::InvalidInput)?;
+
+        // Pass 1: Build hash table
+        let build_event = unsafe {
+            ExecuteKernel::new(&self.kernel_hash_build)
+                .set_arg(input_buf)
+                .set_arg(&count)
+                .set_arg(&hash_counts_buf)
+                .set_arg(&hash_table_buf)
+                .set_global_work_size(input_len)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        build_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Pass 2: Find matches
+        let find_event = unsafe {
+            ExecuteKernel::new(&self.kernel_hash_find)
+                .set_arg(input_buf)
+                .set_arg(&count)
+                .set_arg(&hash_counts_buf)
+                .set_arg(&hash_table_buf)
+                .set_arg(output_buf)
+                .set_global_work_size(input_len)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        find_event.wait().map_err(|_| PzError::Unsupported)?;
+
         Ok(())
     }
 
@@ -935,6 +1044,97 @@ mod tests {
 
         let result = engine.lz77_compress(b"", KernelVariant::Batch).unwrap();
         assert!(result.is_empty());
+    }
+
+    // --- Hash-table LZ77 GPU tests ---
+
+    #[test]
+    fn test_gpu_lz77_hash_round_trip() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input = b"hello world hello world hello world";
+        let compressed = engine
+            .lz77_compress(input, KernelVariant::HashTable)
+            .expect("GPU hash compression failed");
+
+        let decompressed = crate::lz77::decompress(&compressed).expect("decompression failed");
+        assert_eq!(&decompressed, input);
+    }
+
+    #[test]
+    fn test_gpu_lz77_hash_round_trip_longer() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input = b"the quick brown fox jumps over the lazy dog. the quick brown fox.";
+        let compressed = engine
+            .lz77_compress(input, KernelVariant::HashTable)
+            .expect("GPU hash compression failed");
+
+        let decompressed = crate::lz77::decompress(&compressed).expect("decompression failed");
+        assert_eq!(&decompressed, &input[..]);
+    }
+
+    #[test]
+    fn test_gpu_lz77_hash_round_trip_large() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let pattern = b"Hello, World! This is a test pattern. ";
+        let mut input = Vec::new();
+        for _ in 0..200 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = engine
+            .lz77_compress(&input, KernelVariant::HashTable)
+            .expect("GPU hash compression failed");
+
+        let decompressed = crate::lz77::decompress(&compressed).expect("decompression failed");
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_gpu_lz77_hash_no_matches() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input = b"abcdefgh";
+        let compressed = engine
+            .lz77_compress(input, KernelVariant::HashTable)
+            .expect("GPU hash compression failed");
+
+        let decompressed = crate::lz77::decompress(&compressed).expect("decompression failed");
+        assert_eq!(&decompressed, input);
+    }
+
+    #[test]
+    fn test_gpu_lz77_hash_binary_data() {
+        let engine = match OpenClEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        };
+
+        let input: Vec<u8> = (0..=255).cycle().take(1024).collect();
+        let compressed = engine
+            .lz77_compress(&input, KernelVariant::HashTable)
+            .expect("GPU hash compression failed");
+
+        let decompressed = crate::lz77::decompress(&compressed).expect("decompression failed");
+        assert_eq!(decompressed, input);
     }
 
     // --- BWT GPU tests ---

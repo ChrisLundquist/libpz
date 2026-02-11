@@ -941,8 +941,8 @@ fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResu
                     let table = engine.find_topk_matches(input)?;
                     return crate::optimal::compress_optimal_with_table(input, &table);
                 }
-                // GPU greedy path
-                return engine.lz77_compress(input, crate::opencl::KernelVariant::Batch);
+                // GPU greedy path — use hash-table kernel for better performance
+                return engine.lz77_compress(input, crate::opencl::KernelVariant::HashTable);
             }
         }
     }
