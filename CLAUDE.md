@@ -35,7 +35,7 @@ Before every commit, **always** run (the pre-commit hook handles 1 and 2 automat
 - `src/opencl.rs` — OpenCL GPU backend (feature-gated behind `opencl`)
 - `src/ffi.rs` — C FFI bindings
 - `src/validation.rs` — cross-module integration tests
-- `kernels/*.cl` — OpenCL kernel source (lz77.cl, lz77_batch.cl, lz77_topk.cl, lz77_hash.cl, bwt_sort.cl, huffman_encode.cl)
+- `kernels/*.cl` — OpenCL kernel source (lz77.cl, lz77_batch.cl, lz77_topk.cl, lz77_hash.cl, bwt_radix.cl, bwt_rank.cl, bwt_sort.cl, huffman_encode.cl)
 - `benches/throughput.rs` — end-to-end pipeline benchmarks vs gzip/pigz/zstd, parallel scaling
 - `benches/stages.rs` — per-algorithm scaling benchmarks, GPU vs CPU comparisons
 
@@ -56,12 +56,12 @@ Before every commit, **always** run (the pre-commit hook handles 1 and 2 automat
 - **Data analysis:** `src/analysis.rs` — statistical profiling (Shannon entropy, autocorrelation, run ratio, match density, distribution shape) with sampling support
 - **Optimal parsing:** GPU top-K match table → CPU backward DP (4-6% better compression)
 - **Multi-threading:** Block-parallel and pipeline-parallel via V2 container format; within-block parallel LZ77 match finding (`compress_lazy_parallel`)
-- **GPU kernels:** LZ77 hash-table (fast), LZ77 batch/per-position (legacy), LZ77 top-K, BWT bitonic sort, Huffman encode (two-pass with Blelloch prefix sum), GPU Deflate chaining (LZ77→Huffman on device)
+- **GPU kernels:** LZ77 hash-table (fast), LZ77 batch/per-position (legacy), LZ77 top-K, BWT radix sort + parallel rank assignment, Huffman encode (two-pass with Blelloch prefix sum), GPU Deflate chaining (LZ77→Huffman on device)
 - **Tooling:** CLI (`pz` with `-a`/`--auto` and `--trial` flags), C FFI, Criterion benchmarks, CI (3 OS + OpenCL)
 
 ### BWT implementation
-- **CPU:** Uses SA-IS (Suffix Array by Induced Sorting) — O(n) linear time via doubled-text-with-sentinel strategy. Replaced earlier O(n log²n) naive sort.
-- **GPU:** Still uses bitonic sort for suffix array construction — O(n log²n) with many kernel launches. Significantly slower than CPU SA-IS at all tested sizes. The GPU BWT path is not used in the default pipeline.
+- **CPU:** Uses SA-IS (Suffix Array by Induced Sorting) — O(n) linear time via doubled-text-with-sentinel strategy.
+- **GPU:** Uses LSB-first 8-bit radix sort with prefix-doubling for suffix array construction. Replaced earlier bitonic sort (PR #21). Features adaptive key width (skip zero-digit radix passes) and event chain batching (one host sync per doubling step). Rank assignment runs on GPU via Blelloch prefix sum + scatter. Still slower than CPU SA-IS at all sizes but dramatically improved from bitonic sort (7-14x faster). The GPU uses circular comparison `(sa[i]+k) % n` vs CPU SA-IS's doubled-text approach — both produce valid BWTs that round-trip correctly.
 
 ### GPU stage chaining
 The Deflate GPU path now chains LZ77 → Huffman on the GPU:
@@ -80,10 +80,6 @@ This is activated automatically when `Backend::OpenCl` is selected and input ≥
 ### Not started
 - M5.3: Fuzz testing (`cargo-fuzz`)
 - M12: Vulkan compute backend
-
-### Known issue
-- `test_gpu_bwt_all_same` fails (pre-existing): GPU BWT produces wrong
-  primary_index for all-same-byte inputs due to bitonic sort tie-breaking
 
 ## GPU benchmark results (AMD gfx1201 / RDNA3)
 
@@ -115,22 +111,24 @@ GPU Huffman with Blelloch prefix sum crosses over ~128KB. At 256KB the GPU scan 
 | 256KB | 6.06ms (41 MiB/s) | 4.93ms (51 MiB/s) | **GPU 1.2x faster** |
 | 1MB | 23.5ms (43 MiB/s) | 18.3ms (55 MiB/s) | **GPU 1.3x faster** |
 
-### BWT GPU (bitonic sort — not recommended, SA-IS CPU is faster)
+### BWT GPU (radix sort)
 
-| Size | GPU bitonic | CPU SA-IS |
-|------|------------|-----------|
-| 1KB  | 30ms (33 KiB/s) | ~3µs |
-| 10KB | 42ms (240 KiB/s) | ~50µs |
-| 64KB | 63ms (1 MiB/s) | ~1ms |
+| Size | GPU radix | Throughput | Old bitonic | Speedup vs bitonic |
+|------|-----------|------------|-------------|--------------------|
+| 1KB  | 3.4ms | 295 KiB/s | 23ms | **6.8x** |
+| 10KB | 5.9ms | 1.6 MiB/s | 42ms | **7.1x** |
+| 64KB | 4.1ms | 15.3 MiB/s | 56ms | **13.7x** |
+| 256KB | 11.6ms | 21.6 MiB/s | — | — |
+| 4MB | 333ms | 12.0 MiB/s | — | — |
+| 16MB | 1.73s | 9.2 MiB/s | — | — |
 
-GPU BWT is 30-10,000x slower than CPU SA-IS. The bitonic sort approach has O(log²n) kernel launches with host sync between steps, making it fundamentally unsuitable. CPU SA-IS is O(n) and dominates at all sizes.
+GPU BWT radix sort is 7-14x faster than the old bitonic sort. Still slower than CPU SA-IS at small sizes but becoming competitive at 64KB+ (CPU SA-IS ~1ms at 64KB vs GPU 4.1ms). The gap narrows at larger sizes where GPU parallelism helps more.
 
 ## Remaining GPU bottlenecks
 
-1. **Bitonic sort for BWT** — O(log²n) kernel launches per doubling step, with
-   host↔device sync between steps. CPU SA-IS is O(n) and vastly faster.
-   The GPU BWT path exists but should not be used; it remains as a reference
-   implementation.
+1. **GPU BWT still slower than CPU SA-IS** — Radix sort improved 7-14x over bitonic
+   sort, but CPU SA-IS (O(n)) remains faster at small/medium sizes. GPU catches up
+   at 64KB+ but prefix-doubling's O(n log n) work is inherently more than SA-IS's O(n).
 
 2. **No shared memory usage** — LZ77 hash kernel uses only global memory.
    Loading hash buckets into `__local` memory could help at larger sizes.
@@ -141,21 +139,35 @@ GPU BWT is 30-10,000x slower than CPU SA-IS. The bitonic sort approach has O(log
 4. **Huffman WriteCodes atomic contention** — Per-bit atomic_or on the output
    buffer limits scaling. Chunk-based packing could reduce contention.
 
+5. **Deflate chained still downloads LZ77 output** — The `deflate_chained` path
+   downloads LZ77 data for CPU tree construction. Using `ByteHistogram` kernel
+   to compute frequencies on-device would reduce the transfer to 1KB (256 freqs).
+
 ## Next steps
 
-### Priority 1: Optimize GPU BWT or remove it
-- The GPU BWT bitonic sort path is 10,000x slower than CPU SA-IS at small sizes
-- Options: (a) implement GPU-friendly radix sort, (b) adapt SA-IS for GPU, or (c) remove the GPU BWT path entirely and always use CPU SA-IS
-- Fix `test_gpu_bwt_all_same` bug if keeping the GPU path
+### Priority 1: Eliminate LZ77 download in chained Deflate
+- Run `ByteHistogram` kernel on LZ77 output (already on device)
+- Download only the 256-entry histogram (1KB) instead of full LZ77 output
+- Build Huffman tree from histogram on CPU, upload code table
+- Run Huffman encode on already-on-device LZ77 data
+- Expected to improve Deflate chained throughput significantly at larger sizes
 
-### Priority 2: Use local/shared memory in hash kernel
+### Priority 2: Use local/shared memory in LZ77 hash kernel
 - Load hash buckets into `__local` memory for faster repeated access
 - Could improve GPU LZ77 performance at mid-range sizes (64KB-256KB)
+- May lower the GPU crossover point from 256KB toward 64-128KB
 
-### Priority 3: Benchmark at even larger sizes
-- Add 4MB, 16MB tiers — GPU advantage should grow with size
-- Profile Deflate chained path at larger sizes
+### Priority 3: Chunk-based Huffman bit packing
+- Replace per-bit `atomic_or` in WriteCodes with work-group-local packing
+- Each work-group packs its chunk into local memory (no atomics within WG)
+- Single copy from local → global per chunk
+- Could 5-10x GPU Huffman throughput
 
 ### Priority 4: Fuzz testing
 - Set up `cargo-fuzz` for round-trip correctness on all pipelines
 - Target edge cases in LZ77, Huffman, BWT decode paths
+
+### Priority 5: Auto-selection threshold tuning
+- Run all 3 pipelines on Canterbury + Silesia corpora
+- Measure actual compression ratios vs analysis metrics
+- Tune heuristic decision tree thresholds empirically

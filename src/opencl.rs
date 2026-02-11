@@ -343,7 +343,6 @@ impl OpenClEngine {
         let kernel_hash_find =
             Kernel::create(&program_hash, "FindMatches").map_err(|_| PzError::Unsupported)?;
 
-<<<<<<< HEAD
         // Compile BWT rank assignment kernels with workgroup size define.
         // Cap at 256 and round down to the nearest power of 2 for portability.
         let capped = max_work_group_size.clamp(1, 256);
