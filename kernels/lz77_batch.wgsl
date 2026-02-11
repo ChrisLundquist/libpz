@@ -24,15 +24,15 @@ fn read_byte(pos: u32) -> u32 {
     return (input[word_idx] >> (byte_idx * 8u)) & 0xFFu;
 }
 
-fn find_match_classic(search_start: u32, search_size: u32, target: u32, target_size: u32) -> Lz77Match {
+fn find_match_classic(search_start: u32, search_size: u32, tgt: u32, tgt_size: u32) -> Lz77Match {
     var best: Lz77Match;
     best.offset = 0u;
     best.length = 0u;
-    best.next = read_byte(target);
+    best.next = read_byte(tgt);
 
     for (var i = 0u; i < search_size; i = i + 1u) {
-        if (best.length > 0u && (i + best.length) < search_size && best.length < target_size) {
-            if (read_byte(search_start + i + best.length) != read_byte(target + best.length)) {
+        if (best.length > 0u && (i + best.length) < search_size && best.length < tgt_size) {
+            if (read_byte(search_start + i + best.length) != read_byte(tgt + best.length)) {
                 continue;
             }
         }
@@ -40,10 +40,10 @@ fn find_match_classic(search_start: u32, search_size: u32, target: u32, target_s
         var temp_match_length = 0u;
         var tail = i + temp_match_length;
         loop {
-            if (tail >= search_size || temp_match_length >= target_size) {
+            if (tail >= search_size || temp_match_length >= tgt_size) {
                 break;
             }
-            if (read_byte(search_start + tail) != read_byte(target + temp_match_length)) {
+            if (read_byte(search_start + tail) != read_byte(tgt + temp_match_length)) {
                 break;
             }
             temp_match_length = temp_match_length + 1u;
@@ -55,12 +55,12 @@ fn find_match_classic(search_start: u32, search_size: u32, target: u32, target_s
         }
     }
     loop {
-        if (best.length < target_size) {
+        if (best.length < tgt_size) {
             break;
         }
         best.length = best.length - 1u;
     }
-    best.next = read_byte(target + best.length);
+    best.next = read_byte(tgt + best.length);
     return best;
 }
 

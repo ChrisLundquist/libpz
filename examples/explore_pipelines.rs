@@ -6,7 +6,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use pz::pipeline::{self, CompressOptions, ParseStrategy, Pipeline};
+use pz::pipeline::{self, Backend, CompressOptions, ParseStrategy, Pipeline};
 
 /// Maximum time allowed for a single compress call before we disqualify it.
 const COMPRESS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -21,6 +21,15 @@ struct Result {
     decompress_us: u64,
     compress_mbps: f64,
     roundtrip_ok: bool,
+}
+
+/// Holds optional GPU engine handles.
+#[allow(dead_code)]
+struct GpuEngines {
+    #[cfg(feature = "opencl")]
+    opencl: Option<std::sync::Arc<pz::opencl::OpenClEngine>>,
+    #[cfg(feature = "webgpu")]
+    webgpu: Option<std::sync::Arc<pz::webgpu::WebGpuEngine>>,
 }
 
 /// Pipe data through an external command, writing stdin from a separate thread
@@ -59,27 +68,55 @@ fn measure_pz(
     pipe: Pipeline,
     strategy: ParseStrategy,
     threads: usize,
+    backend: Backend,
+    _engines: &GpuEngines,
 ) -> Option<Result> {
+    let backend_tag = match backend {
+        Backend::Cpu => "",
+        #[cfg(feature = "opencl")]
+        Backend::OpenCl => "/OpenCL",
+        #[cfg(feature = "webgpu")]
+        Backend::WebGpu => "/WebGPU",
+    };
     let label = format!(
-        "pz/{:?}/{:?}/{}t",
+        "pz/{:?}/{:?}/{}t{}",
         pipe,
         strategy,
         if threads == 0 {
             "auto".into()
         } else {
             threads.to_string()
-        }
+        },
+        backend_tag,
     );
 
     let opts = CompressOptions {
         parse_strategy: strategy,
         threads,
+        backend,
+        #[cfg(feature = "opencl")]
+        opencl_engine: _engines.opencl.clone(),
+        #[cfg(feature = "webgpu")]
+        webgpu_engine: _engines.webgpu.clone(),
         ..Default::default()
     };
 
-    // Single compress with timeout check
+    // Single compress with timeout check (catch panics from GPU backends)
     let t = Instant::now();
-    let compressed = pipeline::compress_with_options(data, pipe, &opts).unwrap();
+    let compress_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pipeline::compress_with_options(data, pipe, &opts)
+    }));
+    let compressed = match compress_result {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            eprintln!("    ERROR: {} failed: {}", label, e);
+            return None;
+        }
+        Err(_) => {
+            eprintln!("    PANIC: {} panicked, skipping", label);
+            return None;
+        }
+    };
     let elapsed = t.elapsed();
     if elapsed > COMPRESS_TIMEOUT {
         eprintln!(
@@ -208,6 +245,41 @@ fn should_skip_for_large(pipe: Pipeline, strategy: ParseStrategy, data_len: usiz
 }
 
 fn main() {
+    // Initialize GPU engines (if feature-enabled and hardware available)
+    #[cfg(feature = "opencl")]
+    let has_opencl;
+    #[cfg(feature = "webgpu")]
+    let has_webgpu;
+
+    let engines = GpuEngines {
+        #[cfg(feature = "opencl")]
+        opencl: match pz::opencl::OpenClEngine::new() {
+            Ok(e) => {
+                eprintln!("OpenCL engine initialized: {}", e.device_name());
+                has_opencl = true;
+                Some(std::sync::Arc::new(e))
+            }
+            Err(e) => {
+                eprintln!("OpenCL not available: {}", e);
+                has_opencl = false;
+                None
+            }
+        },
+        #[cfg(feature = "webgpu")]
+        webgpu: match pz::webgpu::WebGpuEngine::new() {
+            Ok(e) => {
+                eprintln!("WebGPU engine initialized: {}", e.device_name());
+                has_webgpu = true;
+                Some(std::sync::Arc::new(e))
+            }
+            Err(e) => {
+                eprintln!("WebGPU not available: {}", e);
+                has_webgpu = false;
+                None
+            }
+        },
+    };
+
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
 
     // Collect test files
@@ -253,20 +325,41 @@ fn main() {
     println!("=== Pipeline Exploration: pz vs gzip ===\n");
 
     // Pipeline/strategy combinations to test
-    let pz_configs: Vec<(Pipeline, ParseStrategy, usize)> = vec![
-        // Single-threaded variants
-        (Pipeline::Deflate, ParseStrategy::Greedy, 1),
-        (Pipeline::Deflate, ParseStrategy::Lazy, 1),
-        (Pipeline::Deflate, ParseStrategy::Optimal, 1),
-        (Pipeline::Lza, ParseStrategy::Greedy, 1),
-        (Pipeline::Lza, ParseStrategy::Lazy, 1),
-        (Pipeline::Lza, ParseStrategy::Optimal, 1),
-        (Pipeline::Bw, ParseStrategy::Auto, 1),
-        // Multi-threaded
-        (Pipeline::Deflate, ParseStrategy::Lazy, 0),
-        (Pipeline::Lza, ParseStrategy::Lazy, 0),
-        (Pipeline::Bw, ParseStrategy::Auto, 0),
+    #[allow(unused_mut)]
+    let mut pz_configs: Vec<(Pipeline, ParseStrategy, usize, Backend)> = vec![
+        // Single-threaded CPU variants
+        (Pipeline::Deflate, ParseStrategy::Greedy, 1, Backend::Cpu),
+        (Pipeline::Deflate, ParseStrategy::Lazy, 1, Backend::Cpu),
+        (Pipeline::Deflate, ParseStrategy::Optimal, 1, Backend::Cpu),
+        (Pipeline::Lza, ParseStrategy::Greedy, 1, Backend::Cpu),
+        (Pipeline::Lza, ParseStrategy::Lazy, 1, Backend::Cpu),
+        (Pipeline::Lza, ParseStrategy::Optimal, 1, Backend::Cpu),
+        (Pipeline::Bw, ParseStrategy::Auto, 1, Backend::Cpu),
+        // Multi-threaded CPU
+        (Pipeline::Deflate, ParseStrategy::Lazy, 0, Backend::Cpu),
+        (Pipeline::Lza, ParseStrategy::Lazy, 0, Backend::Cpu),
+        (Pipeline::Bw, ParseStrategy::Auto, 0, Backend::Cpu),
     ];
+
+    // OpenCL GPU variants (if available)
+    #[cfg(feature = "opencl")]
+    if has_opencl {
+        pz_configs.extend([
+            (Pipeline::Deflate, ParseStrategy::Auto, 1, Backend::OpenCl),
+            (Pipeline::Lza, ParseStrategy::Auto, 1, Backend::OpenCl),
+            (Pipeline::Bw, ParseStrategy::Auto, 1, Backend::OpenCl),
+        ]);
+    }
+
+    // WebGPU GPU variants (if available)
+    #[cfg(feature = "webgpu")]
+    if has_webgpu {
+        pz_configs.extend([
+            (Pipeline::Deflate, ParseStrategy::Auto, 1, Backend::WebGpu),
+            (Pipeline::Lza, ParseStrategy::Auto, 1, Backend::WebGpu),
+            (Pipeline::Bw, ParseStrategy::Auto, 1, Backend::WebGpu),
+        ]);
+    }
 
     let gzip_levels = ["-1", "-6", "-9"];
 
@@ -286,12 +379,23 @@ fn main() {
         }
 
         // pz pipelines
-        for &(pipe, strategy, threads) in &pz_configs {
+        for &(pipe, strategy, threads, backend) in &pz_configs {
             if should_skip_for_large(pipe, strategy, data.len()) {
                 continue;
             }
-            eprint!("  testing {:?}/{:?}/{}t ... ", pipe, strategy, threads);
-            if let Some(r) = measure_pz(data, file_name, pipe, strategy, threads) {
+            let backend_tag = match backend {
+                Backend::Cpu => "",
+                #[cfg(feature = "opencl")]
+                Backend::OpenCl => "/OpenCL",
+                #[cfg(feature = "webgpu")]
+                Backend::WebGpu => "/WebGPU",
+            };
+            eprint!(
+                "  testing {:?}/{:?}/{}t{} ... ",
+                pipe, strategy, threads, backend_tag
+            );
+            if let Some(r) = measure_pz(data, file_name, pipe, strategy, threads, backend, &engines)
+            {
                 eprintln!("{:.3}x @ {:.1} MB/s", r.ratio, r.compress_mbps);
                 results.push(r);
             }

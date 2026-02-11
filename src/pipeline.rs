@@ -1238,7 +1238,9 @@ fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResu
     {
         if let Backend::WebGpu = options.backend {
             if let Some(ref engine) = options.webgpu_engine {
-                if input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE {
+                if input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
+                    && input.len() <= engine.max_dispatch_input_size()
+                {
                     if options.parse_strategy == ParseStrategy::Optimal {
                         let table = engine.find_topk_matches(input)?;
                         return crate::optimal::compress_optimal_with_table(input, &table);
@@ -1285,7 +1287,10 @@ fn compress_block_deflate(input: &[u8], options: &CompressOptions) -> PzResult<V
     {
         if let Backend::WebGpu = options.backend {
             if let Some(ref engine) = options.webgpu_engine {
-                if !engine.is_cpu_device() && input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE {
+                if !engine.is_cpu_device()
+                    && input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
+                    && input.len() <= engine.max_dispatch_input_size()
+                {
                     return engine.deflate_chained(input);
                 }
             }
@@ -1351,7 +1356,10 @@ fn bwt_encode_with_backend(input: &[u8], options: &CompressOptions) -> PzResult<
     {
         if let Backend::WebGpu = options.backend {
             if let Some(ref engine) = options.webgpu_engine {
-                if !engine.is_cpu_device() && input.len() >= crate::webgpu::MIN_GPU_BWT_SIZE {
+                if !engine.is_cpu_device()
+                    && input.len() >= crate::webgpu::MIN_GPU_BWT_SIZE
+                    && input.len() <= engine.max_dispatch_input_size()
+                {
                     return engine.bwt_encode(input);
                 }
             }

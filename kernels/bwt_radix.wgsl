@@ -16,7 +16,7 @@ fn radix_compute_keys(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = rk_params.x;
     let padded_n = rk_params.y;
     let k = rk_params.z;
-    let pass = rk_params.w;
+    let radix_pass = rk_params.w;
     if (i >= padded_n) {
         return;
     }
@@ -31,10 +31,10 @@ fn radix_compute_keys(@builtin(global_invocation_id) gid: vec3<u32>) {
     let r2 = rk_rank[(sa_i + k) % n];
 
     var word = r2;
-    if (pass >= 4u) {
+    if (radix_pass >= 4u) {
         word = r1;
     }
-    let shift = (pass & 3u) * 8u;
+    let shift = (radix_pass & 3u) * 8u;
     rk_keys[i] = (word >> shift) & 0xFFu;
 }
 
