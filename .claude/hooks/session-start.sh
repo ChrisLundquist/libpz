@@ -6,20 +6,7 @@ if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
   exit 0
 fi
 
-echo '{"async": true, "asyncTimeout": 300000}'
+cd "$CLAUDE_PROJECT_DIR"
 
-# Build Rust dependencies (cached after first run)
-cd "$CLAUDE_PROJECT_DIR/libpz-rs"
-cargo build 2>&1
+# Ensure clippy is available (quick no-op if already installed)
 cargo clippy --version >/dev/null 2>&1 || rustup component add clippy
-
-# Extract test sample data if not already present
-cd "$CLAUDE_PROJECT_DIR/samples"
-if [ ! -d cantrbry ]; then
-  mkdir -p cantrbry
-  tar -xzf cantrbry.tar.gz -C cantrbry
-fi
-if [ ! -d large ]; then
-  mkdir -p large
-  tar -xzf large.tar.gz -C large
-fi
