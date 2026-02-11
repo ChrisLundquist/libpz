@@ -532,6 +532,180 @@ fn bench_huffman_gpu(_c: &mut Criterion) {}
 #[cfg(not(feature = "opencl"))]
 fn bench_deflate_gpu_chained(_c: &mut Criterion) {}
 
+#[cfg(feature = "webgpu")]
+fn bench_lz77_webgpu(c: &mut Criterion) {
+    use pz::webgpu::{KernelVariant, WebGpuEngine};
+
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => return,
+    };
+
+    let mut group = c.benchmark_group("lz77_webgpu");
+    cap(&mut group);
+    for &size in SIZES_ALL {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        let eng = engine.clone();
+        group.bench_with_input(
+            BenchmarkId::new("compress_webgpu_batch", size),
+            &data,
+            move |b, data| {
+                b.iter(|| eng.lz77_compress(data, KernelVariant::Batch).unwrap());
+            },
+        );
+
+        let eng2 = engine.clone();
+        group.bench_with_input(
+            BenchmarkId::new("compress_webgpu_hash", size),
+            &data,
+            move |b, data| {
+                b.iter(|| eng2.lz77_compress(data, KernelVariant::HashTable).unwrap());
+            },
+        );
+    }
+    group.finish();
+}
+
+#[cfg(feature = "webgpu")]
+fn bench_deflate_webgpu_chained(c: &mut Criterion) {
+    use pz::pipeline::CompressOptions;
+    use pz::webgpu::WebGpuEngine;
+
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => {
+            eprintln!("stages: no WebGPU device, skipping WebGPU Deflate chained benchmarks");
+            return;
+        }
+    };
+
+    let mut group = c.benchmark_group("deflate_webgpu_chained");
+    cap(&mut group);
+    for &size in &[65536, 262_144, 1_048_576, 4_194_304, 16_777_216] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // CPU Deflate (single-threaded) baseline
+        group.bench_with_input(BenchmarkId::new("cpu_1t", size), &data, |b, data| {
+            let opts = CompressOptions {
+                threads: 1,
+                ..Default::default()
+            };
+            b.iter(|| {
+                pz::pipeline::compress_with_options(data, pz::pipeline::Pipeline::Deflate, &opts)
+                    .unwrap()
+            });
+        });
+
+        // WebGPU chained Deflate
+        let eng = engine.clone();
+        group.bench_with_input(
+            BenchmarkId::new("webgpu_chained", size),
+            &data,
+            move |b, data| {
+                b.iter(|| eng.deflate_chained(data).unwrap());
+            },
+        );
+    }
+    group.finish();
+}
+
+#[cfg(feature = "webgpu")]
+fn bench_bwt_webgpu(c: &mut Criterion) {
+    use pz::webgpu::WebGpuEngine;
+
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => {
+            eprintln!("stages: no WebGPU device, skipping WebGPU BWT benchmarks");
+            return;
+        }
+    };
+
+    eprintln!("stages: WebGPU device: {}", engine.device_name());
+
+    let mut group = c.benchmark_group("bwt_webgpu");
+    cap(&mut group);
+    for &size in SIZES_ALL {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        let eng = engine.clone();
+        group.bench_with_input(
+            BenchmarkId::new("encode_webgpu", size),
+            &data,
+            move |b, data| {
+                b.iter(|| eng.bwt_encode(data).unwrap());
+            },
+        );
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "webgpu"))]
+fn bench_bwt_webgpu(_c: &mut Criterion) {}
+
+#[cfg(feature = "webgpu")]
+fn bench_huffman_webgpu(c: &mut Criterion) {
+    use pz::webgpu::WebGpuEngine;
+
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => {
+            eprintln!("stages: no WebGPU device, skipping WebGPU Huffman benchmarks");
+            return;
+        }
+    };
+
+    let mut group = c.benchmark_group("huffman_webgpu");
+    cap(&mut group);
+    for &size in &[10240, 65536, 262_144, 4_194_304, 16_777_216] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // Build tree and LUT
+        let tree = pz::huffman::HuffmanTree::from_data(&data).unwrap();
+        let mut code_lut = [0u32; 256];
+        for byte in 0..=255u8 {
+            let (codeword, bits) = tree.get_code(byte);
+            code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+        }
+
+        // CPU baseline
+        let tree_clone = tree.clone();
+        group.bench_with_input(
+            BenchmarkId::new("encode_cpu", size),
+            &data,
+            move |b, data| {
+                b.iter(|| tree_clone.encode(data).unwrap());
+            },
+        );
+
+        // WebGPU encode
+        let eng = engine.clone();
+        let lut = code_lut;
+        group.bench_with_input(
+            BenchmarkId::new("encode_webgpu", size),
+            &data,
+            move |b, data| {
+                b.iter(|| eng.huffman_encode(data, &lut).unwrap());
+            },
+        );
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "webgpu"))]
+fn bench_huffman_webgpu(_c: &mut Criterion) {}
+
+#[cfg(not(feature = "webgpu"))]
+fn bench_lz77_webgpu(_c: &mut Criterion) {}
+
+#[cfg(not(feature = "webgpu"))]
+fn bench_deflate_webgpu_chained(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_bwt,
@@ -549,6 +723,10 @@ criterion_group!(
     bench_bwt_gpu,
     bench_lz77_gpu,
     bench_huffman_gpu,
-    bench_deflate_gpu_chained
+    bench_deflate_gpu_chained,
+    bench_bwt_webgpu,
+    bench_lz77_webgpu,
+    bench_huffman_webgpu,
+    bench_deflate_webgpu_chained
 );
 criterion_main!(benches);

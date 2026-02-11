@@ -45,6 +45,7 @@ pub enum PzPipeline {
 pub struct PzDeviceInfo {
     pub opencl_devices: i32,
     pub vulkan_devices: i32,
+    pub webgpu_devices: i32,
     pub cpu_threads: i32,
 }
 
@@ -56,8 +57,13 @@ pub struct PzContext {
     /// with pipeline CompressOptions.
     #[cfg(feature = "opencl")]
     opencl_engine: Option<std::sync::Arc<crate::opencl::OpenClEngine>>,
+    /// WebGPU engine, if available.
+    #[cfg(feature = "webgpu")]
+    webgpu_engine: Option<std::sync::Arc<crate::webgpu::WebGpuEngine>>,
     /// Cached count of OpenCL devices found during init.
     opencl_device_count: i32,
+    /// Cached count of WebGPU devices found during init.
+    webgpu_device_count: i32,
 }
 
 /// Initialize a libpz context.
@@ -81,11 +87,26 @@ pub extern "C" fn pz_init() -> *mut PzContext {
     #[cfg(not(feature = "opencl"))]
     let opencl_device_count = 0i32;
 
+    #[cfg(feature = "webgpu")]
+    let (webgpu_engine, webgpu_device_count) = {
+        let count = crate::webgpu::device_count() as i32;
+        let engine = crate::webgpu::WebGpuEngine::new()
+            .ok()
+            .map(std::sync::Arc::new);
+        (engine, count)
+    };
+
+    #[cfg(not(feature = "webgpu"))]
+    let webgpu_device_count = 0i32;
+
     let ctx = Box::new(PzContext {
         _initialized: true,
         #[cfg(feature = "opencl")]
         opencl_engine,
+        #[cfg(feature = "webgpu")]
+        webgpu_engine,
         opencl_device_count,
+        webgpu_device_count,
     });
     Box::into_raw(ctx)
 }
@@ -123,6 +144,7 @@ pub unsafe extern "C" fn pz_query_devices(ctx: *const PzContext, info: *mut PzDe
     let info = &mut *info;
     info.opencl_devices = ctx.opencl_device_count;
     info.vulkan_devices = 0; // Phase 5
+    info.webgpu_devices = ctx.webgpu_device_count;
     info.cpu_threads = std::thread::available_parallelism()
         .map(|n| n.get() as i32)
         .unwrap_or(1);
@@ -157,7 +179,23 @@ fn build_compress_options(
         }
     }
 
-    #[cfg(not(feature = "opencl"))]
+    #[cfg(feature = "webgpu")]
+    {
+        if let Some(ref engine) = ctx.webgpu_engine {
+            if _input_len >= crate::webgpu::MIN_GPU_INPUT_SIZE {
+                return pipeline::CompressOptions {
+                    backend: pipeline::Backend::WebGpu,
+                    threads,
+                    #[cfg(feature = "opencl")]
+                    opencl_engine: None,
+                    webgpu_engine: Some(engine.clone()),
+                    ..Default::default()
+                };
+            }
+        }
+    }
+
+    #[cfg(not(any(feature = "opencl", feature = "webgpu")))]
     let _ = ctx;
 
     pipeline::CompressOptions {
@@ -521,6 +559,7 @@ mod tests {
             let mut info = PzDeviceInfo {
                 opencl_devices: -1,
                 vulkan_devices: -1,
+                webgpu_devices: -1,
                 cpu_threads: -1,
             };
             let result = pz_query_devices(ctx, &mut info);

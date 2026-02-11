@@ -359,6 +359,97 @@ fn bench_compress_gpu_large(c: &mut Criterion) {
 #[cfg(not(feature = "opencl"))]
 fn bench_compress_gpu_large(_c: &mut Criterion) {}
 
+#[cfg(feature = "webgpu")]
+fn bench_compress_webgpu(c: &mut Criterion) {
+    use pz::pipeline::{Backend, CompressOptions};
+    use pz::webgpu::WebGpuEngine;
+
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => {
+            eprintln!("throughput: no WebGPU device, skipping WebGPU benchmarks");
+            return;
+        }
+    };
+
+    eprintln!("throughput: WebGPU device: {}", engine.device_name());
+
+    let data = get_test_data();
+    let mut group = c.benchmark_group("compress_webgpu");
+    cap(&mut group);
+    group.throughput(Throughput::Bytes(data.len() as u64));
+
+    let options = CompressOptions {
+        backend: Backend::WebGpu,
+        threads: 1,
+        block_size: 0,
+        parse_strategy: pz::pipeline::ParseStrategy::Greedy,
+        #[cfg(feature = "opencl")]
+        opencl_engine: None,
+        webgpu_engine: Some(engine),
+    };
+
+    for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+        let opts = options.clone();
+        group.bench_with_input(
+            BenchmarkId::new("pz_webgpu", format!("{:?}", pipe)),
+            &data,
+            move |b, data| {
+                b.iter(|| pipeline::compress_with_options(data, pipe, &opts).unwrap());
+            },
+        );
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "webgpu"))]
+fn bench_compress_webgpu(_c: &mut Criterion) {}
+
+/// End-to-end WebGPU pipeline throughput at 4MB and 16MB.
+#[cfg(feature = "webgpu")]
+fn bench_compress_webgpu_large(c: &mut Criterion) {
+    use pz::pipeline::{Backend, CompressOptions};
+    use pz::webgpu::WebGpuEngine;
+
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => {
+            eprintln!("throughput: no WebGPU device, skipping large WebGPU benchmarks");
+            return;
+        }
+    };
+
+    let mut group = c.benchmark_group("compress_webgpu_large");
+    cap(&mut group);
+
+    for &size in &[4_194_304usize, 16_777_216] {
+        let data = get_test_data_sized(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        let options = CompressOptions {
+            backend: Backend::WebGpu,
+            webgpu_engine: Some(engine.clone()),
+            ..CompressOptions::default()
+        };
+
+        for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            let opts = options.clone();
+            group.bench_with_input(
+                BenchmarkId::new(format!("{:?}_webgpu", pipe), size),
+                &data,
+                move |b, data| {
+                    b.iter(|| pipeline::compress_with_options(data, pipe, &opts).unwrap());
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "webgpu"))]
+fn bench_compress_webgpu_large(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_compress,
@@ -367,6 +458,8 @@ criterion_group!(
     bench_compress_large,
     bench_decompress_large,
     bench_compress_gpu,
-    bench_compress_gpu_large
+    bench_compress_gpu_large,
+    bench_compress_webgpu,
+    bench_compress_webgpu_large
 );
 criterion_main!(benches);

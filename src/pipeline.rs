@@ -41,6 +41,9 @@ pub enum Backend {
     /// OpenCL GPU backend (requires `opencl` feature and a GPU device).
     #[cfg(feature = "opencl")]
     OpenCl,
+    /// WebGPU backend via wgpu (requires `webgpu` feature).
+    #[cfg(feature = "webgpu")]
+    WebGpu,
 }
 
 /// LZ77 match selection strategy.
@@ -80,6 +83,9 @@ pub struct CompressOptions {
     /// OpenCL engine handle, required when `backend` is `Backend::OpenCl`.
     #[cfg(feature = "opencl")]
     pub opencl_engine: Option<std::sync::Arc<crate::opencl::OpenClEngine>>,
+    /// WebGPU engine handle, required when `backend` is `Backend::WebGpu`.
+    #[cfg(feature = "webgpu")]
+    pub webgpu_engine: Option<std::sync::Arc<crate::webgpu::WebGpuEngine>>,
 }
 
 impl Default for CompressOptions {
@@ -91,6 +97,8 @@ impl Default for CompressOptions {
             parse_strategy: ParseStrategy::Auto,
             #[cfg(feature = "opencl")]
             opencl_engine: None,
+            #[cfg(feature = "webgpu")]
+            webgpu_engine: None,
         }
     }
 }
@@ -962,6 +970,21 @@ fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResu
         }
     }
 
+    #[cfg(feature = "webgpu")]
+    {
+        if let Backend::WebGpu = options.backend {
+            if let Some(ref engine) = options.webgpu_engine {
+                if input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE {
+                    if options.parse_strategy == ParseStrategy::Optimal {
+                        let table = engine.find_topk_matches(input)?;
+                        return crate::optimal::compress_optimal_with_table(input, &table);
+                    }
+                    return engine.lz77_compress(input, crate::webgpu::KernelVariant::HashTable);
+                }
+            }
+        }
+    }
+
     // CPU paths — use parallel match finding when threads > 1 and input is large
     let num_threads = resolve_thread_count(options.threads);
     match options.parse_strategy {
@@ -988,6 +1011,17 @@ fn compress_block_deflate(input: &[u8], options: &CompressOptions) -> PzResult<V
         if let Backend::OpenCl = options.backend {
             if let Some(ref engine) = options.opencl_engine {
                 if !engine.is_cpu_device() && input.len() >= crate::opencl::MIN_GPU_INPUT_SIZE {
+                    return engine.deflate_chained(input);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "webgpu")]
+    {
+        if let Backend::WebGpu = options.backend {
+            if let Some(ref engine) = options.webgpu_engine {
+                if !engine.is_cpu_device() && input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE {
                     return engine.deflate_chained(input);
                 }
             }
@@ -1078,7 +1112,18 @@ fn bwt_encode_with_backend(input: &[u8], options: &CompressOptions) -> PzResult<
         }
     }
 
-    #[cfg(not(feature = "opencl"))]
+    #[cfg(feature = "webgpu")]
+    {
+        if let Backend::WebGpu = options.backend {
+            if let Some(ref engine) = options.webgpu_engine {
+                if !engine.is_cpu_device() && input.len() >= crate::webgpu::MIN_GPU_BWT_SIZE {
+                    return engine.bwt_encode(input);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(feature = "opencl", feature = "webgpu")))]
     let _ = options;
 
     bwt::encode(input).ok_or(PzError::InvalidInput)
