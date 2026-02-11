@@ -23,30 +23,34 @@ struct Result {
     roundtrip_ok: bool,
 }
 
-fn gzip_compress(data: &[u8], level: &str) -> Option<Vec<u8>> {
-    let mut child = Command::new("gzip")
-        .args([level, "-c"])
+/// Pipe data through an external command, writing stdin from a separate thread
+/// to avoid pipe deadlocks on large inputs.
+fn pipe_through(data: &[u8], cmd: &str, args: &[&str]) -> Option<Vec<u8>> {
+    let mut child = Command::new(cmd)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    child.stdin.take()?.write_all(data).ok()?;
+
+    let mut stdin = child.stdin.take()?;
+    let data_owned = data.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&data_owned);
+    });
+
     let out = child.wait_with_output().ok()?;
+    let _ = writer.join();
     out.status.success().then_some(out.stdout)
 }
 
+fn gzip_compress(data: &[u8], level: &str) -> Option<Vec<u8>> {
+    pipe_through(data, "gzip", &[level, "-c"])
+}
+
 fn gzip_decompress(data: &[u8]) -> Option<Vec<u8>> {
-    let mut child = Command::new("gzip")
-        .args(["-dc"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    child.stdin.take()?.write_all(data).ok()?;
-    let out = child.wait_with_output().ok()?;
-    out.status.success().then_some(out.stdout)
+    pipe_through(data, "gzip", &["-dc"])
 }
 
 fn measure_pz(
