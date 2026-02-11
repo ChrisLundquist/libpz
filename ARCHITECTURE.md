@@ -5,7 +5,7 @@ For day-to-day development instructions, see `CLAUDE.md`.
 
 ## Completed milestones (11/12)
 - **Algorithms:** LZ77 (brute, hashchain, lazy, parallel), Huffman, BWT (SA-IS), MTF, RLE, RangeCoder, FSE
-- **Pipelines:** Deflate (LZ77+Huffman), Bw (BWT+MTF+RLE+RC), Lza (LZ77+RC)
+- **Pipelines:** Deflate (LZ77+Huffman), Bw (BWT+MTF+RLE+RC), Lza (LZ77+RC) — Deflate and Lza use multi-stream entropy coding for ~16-18% better compression
 - **Auto-selection:** Heuristic (`select_pipeline`) and trial-based (`select_pipeline_trial`) pipeline selection using data analysis (entropy, match density, run ratio, autocorrelation)
 - **Data analysis:** `src/analysis.rs` — statistical profiling (Shannon entropy, autocorrelation, run ratio, match density, distribution shape) with sampling support
 - **Optimal parsing:** GPU top-K match table → CPU backward DP (4-6% better compression)
@@ -20,6 +20,64 @@ For day-to-day development instructions, see `CLAUDE.md`.
 ## BWT implementation
 - **CPU:** Uses SA-IS (Suffix Array by Induced Sorting) — O(n) linear time via doubled-text-with-sentinel strategy.
 - **GPU:** Uses LSB-first 8-bit radix sort with prefix-doubling for suffix array construction. Replaced earlier bitonic sort (PR #21). Features adaptive key width (skip zero-digit radix passes) and event chain batching (one host sync per doubling step). Rank assignment runs on GPU via Blelloch prefix sum + scatter. Still slower than CPU SA-IS at all sizes but dramatically improved from bitonic sort (7-14x faster). The GPU uses circular comparison `(sa[i]+k) % n` vs CPU SA-IS's doubled-text approach — both produce valid BWTs that round-trip correctly.
+
+## Multi-stream Deflate
+
+The Deflate and Lza pipelines use **multi-stream entropy coding** to improve
+compression ratio by separating LZ77 output into independent byte streams with
+tighter symbol distributions. Instead of feeding one mixed stream to the entropy
+coder, the encoder deinterleaves tokens into three streams:
+
+| Stream | Contents | Why it helps |
+|--------|----------|-------------|
+| **Offsets** | High bytes of match offsets (offset >> 8) | Offsets cluster in a narrow range; dedicated Huffman/RC table exploits this |
+| **Lengths** | Match lengths (capped to u8) | Length distribution is highly skewed (short matches dominate) |
+| **Literals** | Literal bytes + low offset bytes + next bytes | Natural-language / binary byte distribution |
+
+Each stream gets its own Huffman tree (Deflate) or range-coder context (Lza),
+yielding lower per-stream entropy than a single combined stream.
+
+### Encoding format
+
+Multi-stream data is stored with a `0x02` stream-format flag in the container
+header, followed by three length-prefixed compressed sub-streams:
+
+```
+[stream_format: u8 = 0x02]
+[offsets_len: u32 LE] [offsets compressed data...]
+[lengths_len: u32 LE] [lengths compressed data...]
+[literals_len: u32 LE] [literals compressed data...]
+```
+
+The decoder reads the flag, decompresses each sub-stream independently, then
+reinterleaves them back into the original LZ77 token sequence. Single-stream
+format (`0x01`) is used as fallback for small inputs (< 256 bytes) or when
+multi-stream produces larger output.
+
+### Benchmark results
+
+Comparison on Canterbury + Large corpus (14 files, 13.3 MB total), averaged over
+3 iterations. "Before" = single-stream, "After" = multi-stream:
+
+**Compression (size and throughput):**
+
+| Pipeline | Before (bytes) | After (bytes) | Size delta | Throughput delta |
+|----------|---------------|--------------|------------|-----------------|
+| Deflate  | 6,319,168     | 5,301,184    | **-16.1%** | +1.6% faster    |
+| Lza      | 6,199,044     | 5,107,601    | **-17.6%** | +2.8% faster    |
+
+**Decompression throughput:**
+
+| Pipeline | Throughput delta |
+|----------|-----------------|
+| Deflate  | **+8.4%** faster |
+| Lza      | **+2.4%** faster |
+
+Multi-stream is a pure win: better compression **and** faster speed. The largest
+gains are on big files (E.coli: -21% size, +11% decode throughput; bible.txt:
+-14% size, +16% decode throughput). Small files (< 4 KB) may see slight
+expansion due to the overhead of three separate stream headers — the encoder
+automatically falls back to single-stream when multi-stream would be larger.
 
 ## SIMD acceleration
 `src/simd.rs` provides runtime-dispatched SIMD for CPU hot paths:

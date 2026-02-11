@@ -487,6 +487,9 @@ struct StageBlock {
     original_len: usize,
     /// The current data payload. Each stage replaces this with its output.
     data: Vec<u8>,
+    /// Optional multi-stream payload. When `Some`, downstream stages encode/decode
+    /// each stream independently instead of using `data`.
+    streams: Option<Vec<Vec<u8>>>,
     /// Accumulated metadata from prior stages.
     metadata: StageMetadata,
 }
@@ -514,29 +517,92 @@ fn pipeline_stage_count(pipeline: Pipeline) -> usize {
 
 // --- Compression stage functions ---
 
-/// Deflate stage 0: LZ77 compression.
+/// Deflate/Lza stage 0: LZ77 compression with multi-stream deinterleaving.
+///
+/// After LZ77 compression, the flat match stream (5 bytes per match:
+/// offset_lo, offset_hi, length_lo, length_hi, next) is split into 3
+/// independent streams for better entropy coding:
+///   - Stream 0: offsets (2 bytes per match, little-endian u16)
+///   - Stream 1: lengths (2 bytes per match, little-endian u16)
+///   - Stream 2: literals (1 byte per match, the `next` field)
 fn stage_lz77_compress(mut block: StageBlock, options: &CompressOptions) -> PzResult<StageBlock> {
-    block.data = lz77_compress_with_backend(&block.data, options)?;
-    block.metadata.lz_len = Some(block.data.len());
+    let lz_data = lz77_compress_with_backend(&block.data, options)?;
+    let lz_len = lz_data.len();
+    block.metadata.lz_len = Some(lz_len);
+
+    // Deinterleave into 3 streams
+    let match_size = lz77::Match::SERIALIZED_SIZE; // 5
+    let num_matches = lz_len / match_size;
+
+    let mut offsets = Vec::with_capacity(num_matches * 2);
+    let mut lengths = Vec::with_capacity(num_matches * 2);
+    let mut literals = Vec::with_capacity(num_matches);
+
+    for i in 0..num_matches {
+        let base = i * match_size;
+        offsets.push(lz_data[base]);
+        offsets.push(lz_data[base + 1]);
+        lengths.push(lz_data[base + 2]);
+        lengths.push(lz_data[base + 3]);
+        literals.push(lz_data[base + 4]);
+    }
+
+    block.streams = Some(vec![offsets, lengths, literals]);
+    block.data.clear();
     Ok(block)
 }
 
 /// Deflate stage 1: Huffman encoding + serialization.
+///
+/// Multi-stream format (when `block.streams` is `Some`):
+///   [0u32: sentinel] [num_streams: u8] [lz_len: u32]
+///   For each stream:
+///     [stream_data_len: u32] [total_bits: u32] [freq_table: 256×u32] [huffman_data]
+///
+/// Single-stream format (legacy, when `block.streams` is `None`):
+///   [lz_len: u32] [total_bits: u32] [freq_table: 256×u32] [huffman_data]
 fn stage_huffman_encode(mut block: StageBlock) -> PzResult<StageBlock> {
     let lz_len = block.metadata.lz_len.unwrap();
-    let tree = HuffmanTree::from_data(&block.data).ok_or(PzError::InvalidInput)?;
-    let (huffman_data, total_bits) = tree.encode(&block.data)?;
-    let freq_table = tree.serialize_frequencies();
 
-    let mut output = Vec::new();
-    output.extend_from_slice(&(lz_len as u32).to_le_bytes());
-    output.extend_from_slice(&(total_bits as u32).to_le_bytes());
-    for &freq in &freq_table {
-        output.extend_from_slice(&freq.to_le_bytes());
+    if let Some(streams) = block.streams.take() {
+        // Multi-stream encoding: encode each stream independently
+        let mut output = Vec::new();
+        // Sentinel: 0u32 distinguishes from single-stream (lz_len > 0)
+        output.extend_from_slice(&0u32.to_le_bytes());
+        output.push(streams.len() as u8);
+        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
+
+        for stream in &streams {
+            let tree = HuffmanTree::from_data(stream).ok_or(PzError::InvalidInput)?;
+            let (huffman_data, total_bits) = tree.encode(stream)?;
+            let freq_table = tree.serialize_frequencies();
+
+            output.extend_from_slice(&(huffman_data.len() as u32).to_le_bytes());
+            output.extend_from_slice(&(total_bits as u32).to_le_bytes());
+            for &freq in &freq_table {
+                output.extend_from_slice(&freq.to_le_bytes());
+            }
+            output.extend_from_slice(&huffman_data);
+        }
+
+        block.data = output;
+    } else {
+        // Single-stream (legacy) path
+        let tree = HuffmanTree::from_data(&block.data).ok_or(PzError::InvalidInput)?;
+        let (huffman_data, total_bits) = tree.encode(&block.data)?;
+        let freq_table = tree.serialize_frequencies();
+
+        let mut output = Vec::new();
+        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
+        output.extend_from_slice(&(total_bits as u32).to_le_bytes());
+        for &freq in &freq_table {
+            output.extend_from_slice(&freq.to_le_bytes());
+        }
+        output.extend_from_slice(&huffman_data);
+
+        block.data = output;
     }
-    output.extend_from_slice(&huffman_data);
 
-    block.data = output;
     Ok(block)
 }
 
@@ -577,15 +643,41 @@ fn stage_rangecoder_encode_bw(mut block: StageBlock) -> PzResult<StageBlock> {
 }
 
 /// Lza stage 1: Range coder encoding + serialization.
+///
+/// Multi-stream format (when `block.streams` is `Some`):
+///   [0u32: sentinel] [num_streams: u8] [lz_len: u32]
+///   For each stream:
+///     [original_stream_len: u32] [compressed_stream_len: u32] [rc_data]
+///
+/// Single-stream format (legacy, when `block.streams` is `None`):
+///   [lz_len: u32] [rc_data]
 fn stage_rangecoder_encode_lza(mut block: StageBlock) -> PzResult<StageBlock> {
     let lz_len = block.metadata.lz_len.unwrap();
-    let rc_data = rangecoder::encode(&block.data);
 
-    let mut output = Vec::new();
-    output.extend_from_slice(&(lz_len as u32).to_le_bytes());
-    output.extend_from_slice(&rc_data);
+    if let Some(streams) = block.streams.take() {
+        // Multi-stream encoding
+        let mut output = Vec::new();
+        output.extend_from_slice(&0u32.to_le_bytes()); // sentinel
+        output.push(streams.len() as u8);
+        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
 
-    block.data = output;
+        for stream in &streams {
+            let rc_data = rangecoder::encode(stream);
+            output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+            output.extend_from_slice(&(rc_data.len() as u32).to_le_bytes());
+            output.extend_from_slice(&rc_data);
+        }
+
+        block.data = output;
+    } else {
+        // Single-stream (legacy) path
+        let rc_data = rangecoder::encode(&block.data);
+        let mut output = Vec::new();
+        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
+        output.extend_from_slice(&rc_data);
+        block.data = output;
+    }
+
     Ok(block)
 }
 
@@ -626,60 +718,230 @@ fn stage_bwt_decode(mut block: StageBlock) -> PzResult<StageBlock> {
 }
 
 /// Deflate decompress stage 0: parse metadata + Huffman decode.
+///
+/// Detects multi-stream vs single-stream format by checking the first u32:
+///   - 0 → multi-stream (sentinel), followed by num_streams, lz_len, per-stream data
+///   - non-zero → single-stream (legacy), first u32 is lz_len
 fn stage_huffman_decode(mut block: StageBlock) -> PzResult<StageBlock> {
-    if block.data.len() < 1032 {
-        return Err(PzError::InvalidInput);
-    }
-    let lz_len =
-        u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]) as usize;
-    let total_bits =
-        u32::from_le_bytes([block.data[4], block.data[5], block.data[6], block.data[7]]) as usize;
-
-    let mut freq_table = crate::frequency::FrequencyTable::new();
-    for i in 0..256 {
-        let offset = 8 + i * 4;
-        freq_table.byte[i] = u32::from_le_bytes([
-            block.data[offset],
-            block.data[offset + 1],
-            block.data[offset + 2],
-            block.data[offset + 3],
-        ]);
-    }
-    freq_table.total = freq_table.byte.iter().map(|&f| f as u64).sum();
-    freq_table.used = freq_table.byte.iter().filter(|&&f| f > 0).count() as u32;
-
-    let tree = HuffmanTree::from_frequency_table(&freq_table).ok_or(PzError::InvalidInput)?;
-    let mut lz_data = vec![0u8; lz_len];
-    let decoded_len = tree.decode_to_buf(&block.data[1032..], total_bits, &mut lz_data)?;
-    if decoded_len != lz_len {
+    if block.data.len() < 4 {
         return Err(PzError::InvalidInput);
     }
 
-    block.metadata.lz_len = Some(lz_len);
-    block.data = lz_data;
+    let first_u32 =
+        u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]);
+
+    if first_u32 == 0 {
+        // Multi-stream format
+        // Header: [0u32: sentinel][num_streams: u8][lz_len: u32]
+        if block.data.len() < 9 {
+            return Err(PzError::InvalidInput);
+        }
+        let num_streams = block.data[4] as usize;
+        let lz_len =
+            u32::from_le_bytes([block.data[5], block.data[6], block.data[7], block.data[8]])
+                as usize;
+        block.metadata.lz_len = Some(lz_len);
+
+        let mut pos = 9;
+        let mut decoded_streams = Vec::with_capacity(num_streams);
+
+        for _ in 0..num_streams {
+            // Per-stream: [stream_data_len: u32][total_bits: u32][freq_table: 256×u32][huffman_data]
+            if pos + 1032 > block.data.len() {
+                return Err(PzError::InvalidInput);
+            }
+            let stream_data_len = u32::from_le_bytes([
+                block.data[pos],
+                block.data[pos + 1],
+                block.data[pos + 2],
+                block.data[pos + 3],
+            ]) as usize;
+            let total_bits = u32::from_le_bytes([
+                block.data[pos + 4],
+                block.data[pos + 5],
+                block.data[pos + 6],
+                block.data[pos + 7],
+            ]) as usize;
+
+            let mut freq_table = crate::frequency::FrequencyTable::new();
+            for i in 0..256 {
+                let off = pos + 8 + i * 4;
+                freq_table.byte[i] = u32::from_le_bytes([
+                    block.data[off],
+                    block.data[off + 1],
+                    block.data[off + 2],
+                    block.data[off + 3],
+                ]);
+            }
+            freq_table.total = freq_table.byte.iter().map(|&f| f as u64).sum();
+            freq_table.used = freq_table.byte.iter().filter(|&&f| f > 0).count() as u32;
+
+            let huff_start = pos + 1032;
+            if huff_start + stream_data_len > block.data.len() {
+                return Err(PzError::InvalidInput);
+            }
+            let tree =
+                HuffmanTree::from_frequency_table(&freq_table).ok_or(PzError::InvalidInput)?;
+            let decoded = tree.decode(
+                &block.data[huff_start..huff_start + stream_data_len],
+                total_bits,
+            )?;
+
+            decoded_streams.push(decoded);
+            pos = huff_start + stream_data_len;
+        }
+
+        block.streams = Some(decoded_streams);
+        block.data.clear();
+    } else {
+        // Single-stream (legacy) format
+        if block.data.len() < 1032 {
+            return Err(PzError::InvalidInput);
+        }
+        let lz_len = first_u32 as usize;
+        let total_bits =
+            u32::from_le_bytes([block.data[4], block.data[5], block.data[6], block.data[7]])
+                as usize;
+
+        let mut freq_table = crate::frequency::FrequencyTable::new();
+        for i in 0..256 {
+            let offset = 8 + i * 4;
+            freq_table.byte[i] = u32::from_le_bytes([
+                block.data[offset],
+                block.data[offset + 1],
+                block.data[offset + 2],
+                block.data[offset + 3],
+            ]);
+        }
+        freq_table.total = freq_table.byte.iter().map(|&f| f as u64).sum();
+        freq_table.used = freq_table.byte.iter().filter(|&&f| f > 0).count() as u32;
+
+        let tree = HuffmanTree::from_frequency_table(&freq_table).ok_or(PzError::InvalidInput)?;
+        let mut lz_data = vec![0u8; lz_len];
+        let decoded_len = tree.decode_to_buf(&block.data[1032..], total_bits, &mut lz_data)?;
+        if decoded_len != lz_len {
+            return Err(PzError::InvalidInput);
+        }
+
+        block.metadata.lz_len = Some(lz_len);
+        block.data = lz_data;
+    }
+
     Ok(block)
 }
 
 /// Deflate/Lza decompress: LZ77 decompress.
+///
+/// If `block.streams` is `Some` with 3 streams (offsets, lengths, literals),
+/// reinterleaves them into the flat LzMatch byte stream before decompressing.
 fn stage_lz77_decompress(mut block: StageBlock) -> PzResult<StageBlock> {
-    let mut output = vec![0u8; block.original_len];
-    let out_len = lz77::decompress_to_buf(&block.data, &mut output)?;
-    if out_len != block.original_len {
-        return Err(PzError::InvalidInput);
+    if let Some(streams) = block.streams.take() {
+        // Multi-stream: reinterleave offsets, lengths, literals into flat LzMatch bytes
+        if streams.len() != 3 {
+            return Err(PzError::InvalidInput);
+        }
+        let offsets = &streams[0];
+        let lengths = &streams[1];
+        let literals = &streams[2];
+
+        // offsets and lengths are 2 bytes per match, literals are 1 byte per match
+        if offsets.len() != lengths.len() || offsets.len() != literals.len() * 2 {
+            return Err(PzError::InvalidInput);
+        }
+        let num_matches = literals.len();
+        let match_size = lz77::Match::SERIALIZED_SIZE; // 5
+        let mut lz_data = Vec::with_capacity(num_matches * match_size);
+
+        for i in 0..num_matches {
+            lz_data.push(offsets[i * 2]);
+            lz_data.push(offsets[i * 2 + 1]);
+            lz_data.push(lengths[i * 2]);
+            lz_data.push(lengths[i * 2 + 1]);
+            lz_data.push(literals[i]);
+        }
+
+        let mut output = vec![0u8; block.original_len];
+        let out_len = lz77::decompress_to_buf(&lz_data, &mut output)?;
+        if out_len != block.original_len {
+            return Err(PzError::InvalidInput);
+        }
+        block.data = output;
+        block.streams = None;
+    } else {
+        // Single-stream (legacy) path
+        let mut output = vec![0u8; block.original_len];
+        let out_len = lz77::decompress_to_buf(&block.data, &mut output)?;
+        if out_len != block.original_len {
+            return Err(PzError::InvalidInput);
+        }
+        block.data = output;
     }
-    block.data = output;
     Ok(block)
 }
 
 /// Lza decompress stage 0: parse metadata + range decode.
+///
+/// Detects multi-stream vs single-stream format by checking the first u32:
+///   - 0 → multi-stream (sentinel)
+///   - non-zero → single-stream (legacy), first u32 is lz_len
 fn stage_rangecoder_decode_lza(mut block: StageBlock) -> PzResult<StageBlock> {
     if block.data.len() < 4 {
         return Err(PzError::InvalidInput);
     }
-    let lz_len =
-        u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]) as usize;
-    block.metadata.lz_len = Some(lz_len);
-    block.data = rangecoder::decode(&block.data[4..], lz_len)?;
+
+    let first_u32 =
+        u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]);
+
+    if first_u32 == 0 {
+        // Multi-stream format
+        if block.data.len() < 9 {
+            return Err(PzError::InvalidInput);
+        }
+        let num_streams = block.data[4] as usize;
+        let lz_len =
+            u32::from_le_bytes([block.data[5], block.data[6], block.data[7], block.data[8]])
+                as usize;
+        block.metadata.lz_len = Some(lz_len);
+
+        let mut pos = 9;
+        let mut decoded_streams = Vec::with_capacity(num_streams);
+
+        for _ in 0..num_streams {
+            if pos + 8 > block.data.len() {
+                return Err(PzError::InvalidInput);
+            }
+            let orig_stream_len = u32::from_le_bytes([
+                block.data[pos],
+                block.data[pos + 1],
+                block.data[pos + 2],
+                block.data[pos + 3],
+            ]) as usize;
+            let comp_stream_len = u32::from_le_bytes([
+                block.data[pos + 4],
+                block.data[pos + 5],
+                block.data[pos + 6],
+                block.data[pos + 7],
+            ]) as usize;
+            pos += 8;
+
+            if pos + comp_stream_len > block.data.len() {
+                return Err(PzError::InvalidInput);
+            }
+            let decoded =
+                rangecoder::decode(&block.data[pos..pos + comp_stream_len], orig_stream_len)?;
+            decoded_streams.push(decoded);
+            pos += comp_stream_len;
+        }
+
+        block.streams = Some(decoded_streams);
+        block.data.clear();
+    } else {
+        // Single-stream (legacy) format
+        let lz_len = first_u32 as usize;
+        block.metadata.lz_len = Some(lz_len);
+        block.data = rangecoder::decode(&block.data[4..], lz_len)?;
+    }
+
     Ok(block)
 }
 
@@ -777,6 +1039,7 @@ fn compress_pipeline_parallel(
                     block_index: i,
                     original_len: chunk.len(),
                     data: chunk.to_vec(),
+                    streams: None,
                     metadata: StageMetadata::default(),
                 };
                 if tx_in.send(Ok(block)).is_err() {
@@ -909,6 +1172,7 @@ fn decompress_pipeline_parallel(
                     block_index: i,
                     original_len: orig_block_len,
                     data: comp_data.to_vec(),
+                    streams: None,
                     metadata: StageMetadata::default(),
                 };
                 if tx_in.send(Ok(block)).is_err() {
@@ -1032,6 +1296,7 @@ fn compress_block_deflate(input: &[u8], options: &CompressOptions) -> PzResult<V
         block_index: 0,
         original_len: input.len(),
         data: input.to_vec(),
+        streams: None,
         metadata: StageMetadata::default(),
     };
     let block = stage_lz77_compress(block, options)?;
@@ -1049,46 +1314,16 @@ fn compress_deflate_with_options(input: &[u8], options: &CompressOptions) -> PzR
 
 /// Decompress a single Deflate block (no container header).
 fn decompress_block_deflate(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    // Parse metadata: lz_len(4) + total_bits(4) + freq_table(1024) = 1032 bytes
-    if payload.len() < 1032 {
-        return Err(PzError::InvalidInput);
-    }
-
-    let lz_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-    let total_bits = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
-
-    // Reconstruct frequency table
-    let mut freq_table = crate::frequency::FrequencyTable::new();
-    for i in 0..256 {
-        let offset = 8 + i * 4;
-        freq_table.byte[i] = u32::from_le_bytes([
-            payload[offset],
-            payload[offset + 1],
-            payload[offset + 2],
-            payload[offset + 3],
-        ]);
-    }
-    freq_table.total = freq_table.byte.iter().map(|&f| f as u64).sum();
-    freq_table.used = freq_table.byte.iter().filter(|&&f| f > 0).count() as u32;
-
-    let huffman_data = &payload[1032..];
-
-    // Stage 1: Huffman decode
-    let tree = HuffmanTree::from_frequency_table(&freq_table).ok_or(PzError::InvalidInput)?;
-    let mut lz_data = vec![0u8; lz_len];
-    let decoded_len = tree.decode_to_buf(huffman_data, total_bits, &mut lz_data)?;
-    if decoded_len != lz_len {
-        return Err(PzError::InvalidInput);
-    }
-
-    // Stage 2: LZ77 decompress
-    let mut output = vec![0u8; orig_len];
-    let out_len = lz77::decompress_to_buf(&lz_data, &mut output)?;
-    if out_len != orig_len {
-        return Err(PzError::InvalidInput);
-    }
-
-    Ok(output)
+    let block = StageBlock {
+        block_index: 0,
+        original_len: orig_len,
+        data: payload.to_vec(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+    let block = stage_huffman_decode(block)?;
+    let block = stage_lz77_decompress(block)?;
+    Ok(block.data)
 }
 
 fn decompress_deflate(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
@@ -1137,6 +1372,7 @@ fn compress_block_bw(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8
         block_index: 0,
         original_len: input.len(),
         data: input.to_vec(),
+        streams: None,
         metadata: StageMetadata::default(),
     };
     let block = stage_bwt_encode(block, options)?;
@@ -1196,6 +1432,7 @@ fn compress_block_lza(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u
         block_index: 0,
         original_len: input.len(),
         data: input.to_vec(),
+        streams: None,
         metadata: StageMetadata::default(),
     };
     let block = stage_lz77_compress(block, options)?;
@@ -1213,24 +1450,16 @@ fn compress_lza_with_options(input: &[u8], options: &CompressOptions) -> PzResul
 
 /// Decompress a single LZA block (no container header).
 fn decompress_block_lza(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    if payload.len() < 4 {
-        return Err(PzError::InvalidInput);
-    }
-
-    let lz_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-    let rc_data = &payload[4..];
-
-    // Stage 1: Range decode
-    let lz_data = rangecoder::decode(rc_data, lz_len)?;
-
-    // Stage 2: LZ77 decompress
-    let mut output = vec![0u8; orig_len];
-    let out_len = lz77::decompress_to_buf(&lz_data, &mut output)?;
-    if out_len != orig_len {
-        return Err(PzError::InvalidInput);
-    }
-
-    Ok(output)
+    let block = StageBlock {
+        block_index: 0,
+        original_len: orig_len,
+        data: payload.to_vec(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+    let block = stage_rangecoder_decode_lza(block)?;
+    let block = stage_lz77_decompress(block)?;
+    Ok(block.data)
 }
 
 fn decompress_lza(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
@@ -1941,5 +2170,209 @@ mod tests {
             let decompressed = decompress(&compressed).unwrap();
             assert_eq!(&decompressed, input);
         }
+    }
+
+    // --- Multi-stream Deflate tests ---
+
+    #[test]
+    fn test_multistream_deflate_round_trip_small() {
+        let input = b"hello, world! hello, world!";
+        let compressed = compress(input, Pipeline::Deflate).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_multistream_deflate_round_trip_medium() {
+        // 10KB of repetitive text
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let mut input = Vec::new();
+        for _ in 0..222 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = compress(&input, Pipeline::Deflate).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+        assert!(
+            compressed.len() < input.len(),
+            "compressed {} >= input {}",
+            compressed.len(),
+            input.len()
+        );
+    }
+
+    #[test]
+    fn test_multistream_deflate_round_trip_large() {
+        // 1MB of pseudo-random + repeated data
+        let mut input = Vec::with_capacity(1 << 20);
+        let pattern = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        while input.len() < (1 << 20) {
+            input.extend_from_slice(pattern);
+        }
+        input.truncate(1 << 20);
+        // Sprinkle pseudo-random bytes for variety
+        let mut state: u32 = 42;
+        for i in (0..input.len()).step_by(37) {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            input[i] = (state >> 16) as u8;
+        }
+
+        let compressed = compress(&input, Pipeline::Deflate).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_multistream_deflate_round_trip_binary() {
+        let input: Vec<u8> = (0..=255).cycle().take(2048).collect();
+        let compressed = compress(&input, Pipeline::Deflate).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_multistream_deflate_multiblock() {
+        // Multi-block pipeline-parallel path
+        let pattern = b"Multi-stream multi-block test pattern. ";
+        let mut input = Vec::new();
+        for _ in 0..200 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = compress_mt(&input, Pipeline::Deflate, 4, 1024).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_multistream_deflate_compression_ratio() {
+        // Multi-stream should compress well on structured/repetitive data
+        // because offset/length/literal distributions are each tighter
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let mut input = Vec::new();
+        for _ in 0..500 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = compress(&input, Pipeline::Deflate).unwrap();
+        assert!(
+            compressed.len() < input.len() / 2,
+            "expected significant compression: compressed {} vs input {}",
+            compressed.len(),
+            input.len()
+        );
+    }
+
+    // --- Multi-stream LZA tests ---
+
+    #[test]
+    fn test_multistream_lza_round_trip_small() {
+        let input = b"hello, world! hello, world!";
+        let compressed = compress(input, Pipeline::Lza).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_multistream_lza_round_trip_medium() {
+        let pattern = b"abcdefghij abcdefghij ";
+        let mut input = Vec::new();
+        for _ in 0..500 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = compress(&input, Pipeline::Lza).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+        assert!(
+            compressed.len() < input.len(),
+            "compressed {} >= input {}",
+            compressed.len(),
+            input.len()
+        );
+    }
+
+    #[test]
+    fn test_multistream_lza_round_trip_large() {
+        // 1MB input
+        let mut input = Vec::with_capacity(1 << 20);
+        let pattern = b"LZA multi-stream test data with some repetition. ";
+        while input.len() < (1 << 20) {
+            input.extend_from_slice(pattern);
+        }
+        input.truncate(1 << 20);
+
+        let compressed = compress(&input, Pipeline::Lza).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_multistream_lza_multiblock() {
+        let pattern = b"LZA multi-stream multi-block test. ";
+        let mut input = Vec::new();
+        for _ in 0..200 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = compress_mt(&input, Pipeline::Lza, 4, 1024).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_multistream_all_pipelines_round_trip() {
+        // Verify all pipelines still produce correct round-trips
+        let pattern = b"Cross-pipeline multi-stream validation. ";
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend_from_slice(pattern);
+        }
+        for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            let compressed = compress(&input, pipeline).unwrap();
+            let decompressed = decompress(&compressed).unwrap();
+            assert_eq!(decompressed, input, "round-trip failed for {:?}", pipeline);
+        }
+    }
+
+    #[test]
+    fn test_multistream_stage_deinterleave_reinterleave() {
+        // Unit test: verify LZ77 deinterleave/reinterleave round-trips correctly
+        // by going through the stage functions directly
+        let input = b"The quick brown fox jumps over the lazy dog. The quick brown fox.";
+        let opts = CompressOptions::default();
+        let block = StageBlock {
+            block_index: 0,
+            original_len: input.len(),
+            data: input.to_vec(),
+            streams: None,
+            metadata: StageMetadata::default(),
+        };
+
+        // LZ77 compress → produces streams
+        let block = stage_lz77_compress(block, &opts).unwrap();
+        assert!(block.streams.is_some());
+        let streams = block.streams.as_ref().unwrap();
+        assert_eq!(streams.len(), 3);
+        // offsets and lengths are 2 bytes per match, literals 1 byte per match
+        assert_eq!(streams[0].len(), streams[1].len());
+        assert_eq!(streams[0].len(), streams[2].len() * 2);
+
+        // Huffman encode → serializes streams into data
+        let block = stage_huffman_encode(block).unwrap();
+        assert!(block.streams.is_none());
+        assert!(!block.data.is_empty());
+        // Verify multi-stream sentinel
+        let sentinel =
+            u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]);
+        assert_eq!(sentinel, 0, "expected multi-stream sentinel");
+        assert_eq!(block.data[4], 3, "expected 3 streams");
+
+        // Huffman decode → restores streams
+        let block = stage_huffman_decode(block).unwrap();
+        assert!(block.streams.is_some());
+        let streams = block.streams.as_ref().unwrap();
+        assert_eq!(streams.len(), 3);
+
+        // LZ77 decompress → reinterleaves and decompresses
+        let block = stage_lz77_decompress(block).unwrap();
+        assert!(block.streams.is_none());
+        assert_eq!(block.data, input);
     }
 }

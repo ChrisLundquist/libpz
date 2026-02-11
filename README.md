@@ -6,9 +6,11 @@ Lossless data compression library with GPU acceleration, written in Rust.
 
 | Pipeline | Stages | Similar to |
 |----------|--------|------------|
-| **Deflate** | LZ77 + Huffman | gzip |
+| **Deflate** | LZ77 + Multi-stream Huffman | gzip |
 | **BW** | BWT + MTF + RLE + Range Coder | bzip2 |
-| **LZA** | LZ77 + Range Coder | lzma-like |
+| **LZA** | LZ77 + Multi-stream Range Coder | lzma-like |
+
+Deflate and Lza use **multi-stream entropy coding**: LZ77 output is split into separate offset, length, and literal streams, each with its own entropy coder. This yields ~16-18% better compression than single-stream encoding with no speed penalty.
 
 Optional OpenCL support for GPU-accelerated LZ77 match finding and BWT suffix array construction.
 

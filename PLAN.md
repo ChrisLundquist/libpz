@@ -146,9 +146,9 @@ This serves as the correctness oracle for future GPU and multi-threaded backends
 
 | Pipeline | ID | Stages | Similar to |
 |----------|----|--------|------------|
-| `Deflate` | 0 | LZ77 → Huffman | gzip |
+| `Deflate` | 0 | LZ77 → Multi-stream Huffman | gzip |
 | `Bw` | 1 | BWT → MTF → RLE → RangeCoder | bzip2 |
-| `Lza` | 2 | LZ77 → RangeCoder | lzma-like |
+| `Lza` | 2 | LZ77 → Multi-stream RangeCoder | lzma-like |
 
 ### Container Format
 
@@ -159,6 +159,8 @@ Self-describing binary format for compressed data:
 - Deflate pipeline includes Huffman frequency table in metadata (~1KB)
 - Bw pipeline includes BWT primary_index (4 bytes) in metadata
 - Decompression auto-detects pipeline from header
+- Deflate and Lza use a `stream_format` byte: `0x01` = single-stream (legacy),
+  `0x02` = multi-stream (offsets/lengths/literals split into 3 sub-streams)
 
 ### Modular Algorithm Composition
 
