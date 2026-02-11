@@ -162,6 +162,8 @@ pub struct WebGpuEngine {
     device_name: String,
     /// Maximum compute workgroup size.
     max_work_group_size: usize,
+    /// Maximum workgroups per dispatch dimension (device-queried, typically 65535).
+    max_workgroups_per_dim: u32,
     /// Whether the selected device is a CPU (not GPU).
     is_cpu: bool,
     /// Scan workgroup size (power of 2, capped at 256).
@@ -208,6 +210,7 @@ impl WebGpuEngine {
         let is_cpu = matches!(info.device_type, wgpu::DeviceType::Cpu);
         let limits = adapter.limits();
         let max_work_group_size = limits.max_compute_workgroup_size_x as usize;
+        let max_workgroups_per_dim = limits.max_compute_workgroups_per_dimension;
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -270,6 +273,7 @@ impl WebGpuEngine {
             huffman_module,
             device_name,
             max_work_group_size,
+            max_workgroups_per_dim,
             is_cpu,
             scan_workgroup_size,
         })
@@ -288,6 +292,14 @@ impl WebGpuEngine {
     /// Check if the selected device is a CPU (not a GPU or accelerator).
     pub fn is_cpu_device(&self) -> bool {
         self.is_cpu
+    }
+
+    /// Maximum input size (bytes) that fits in a single GPU dispatch.
+    ///
+    /// Computed from the device's `max_compute_workgroups_per_dimension`
+    /// and the smallest workgroup size used by our kernels (64).
+    pub fn max_dispatch_input_size(&self) -> usize {
+        self.max_workgroups_per_dim as usize * 64
     }
 
     // --- Helper: create buffer with data ---
@@ -348,13 +360,19 @@ impl WebGpuEngine {
     }
 
     /// Dispatch a compute pass with the given pipeline and bind group.
+    ///
+    /// Returns `Err(Unsupported)` if the dispatch would exceed the WebGPU
+    /// per-dimension workgroup limit of 65535.
     fn dispatch(
         &self,
         pipeline: &wgpu::ComputePipeline,
         bind_group: &wgpu::BindGroup,
         workgroups_x: u32,
         label: &str,
-    ) {
+    ) -> PzResult<()> {
+        if workgroups_x > self.max_workgroups_per_dim {
+            return Err(PzError::Unsupported);
+        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
@@ -368,6 +386,7 @@ impl WebGpuEngine {
             pass.dispatch_workgroups(workgroups_x, 1, 1);
         }
         self.queue.submit(Some(encoder.finish()));
+        Ok(())
     }
 
     // --- Pad input to u32-aligned for WGSL byte reading ---
@@ -446,7 +465,7 @@ impl WebGpuEngine {
         });
 
         let workgroups = (input_len as u32).div_ceil(64);
-        self.dispatch(&pipeline, &bind_group, workgroups, "lz77_per_pos");
+        self.dispatch(&pipeline, &bind_group, workgroups, "lz77_per_pos")?;
 
         let raw = self.read_buffer(
             &output_buf,
@@ -510,7 +529,7 @@ impl WebGpuEngine {
 
         let num_work_items = input_len.div_ceil(BATCH_STEP_SIZE);
         let workgroups = (num_work_items as u32).div_ceil(64);
-        self.dispatch(&pipeline, &bind_group, workgroups, "lz77_batch");
+        self.dispatch(&pipeline, &bind_group, workgroups, "lz77_batch")?;
 
         let raw = self.read_buffer(
             &output_buf,
@@ -591,7 +610,7 @@ impl WebGpuEngine {
         });
 
         let workgroups = (input_len as u32).div_ceil(64);
-        self.dispatch(&build_pipeline, &build_bg, workgroups, "lz77_hash_build");
+        self.dispatch(&build_pipeline, &build_bg, workgroups, "lz77_hash_build")?;
 
         // Pass 2: Find matches — uses a separate pipeline with different bindings
         // We need to read back hash_counts for the find pass (read-only)
@@ -635,7 +654,7 @@ impl WebGpuEngine {
             ],
         });
 
-        self.dispatch(&find_pipeline, &find_bg, workgroups, "lz77_hash_find");
+        self.dispatch(&find_pipeline, &find_bg, workgroups, "lz77_hash_find")?;
 
         let raw = self.read_buffer(
             &output_buf,
@@ -716,7 +735,7 @@ impl WebGpuEngine {
         });
 
         let workgroups = (input_len as u32).div_ceil(64);
-        self.dispatch(&pipeline, &bind_group, workgroups, "lz77_topk");
+        self.dispatch(&pipeline, &bind_group, workgroups, "lz77_topk")?;
 
         let raw = self.read_buffer(&output_buf, (output_len * 4) as u64);
         let packed: &[u32] = bytemuck::cast_slice(&raw);
@@ -959,7 +978,7 @@ impl WebGpuEngine {
         });
 
         let workgroups = padded_n.div_ceil(256);
-        self.dispatch(&pipeline, &bg, workgroups, "rank_compare");
+        self.dispatch(&pipeline, &bg, workgroups, "rank_compare")?;
         Ok(())
     }
 
@@ -1024,7 +1043,7 @@ impl WebGpuEngine {
         });
 
         let workgroups = num_blocks as u32;
-        self.dispatch(&pipeline, &bg, workgroups.max(1), "prefix_sum_local");
+        self.dispatch(&pipeline, &bg, workgroups.max(1), "prefix_sum_local")?;
 
         if num_blocks > 1 {
             // Recursively scan block sums, then propagate
@@ -1077,7 +1096,7 @@ impl WebGpuEngine {
             });
 
             let prop_wg = (count as u32).div_ceil(256);
-            self.dispatch(&prop_pipeline, &prop_bg, prop_wg, "prefix_sum_propagate");
+            self.dispatch(&prop_pipeline, &prop_bg, prop_wg, "prefix_sum_propagate")?;
         }
 
         Ok(())
@@ -1134,7 +1153,7 @@ impl WebGpuEngine {
         });
 
         let workgroups = padded_n.div_ceil(256);
-        self.dispatch(&pipeline, &bg, workgroups, "rank_scatter");
+        self.dispatch(&pipeline, &bg, workgroups, "rank_scatter")?;
         Ok(())
     }
 
@@ -1216,7 +1235,7 @@ impl WebGpuEngine {
             });
 
             let global_wg = (padded_n as u32).div_ceil(256);
-            self.dispatch(&key_pipeline, &key_bg, global_wg, "radix_keys");
+            self.dispatch(&key_pipeline, &key_bg, global_wg, "radix_keys")?;
 
             // Phase 2: Histogram
             let hist_params = [padded_n as u32, num_groups as u32, 0, 0];
@@ -1267,7 +1286,7 @@ impl WebGpuEngine {
                 &hist_bg,
                 num_groups as u32,
                 "radix_histogram",
-            );
+            )?;
 
             // Phase 3: Prefix sum over histogram, then inclusive_to_exclusive
             let mut hist_scan_buf_temp = self.create_buffer(
@@ -1319,7 +1338,7 @@ impl WebGpuEngine {
             });
 
             let ite_wg = (histogram_len as u32).div_ceil(256);
-            self.dispatch(&ite_pipeline, &ite_bg, ite_wg, "ite");
+            self.dispatch(&ite_pipeline, &ite_bg, ite_wg, "ite")?;
 
             // Phase 4: Scatter
             let scat_params = [padded_n as u32, num_groups as u32, 0, 0];
@@ -1368,7 +1387,7 @@ impl WebGpuEngine {
                 ],
             });
 
-            self.dispatch(&scat_pipeline, &scat_bg, num_groups as u32, "radix_scatter");
+            self.dispatch(&scat_pipeline, &scat_bg, num_groups as u32, "radix_scatter")?;
 
             // Swap sa buffers
             std::mem::swap(sa_buf, sa_buf_alt);
@@ -1433,7 +1452,7 @@ impl WebGpuEngine {
         });
 
         let workgroups = (n as u32).div_ceil(64);
-        self.dispatch(&pipeline, &bg, workgroups, "byte_histogram");
+        self.dispatch(&pipeline, &bg, workgroups, "byte_histogram")?;
 
         let raw = self.read_buffer(&hist_buf, (256 * 4) as u64);
         let hist: &[u32] = bytemuck::cast_slice(&raw);
@@ -1513,7 +1532,7 @@ impl WebGpuEngine {
         });
 
         let workgroups = (n as u32).div_ceil(64);
-        self.dispatch(&pipeline1, &bg1, workgroups, "huff_pass1");
+        self.dispatch(&pipeline1, &bg1, workgroups, "huff_pass1")?;
 
         // Download bit lengths and compute prefix sum on CPU
         let raw_lengths = self.read_buffer(&bit_lengths_buf, (n * 4) as u64);
@@ -1584,7 +1603,7 @@ impl WebGpuEngine {
             ],
         });
 
-        self.dispatch(&pipeline2, &bg2, workgroups, "huff_pass2");
+        self.dispatch(&pipeline2, &bg2, workgroups, "huff_pass2")?;
 
         // Download output
         let raw_output = self.read_buffer(&output_buf, (output_uints * 4) as u64);
