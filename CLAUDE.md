@@ -1,5 +1,11 @@
 # CLAUDE.md — libpz development guide
 
+## First-time setup
+Extract test sample data (needed for validation/benchmark tests):
+```bash
+cd samples && mkdir -p cantrbry large && tar -xzf cantrbry.tar.gz -C cantrbry && tar -xzf large.tar.gz -C large && cd ..
+```
+
 ## Build & test commands
 ```bash
 cargo build                    # compile
