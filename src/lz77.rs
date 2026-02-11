@@ -309,6 +309,9 @@ impl HashChainFinder {
     }
 
     /// Find the best match at `pos` in `input`, looking back up to MAX_WINDOW bytes.
+    ///
+    /// Uses SIMD-accelerated byte comparison (SSE2: 16 bytes/cycle,
+    /// AVX2: 32 bytes/cycle) for the inner match extension loop.
     pub(crate) fn find_match(&self, input: &[u8], pos: usize) -> Match {
         let remaining = input.len() - pos;
         if remaining < 3 {
@@ -320,6 +323,7 @@ impl HashChainFinder {
             };
         }
 
+        let dispatcher = crate::simd::Dispatcher::new();
         let h = hash3(input, pos);
         let mut chain_pos = self.head[h] as usize;
         let mut best_offset: u32 = 0;
@@ -328,14 +332,10 @@ impl HashChainFinder {
         let mut chain_count = 0;
 
         while chain_pos >= min_pos && chain_pos < pos && chain_count < MAX_CHAIN {
-            // Compare bytes
-            let mut match_len = 0u32;
-            let max_len = remaining.min(pos - chain_pos) as u32;
-            while match_len < max_len
-                && input[chain_pos + match_len as usize] == input[pos + match_len as usize]
-            {
-                match_len += 1;
-            }
+            // SIMD-accelerated byte comparison
+            let max_len = remaining.min(pos - chain_pos);
+            let match_len = dispatcher.compare_bytes(&input[chain_pos..], &input[pos..]) as u32;
+            let match_len = match_len.min(max_len as u32);
 
             if match_len > best_length && match_len >= MIN_MATCH {
                 best_length = match_len;
@@ -384,12 +384,15 @@ impl HashChainFinder {
     /// For each distinct match length found (>= MIN_MATCH), keeps the
     /// candidate with the smallest offset. Returns up to `k` candidates
     /// sorted by length descending.
+    ///
+    /// Uses SIMD-accelerated byte comparison for match extension.
     pub(crate) fn find_top_k(&self, input: &[u8], pos: usize, k: usize) -> Vec<(u16, u16)> {
         let remaining = input.len() - pos;
         if remaining < MIN_MATCH as usize {
             return Vec::new();
         }
 
+        let dispatcher = crate::simd::Dispatcher::new();
         let h = hash3(input, pos);
         let mut chain_pos = self.head[h] as usize;
         let min_pos = pos.saturating_sub(MAX_WINDOW);
@@ -400,13 +403,9 @@ impl HashChainFinder {
         let mut found: Vec<(u16, u16)> = Vec::new();
 
         while chain_pos >= min_pos && chain_pos < pos && chain_count < MAX_CHAIN {
-            let mut match_len = 0u32;
-            let max_len = remaining.min(pos - chain_pos) as u32;
-            while match_len < max_len
-                && input[chain_pos + match_len as usize] == input[pos + match_len as usize]
-            {
-                match_len += 1;
-            }
+            let max_len = remaining.min(pos - chain_pos);
+            let match_len = dispatcher.compare_bytes(&input[chain_pos..], &input[pos..]) as u32;
+            let match_len = match_len.min(max_len as u32);
 
             if match_len >= MIN_MATCH {
                 let offset = (pos - chain_pos) as u16;
@@ -525,6 +524,200 @@ pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
 
         output.extend_from_slice(&m.to_bytes());
         pos += advance;
+    }
+
+    Ok(output)
+}
+
+/// Minimum input size for parallel LZ77 match finding.
+/// Below this, thread overhead exceeds the benefit.
+/// Set high because each thread must warm up a MAX_WINDOW-sized hash chain,
+/// which is expensive. Need segments large enough to amortize warmup cost.
+const MIN_PARALLEL_SIZE: usize = 256 * 1024;
+
+/// Minimum per-thread segment size for parallel match finding.
+/// Each thread pays ~MAX_WINDOW warmup cost, so segments must be
+/// significantly larger than MAX_WINDOW to see benefit.
+const MIN_SEGMENT_SIZE: usize = 128 * 1024;
+
+/// Pre-computed match candidate at a position.
+/// offset=0 means no match found (literal).
+#[derive(Clone, Copy)]
+struct PreMatch {
+    offset: u32,
+    length: u32,
+}
+
+/// Compress input using parallel match finding with lazy evaluation.
+///
+/// Splits the match-finding work across `num_threads` threads, each building
+/// an independent `HashChainFinder` for its segment. The main thread then
+/// walks through the pre-computed matches sequentially, applying lazy
+/// evaluation and emitting the final match stream.
+///
+/// Falls back to single-threaded `compress_lazy` for small inputs.
+pub fn compress_lazy_parallel(input: &[u8], num_threads: usize) -> PzResult<Vec<u8>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let threads = num_threads.max(1);
+    if threads <= 1 || input.len() < MIN_PARALLEL_SIZE {
+        return compress_lazy(input);
+    }
+
+    // Limit threads so each segment is at least MIN_SEGMENT_SIZE.
+    // This ensures the warmup cost (MAX_WINDOW inserts per thread) is
+    // amortized over enough actual work.
+    let max_useful_threads = input.len() / MIN_SEGMENT_SIZE;
+    let threads = threads.min(max_useful_threads).max(1);
+    if threads <= 1 {
+        return compress_lazy(input);
+    }
+
+    // Pre-compute matches at every position in parallel
+    let match_table = build_match_table_parallel(input, threads);
+
+    // Sequential lazy evaluation using pre-computed matches
+    serialize_lazy(&match_table, input)
+}
+
+/// Build a match table by finding the best match at every position in parallel.
+///
+/// Each thread processes a segment of positions, building its own HashChainFinder
+/// with a warm-up region of MAX_WINDOW bytes before its segment.
+fn build_match_table_parallel(input: &[u8], num_threads: usize) -> Vec<PreMatch> {
+    let n = input.len();
+    let mut table = vec![
+        PreMatch {
+            offset: 0,
+            length: 0
+        };
+        n
+    ];
+
+    // Split positions into roughly equal segments
+    let segment_size = n.div_ceil(num_threads);
+
+    std::thread::scope(|scope| {
+        // Split the table into mutable slices, one per thread.
+        // Each thread writes to its own non-overlapping segment.
+        let mut remaining_table = &mut table[..];
+        let mut handles = Vec::with_capacity(num_threads);
+
+        for seg_idx in 0..num_threads {
+            let seg_start = seg_idx * segment_size;
+            if seg_start >= n {
+                break;
+            }
+            let seg_end = (seg_start + segment_size).min(n);
+            let seg_len = seg_end - seg_start;
+
+            // Split off this segment's slice
+            let (seg_slice, rest) = remaining_table.split_at_mut(seg_len);
+            remaining_table = rest;
+
+            handles.push(scope.spawn(move || {
+                let mut finder = HashChainFinder::new();
+
+                // Warm-up: insert positions in the preceding window so the
+                // hash chains have context for positions near the segment start.
+                // Skip warmup for the first segment (starts at 0, no prior context).
+                if seg_start > 0 {
+                    let warmup_start = seg_start.saturating_sub(MAX_WINDOW);
+                    for pos in warmup_start..seg_start {
+                        finder.insert(input, pos);
+                    }
+                }
+
+                // Process each position in this segment
+                for pos in seg_start..seg_end {
+                    let m = finder.find_match(input, pos);
+                    finder.insert(input, pos);
+
+                    seg_slice[pos - seg_start] = PreMatch {
+                        offset: m.offset,
+                        length: if m.length >= MIN_MATCH { m.length } else { 0 },
+                    };
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
+
+    table
+}
+
+/// Serialize pre-computed matches with lazy evaluation.
+///
+/// Walks through the match table sequentially, applying the same lazy
+/// matching logic as `compress_lazy`: if the next position has a longer
+/// match, emit a literal and use the next match instead.
+fn serialize_lazy(table: &[PreMatch], input: &[u8]) -> PzResult<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut pos: usize = 0;
+    let n = input.len();
+
+    while pos < n {
+        let pm = table[pos];
+
+        if pm.length >= MIN_MATCH && pos + 1 < n {
+            let next_pm = table[pos + 1];
+            if next_pm.length > pm.length {
+                // Emit literal for current position, use next match
+                let literal = Match {
+                    offset: 0,
+                    length: 0,
+                    next: input[pos],
+                };
+                output.extend_from_slice(&literal.to_bytes());
+                pos += 1;
+
+                // Ensure room for the `next` byte
+                let remaining = n - pos;
+                let mut len = next_pm.length;
+                while len as usize >= remaining && len > 0 {
+                    len -= 1;
+                }
+                let next_byte = if (len as usize) < remaining {
+                    input[pos + len as usize]
+                } else {
+                    0
+                };
+
+                let m = Match {
+                    offset: next_pm.offset,
+                    length: len,
+                    next: next_byte,
+                };
+                output.extend_from_slice(&m.to_bytes());
+                pos += len as usize + 1;
+                continue;
+            }
+        }
+
+        // Use match as-is (or emit literal if no match)
+        let remaining = n - pos;
+        let mut len = pm.length;
+        while len as usize >= remaining && len > 0 {
+            len -= 1;
+        }
+        let next_byte = if (len as usize) < remaining {
+            input[pos + len as usize]
+        } else {
+            0
+        };
+
+        let m = Match {
+            offset: pm.offset,
+            length: len,
+            next: next_byte,
+        };
+        output.extend_from_slice(&m.to_bytes());
+        pos += len as usize + 1;
     }
 
     Ok(output)
@@ -867,5 +1060,84 @@ mod tests {
         let compressed = compress_lazy(&input).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
+    }
+
+    // --- Parallel LZ77 tests ---
+
+    #[test]
+    fn test_parallel_round_trip_empty() {
+        let compressed = compress_lazy_parallel(&[], 4).unwrap();
+        assert!(compressed.is_empty());
+    }
+
+    #[test]
+    fn test_parallel_round_trip_small() {
+        // Below parallel threshold, falls back to single-threaded
+        let input = b"hello, world! hello, world!";
+        let compressed = compress_lazy_parallel(input, 4).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_parallel_round_trip_large() {
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let mut input = Vec::new();
+        for _ in 0..5830 {
+            input.extend_from_slice(pattern);
+        }
+        // Should be above MIN_PARALLEL_SIZE (256KB = 262144)
+        assert!(input.len() >= MIN_PARALLEL_SIZE);
+
+        let compressed = compress_lazy_parallel(&input, 2).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_parallel_round_trip_binary() {
+        // Just above MIN_PARALLEL_SIZE (256KB) — keeps debug-mode test fast
+        let input: Vec<u8> = (0..=255).cycle().take(260_000).collect();
+        let compressed = compress_lazy_parallel(&input, 2).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_parallel_various_thread_counts() {
+        // Just above MIN_PARALLEL_SIZE (256KB), keeps debug-mode test fast
+        let pattern = b"abcdefghij klmnopqrst uvwxyz 0123456789 ";
+        let mut input = Vec::new();
+        for _ in 0..6600 {
+            input.extend_from_slice(pattern);
+        }
+
+        for threads in [1, 2, 4] {
+            let compressed = compress_lazy_parallel(&input, threads).unwrap();
+            let decompressed = decompress(&compressed).unwrap();
+            assert_eq!(decompressed, input, "failed with {} threads", threads);
+        }
+    }
+
+    #[test]
+    fn test_parallel_all_same_bytes() {
+        // Just above MIN_PARALLEL_SIZE (256KB)
+        let input = vec![0xAA; 260_000];
+        let compressed = compress_lazy_parallel(&input, 2).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_parallel_single_thread_matches_sequential() {
+        // With 1 thread, parallel should produce same output as sequential
+        let pattern = b"Hello, World! This is a test pattern. ";
+        let mut input = Vec::new();
+        for _ in 0..200 {
+            input.extend_from_slice(pattern);
+        }
+        let seq = compress_lazy(&input).unwrap();
+        let par = compress_lazy_parallel(&input, 1).unwrap();
+        assert_eq!(seq, par);
     }
 }

@@ -260,6 +260,111 @@ fn bench_bwt_gpu(c: &mut Criterion) {
 }
 
 #[cfg(feature = "opencl")]
+fn bench_huffman_gpu(c: &mut Criterion) {
+    use pz::opencl::OpenClEngine;
+
+    let engine = match OpenClEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => {
+            eprintln!("stages: no OpenCL device, skipping GPU Huffman benchmarks");
+            return;
+        }
+    };
+
+    let mut group = c.benchmark_group("huffman_gpu");
+    cap(&mut group);
+    for &size in &[10240, 65536, 262_144, 4_194_304, 16_777_216] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // Build tree and LUT
+        let tree = pz::huffman::HuffmanTree::from_data(&data).unwrap();
+        let mut code_lut = [0u32; 256];
+        for byte in 0..=255u8 {
+            let (codeword, bits) = tree.get_code(byte);
+            code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+        }
+
+        // CPU baseline
+        let tree_clone = tree.clone();
+        group.bench_with_input(
+            BenchmarkId::new("encode_cpu", size),
+            &data,
+            move |b, data| {
+                b.iter(|| tree_clone.encode(data).unwrap());
+            },
+        );
+
+        // GPU with CPU prefix sum
+        let eng1 = engine.clone();
+        let lut1 = code_lut;
+        group.bench_with_input(
+            BenchmarkId::new("encode_gpu_cpu_scan", size),
+            &data,
+            move |b, data| {
+                b.iter(|| eng1.huffman_encode(data, &lut1).unwrap());
+            },
+        );
+
+        // GPU with GPU prefix sum
+        let eng2 = engine.clone();
+        let lut2 = code_lut;
+        group.bench_with_input(
+            BenchmarkId::new("encode_gpu_gpu_scan", size),
+            &data,
+            move |b, data| {
+                b.iter(|| eng2.huffman_encode_gpu_scan(data, &lut2).unwrap());
+            },
+        );
+    }
+    group.finish();
+}
+
+#[cfg(feature = "opencl")]
+fn bench_deflate_gpu_chained(c: &mut Criterion) {
+    use pz::opencl::OpenClEngine;
+    use pz::pipeline::CompressOptions;
+
+    let engine = match OpenClEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => {
+            eprintln!("stages: no OpenCL device, skipping GPU Deflate chained benchmarks");
+            return;
+        }
+    };
+
+    let mut group = c.benchmark_group("deflate_gpu_chained");
+    cap(&mut group);
+    for &size in &[65536, 262_144, 1_048_576, 4_194_304, 16_777_216] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // CPU Deflate (single-threaded)
+        group.bench_with_input(BenchmarkId::new("cpu_1t", size), &data, |b, data| {
+            let opts = CompressOptions {
+                threads: 1,
+                ..Default::default()
+            };
+            b.iter(|| {
+                pz::pipeline::compress_with_options(data, pz::pipeline::Pipeline::Deflate, &opts)
+                    .unwrap()
+            });
+        });
+
+        // GPU chained Deflate
+        let eng = engine.clone();
+        group.bench_with_input(
+            BenchmarkId::new("gpu_chained", size),
+            &data,
+            move |b, data| {
+                b.iter(|| eng.deflate_chained(data).unwrap());
+            },
+        );
+    }
+    group.finish();
+}
+
+#[cfg(feature = "opencl")]
 fn bench_lz77_gpu(c: &mut Criterion) {
     use pz::opencl::{KernelVariant, OpenClEngine};
 
@@ -295,11 +400,137 @@ fn bench_lz77_gpu(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_lz77_parallel(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lz77_parallel");
+    for &size in &[65536, 262144, 1048576] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // Baseline: single-threaded lazy
+        group.bench_with_input(
+            BenchmarkId::new("compress_lazy_1t", size),
+            &data,
+            |b, data| {
+                b.iter(|| pz::lz77::compress_lazy(data).unwrap());
+            },
+        );
+
+        // Parallel with various thread counts
+        for &threads in &[2, 4, 8] {
+            group.bench_with_input(
+                BenchmarkId::new(format!("compress_lazy_{}t", threads), size),
+                &data,
+                |b, data| {
+                    b.iter(|| pz::lz77::compress_lazy_parallel(data, threads).unwrap());
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+fn bench_analysis(c: &mut Criterion) {
+    let mut group = c.benchmark_group("analysis");
+    for &size in &[1024, 10240, 65536, 262144] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("analyze", size), &data, |b, data| {
+            b.iter(|| pz::analysis::analyze(data));
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("analyze_sample_4k", size),
+            &data,
+            |b, data| {
+                b.iter(|| pz::analysis::analyze_with_sample(data, 4096));
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_simd(c: &mut Criterion) {
+    use pz::simd::{scalar, Dispatcher};
+
+    let mut group = c.benchmark_group("simd");
+    for &size in &[1024, 10240, 65536, 262_144, 1_048_576] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // Byte frequency counting: scalar baseline
+        group.bench_with_input(
+            BenchmarkId::new("byte_freq_scalar", size),
+            &data,
+            |b, data| {
+                b.iter(|| scalar::byte_frequencies(data));
+            },
+        );
+
+        // Byte frequency counting: SIMD dispatch
+        group.bench_with_input(
+            BenchmarkId::new("byte_freq_simd", size),
+            &data,
+            |b, data| {
+                let d = Dispatcher::new();
+                b.iter(|| d.byte_frequencies(data));
+            },
+        );
+
+        // Match comparison: create two copies with a known mismatch
+        let mut data2 = data.clone();
+        let mismatch_pos = size / 2;
+        data2[mismatch_pos] ^= 0xFF;
+
+        // Compare bytes: scalar baseline
+        group.bench_with_input(
+            BenchmarkId::new("compare_scalar", size),
+            &data,
+            |b, data| {
+                b.iter(|| scalar::compare_bytes(data, &data2, data.len().min(258)));
+            },
+        );
+
+        // Compare bytes: SIMD dispatch
+        group.bench_with_input(BenchmarkId::new("compare_simd", size), &data, |b, data| {
+            let d = Dispatcher::new();
+            b.iter(|| d.compare_bytes(data, &data2));
+        });
+    }
+    group.finish();
+}
+
+fn bench_auto_select(c: &mut Criterion) {
+    use pz::pipeline::{self, CompressOptions};
+
+    let mut group = c.benchmark_group("auto_select");
+    for &size in &[10240, 65536, 262144] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("heuristic", size), &data, |b, data| {
+            b.iter(|| pipeline::select_pipeline(data));
+        });
+
+        group.bench_with_input(BenchmarkId::new("trial_4k", size), &data, |b, data| {
+            let opts = CompressOptions::default();
+            b.iter(|| pipeline::select_pipeline_trial(data, &opts, 4096));
+        });
+    }
+    group.finish();
+}
+
 #[cfg(not(feature = "opencl"))]
 fn bench_bwt_gpu(_c: &mut Criterion) {}
 
 #[cfg(not(feature = "opencl"))]
 fn bench_lz77_gpu(_c: &mut Criterion) {}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_huffman_gpu(_c: &mut Criterion) {}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_deflate_gpu_chained(_c: &mut Criterion) {}
 
 criterion_group!(
     benches,
@@ -311,7 +542,13 @@ criterion_group!(
     bench_rle,
     bench_rangecoder,
     bench_fse,
+    bench_simd,
+    bench_lz77_parallel,
+    bench_analysis,
+    bench_auto_select,
     bench_bwt_gpu,
-    bench_lz77_gpu
+    bench_lz77_gpu,
+    bench_huffman_gpu,
+    bench_deflate_gpu_chained
 );
 criterion_main!(benches);

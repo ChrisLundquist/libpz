@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod bwt;
 pub mod crc32;
 pub mod deflate;
@@ -12,6 +13,7 @@ pub mod pipeline;
 pub mod pqueue;
 pub mod rangecoder;
 pub mod rle;
+pub mod simd;
 
 #[cfg(feature = "opencl")]
 pub mod opencl;

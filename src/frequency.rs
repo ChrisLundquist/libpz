@@ -28,10 +28,12 @@ impl FrequencyTable {
     ///
     /// Populates `self.byte` with per-byte counts, and computes
     /// `self.total` and `self.used`.
+    ///
+    /// Uses SIMD-accelerated counting when available (AVX2 on x86_64
+    /// with 4-bank histogramming, SSE2 with unrolled scalar).
     pub fn count(&mut self, input: &[u8]) {
-        for &b in input {
-            self.byte[b as usize] += 1;
-        }
+        let d = crate::simd::Dispatcher::new();
+        self.byte = d.byte_frequencies(input);
 
         self.total = self.byte.iter().map(|&c| c as u64).sum();
         self.used = self.byte.iter().filter(|&&c| c > 0).count() as u32;
