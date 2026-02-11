@@ -3,9 +3,32 @@
 //! Benchmarks each compression primitive individually at multiple input
 //! sizes to identify bottlenecks and show scaling behavior. BWT's
 //! O(n log^2 n) suffix array construction is expected to dominate.
+//!
+//! Size tiers:
+//!   - Small:  1KB, 10KB, 64KB       — all algorithms
+//!   - Medium: 256KB                  — GPU crossover region
+//!   - Large:  4MB, 16MB              — GPU advantage expected
+//!
+//! All groups enforce warm_up_time(5s) + measurement_time(10s) + sample_size(10)
+//! to keep total runtime bounded (~60s per slow benchmark).
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::path::Path;
+use std::time::Duration;
+
+/// Small/medium sizes benchmarked for all algorithms.
+const SIZES_SMALL: &[usize] = &[1024, 10240, 65536];
+/// All sizes including large tiers for fast algorithms (LZ77, Huffman, etc.).
+const SIZES_ALL: &[usize] = &[1024, 10240, 65536, 262_144, 4_194_304, 16_777_216];
+/// Large sizes only — for targeted GPU-vs-CPU comparisons.
+const SIZES_LARGE: &[usize] = &[262_144, 4_194_304];
+
+/// Apply standard timeout caps to a benchmark group.
+fn cap(group: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>) {
+    group.warm_up_time(Duration::from_secs(5));
+    group.measurement_time(Duration::from_secs(10));
+    group.sample_size(10);
+}
 
 /// Load test data, truncated to the requested size.
 fn get_test_data(size: usize) -> Vec<u8> {
@@ -39,14 +62,33 @@ fn get_test_data(size: usize) -> Vec<u8> {
 
 fn bench_bwt(c: &mut Criterion) {
     let mut group = c.benchmark_group("bwt");
-    for &size in &[1024, 10240, 65536] {
+    cap(&mut group);
+    for &size in SIZES_SMALL {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::new("encode", size), &data, |b, data| {
             b.iter(|| pz::bwt::encode(data).unwrap());
         });
 
-        // Pre-encode for decode benchmark
+        let encoded = pz::bwt::encode(&data).unwrap();
+        group.bench_with_input(BenchmarkId::new("decode", size), &encoded, |b, enc| {
+            b.iter(|| pz::bwt::decode(&enc.data, enc.primary_index).unwrap());
+        });
+    }
+    group.finish();
+}
+
+fn bench_bwt_large(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bwt_large");
+    cap(&mut group);
+    // Cap at 4MB — 16MB BWT CPU encode is ~6s/iter, too slow for criterion.
+    for &size in SIZES_LARGE {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::new("encode", size), &data, |b, data| {
+            b.iter(|| pz::bwt::encode(data).unwrap());
+        });
+
         let encoded = pz::bwt::encode(&data).unwrap();
         group.bench_with_input(BenchmarkId::new("decode", size), &encoded, |b, enc| {
             b.iter(|| pz::bwt::decode(&enc.data, enc.primary_index).unwrap());
@@ -57,7 +99,8 @@ fn bench_bwt(c: &mut Criterion) {
 
 fn bench_lz77(c: &mut Criterion) {
     let mut group = c.benchmark_group("lz77");
-    for &size in &[1024, 10240, 65536, 262144, 1048576] {
+    cap(&mut group);
+    for &size in SIZES_ALL {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -88,7 +131,8 @@ fn bench_lz77(c: &mut Criterion) {
 
 fn bench_huffman(c: &mut Criterion) {
     let mut group = c.benchmark_group("huffman");
-    for &size in &[1024, 10240, 65536] {
+    cap(&mut group);
+    for &size in SIZES_ALL {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -109,7 +153,8 @@ fn bench_huffman(c: &mut Criterion) {
 
 fn bench_mtf(c: &mut Criterion) {
     let mut group = c.benchmark_group("mtf");
-    for &size in &[1024, 10240, 65536] {
+    cap(&mut group);
+    for &size in SIZES_ALL {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -127,7 +172,8 @@ fn bench_mtf(c: &mut Criterion) {
 
 fn bench_rle(c: &mut Criterion) {
     let mut group = c.benchmark_group("rle");
-    for &size in &[1024, 10240, 65536] {
+    cap(&mut group);
+    for &size in SIZES_ALL {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -145,7 +191,8 @@ fn bench_rle(c: &mut Criterion) {
 
 fn bench_rangecoder(c: &mut Criterion) {
     let mut group = c.benchmark_group("rangecoder");
-    for &size in &[1024, 10240, 65536] {
+    cap(&mut group);
+    for &size in SIZES_ALL {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -163,7 +210,8 @@ fn bench_rangecoder(c: &mut Criterion) {
 
 fn bench_fse(c: &mut Criterion) {
     let mut group = c.benchmark_group("fse");
-    for &size in &[1024, 10240, 65536] {
+    cap(&mut group);
+    for &size in SIZES_ALL {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -194,7 +242,8 @@ fn bench_bwt_gpu(c: &mut Criterion) {
     eprintln!("stages: GPU device: {}", engine.device_name());
 
     let mut group = c.benchmark_group("bwt_gpu");
-    for &size in &[1024, 10240, 65536] {
+    cap(&mut group);
+    for &size in SIZES_ALL {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -220,7 +269,8 @@ fn bench_lz77_gpu(c: &mut Criterion) {
     };
 
     let mut group = c.benchmark_group("lz77_gpu");
-    for &size in &[1024, 10240, 65536, 262144, 1048576] {
+    cap(&mut group);
+    for &size in SIZES_ALL {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -254,6 +304,7 @@ fn bench_lz77_gpu(_c: &mut Criterion) {}
 criterion_group!(
     benches,
     bench_bwt,
+    bench_bwt_large,
     bench_lz77,
     bench_huffman,
     bench_mtf,

@@ -64,7 +64,18 @@ __kernel void bitonic_sort_step(
     // Determine sort direction for this block
     bool ascending = ((i & k_sort) == 0);
 
-    bool should_swap = ascending ? (key_i > key_ixj) : (key_i < key_ixj);
+    // When composite keys are equal, break ties by suffix index (descending)
+    // so that higher-indexed suffixes sort first. This matches the CPU SA-IS
+    // behavior on doubled text with sentinel: for identical rotations, the
+    // rotation starting at a higher position has the sentinel closer, making
+    // it lexicographically smaller.
+    bool should_swap;
+    if (key_i != key_ixj) {
+        should_swap = ascending ? (key_i > key_ixj) : (key_i < key_ixj);
+    } else {
+        // Equal keys: higher suffix index comes first (descending order)
+        should_swap = ascending ? (sa_i < sa_ixj) : (sa_i > sa_ixj);
+    }
 
     if (should_swap) {
         sa[i]   = sa_ixj;

@@ -3,13 +3,26 @@
 //! Measures compression and decompression throughput in MB/s for each
 //! pipeline, and compares against external tools (gzip, pigz, zstd)
 //! when available on the system PATH.
+//!
+//! Size tiers: default corpus (~135KB), 4MB, 16MB.
+//!
+//! All groups enforce warm_up_time(5s) + measurement_time(10s) + sample_size(10)
+//! to keep total runtime bounded.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use pz::pipeline::{self, Pipeline};
+
+/// Apply standard timeout caps to a benchmark group.
+fn cap(group: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>) {
+    group.warm_up_time(Duration::from_secs(5));
+    group.measurement_time(Duration::from_secs(10));
+    group.sample_size(10);
+}
 
 /// Load test data from the Canterbury corpus, or fall back to synthetic data.
 fn get_test_data() -> Vec<u8> {
@@ -40,6 +53,21 @@ fn get_test_data() -> Vec<u8> {
     // Fallback: synthetic repetitive text (~135KB)
     let pattern = b"The quick brown fox jumps over the lazy dog. ";
     pattern.repeat(3000)
+}
+
+/// Load test data, repeated to fill the requested size.
+fn get_test_data_sized(size: usize) -> Vec<u8> {
+    let base = get_test_data();
+    if base.len() >= size {
+        return base[..size].to_vec();
+    }
+    let mut data = Vec::with_capacity(size);
+    while data.len() < size {
+        let remaining = size - data.len();
+        let chunk = remaining.min(base.len());
+        data.extend_from_slice(&base[..chunk]);
+    }
+    data
 }
 
 /// Check if a command exists on PATH.
@@ -79,6 +107,7 @@ fn shell_decompress(data: &[u8], cmd: &str, args: &[&str]) -> Option<Vec<u8>> {
 fn bench_compress(c: &mut Criterion) {
     let data = get_test_data();
     let mut group = c.benchmark_group("compress");
+    cap(&mut group);
     group.throughput(Throughput::Bytes(data.len() as u64));
 
     // pz pipelines
@@ -119,6 +148,7 @@ fn bench_compress(c: &mut Criterion) {
 fn bench_decompress(c: &mut Criterion) {
     let data = get_test_data();
     let mut group = c.benchmark_group("decompress");
+    cap(&mut group);
     group.throughput(Throughput::Bytes(data.len() as u64));
 
     // Pre-compress lazily so filtered-out benchmarks don't pay the cost.
@@ -176,6 +206,7 @@ fn bench_compress_gpu(c: &mut Criterion) {
 
     let data = get_test_data();
     let mut group = c.benchmark_group("compress_gpu");
+    cap(&mut group);
     group.throughput(Throughput::Bytes(data.len() as u64));
 
     let options = CompressOptions {
@@ -203,10 +234,98 @@ fn bench_compress_gpu(c: &mut Criterion) {
 #[cfg(not(feature = "opencl"))]
 fn bench_compress_gpu(_c: &mut Criterion) {}
 
+/// End-to-end pipeline throughput at 4MB and 16MB (CPU).
+fn bench_compress_large(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compress_large");
+    cap(&mut group);
+
+    for &size in &[4_194_304usize, 16_777_216] {
+        let data = get_test_data_sized(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        for &pipe in &[Pipeline::Deflate, Pipeline::Lza] {
+            group.bench_with_input(
+                BenchmarkId::new(format!("{:?}", pipe), size),
+                &data,
+                |b, data| {
+                    b.iter(|| pipeline::compress(data, pipe).unwrap());
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+/// End-to-end pipeline decompression at 4MB and 16MB (CPU).
+fn bench_decompress_large(c: &mut Criterion) {
+    let mut group = c.benchmark_group("decompress_large");
+    cap(&mut group);
+
+    for &size in &[4_194_304usize, 16_777_216] {
+        let data = get_test_data_sized(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        for &pipe in &[Pipeline::Deflate, Pipeline::Lza] {
+            group.bench_function(BenchmarkId::new(format!("{:?}", pipe), size), |b| {
+                let compressed = pipeline::compress(&data, pipe).unwrap();
+                b.iter(|| pipeline::decompress(&compressed).unwrap());
+            });
+        }
+    }
+    group.finish();
+}
+
+/// End-to-end GPU pipeline throughput at 4MB and 16MB.
+#[cfg(feature = "opencl")]
+fn bench_compress_gpu_large(c: &mut Criterion) {
+    use pz::opencl::OpenClEngine;
+    use pz::pipeline::{Backend, CompressOptions};
+
+    let engine = match OpenClEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => {
+            eprintln!("throughput: no OpenCL device, skipping large GPU benchmarks");
+            return;
+        }
+    };
+
+    let mut group = c.benchmark_group("compress_gpu_large");
+    cap(&mut group);
+
+    for &size in &[4_194_304usize, 16_777_216] {
+        let data = get_test_data_sized(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        let options = CompressOptions {
+            backend: Backend::OpenCl,
+            opencl_engine: Some(engine.clone()),
+            ..CompressOptions::default()
+        };
+
+        for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            let opts = options.clone();
+            group.bench_with_input(
+                BenchmarkId::new(format!("{:?}_gpu", pipe), size),
+                &data,
+                move |b, data| {
+                    b.iter(|| pipeline::compress_with_options(data, pipe, &opts).unwrap());
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_compress_gpu_large(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_compress,
     bench_decompress,
-    bench_compress_gpu
+    bench_compress_large,
+    bench_decompress_large,
+    bench_compress_gpu,
+    bench_compress_gpu_large
 );
 criterion_main!(benches);
