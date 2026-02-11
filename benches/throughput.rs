@@ -180,6 +180,9 @@ fn bench_compress_gpu(c: &mut Criterion) {
 
     let options = CompressOptions {
         backend: Backend::OpenCl,
+        threads: 1,
+        block_size: 0,
+        parse_strategy: pz::pipeline::ParseStrategy::Greedy,
         opencl_engine: Some(engine),
     };
 

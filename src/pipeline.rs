@@ -46,8 +46,13 @@ pub enum Backend {
 /// LZ77 match selection strategy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ParseStrategy {
-    /// Greedy: hash-chain match finder, pick the longest match.
+    /// Auto: choose the best strategy based on backend and input size.
+    /// - GPU backend + large input: GPU hash-table kernel
+    /// - CPU backend: lazy matching (best compression)
+    /// - Equivalent to Lazy on CPU, HashTable on GPU.
     #[default]
+    Auto,
+    /// Greedy: hash-chain match finder, pick the longest match.
     Greedy,
     /// Lazy: check if the next position has a longer match (gzip-style).
     Lazy,
@@ -83,7 +88,7 @@ impl Default for CompressOptions {
             backend: Backend::Cpu,
             threads: 0,
             block_size: DEFAULT_BLOCK_SIZE,
-            parse_strategy: ParseStrategy::Greedy,
+            parse_strategy: ParseStrategy::Auto,
             #[cfg(feature = "opencl")]
             opencl_engine: None,
         }
@@ -931,26 +936,36 @@ fn decompress_pipeline_parallel(
 // --- LZ77 helper: select GPU or CPU backend for match finding ---
 
 /// Run LZ77 compression using the configured backend and parse strategy.
+///
+/// Backend/strategy selection logic:
+/// - `Auto` on GPU: hash-table kernel (best throughput at ≥256KB)
+/// - `Auto` on CPU: lazy matching (best compression ratio)
+/// - `Optimal` on GPU: GPU top-K match table → CPU backward DP
+/// - `Optimal` on CPU: CPU match table → CPU backward DP
+/// - GPU backend falls back to CPU when input < MIN_GPU_INPUT_SIZE
 fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
     #[cfg(feature = "opencl")]
     {
         if let Backend::OpenCl = options.backend {
             if let Some(ref engine) = options.opencl_engine {
-                if options.parse_strategy == ParseStrategy::Optimal {
-                    // GPU top-K match table + CPU optimal parse DP
-                    let table = engine.find_topk_matches(input)?;
-                    return crate::optimal::compress_optimal_with_table(input, &table);
+                if input.len() >= crate::opencl::MIN_GPU_INPUT_SIZE {
+                    if options.parse_strategy == ParseStrategy::Optimal {
+                        // GPU top-K match table + CPU optimal parse DP
+                        let table = engine.find_topk_matches(input)?;
+                        return crate::optimal::compress_optimal_with_table(input, &table);
+                    }
+                    // GPU hash-table kernel for Auto/Greedy/Lazy
+                    return engine.lz77_compress(input, crate::opencl::KernelVariant::HashTable);
                 }
-                // GPU greedy path
-                return engine.lz77_compress(input, crate::opencl::KernelVariant::Batch);
+                // Input too small for GPU — fall through to CPU paths
             }
         }
     }
 
     // CPU paths
     match options.parse_strategy {
+        ParseStrategy::Auto | ParseStrategy::Lazy => lz77::compress_lazy(input),
         ParseStrategy::Greedy => lz77::compress_hashchain(input),
-        ParseStrategy::Lazy => lz77::compress_lazy(input),
         ParseStrategy::Optimal => crate::optimal::compress_optimal(input),
     }
 }

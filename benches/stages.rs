@@ -57,7 +57,7 @@ fn bench_bwt(c: &mut Criterion) {
 
 fn bench_lz77(c: &mut Criterion) {
     let mut group = c.benchmark_group("lz77");
-    for &size in &[1024, 10240, 65536] {
+    for &size in &[1024, 10240, 65536, 262144, 1048576] {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -220,7 +220,7 @@ fn bench_lz77_gpu(c: &mut Criterion) {
     };
 
     let mut group = c.benchmark_group("lz77_gpu");
-    for &size in &[1024, 10240, 65536] {
+    for &size in &[1024, 10240, 65536, 262144, 1048576] {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -230,6 +230,15 @@ fn bench_lz77_gpu(c: &mut Criterion) {
             &data,
             move |b, data| {
                 b.iter(|| eng.lz77_compress(data, KernelVariant::Batch).unwrap());
+            },
+        );
+
+        let eng2 = engine.clone();
+        group.bench_with_input(
+            BenchmarkId::new("compress_gpu_hash", size),
+            &data,
+            move |b, data| {
+                b.iter(|| eng2.lz77_compress(data, KernelVariant::HashTable).unwrap());
             },
         );
     }

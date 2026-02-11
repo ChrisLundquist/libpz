@@ -33,7 +33,9 @@ fn usage() {
     eprintln!("  -t, --threads N    Number of threads (0=auto, 1=single-threaded)");
     #[cfg(feature = "opencl")]
     eprintln!("  -g, --gpu          Use GPU (OpenCL) for compression");
-    eprintln!("  -O, --optimal      Use optimal parsing (better compression, slower)");
+    eprintln!("  -O, --optimal      Use optimal parsing (best compression, slowest)");
+    eprintln!("  --lazy             Use lazy matching (good compression, default)");
+    eprintln!("  --greedy           Use greedy matching (fastest, least compression)");
     eprintln!("  -q, --quiet        Suppress warnings");
     eprintln!("  -v, --verbose      Verbose output");
     eprintln!("  -h, --help         Show this help");
@@ -53,7 +55,7 @@ struct Opts {
     verbose: bool,
     quiet: bool,
     gpu: bool,
-    optimal: bool,
+    parse_strategy: ParseStrategy,
     threads: usize,
     pipeline: Pipeline,
     files: Vec<String>,
@@ -70,7 +72,7 @@ fn parse_args() -> Opts {
         verbose: false,
         quiet: false,
         gpu: false,
-        optimal: false,
+        parse_strategy: ParseStrategy::Auto,
         threads: 0,
         pipeline: Pipeline::Deflate,
         files: Vec::new(),
@@ -88,7 +90,9 @@ fn parse_args() -> Opts {
             "-v" | "--verbose" => opts.verbose = true,
             "-q" | "--quiet" => opts.quiet = true,
             "-g" | "--gpu" | "--opencl" => opts.gpu = true,
-            "-O" | "--optimal" => opts.optimal = true,
+            "-O" | "--optimal" => opts.parse_strategy = ParseStrategy::Optimal,
+            "--lazy" => opts.parse_strategy = ParseStrategy::Lazy,
+            "--greedy" => opts.parse_strategy = ParseStrategy::Greedy,
             "-h" | "--help" => {
                 usage();
                 process::exit(0);
@@ -136,7 +140,7 @@ fn parse_args() -> Opts {
                         'v' => opts.verbose = true,
                         'q' => opts.quiet = true,
                         'g' => opts.gpu = true,
-                        'O' => opts.optimal = true,
+                        'O' => opts.parse_strategy = ParseStrategy::Optimal,
                         _ => {
                             eprintln!("pz: unknown flag '-{ch}'");
                             process::exit(1);
@@ -200,11 +204,7 @@ fn compress_data(
 
 /// Build compression options from CLI flags.
 fn build_cli_options(opts: &Opts) -> CompressOptions {
-    let parse_strategy = if opts.optimal {
-        ParseStrategy::Optimal
-    } else {
-        ParseStrategy::Greedy
-    };
+    let parse_strategy = opts.parse_strategy;
 
     #[cfg(feature = "opencl")]
     {
