@@ -616,37 +616,98 @@ pub fn encode_bijective(input: &[u8]) -> Option<(Vec<u8>, Vec<usize>)> {
 /// Key insight: each factor is a Lyndon word, which by definition is the
 /// lexicographically smallest rotation of itself. In the sorted rotation matrix,
 /// the original string is always at row 0, so `primary_index = 0` for every factor.
-/// This lets us reuse the standard O(n) LF-mapping decode.
+///
+/// Optimized: pre-allocates a single output buffer and reuses a single LF table
+/// across all factors, reducing heap allocations from 2k to 2 (where k = factor count).
 pub fn decode_bijective(bwt: &[u8], factor_lengths: &[usize]) -> PzResult<Vec<u8>> {
     if bwt.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Verify total lengths match
     let total: usize = factor_lengths.iter().sum();
     if total != bwt.len() {
         return Err(PzError::InvalidInput);
     }
 
-    let mut output = Vec::with_capacity(bwt.len());
+    let mut output = vec![0u8; total];
+    decode_bijective_into(bwt, factor_lengths, &mut output)?;
+    Ok(output)
+}
+
+/// Perform the bijective BWT inverse into a pre-allocated output buffer.
+///
+/// Returns the number of bytes written.
+pub fn decode_bijective_to_buf(
+    bwt: &[u8],
+    factor_lengths: &[usize],
+    output: &mut [u8],
+) -> PzResult<usize> {
+    if bwt.is_empty() {
+        return Ok(0);
+    }
+
+    let total: usize = factor_lengths.iter().sum();
+    if total != bwt.len() {
+        return Err(PzError::InvalidInput);
+    }
+    if output.len() < total {
+        return Err(PzError::BufferTooSmall);
+    }
+
+    decode_bijective_into(bwt, factor_lengths, &mut output[..total])?;
+    Ok(total)
+}
+
+/// Core bijective decode: inline LF-mapping with buffer reuse.
+fn decode_bijective_into(bwt: &[u8], factor_lengths: &[usize], output: &mut [u8]) -> PzResult<()> {
+    // Pre-allocate LF table at max factor size — reused across all factors.
+    let max_flen = factor_lengths.iter().copied().max().unwrap_or(0);
+    let mut lf = vec![0u32; max_flen];
+
     let mut offset = 0;
 
     for &flen in factor_lengths {
         let factor_bwt = &bwt[offset..offset + flen];
+        let out_slice = &mut output[offset..offset + flen];
         offset += flen;
 
         if flen == 1 {
-            output.push(factor_bwt[0]);
+            out_slice[0] = factor_bwt[0];
             continue;
         }
 
-        // Lyndon word ⟹ original is lex-smallest rotation ⟹ primary_index = 0.
-        // Use the standard LF-mapping decode, O(n).
-        let decoded = decode(factor_bwt, 0)?;
-        output.extend_from_slice(&decoded);
+        // Inline LF-mapping decode with primary_index = 0 (Lyndon property).
+        // Step 1: Count byte occurrences
+        let mut counts = [0u32; 256];
+        for &byte in factor_bwt {
+            counts[byte as usize] += 1;
+        }
+
+        // Step 2: Cumulative counts (starting positions in first column)
+        let mut cumul = [0u32; 256];
+        let mut sum = 0u32;
+        for (c, &count) in counts.iter().enumerate() {
+            cumul[c] = sum;
+            sum += count;
+        }
+
+        // Step 3: Build LF-mapping into reused buffer
+        let lf_slice = &mut lf[..flen];
+        let mut running = cumul;
+        for (i, &byte) in factor_bwt.iter().enumerate() {
+            lf_slice[i] = running[byte as usize];
+            running[byte as usize] += 1;
+        }
+
+        // Step 4: Follow LF-mapping from row 0, reading backwards
+        let mut idx: usize = 0;
+        for i in (0..flen).rev() {
+            out_slice[i] = factor_bwt[idx];
+            idx = lf_slice[idx] as usize;
+        }
     }
 
-    Ok(output)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1034,6 +1095,26 @@ mod tests {
         let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
         let decoded = decode_bijective(&bwt_data, &factor_lens).unwrap();
         assert_eq!(&decoded, &input[..]);
+    }
+
+    #[test]
+    fn test_bijective_decode_to_buf() {
+        let input = b"the quick brown fox jumps over the lazy dog";
+        let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
+        let mut buf = vec![0u8; 100];
+        let n = decode_bijective_to_buf(&bwt_data, &factor_lens, &mut buf).unwrap();
+        assert_eq!(&buf[..n], &input[..]);
+    }
+
+    #[test]
+    fn test_bijective_decode_to_buf_too_small() {
+        let input = b"hello";
+        let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
+        let mut buf = vec![0u8; 2];
+        assert_eq!(
+            decode_bijective_to_buf(&bwt_data, &factor_lens, &mut buf),
+            Err(PzError::BufferTooSmall)
+        );
     }
 
     #[test]
