@@ -586,10 +586,10 @@ pub fn encode_bijective(input: &[u8]) -> Option<(Vec<u8>, Vec<usize>)> {
 /// Given the transformed data and the factor lengths from encode_bijective,
 /// reconstructs the original input by inverting each factor's BWT independently.
 ///
-/// For each factor, since it is a Lyndon word (lexicographically smallest rotation),
-/// we know the original string is the lexicographically smallest rotation of the
-/// BWT output for that factor. We recover it using the standard LF-mapping approach
-/// and then select the rotation that is a Lyndon word.
+/// Key insight: each factor is a Lyndon word, which by definition is the
+/// lexicographically smallest rotation of itself. In the sorted rotation matrix,
+/// the original string is always at row 0, so `primary_index = 0` for every factor.
+/// This lets us reuse the standard O(n) LF-mapping decode.
 pub fn decode_bijective(bwt: &[u8], factor_lengths: &[usize]) -> PzResult<Vec<u8>> {
     if bwt.is_empty() {
         return Ok(Vec::new());
@@ -613,55 +613,10 @@ pub fn decode_bijective(bwt: &[u8], factor_lengths: &[usize]) -> PzResult<Vec<u8
             continue;
         }
 
-        // Build LF-mapping for this factor
-        let mut counts = [0u32; 256];
-        for &byte in factor_bwt {
-            counts[byte as usize] += 1;
-        }
-
-        let mut cumul = [0u32; 256];
-        let mut sum = 0u32;
-        for (c, &count) in counts.iter().enumerate() {
-            cumul[c] = sum;
-            sum += count;
-        }
-
-        let mut lf = vec![0u32; flen];
-        let mut running = cumul;
-        for (i, &byte) in factor_bwt.iter().enumerate() {
-            lf[i] = running[byte as usize];
-            running[byte as usize] += 1;
-        }
-
-        // For a Lyndon word, the original is the lex-smallest rotation.
-        // Try each starting position in the LF-mapping and find the one
-        // that produces the lexicographically smallest string.
-        // Since it's a Lyndon word, exactly one rotation will be the smallest.
-        let mut best_start = 0usize;
-        let mut best_rotation: Option<Vec<u8>> = None;
-
-        for start in 0..flen {
-            let mut rotation = Vec::with_capacity(flen);
-            let mut idx = start;
-            for _ in (0..flen).rev() {
-                rotation.push(factor_bwt[idx]);
-                idx = lf[idx] as usize;
-            }
-            rotation.reverse();
-
-            if let Some(ref best) = best_rotation {
-                if rotation < *best {
-                    best_rotation = Some(rotation);
-                    best_start = start;
-                }
-            } else {
-                best_rotation = Some(rotation);
-                best_start = start;
-            }
-        }
-
-        let _ = best_start; // used for debugging if needed
-        output.extend(best_rotation.unwrap());
+        // Lyndon word ⟹ original is lex-smallest rotation ⟹ primary_index = 0.
+        // Use the standard LF-mapping decode, O(n).
+        let decoded = decode(factor_bwt, 0)?;
+        output.extend_from_slice(&decoded);
     }
 
     Ok(output)
@@ -1129,17 +1084,17 @@ mod tests {
             );
         }
 
-        // Canterbury corpus
+        // Canterbury corpus — with timing
         let cantrbry_dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/cantrbry");
         if cantrbry_dir.exists() {
-            println!("\n--- Canterbury Corpus ---");
+            println!("\n--- Canterbury Corpus (compression ratio) ---");
             println!(
-                "{:<30} {:>8} {:>8} {:>8} {:>8} {:>7}",
+                "{:<25} {:>8} {:>8} {:>8} {:>8} {:>7}",
                 "File", "Std Runs", "Bij Runs", "Std Size", "Bij Size", "Delta%"
             );
             println!(
-                "{:-<30} {:->8} {:->8} {:->8} {:->8} {:->7}",
+                "{:-<25} {:->8} {:->8} {:->8} {:->8} {:->7}",
                 "", "", "", "", "", ""
             );
 
@@ -1151,10 +1106,11 @@ mod tests {
                 "grammar.lsp",
                 "xargs.1",
             ];
+
+            // First pass: compression ratios
             for filename in &files {
                 let path = cantrbry_dir.join(filename);
                 if let Ok(data) = std::fs::read(&path) {
-                    // Cap at 64KB for reasonable test time
                     let input = if data.len() > 65536 {
                         &data[..65536]
                     } else {
@@ -1180,17 +1136,88 @@ mod tests {
 
                     let std_runs = count_runs2(&std_result.data);
                     let bij_runs = count_runs2(&bij_data);
-
                     let delta_pct = (bij_fse.len() as f64 / std_fse.len() as f64 - 1.0) * 100.0;
 
                     println!(
-                        "{:<30} {:>8} {:>8} {:>8} {:>8} {:>+6.1}%",
+                        "{:<25} {:>8} {:>8} {:>8} {:>8} {:>+6.1}%",
                         format!("{filename} ({}B)", input.len()),
                         std_runs,
                         bij_runs,
                         std_fse.len(),
                         bij_fse.len(),
                         delta_pct,
+                    );
+                }
+            }
+
+            // Second pass: timing (encode + decode, 3 iterations, report median-ish)
+            println!("\n--- Canterbury Corpus (timing) ---");
+            println!(
+                "{:<25} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10}",
+                "File", "Std Enc", "Bij Enc", "Std Dec", "Bij Dec", "Factors", "Avg Flen"
+            );
+            println!(
+                "{:-<25} {:->10} {:->10} {:->10} {:->10} {:->8} {:->10}",
+                "", "", "", "", "", "", ""
+            );
+
+            for filename in &files {
+                let path = cantrbry_dir.join(filename);
+                if let Ok(data) = std::fs::read(&path) {
+                    let input = if data.len() > 65536 {
+                        &data[..65536]
+                    } else {
+                        &data
+                    };
+
+                    // Warm up + measure standard BWT encode (3 runs, take last)
+                    let mut std_enc_us = 0u128;
+                    let mut std_result = None;
+                    for _ in 0..3 {
+                        let t0 = std::time::Instant::now();
+                        std_result = Some(encode(input).unwrap());
+                        std_enc_us = t0.elapsed().as_micros();
+                    }
+                    let std_result = std_result.unwrap();
+
+                    // Measure standard BWT decode
+                    let mut std_dec_us = 0u128;
+                    for _ in 0..3 {
+                        let t0 = std::time::Instant::now();
+                        let _ = decode(&std_result.data, std_result.primary_index).unwrap();
+                        std_dec_us = t0.elapsed().as_micros();
+                    }
+
+                    // Measure bijective BWT encode
+                    let mut bij_enc_us = 0u128;
+                    let mut bij_result = None;
+                    for _ in 0..3 {
+                        let t0 = std::time::Instant::now();
+                        bij_result = Some(encode_bijective(input).unwrap());
+                        bij_enc_us = t0.elapsed().as_micros();
+                    }
+                    let (bij_data, bij_factors) = bij_result.unwrap();
+
+                    // Measure bijective BWT decode
+                    let mut bij_dec_us = 0u128;
+                    for _ in 0..3 {
+                        let t0 = std::time::Instant::now();
+                        let _ = decode_bijective(&bij_data, &bij_factors).unwrap();
+                        bij_dec_us = t0.elapsed().as_micros();
+                    }
+
+                    let num_factors = bij_factors.len();
+                    let avg_flen = input.len() as f64 / num_factors as f64;
+
+                    println!(
+                        "{:<25} {:>8}us {:>8}us {:>8}us {:>8}us {:>8} {:>9.1}",
+                        format!("{filename} ({}B)", input.len()),
+                        std_enc_us,
+                        bij_enc_us,
+                        std_dec_us,
+                        bij_dec_us,
+                        num_factors,
+                        avg_flen,
                     );
                 }
             }
