@@ -120,6 +120,8 @@ pub enum Pipeline {
     Deflate = 0,
     /// BWT + MTF + RLE + FSE (bzip2-like)
     Bw = 1,
+    /// Bijective BWT + MTF + RLE + FSE (parallelizable BWT variant)
+    Bbw = 2,
     /// LZ77 + rANS (fast entropy coding, SIMD/GPU friendly)
     Lzr = 3,
     /// LZ77 + FSE (finite state entropy, zstd-style)
@@ -133,6 +135,7 @@ impl TryFrom<u8> for Pipeline {
         match v {
             0 => Ok(Self::Deflate),
             1 => Ok(Self::Bw),
+            2 => Ok(Self::Bbw),
             3 => Ok(Self::Lzr),
             4 => Ok(Self::Lzf),
             _ => Err(PzError::Unsupported),
@@ -281,6 +284,7 @@ fn compress_block(
     match pipeline {
         Pipeline::Deflate => compress_block_deflate(input, options),
         Pipeline::Bw => compress_block_bw(input, options),
+        Pipeline::Bbw => compress_block_bbw(input, options),
         Pipeline::Lzr => compress_block_lzr(input, options),
         Pipeline::Lzf => compress_block_lzf(input, options),
     }
@@ -291,6 +295,7 @@ fn decompress_block(payload: &[u8], pipeline: Pipeline, orig_len: usize) -> PzRe
     match pipeline {
         Pipeline::Deflate => decompress_block_deflate(payload, orig_len),
         Pipeline::Bw => decompress_block_bw(payload, orig_len),
+        Pipeline::Bbw => decompress_block_bbw(payload, orig_len),
         Pipeline::Lzr => decompress_block_lzr(payload, orig_len),
         Pipeline::Lzf => decompress_block_lzf(payload, orig_len),
     }
@@ -489,8 +494,10 @@ struct StageBlock {
 struct StageMetadata {
     /// BWT primary index (Bw pipeline, set by BWT stage).
     bwt_primary_index: Option<u32>,
+    /// Bijective BWT factor lengths (Bbw pipeline, set by BBWT stage).
+    bbwt_factor_lengths: Option<Vec<usize>>,
     /// Length of data before entropy coding.
-    /// Bw: RLE output length.
+    /// Bw/Bbw: RLE output length.
     pre_entropy_len: Option<usize>,
     /// Deflate: LZ77 output length.
     lz_len: Option<usize>,
@@ -501,6 +508,7 @@ fn pipeline_stage_count(pipeline: Pipeline) -> usize {
     match pipeline {
         Pipeline::Deflate => 2,
         Pipeline::Bw => 4,
+        Pipeline::Bbw => 4,
         Pipeline::Lzr => 2,
         Pipeline::Lzf => 2,
     }
@@ -845,6 +853,10 @@ fn run_compress_stage(
         (Pipeline::Bw, 1) => stage_mtf_encode(block),
         (Pipeline::Bw, 2) => stage_rle_encode(block),
         (Pipeline::Bw, 3) => stage_fse_encode_bw(block),
+        (Pipeline::Bbw, 0) => stage_bbwt_encode(block, options),
+        (Pipeline::Bbw, 1) => stage_mtf_encode(block),
+        (Pipeline::Bbw, 2) => stage_rle_encode(block),
+        (Pipeline::Bbw, 3) => stage_fse_encode_bbw(block),
         (Pipeline::Lzr, 0) => stage_lz77_compress(block, options),
         (Pipeline::Lzr, 1) => stage_rans_encode(block),
         (Pipeline::Lzf, 0) => stage_lz77_compress(block, options),
@@ -868,6 +880,11 @@ fn run_decompress_stage(
         (Pipeline::Bw, 1) => stage_rle_decode(block),
         (Pipeline::Bw, 2) => stage_mtf_decode(block),
         (Pipeline::Bw, 3) => stage_bwt_decode(block),
+        // Bbw: FSE decode(0) → RLE decode(1) → MTF decode(2) → BBWT decode(3)
+        (Pipeline::Bbw, 0) => stage_fse_decode_bbw(block),
+        (Pipeline::Bbw, 1) => stage_rle_decode(block),
+        (Pipeline::Bbw, 2) => stage_mtf_decode(block),
+        (Pipeline::Bbw, 3) => stage_bbwt_decode(block),
         // Lzr: rANS decode(0) → LZ77 decompress(1)
         (Pipeline::Lzr, 0) => stage_rans_decode(block),
         (Pipeline::Lzr, 1) => stage_lz77_decompress(block),
@@ -1284,6 +1301,178 @@ fn decompress_block_bw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 
     // Stage 4: Inverse BWT
     let output = bwt::decode(&bwt_data, primary_index)?;
+
+    if output.len() != orig_len {
+        return Err(PzError::InvalidInput);
+    }
+
+    Ok(output)
+}
+
+// --- BBW pipeline: Bijective BWT + MTF + RLE + FSE ---
+
+/// Bbw stage 0: bijective BWT encoding.
+fn stage_bbwt_encode(mut block: StageBlock, options: &CompressOptions) -> PzResult<StageBlock> {
+    let (bwt_data, factor_lengths) = bbwt_encode_with_backend(&block.data, options)?;
+    block.metadata.bbwt_factor_lengths = Some(factor_lengths);
+    block.data = bwt_data;
+    Ok(block)
+}
+
+/// Bbw stage 3: FSE encoding + serialization.
+///
+/// Format: [num_factors: u16] [factor_lengths: u32 × num_factors] [rle_len: u32] [fse_data...]
+fn stage_fse_encode_bbw(mut block: StageBlock) -> PzResult<StageBlock> {
+    let factor_lengths = block.metadata.bbwt_factor_lengths.take().unwrap();
+    let rle_len = block.metadata.pre_entropy_len.unwrap();
+    let fse_data = fse::encode(&block.data);
+
+    let mut output = Vec::new();
+    output.extend_from_slice(&(factor_lengths.len() as u16).to_le_bytes());
+    for &fl in &factor_lengths {
+        output.extend_from_slice(&(fl as u32).to_le_bytes());
+    }
+    output.extend_from_slice(&(rle_len as u32).to_le_bytes());
+    output.extend_from_slice(&fse_data);
+
+    block.data = output;
+    Ok(block)
+}
+
+/// Bbw decompress stage 0: parse metadata + FSE decode.
+fn stage_fse_decode_bbw(mut block: StageBlock) -> PzResult<StageBlock> {
+    if block.data.len() < 2 {
+        return Err(PzError::InvalidInput);
+    }
+    let num_factors = u16::from_le_bytes([block.data[0], block.data[1]]) as usize;
+    let header_len = 2 + num_factors * 4 + 4; // num_factors(2) + factor_lengths(4*k) + rle_len(4)
+    if block.data.len() < header_len {
+        return Err(PzError::InvalidInput);
+    }
+
+    let mut factor_lengths = Vec::with_capacity(num_factors);
+    for i in 0..num_factors {
+        let offset = 2 + i * 4;
+        let fl = u32::from_le_bytes([
+            block.data[offset],
+            block.data[offset + 1],
+            block.data[offset + 2],
+            block.data[offset + 3],
+        ]) as usize;
+        factor_lengths.push(fl);
+    }
+
+    let rle_offset = 2 + num_factors * 4;
+    let rle_len = u32::from_le_bytes([
+        block.data[rle_offset],
+        block.data[rle_offset + 1],
+        block.data[rle_offset + 2],
+        block.data[rle_offset + 3],
+    ]) as usize;
+
+    block.metadata.bbwt_factor_lengths = Some(factor_lengths);
+    block.data = fse::decode(&block.data[header_len..], rle_len)?;
+    Ok(block)
+}
+
+/// Bbw decompress stage 3: bijective BWT decode.
+fn stage_bbwt_decode(mut block: StageBlock) -> PzResult<StageBlock> {
+    let factor_lengths = block
+        .metadata
+        .bbwt_factor_lengths
+        .take()
+        .ok_or(PzError::InvalidInput)?;
+    block.data = bwt::decode_bijective(&block.data, &factor_lengths)?;
+    Ok(block)
+}
+
+/// Run bijective BWT encoding using the configured backend.
+fn bbwt_encode_with_backend(
+    input: &[u8],
+    options: &CompressOptions,
+) -> PzResult<(Vec<u8>, Vec<usize>)> {
+    #[cfg(feature = "webgpu")]
+    {
+        if let Backend::WebGpu = options.backend {
+            if let Some(ref engine) = options.webgpu_engine {
+                if !engine.is_cpu_device()
+                    && input.len() >= crate::webgpu::MIN_GPU_BWT_SIZE
+                    && input.len() <= engine.max_dispatch_input_size()
+                {
+                    return engine.bwt_encode_bijective(input);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "webgpu"))]
+    let _ = options;
+
+    bwt::encode_bijective(input).ok_or(PzError::InvalidInput)
+}
+
+/// Compress a single block using the Bbw pipeline (no container header).
+fn compress_block_bbw(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
+    let block = StageBlock {
+        block_index: 0,
+        original_len: input.len(),
+        data: input.to_vec(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+    let block = stage_bbwt_encode(block, options)?;
+    let block = stage_mtf_encode(block)?;
+    let block = stage_rle_encode(block)?;
+    let block = stage_fse_encode_bbw(block)?;
+    Ok(block.data)
+}
+
+/// Decompress a single Bbw block (no container header).
+fn decompress_block_bbw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    if payload.len() < 6 {
+        return Err(PzError::InvalidInput);
+    }
+
+    // Parse header: [num_factors: u16] [factor_lengths: u32 × k] [rle_len: u32]
+    let num_factors = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    let header_len = 2 + num_factors * 4 + 4;
+    if payload.len() < header_len {
+        return Err(PzError::InvalidInput);
+    }
+
+    let mut factor_lengths = Vec::with_capacity(num_factors);
+    for i in 0..num_factors {
+        let offset = 2 + i * 4;
+        let fl = u32::from_le_bytes([
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+        ]) as usize;
+        factor_lengths.push(fl);
+    }
+
+    let rle_offset = 2 + num_factors * 4;
+    let rle_len = u32::from_le_bytes([
+        payload[rle_offset],
+        payload[rle_offset + 1],
+        payload[rle_offset + 2],
+        payload[rle_offset + 3],
+    ]) as usize;
+
+    let entropy_data = &payload[header_len..];
+
+    // Stage 1: FSE decode
+    let rle_data = fse::decode(entropy_data, rle_len)?;
+
+    // Stage 2: RLE decode
+    let mtf_data = rle::decode(&rle_data)?;
+
+    // Stage 3: Inverse MTF
+    let bwt_data = mtf::decode(&mtf_data);
+
+    // Stage 4: Inverse bijective BWT
+    let output = bwt::decode_bijective(&bwt_data, &factor_lengths)?;
 
     if output.len() != orig_len {
         return Err(PzError::InvalidInput);
@@ -1753,6 +1942,50 @@ mod tests {
     fn test_bw_round_trip_all_same() {
         let input = vec![b'x'; 200];
         let compressed = compress(&input, Pipeline::Bw).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    // --- Bbw pipeline round-trip tests ---
+
+    #[test]
+    fn test_bbw_round_trip_hello() {
+        let input = b"hello, world! hello, world!";
+        let compressed = compress(input, Pipeline::Bbw).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_bbw_round_trip_repeating() {
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = compress(&input, Pipeline::Bbw).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+        assert!(
+            compressed.len() < input.len(),
+            "compressed {} >= input {}",
+            compressed.len(),
+            input.len()
+        );
+    }
+
+    #[test]
+    fn test_bbw_round_trip_binary() {
+        let input: Vec<u8> = (0..=255).cycle().take(512).collect();
+        let compressed = compress(&input, Pipeline::Bbw).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_bbw_round_trip_all_same() {
+        let input = vec![b'x'; 200];
+        let compressed = compress(&input, Pipeline::Bbw).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
