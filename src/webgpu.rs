@@ -16,13 +16,13 @@
 //! ```rust,no_run
 //! # #[cfg(feature = "webgpu")]
 //! # fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! use pz::webgpu::{WebGpuEngine, KernelVariant};
+//! use pz::webgpu::WebGpuEngine;
 //!
 //! let engine = WebGpuEngine::new()?;
 //! println!("Using device: {}", engine.device_name());
 //!
 //! let input = b"hello world hello world";
-//! let matches = engine.find_matches(input, KernelVariant::Batch)?;
+//! let matches = engine.find_matches(input)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -32,14 +32,6 @@ use crate::lz77::Match;
 use crate::{PzError, PzResult};
 
 use wgpu::util::DeviceExt;
-
-/// Embedded WGSL kernel source: one invocation per input position,
-/// 128KB sliding window.
-const LZ77_KERNEL_SOURCE: &str = include_str!("../kernels/lz77.wgsl");
-
-/// Embedded WGSL kernel source: batched variant where each invocation
-/// processes STEP_SIZE (32) consecutive positions with a 32KB window.
-const LZ77_BATCH_KERNEL_SOURCE: &str = include_str!("../kernels/lz77_batch.wgsl");
 
 /// Embedded WGSL kernel source: top-K match finding for optimal parsing.
 const LZ77_TOPK_KERNEL_SOURCE: &str = include_str!("../kernels/lz77_topk.wgsl");
@@ -55,9 +47,6 @@ const BWT_RADIX_KERNEL_SOURCE: &str = include_str!("../kernels/bwt_radix.wgsl");
 
 /// Embedded WGSL kernel source: GPU Huffman encoding.
 const HUFFMAN_ENCODE_KERNEL_SOURCE: &str = include_str!("../kernels/huffman_encode.wgsl");
-
-/// Step size used by the batch kernel (must match STEP_SIZE in lz77_batch.wgsl).
-const BATCH_STEP_SIZE: usize = 32;
 
 /// Number of candidates per position in the top-K kernel (must match K in lz77_topk.wgsl).
 const TOPK_K: usize = 4;
@@ -87,17 +76,6 @@ struct GpuMatch {
 // SAFETY: GpuMatch is repr(C) with all-u32 fields, which are Pod/Zeroable.
 unsafe impl bytemuck::Pod for GpuMatch {}
 unsafe impl bytemuck::Zeroable for GpuMatch {}
-
-/// Which LZ77 kernel variant to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KernelVariant {
-    /// One invocation per position, 128KB window.
-    PerPosition,
-    /// Batched: each invocation handles STEP_SIZE positions, 32KB window.
-    Batch,
-    /// Hash-table-based: two-pass approach.
-    HashTable,
-}
 
 /// Information about a discovered WebGPU device.
 #[derive(Debug, Clone)]
@@ -151,8 +129,6 @@ pub struct WebGpuEngine {
     device: wgpu::Device,
     queue: wgpu::Queue,
     // Cached compute pipelines (created once at init, like OpenCL kernel objects)
-    pipeline_lz77_encode: wgpu::ComputePipeline,
-    pipeline_lz77_batch_encode: wgpu::ComputePipeline,
     pipeline_lz77_topk: wgpu::ComputePipeline,
     pipeline_lz77_hash_build: wgpu::ComputePipeline,
     pipeline_lz77_hash_find: wgpu::ComputePipeline,
@@ -237,16 +213,6 @@ impl WebGpuEngine {
         let capped = max_work_group_size.clamp(1, 256);
         let scan_workgroup_size = 1 << (usize::BITS - 1 - capped.leading_zeros());
 
-        let lz77_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("lz77"),
-            source: wgpu::ShaderSource::Wgsl(LZ77_KERNEL_SOURCE.into()),
-        });
-
-        let lz77_batch_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("lz77_batch"),
-            source: wgpu::ShaderSource::Wgsl(LZ77_BATCH_KERNEL_SOURCE.into()),
-        });
-
         let lz77_topk_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("lz77_topk"),
             source: wgpu::ShaderSource::Wgsl(LZ77_TOPK_KERNEL_SOURCE.into()),
@@ -286,8 +252,6 @@ impl WebGpuEngine {
             };
 
         // Cache all 18 compute pipelines at init time (mirroring OpenCL kernel caching).
-        let pipeline_lz77_encode = make_pipeline("lz77_per_pos", &lz77_module, "encode");
-        let pipeline_lz77_batch_encode = make_pipeline("lz77_batch", &lz77_batch_module, "encode");
         let pipeline_lz77_topk = make_pipeline("lz77_topk", &lz77_topk_module, "encode_topk");
         let pipeline_lz77_hash_build =
             make_pipeline("lz77_hash_build", &lz77_hash_module, "build_hash_table");
@@ -332,8 +296,6 @@ impl WebGpuEngine {
         Ok(WebGpuEngine {
             device,
             queue,
-            pipeline_lz77_encode,
-            pipeline_lz77_batch_encode,
             pipeline_lz77_topk,
             pipeline_lz77_hash_build,
             pipeline_lz77_hash_find,
@@ -483,31 +445,30 @@ impl WebGpuEngine {
         val
     }
 
-    /// Dispatch a compute pass with the given pipeline and bind group.
-    ///
-    /// Uses 2D tiling when `workgroups_x` exceeds the per-dimension limit.
-    /// Kernels must linearize their global ID as `gid.x + gid.y * params.w`
-    /// where `params.w` is set to `wx * workgroup_size` by the caller.
-    fn dispatch(
-        &self,
-        pipeline: &wgpu::ComputePipeline,
-        bind_group: &wgpu::BindGroup,
-        workgroups_x: u32,
-        label: &str,
-    ) -> PzResult<()> {
+    /// Compute 2D tiling dimensions for a given workgroup count.
+    fn tile_workgroups(&self, workgroups_x: u32) -> PzResult<(u32, u32)> {
         let max = self.max_workgroups_per_dim;
-        let (wx, wy) = if workgroups_x <= max {
-            (workgroups_x, 1u32)
+        if workgroups_x <= max {
+            Ok((workgroups_x, 1u32))
         } else {
             let wy = workgroups_x.div_ceil(max);
             if wy > max {
                 return Err(PzError::Unsupported);
             }
-            (max, wy)
-        };
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+            Ok((max, wy))
+        }
+    }
+
+    /// Record a compute pass into an existing command encoder (no submit).
+    fn record_dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::ComputePipeline,
+        bind_group: &wgpu::BindGroup,
+        workgroups_x: u32,
+        label: &str,
+    ) -> PzResult<()> {
+        let (wx, wy) = self.tile_workgroups(workgroups_x)?;
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some(label),
@@ -517,6 +478,21 @@ impl WebGpuEngine {
             pass.set_bind_group(0, bind_group, &[]);
             pass.dispatch_workgroups(wx, wy, 1);
         }
+        Ok(())
+    }
+
+    /// Record and immediately submit a single compute dispatch.
+    fn dispatch(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        bind_group: &wgpu::BindGroup,
+        workgroups_x: u32,
+        label: &str,
+    ) -> PzResult<()> {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        self.record_dispatch(&mut encoder, pipeline, bind_group, workgroups_x, label)?;
         self.queue.submit(Some(encoder.finish()));
         Ok(())
     }
@@ -533,129 +509,13 @@ impl WebGpuEngine {
 
     // --- LZ77 Match Finding ---
 
-    /// Find LZ77 matches for the entire input using the GPU.
-    pub fn find_matches(&self, input: &[u8], variant: KernelVariant) -> PzResult<Vec<Match>> {
+    /// Find LZ77 matches for the entire input using the GPU hash-table kernel.
+    pub fn find_matches(&self, input: &[u8]) -> PzResult<Vec<Match>> {
         if input.is_empty() {
             return Ok(Vec::new());
         }
 
-        match variant {
-            KernelVariant::PerPosition => self.find_matches_per_position(input),
-            KernelVariant::Batch => self.find_matches_batch(input),
-            KernelVariant::HashTable => self.find_matches_hash(input),
-        }
-    }
-
-    fn find_matches_per_position(&self, input: &[u8]) -> PzResult<Vec<Match>> {
-        let input_len = input.len();
-        let padded = Self::pad_input_bytes(input);
-
-        let input_buf = self.create_buffer_init("lz77_input", &padded, wgpu::BufferUsages::STORAGE);
-
-        let output_buf = self.create_buffer(
-            "lz77_output",
-            (input_len * std::mem::size_of::<GpuMatch>()) as u64,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        );
-
-        let workgroups = (input_len as u32).div_ceil(64);
-        let params = [input_len as u32, 0, 0, self.dispatch_width(workgroups, 64)];
-        let params_buf = self.create_buffer_init(
-            "lz77_params",
-            bytemuck::cast_slice(&params),
-            wgpu::BufferUsages::UNIFORM,
-        );
-
-        let bind_group_layout = self.pipeline_lz77_encode.get_bind_group_layout(0);
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lz77_per_pos_bg"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: output_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: params_buf.as_entire_binding(),
-                },
-            ],
-        });
-        self.dispatch(
-            &self.pipeline_lz77_encode,
-            &bind_group,
-            workgroups,
-            "lz77_per_pos",
-        )?;
-
-        let raw = self.read_buffer(
-            &output_buf,
-            (input_len * std::mem::size_of::<GpuMatch>()) as u64,
-        );
-        let gpu_matches: Vec<GpuMatch> = bytemuck::cast_slice(&raw).to_vec();
-
-        Ok(dedupe_gpu_matches(&gpu_matches, input))
-    }
-
-    fn find_matches_batch(&self, input: &[u8]) -> PzResult<Vec<Match>> {
-        let input_len = input.len();
-        let padded = Self::pad_input_bytes(input);
-
-        let input_buf =
-            self.create_buffer_init("lz77_batch_input", &padded, wgpu::BufferUsages::STORAGE);
-
-        let output_buf = self.create_buffer(
-            "lz77_batch_output",
-            (input_len * std::mem::size_of::<GpuMatch>()) as u64,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        );
-
-        let num_work_items = input_len.div_ceil(BATCH_STEP_SIZE);
-        let workgroups = (num_work_items as u32).div_ceil(64);
-        let params = [input_len as u32, 0, 0, self.dispatch_width(workgroups, 64)];
-        let params_buf = self.create_buffer_init(
-            "lz77_batch_params",
-            bytemuck::cast_slice(&params),
-            wgpu::BufferUsages::UNIFORM,
-        );
-
-        let bind_group_layout = self.pipeline_lz77_batch_encode.get_bind_group_layout(0);
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lz77_batch_bg"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: output_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: params_buf.as_entire_binding(),
-                },
-            ],
-        });
-        self.dispatch(
-            &self.pipeline_lz77_batch_encode,
-            &bind_group,
-            workgroups,
-            "lz77_batch",
-        )?;
-
-        let raw = self.read_buffer(
-            &output_buf,
-            (input_len * std::mem::size_of::<GpuMatch>()) as u64,
-        );
-        let gpu_matches: Vec<GpuMatch> = bytemuck::cast_slice(&raw).to_vec();
-
-        Ok(dedupe_gpu_matches(&gpu_matches, input))
+        self.find_matches_hash(input)
     }
 
     fn find_matches_hash(&self, input: &[u8]) -> PzResult<Vec<Match>> {
@@ -692,7 +552,7 @@ impl WebGpuEngine {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
 
-        // Pass 1: Build hash table
+        // Build + Find passes batched into a single command encoder submission
         let build_bg_layout = self.pipeline_lz77_hash_build.get_bind_group_layout(0);
         let build_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_hash_build_bg"),
@@ -716,16 +576,7 @@ impl WebGpuEngine {
                 },
             ],
         });
-        self.dispatch(
-            &self.pipeline_lz77_hash_build,
-            &build_bg,
-            workgroups,
-            "lz77_hash_build",
-        )?;
 
-        // Pass 2: Find matches — uses a separate pipeline with different bindings
-        // We need to read back hash_counts for the find pass (read-only)
-        // The find_matches entry point uses bindings 0,1,4,5,6
         let find_bg_layout = self.pipeline_lz77_hash_find.get_bind_group_layout(0);
         let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_hash_find_bg"),
@@ -754,12 +605,26 @@ impl WebGpuEngine {
             ],
         });
 
-        self.dispatch(
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("lz77_hash"),
+            });
+        self.record_dispatch(
+            &mut encoder,
+            &self.pipeline_lz77_hash_build,
+            &build_bg,
+            workgroups,
+            "lz77_hash_build",
+        )?;
+        self.record_dispatch(
+            &mut encoder,
             &self.pipeline_lz77_hash_find,
             &find_bg,
             workgroups,
             "lz77_hash_find",
         )?;
+        self.queue.submit(Some(encoder.finish()));
 
         let raw = self.read_buffer(
             &output_buf,
@@ -770,9 +635,9 @@ impl WebGpuEngine {
         Ok(dedupe_gpu_matches(&gpu_matches, input))
     }
 
-    /// GPU-accelerated LZ77 compression.
-    pub fn lz77_compress(&self, input: &[u8], variant: KernelVariant) -> PzResult<Vec<u8>> {
-        let matches = self.find_matches(input, variant)?;
+    /// GPU-accelerated LZ77 compression using hash-table kernel.
+    pub fn lz77_compress(&self, input: &[u8]) -> PzResult<Vec<u8>> {
+        let matches = self.find_matches(input)?;
 
         let mut output = Vec::with_capacity(matches.len() * Match::SERIALIZED_SIZE);
         for m in &matches {
@@ -1286,15 +1151,7 @@ impl WebGpuEngine {
                 ],
             });
 
-            let global_wg = (padded_n as u32).div_ceil(256);
-            self.dispatch(
-                &self.pipeline_radix_compute_keys,
-                &key_bg,
-                global_wg,
-                "radix_keys",
-            )?;
-
-            // Phase 2: Histogram
+            // Phases 1+2 batched: compute keys → histogram (single submit)
             let hist_params = [padded_n as u32, num_groups as u32, 0, 0];
             let hist_params_buf = self.create_buffer_init(
                 "hist_params",
@@ -1302,7 +1159,7 @@ impl WebGpuEngine {
                 wgpu::BufferUsages::UNIFORM,
             );
 
-            // Zero the histogram buffer
+            // Zero the histogram buffer (queued transfer, ordered before dispatches)
             let hist_zeros = vec![0u32; histogram_len];
             self.queue
                 .write_buffer(histogram_buf, 0, bytemuck::cast_slice(&hist_zeros));
@@ -1327,12 +1184,27 @@ impl WebGpuEngine {
                 ],
             });
 
-            self.dispatch(
+            let global_wg = (padded_n as u32).div_ceil(256);
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("radix_keys_hist"),
+                });
+            self.record_dispatch(
+                &mut encoder,
+                &self.pipeline_radix_compute_keys,
+                &key_bg,
+                global_wg,
+                "radix_keys",
+            )?;
+            self.record_dispatch(
+                &mut encoder,
                 &self.pipeline_radix_histogram,
                 &hist_bg,
                 num_groups as u32,
                 "radix_histogram",
             )?;
+            self.queue.submit(Some(encoder.finish()));
 
             // Phase 3: Prefix sum over histogram, then inclusive_to_exclusive
             let mut hist_scan_buf_temp = self.create_buffer(
@@ -1882,7 +1754,7 @@ impl WebGpuEngine {
         }
 
         // Stage 1: GPU LZ77 compression
-        let lz_data = self.lz77_compress(input, KernelVariant::HashTable)?;
+        let lz_data = self.lz77_compress(input)?;
         let lz_len = lz_data.len();
 
         if lz_data.is_empty() {
@@ -2060,7 +1932,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lz77_round_trip_per_position() {
+    fn test_lz77_round_trip() {
         let engine = match WebGpuEngine::new() {
             Ok(e) => e,
             Err(PzError::Unsupported) => return,
@@ -2068,39 +1940,7 @@ mod tests {
         };
 
         let input = b"hello world hello world hello";
-        let compressed = engine
-            .lz77_compress(input, KernelVariant::PerPosition)
-            .unwrap();
-        let decompressed = crate::lz77::decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input);
-    }
-
-    #[test]
-    fn test_lz77_round_trip_batch() {
-        let engine = match WebGpuEngine::new() {
-            Ok(e) => e,
-            Err(PzError::Unsupported) => return,
-            Err(e) => panic!("unexpected error: {:?}", e),
-        };
-
-        let input = b"hello world hello world hello";
-        let compressed = engine.lz77_compress(input, KernelVariant::Batch).unwrap();
-        let decompressed = crate::lz77::decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input);
-    }
-
-    #[test]
-    fn test_lz77_round_trip_hash() {
-        let engine = match WebGpuEngine::new() {
-            Ok(e) => e,
-            Err(PzError::Unsupported) => return,
-            Err(e) => panic!("unexpected error: {:?}", e),
-        };
-
-        let input = b"hello world hello world hello";
-        let compressed = engine
-            .lz77_compress(input, KernelVariant::HashTable)
-            .unwrap();
+        let compressed = engine.lz77_compress(input).unwrap();
         let decompressed = crate::lz77::decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }

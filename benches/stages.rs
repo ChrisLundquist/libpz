@@ -534,7 +534,7 @@ fn bench_deflate_gpu_chained(_c: &mut Criterion) {}
 
 #[cfg(feature = "webgpu")]
 fn bench_lz77_webgpu(c: &mut Criterion) {
-    use pz::webgpu::{KernelVariant, WebGpuEngine};
+    use pz::webgpu::WebGpuEngine;
 
     let engine = match WebGpuEngine::new() {
         Ok(e) => std::sync::Arc::new(e),
@@ -549,19 +549,10 @@ fn bench_lz77_webgpu(c: &mut Criterion) {
 
         let eng = engine.clone();
         group.bench_with_input(
-            BenchmarkId::new("compress_webgpu_batch", size),
-            &data,
-            move |b, data| {
-                b.iter(|| eng.lz77_compress(data, KernelVariant::Batch).unwrap());
-            },
-        );
-
-        let eng2 = engine.clone();
-        group.bench_with_input(
             BenchmarkId::new("compress_webgpu_hash", size),
             &data,
             move |b, data| {
-                b.iter(|| eng2.lz77_compress(data, KernelVariant::HashTable).unwrap());
+                b.iter(|| eng.lz77_compress(data).unwrap());
             },
         );
     }
