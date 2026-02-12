@@ -188,12 +188,17 @@ pub fn compress_with_options(
     }
 
     // Multi-block compression: choose between pipeline-parallel and block-parallel.
-    // Pipeline parallelism (one thread per stage) when enough blocks to fill the pipeline.
-    // Block parallelism (one thread per block) otherwise.
+    //
+    // Block parallelism (one thread per block, each block runs all stages) scales
+    // with available cores and is preferred when we have more threads than stages.
+    //
+    // Pipeline parallelism (one thread per stage, blocks flow through channels) is
+    // only beneficial when the stage count is high enough to saturate available
+    // threads (e.g., the 4-stage Bw pipeline on <=4 cores).
     let num_blocks = input.len().div_ceil(block_size);
     let stage_count = pipeline_stage_count(pipeline);
 
-    if num_blocks >= stage_count {
+    if num_blocks > 1 && stage_count >= num_threads {
         compress_pipeline_parallel(input, pipeline, options)
     } else {
         compress_parallel(input, pipeline, options, num_threads)
@@ -250,7 +255,7 @@ pub fn decompress_with_threads(input: &[u8], threads: usize) -> PzResult<Vec<u8>
     let num_threads = resolve_thread_count(threads);
     let stage_count = pipeline_stage_count(pipeline);
 
-    if num_threads > 1 && num_blocks >= stage_count {
+    if num_threads > 1 && num_blocks > 1 && stage_count >= num_threads {
         return decompress_pipeline_parallel(payload, pipeline, orig_len, num_blocks);
     }
     decompress_parallel(payload, pipeline, orig_len, num_blocks, threads)
