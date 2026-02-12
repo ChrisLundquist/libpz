@@ -507,9 +507,10 @@ fn build_suffix_array_naive(input: &[u8]) -> Vec<usize> {
 /// this uses circular `(i + k) % n` modulo comparisons — the same approach
 /// as the GPU BWT kernel. This eliminates the 2n+1 memory overhead.
 ///
-/// Used by `encode_bijective` where factors are typically small (a few KB)
-/// and the allocation savings from avoiding doubling matter more than the
-/// theoretical O(n) vs O(n log n) complexity difference.
+/// Used by the WebGPU engine as a CPU fallback for small Lyndon factors
+/// (below the GPU dispatch threshold). Not used on the main CPU encode
+/// path — SA-IS is faster despite the doubled-string allocation.
+#[cfg(any(feature = "webgpu", test))]
 pub(crate) fn build_circular_suffix_array(input: &[u8]) -> Vec<usize> {
     let n = input.len();
     if n == 0 {
@@ -574,6 +575,7 @@ pub(crate) fn build_circular_suffix_array(input: &[u8]) -> Vec<usize> {
 ///
 /// This is a stable radix sort on one component of the composite key.
 /// `max_rank` is the maximum value in the rank array (for bucket count).
+#[cfg(any(feature = "webgpu", test))]
 fn radix_sort_by_key(
     src: &[usize],
     dst: &mut [usize],
@@ -699,10 +701,10 @@ pub fn encode_bijective(input: &[u8]) -> Option<(Vec<u8>, Vec<usize>)> {
             continue;
         }
 
-        // Build circular suffix array for this factor's rotations.
-        // Uses prefix-doubling with radix sort — avoids 2n+1 string doubling
-        // that build_suffix_array (SA-IS) requires.
-        let sa = build_circular_suffix_array(factor);
+        // Build suffix array using SA-IS on doubled string.
+        // Circular prefix-doubling was tried (commit 21052a0) but benchmarked
+        // 2.5-3× slower due to O(n log n) vs SA-IS's O(n).
+        let sa = build_suffix_array(factor);
 
         // Extract last column of sorted rotation matrix
         for &sa_val in &sa {
