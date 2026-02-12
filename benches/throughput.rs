@@ -6,7 +6,7 @@
 //!
 //! Size tiers: default corpus (~135KB), 4MB, 16MB.
 //!
-//! All groups enforce warm_up_time(5s) + measurement_time(10s) + sample_size(10)
+//! All groups enforce warm_up_time(2s) + measurement_time(5s) + sample_size(10)
 //! to keep total runtime bounded.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -19,8 +19,8 @@ use pz::pipeline::{self, Pipeline};
 
 /// Apply standard timeout caps to a benchmark group.
 fn cap(group: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>) {
-    group.warm_up_time(Duration::from_secs(5));
-    group.measurement_time(Duration::from_secs(10));
+    group.warm_up_time(Duration::from_secs(2));
+    group.measurement_time(Duration::from_secs(5));
     group.sample_size(10);
 }
 
@@ -248,30 +248,11 @@ fn bench_compress_parallel(c: &mut Criterion) {
 
     let data = get_test_data();
     let mut group = c.benchmark_group("compress_parallel");
+    cap(&mut group);
     group.throughput(Throughput::Bytes(data.len() as u64));
 
-    // Single-threaded baseline
-    for &pipe in &[
-        Pipeline::Deflate,
-        Pipeline::Bw,
-        Pipeline::Lza,
-        Pipeline::Lzr,
-        Pipeline::Lzf,
-    ] {
-        group.bench_with_input(
-            BenchmarkId::new("pz_1t", format!("{:?}", pipe)),
-            &data,
-            |b, data| {
-                let opts = CompressOptions {
-                    threads: 1,
-                    ..Default::default()
-                };
-                b.iter(|| pipeline::compress_with_options(data, pipe, &opts).unwrap());
-            },
-        );
-    }
-
-    // Multi-threaded (auto thread count)
+    // Multi-threaded (auto thread count) — compare against single-threaded
+    // results in the `compress` group.
     for &pipe in &[
         Pipeline::Deflate,
         Pipeline::Bw,

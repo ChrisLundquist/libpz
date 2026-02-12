@@ -29,6 +29,10 @@ harness = false
 name = "stages"
 harness = false
 
+[profile.profiling]
+inherits = "release"
+debug = true
+
 [features]
 default = []
 opencl = ["dep:opencl3"]

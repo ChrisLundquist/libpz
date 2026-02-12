@@ -5,28 +5,28 @@
 //! O(n log^2 n) suffix array construction is expected to dominate.
 //!
 //! Size tiers:
-//!   - Small:  1KB, 10KB, 64KB       — all algorithms
-//!   - Medium: 256KB                  — GPU crossover region
-//!   - Large:  4MB, 16MB              — GPU advantage expected
+//!   - Small:  8KB, 64KB             — all algorithms
+//!   - Large:  4MB                   — fast algorithms, scaling behavior
+//!   - GPU:    256KB, 4MB            — GPU crossover region
 //!
-//! All groups enforce warm_up_time(5s) + measurement_time(10s) + sample_size(10)
-//! to keep total runtime bounded (~60s per slow benchmark).
+//! All groups enforce warm_up_time(2s) + measurement_time(5s) + sample_size(10)
+//! to keep total runtime bounded.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::path::Path;
 use std::time::Duration;
 
-/// Small/medium sizes benchmarked for all algorithms.
-const SIZES_SMALL: &[usize] = &[1024, 10240, 65536];
-/// All sizes including large tiers for fast algorithms (LZ77, Huffman, etc.).
-const SIZES_ALL: &[usize] = &[1024, 10240, 65536, 262_144, 4_194_304, 16_777_216];
+/// Small sizes benchmarked for slow algorithms (BWT).
+const SIZES_SMALL: &[usize] = &[8192, 65536];
+/// Representative sizes for fast algorithms (LZ77, Huffman, entropy coders, etc.).
+const SIZES_ALL: &[usize] = &[8192, 65536, 4_194_304];
 /// Large sizes only — for targeted GPU-vs-CPU comparisons.
 const SIZES_LARGE: &[usize] = &[262_144, 4_194_304];
 
 /// Apply standard timeout caps to a benchmark group.
 fn cap(group: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>) {
-    group.warm_up_time(Duration::from_secs(5));
-    group.measurement_time(Duration::from_secs(10));
+    group.warm_up_time(Duration::from_secs(2));
+    group.measurement_time(Duration::from_secs(5));
     group.sample_size(10);
 }
 
@@ -416,7 +416,7 @@ fn bench_lz77_gpu(c: &mut Criterion) {
 
 fn bench_analysis(c: &mut Criterion) {
     let mut group = c.benchmark_group("analysis");
-    for &size in &[1024, 10240, 65536, 262144] {
+    for &size in &[8192, 65536] {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -439,7 +439,7 @@ fn bench_simd(c: &mut Criterion) {
     use pz::simd::{scalar, Dispatcher};
 
     let mut group = c.benchmark_group("simd");
-    for &size in &[1024, 10240, 65536, 262_144, 1_048_576] {
+    for &size in &[8192, 65536] {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -489,7 +489,7 @@ fn bench_auto_select(c: &mut Criterion) {
     use pz::pipeline::{self, CompressOptions};
 
     let mut group = c.benchmark_group("auto_select");
-    for &size in &[10240, 65536, 262144] {
+    for &size in &[8192, 65536] {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
