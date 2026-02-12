@@ -776,3 +776,36 @@ fn test_gpu_deflate_chained_larger() {
 
     assert_eq!(decompressed, input);
 }
+
+#[test]
+fn test_gpu_deflate_chained_binary() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    // Binary data with repeating patterns — exercises all byte values
+    let mut input = Vec::new();
+    for i in 0u8..=255 {
+        for _ in 0..40 {
+            input.push(i);
+        }
+    }
+
+    let block_data = engine.deflate_chained(&input).unwrap();
+
+    let decompressed = crate::pipeline::decompress(&{
+        let mut container = Vec::new();
+        container.extend_from_slice(&[b'P', b'Z', 2, 0]);
+        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
+        container.extend_from_slice(&1u32.to_le_bytes());
+        container.extend_from_slice(&(block_data.len() as u32).to_le_bytes());
+        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
+        container.extend_from_slice(&block_data);
+        container
+    })
+    .unwrap();
+
+    assert_eq!(decompressed, input);
+}
