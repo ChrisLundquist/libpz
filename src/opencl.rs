@@ -244,6 +244,8 @@ pub struct OpenClEngine {
     max_work_group_size: usize,
     /// Whether the selected device is a CPU (vs GPU/accelerator).
     is_cpu: bool,
+    /// Whether profiling is enabled (CL_QUEUE_PROFILING_ENABLE).
+    profiling: bool,
 }
 
 // SAFETY: OpenCL 1.2+ guarantees thread safety for context, command queue, kernel,
@@ -268,7 +270,7 @@ impl OpenClEngine {
     /// available device if no GPU is found. Returns an error if no OpenCL
     /// devices are available or kernel compilation fails.
     pub fn new() -> PzResult<Self> {
-        Self::with_device_preference(true)
+        Self::create(true, false)
     }
 
     /// Create a new engine with explicit GPU preference.
@@ -277,6 +279,20 @@ impl OpenClEngine {
     /// to any device). If false, selects the first available device regardless
     /// of type.
     pub fn with_device_preference(prefer_gpu: bool) -> PzResult<Self> {
+        Self::create(prefer_gpu, false)
+    }
+
+    /// Create a new engine with profiling enabled.
+    ///
+    /// When profiling is on, `CL_QUEUE_PROFILING_ENABLE` is set on the
+    /// command queue and major kernel dispatches / buffer transfers print
+    /// timing via `eprintln!`.
+    pub fn with_profiling(profiling: bool) -> PzResult<Self> {
+        Self::create(true, profiling)
+    }
+
+    /// Internal constructor shared by all public constructors.
+    fn create(prefer_gpu: bool, profiling: bool) -> PzResult<Self> {
         // Discover devices
         let all_ids = get_all_devices(CL_DEVICE_TYPE_ALL).map_err(|_| PzError::Unsupported)?;
 
@@ -305,9 +321,16 @@ impl OpenClEngine {
         // Create context and command queue
         let context = Context::from_device(&device).map_err(|_| PzError::Unsupported)?;
 
-        let queue =
-            CommandQueue::create_default_with_properties(&context, CL_QUEUE_PROFILING_ENABLE, 0)
-                .map_err(|_| PzError::Unsupported)?;
+        // Use the OpenCL 1.2 API (create_default) instead of the 2.0
+        // create_default_with_properties, because macOS only supports OpenCL 1.2.
+        let queue_props = if profiling {
+            CL_QUEUE_PROFILING_ENABLE
+        } else {
+            0
+        };
+        #[allow(deprecated)]
+        let queue = CommandQueue::create_default(&context, queue_props)
+            .map_err(|_| PzError::Unsupported)?;
 
         // Compile both kernel variants
         let program_per_pos =
@@ -425,6 +448,7 @@ impl OpenClEngine {
             device_name,
             max_work_group_size,
             is_cpu,
+            profiling,
         })
     }
 
@@ -444,6 +468,31 @@ impl OpenClEngine {
     /// that perform poorly on CPU OpenCL devices.
     pub fn is_cpu_device(&self) -> bool {
         self.is_cpu
+    }
+
+    /// Whether profiling is enabled on this engine.
+    pub fn profiling(&self) -> bool {
+        self.profiling
+    }
+
+    /// Extract elapsed time in milliseconds from a completed OpenCL event.
+    ///
+    /// Requires the command queue to have been created with
+    /// `CL_QUEUE_PROFILING_ENABLE`. Returns `None` if profiling is
+    /// disabled or the event doesn't have timing data.
+    pub fn event_elapsed_ms(event: &Event) -> Option<f64> {
+        let start = event.profiling_command_start().ok()?;
+        let end = event.profiling_command_end().ok()?;
+        Some((end - start) as f64 / 1_000_000.0)
+    }
+
+    /// Log timing for a completed event when profiling is enabled.
+    fn profile_event(&self, label: &str, event: &Event) {
+        if self.profiling {
+            if let Some(ms) = Self::event_elapsed_ms(event) {
+                eprintln!("[pz-gpu] {label}: {ms:.3} ms");
+            }
+        }
     }
 
     /// Find LZ77 matches for the entire input using the GPU.
@@ -481,6 +530,7 @@ impl OpenClEngine {
                 .map_err(|_| PzError::InvalidInput)?
         };
         write_event.wait().map_err(|_| PzError::InvalidInput)?;
+        self.profile_event("find_matches: upload input", &write_event);
 
         // Execute kernel
         match variant {
@@ -503,6 +553,7 @@ impl OpenClEngine {
                 .map_err(|_| PzError::InvalidInput)?
         };
         read_event.wait().map_err(|_| PzError::InvalidInput)?;
+        self.profile_event("find_matches: download matches", &read_event);
 
         // Deduplicate and convert to the Rust Match type
         let matches = dedupe_gpu_matches(&gpu_matches, input);
@@ -530,6 +581,7 @@ impl OpenClEngine {
         };
 
         kernel_event.wait().map_err(|_| PzError::Unsupported)?;
+        self.profile_event("lz77 per-position kernel", &kernel_event);
         Ok(())
     }
 
@@ -555,6 +607,7 @@ impl OpenClEngine {
         };
 
         kernel_event.wait().map_err(|_| PzError::Unsupported)?;
+        self.profile_event("lz77 batch kernel", &kernel_event);
         Ok(())
     }
 
@@ -615,6 +668,7 @@ impl OpenClEngine {
                 .map_err(|_| PzError::Unsupported)?
         };
         build_event.wait().map_err(|_| PzError::Unsupported)?;
+        self.profile_event("lz77 hash: build table", &build_event);
 
         // Pass 2: Find matches
         let find_event = unsafe {
@@ -629,6 +683,7 @@ impl OpenClEngine {
                 .map_err(|_| PzError::Unsupported)?
         };
         find_event.wait().map_err(|_| PzError::Unsupported)?;
+        self.profile_event("lz77 hash: find matches", &find_event);
 
         Ok(())
     }
@@ -1975,6 +2030,7 @@ impl OpenClEngine {
                 .map_err(|_| PzError::Unsupported)?
         };
         write_event.wait().map_err(|_| PzError::Unsupported)?;
+        self.profile_event("deflate_chained: upload LZ77 data", &write_event);
 
         // Stage 2: GPU ByteHistogram — compute frequencies on-device.
         // Only 1KB (256×u32) is downloaded instead of the full LZ77 stream.
@@ -2001,6 +2057,7 @@ impl OpenClEngine {
                 .map_err(|_| PzError::Unsupported)?
         };
         hist_event.wait().map_err(|_| PzError::Unsupported)?;
+        self.profile_event("deflate_chained: byte histogram kernel", &hist_event);
 
         let mut histogram = vec![0u32; 256];
         let read_hist = unsafe {
@@ -2060,6 +2117,7 @@ impl OpenClEngine {
                 .map_err(|_| PzError::Unsupported)?
         };
         pass1_event.wait().map_err(|_| PzError::Unsupported)?;
+        self.profile_event("deflate_chained: huffman bit lengths", &pass1_event);
 
         // Save last bit length before prefix sum overwrites it
         let mut last_val = vec![0u32; 1];
@@ -2132,6 +2190,7 @@ impl OpenClEngine {
                 .map_err(|_| PzError::Unsupported)?
         };
         pass2_event.wait().map_err(|_| PzError::Unsupported)?;
+        self.profile_event("deflate_chained: huffman write codes", &pass2_event);
 
         // Download final encoded bitstream
         let mut output_data = vec![0u32; output_uints];
@@ -2141,6 +2200,7 @@ impl OpenClEngine {
                 .map_err(|_| PzError::Unsupported)?
         };
         read_out.wait().map_err(|_| PzError::Unsupported)?;
+        self.profile_event("deflate_chained: download bitstream", &read_out);
 
         // Convert uint array to bytes (big-endian to match MSB-first packing)
         let output_bytes_len = total_bits.div_ceil(8);
@@ -2950,10 +3010,13 @@ mod tests {
 
         // Decompress using the standard CPU Deflate decoder
         let decompressed = crate::pipeline::decompress(&{
-            // Build a proper PZ container around the block data
+            // Build a proper V2 PZ container around the block data
             let mut container = Vec::new();
-            container.extend_from_slice(&[b'P', b'Z', 1, 0]); // magic + version + pipeline=Deflate
-            container.extend_from_slice(&(input.len() as u32).to_le_bytes());
+            container.extend_from_slice(&[b'P', b'Z', 2, 0]); // magic + version=2 + pipeline=Deflate
+            container.extend_from_slice(&(input.len() as u32).to_le_bytes()); // original length
+            container.extend_from_slice(&1u32.to_le_bytes()); // num_blocks = 1
+            container.extend_from_slice(&(block_data.len() as u32).to_le_bytes()); // compressed_len
+            container.extend_from_slice(&(input.len() as u32).to_le_bytes()); // original_len
             container.extend_from_slice(&block_data);
             container
         })
@@ -2980,8 +3043,11 @@ mod tests {
 
         let decompressed = crate::pipeline::decompress(&{
             let mut container = Vec::new();
-            container.extend_from_slice(&[b'P', b'Z', 1, 0]);
-            container.extend_from_slice(&(input.len() as u32).to_le_bytes());
+            container.extend_from_slice(&[b'P', b'Z', 2, 0]); // magic + version=2 + pipeline=Deflate
+            container.extend_from_slice(&(input.len() as u32).to_le_bytes()); // original length
+            container.extend_from_slice(&1u32.to_le_bytes()); // num_blocks = 1
+            container.extend_from_slice(&(block_data.len() as u32).to_le_bytes()); // compressed_len
+            container.extend_from_slice(&(input.len() as u32).to_le_bytes()); // original_len
             container.extend_from_slice(&block_data);
             container
         })
