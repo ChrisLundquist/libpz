@@ -152,6 +152,7 @@ pub fn decompress_to_buf(input: &[u8], output: &mut [u8]) -> PzResult<usize> {
 // --- Hash-chain match finder ---
 
 /// Compute a hash for 3 bytes at the given position.
+#[inline(always)]
 pub(crate) fn hash3(data: &[u8], pos: usize) -> usize {
     if pos + 2 >= data.len() {
         return 0;
@@ -159,6 +160,26 @@ pub(crate) fn hash3(data: &[u8], pos: usize) -> usize {
     let h = (data[pos] as usize) << 10 ^ (data[pos + 1] as usize) << 5 ^ (data[pos + 2] as usize);
     h & HASH_MASK
 }
+
+/// Unchecked hash for the hot path where caller guarantees `pos + 2 < data.len()`.
+///
+/// # Safety
+/// Caller must ensure `pos + 2 < data.len()`.
+#[inline(always)]
+unsafe fn hash3_unchecked(data: &[u8], pos: usize) -> usize {
+    let h = (*data.get_unchecked(pos) as usize) << 10
+        ^ (*data.get_unchecked(pos + 1) as usize) << 5
+        ^ (*data.get_unchecked(pos + 2) as usize);
+    h & HASH_MASK
+}
+
+/// Maximum hash insertion count per match (longer matches cap insertion
+/// to avoid spending time on positions that will soon leave the window).
+const MAX_INSERT_LEN: usize = 128;
+
+/// Match length threshold above which lazy evaluation is skipped.
+/// A match this long is unlikely to be beaten by the next position.
+const LAZY_SKIP_THRESHOLD: u16 = 32;
 
 /// Hash-chain based match finder.
 ///
@@ -169,6 +190,8 @@ pub(crate) struct HashChainFinder {
     head: Vec<u32>,
     /// prev[pos % MAX_WINDOW] = previous position in the chain
     prev: Vec<u32>,
+    /// Cached SIMD dispatcher — resolved once, avoids per-call feature detection.
+    dispatcher: crate::simd::Dispatcher,
 }
 
 impl HashChainFinder {
@@ -176,6 +199,7 @@ impl HashChainFinder {
         Self {
             head: vec![0; HASH_SIZE],
             prev: vec![0; MAX_WINDOW],
+            dispatcher: crate::simd::Dispatcher::new(),
         }
     }
 
@@ -194,7 +218,6 @@ impl HashChainFinder {
             };
         }
 
-        let dispatcher = crate::simd::Dispatcher::new();
         let h = hash3(input, pos);
         let mut chain_pos = self.head[h] as usize;
         let mut best_offset: u32 = 0;
@@ -205,7 +228,9 @@ impl HashChainFinder {
         while chain_pos >= min_pos && chain_pos < pos && chain_count < MAX_CHAIN {
             // SIMD-accelerated byte comparison
             let max_len = remaining.min(pos - chain_pos);
-            let match_len = dispatcher.compare_bytes(&input[chain_pos..], &input[pos..]) as u32;
+            let match_len =
+                self.dispatcher
+                    .compare_bytes(&input[chain_pos..], &input[pos..]) as u32;
             let match_len = match_len.min(max_len as u32);
 
             if match_len > best_length && match_len >= MIN_MATCH as u32 {
@@ -241,11 +266,13 @@ impl HashChainFinder {
     }
 
     /// Insert position `pos` into the hash chain.
+    #[inline(always)]
     pub(crate) fn insert(&mut self, input: &[u8], pos: usize) {
         if pos + 2 >= input.len() {
             return;
         }
-        let h = hash3(input, pos);
+        // SAFETY: bounds check above guarantees pos + 2 < input.len()
+        let h = unsafe { hash3_unchecked(input, pos) };
         self.prev[pos % MAX_WINDOW] = self.head[h];
         self.head[h] = pos as u32;
     }
@@ -263,7 +290,6 @@ impl HashChainFinder {
             return Vec::new();
         }
 
-        let dispatcher = crate::simd::Dispatcher::new();
         let h = hash3(input, pos);
         let mut chain_pos = self.head[h] as usize;
         let min_pos = pos.saturating_sub(MAX_WINDOW);
@@ -275,7 +301,9 @@ impl HashChainFinder {
 
         while chain_pos >= min_pos && chain_pos < pos && chain_count < MAX_CHAIN {
             let max_len = remaining.min(pos - chain_pos);
-            let match_len = dispatcher.compare_bytes(&input[chain_pos..], &input[pos..]) as u32;
+            let match_len =
+                self.dispatcher
+                    .compare_bytes(&input[chain_pos..], &input[pos..]) as u32;
             let match_len = match_len.min(max_len as u32);
 
             if match_len >= MIN_MATCH as u32 {
@@ -325,7 +353,7 @@ pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
         return Ok(Vec::new());
     }
 
-    let mut output = Vec::new();
+    let mut output = Vec::with_capacity(input.len());
     let mut finder = HashChainFinder::new();
     let mut pos: usize = 0;
 
@@ -334,23 +362,27 @@ pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
         finder.insert(input, pos);
 
         // If we found a match, check if the next position has a longer one
-        if m.length >= MIN_MATCH && pos + 1 < input.len() {
+        // (skip lazy check for long matches — unlikely to be beaten)
+        if m.length >= MIN_MATCH && m.length < LAZY_SKIP_THRESHOLD && pos + 1 < input.len() {
             finder.insert(input, pos + 1);
             let next_m = finder.find_match(input, pos + 1);
 
             if next_m.length > m.length {
                 // Emit current position as a literal, use the next match
-                let literal = Match {
-                    offset: 0,
-                    length: 0,
-                    next: input[pos],
-                };
-                output.extend_from_slice(&literal.to_bytes());
+                output.extend_from_slice(
+                    &Match {
+                        offset: 0,
+                        length: 0,
+                        next: input[pos],
+                    }
+                    .to_bytes(),
+                );
                 pos += 1;
 
-                // Insert positions covered by next_m
+                // Insert positions covered by next_m (capped for long matches)
                 let advance = next_m.length as usize + 1;
-                for i in 1..advance.min(input.len() - pos) {
+                let insert_count = advance.min(input.len() - pos).min(MAX_INSERT_LEN);
+                for i in 1..insert_count {
                     finder.insert(input, pos + i);
                 }
 
@@ -362,7 +394,8 @@ pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
 
         // Use the original match
         let advance = m.length as usize + 1;
-        for i in 1..advance.min(input.len() - pos) {
+        let insert_count = advance.min(input.len() - pos).min(MAX_INSERT_LEN);
+        for i in 1..insert_count {
             finder.insert(input, pos + i);
         }
 

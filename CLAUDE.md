@@ -15,8 +15,6 @@ cargo fmt                      # format code (must match CI)
 cargo clippy --all-targets     # lint (must pass with zero warnings)
 cargo build --features opencl  # compile with GPU support
 cargo test --features opencl   # run all tests including GPU (skips gracefully if no device)
-cargo bench                    # run CPU benchmarks
-cargo bench --features opencl  # run CPU + GPU benchmarks
 ```
 
 ## Git hooks setup
@@ -30,6 +28,43 @@ Before every commit, **always** run (the pre-commit hook handles 1 and 2 automat
 1. `cargo fmt` — format all code
 2. `cargo clippy --all-targets` — fix all warnings, zero warnings policy
 3. `cargo test` — all tests must pass
+
+## Benchmarking & profiling
+
+### Quick comparison vs gzip (end-to-end, real files)
+```bash
+./scripts/bench.sh                              # all Canterbury + large corpus
+./scripts/bench.sh myfile.bin                   # specific files
+BENCH_PIPELINES="deflate lza" ./scripts/bench.sh  # subset of pipelines
+BENCH_ITERS=10 ./scripts/bench.sh              # more iterations
+```
+
+### Criterion microbenchmarks
+```bash
+cargo bench                        # all benchmarks (~10 min)
+cargo bench --bench throughput     # end-to-end pipeline throughput only
+cargo bench --bench stages         # per-algorithm stage benchmarks only
+cargo bench -- fse                 # filter to specific algorithm
+cargo bench -- compress            # filter to compress group
+cargo bench --features opencl      # include GPU benchmarks
+```
+
+### Profiling with samply
+```bash
+cargo install samply                                # one-time setup
+./scripts/profile.sh                                # lza compress, 256KB (default)
+./scripts/profile.sh --pipeline deflate --decompress
+./scripts/profile.sh --stage lz77                   # single algorithm
+./scripts/profile.sh --stage fse --size 1048576     # 1MB input
+```
+
+### Optimization workflow
+1. **Measure** — `./scripts/bench.sh` to get baseline vs gzip
+2. **Identify** — `./scripts/profile.sh --stage <stage>` to find hotspots
+3. **Change** — edit the algorithm
+4. **Validate** — `cargo test <module>` to verify correctness
+5. **Re-measure** — `cargo bench -- <stage>` for precise before/after
+6. **Confirm** — `./scripts/bench.sh` to verify end-to-end improvement
 
 ## Project layout
 - `src/lib.rs` — crate root, module declarations
@@ -45,6 +80,9 @@ Before every commit, **always** run (the pre-commit hook handles 1 and 2 automat
 - `kernels/*.cl` — OpenCL kernel source
 - `benches/throughput.rs` — end-to-end pipeline benchmarks
 - `benches/stages.rs` — per-algorithm scaling benchmarks
+- `scripts/bench.sh` — pz vs gzip comparison (ratio, throughput, all pipelines)
+- `scripts/profile.sh` — samply profiling wrapper
+- `examples/profile.rs` — profiling harness (pipeline or individual stage loops)
 
 ## Conventions
 - Public API: `encode()` / `decode()` returning `PzResult<T>`
