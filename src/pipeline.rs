@@ -590,13 +590,250 @@ struct StageMetadata {
     bwt_primary_index: Option<u32>,
     /// Bijective BWT factor lengths (Bbw pipeline, set by BBWT stage).
     bbwt_factor_lengths: Option<Vec<usize>>,
-    /// Length of data before entropy coding.
-    /// Bw/Bbw: RLE output length.
+    /// Length of data before entropy coding (RLE output for Bw/Bbw, LZ output for LZ pipelines).
     pre_entropy_len: Option<usize>,
-    /// Deflate: LZ77 output length.
-    lz_len: Option<usize>,
-    /// LZSS pipelines: number of tokens (needed to reconstruct flags on decompress).
-    lzss_num_tokens: Option<u32>,
+    /// Opaque metadata from the demuxer that must round-trip through the entropy container.
+    /// E.g., LZSS num_tokens (4 LE bytes). Empty for formats that don't need it.
+    demux_meta: Vec<u8>,
+}
+
+// --- Stream demux trait and implementations ---
+
+/// Output from a demuxer's compress-and-split operation.
+struct DemuxOutput {
+    /// Independent byte streams for entropy coding.
+    streams: Vec<Vec<u8>>,
+    /// Length of the pre-entropy data (e.g., total LZ output before splitting).
+    pre_entropy_len: usize,
+    /// Opaque metadata that must round-trip through the entropy container.
+    meta: Vec<u8>,
+}
+
+/// Describes how a pre-entropy stage (LZ77, LZSS, LZ78, etc.) splits its
+/// output into independent byte streams for entropy coding, and merges
+/// them back on decompression.
+trait StreamDemuxer {
+    /// Number of independent streams this format produces.
+    #[allow(dead_code)]
+    fn stream_count(&self) -> usize;
+
+    /// Compress input bytes and split into independent streams + metadata.
+    fn compress_and_demux(&self, input: &[u8], options: &CompressOptions) -> PzResult<DemuxOutput>;
+
+    /// Reinterleave decoded streams + metadata back into decompressed output.
+    fn remux_and_decompress(
+        &self,
+        streams: Vec<Vec<u8>>,
+        meta: &[u8],
+        original_len: usize,
+    ) -> PzResult<Vec<u8>>;
+}
+
+/// Concrete LZ demuxer variants (enum dispatch, no dyn/vtable overhead).
+enum LzDemuxer {
+    /// LZ77: 3 streams (offsets, lengths, literals).
+    Lz77,
+    /// LZSS: 4 streams (flags, literals, offsets, lengths).
+    Lzss,
+    /// LZ78: 1 stream (flat blob, no splitting).
+    Lz78,
+}
+
+/// Map a pipeline to its demuxer, if it uses one.
+/// Returns `None` for BWT-based pipelines (Bw, Bbw).
+#[allow(dead_code)]
+fn demuxer_for_pipeline(pipeline: Pipeline) -> Option<LzDemuxer> {
+    match pipeline {
+        Pipeline::Deflate | Pipeline::Lzr | Pipeline::Lzf => Some(LzDemuxer::Lz77),
+        Pipeline::LzssR => Some(LzDemuxer::Lzss),
+        Pipeline::Lz78R => Some(LzDemuxer::Lz78),
+        Pipeline::Bw | Pipeline::Bbw => None,
+    }
+}
+
+impl StreamDemuxer for LzDemuxer {
+    fn stream_count(&self) -> usize {
+        match self {
+            LzDemuxer::Lz77 => 3,
+            LzDemuxer::Lzss => 4,
+            LzDemuxer::Lz78 => 1,
+        }
+    }
+
+    fn compress_and_demux(&self, input: &[u8], options: &CompressOptions) -> PzResult<DemuxOutput> {
+        match self {
+            LzDemuxer::Lz77 => {
+                let lz_data = lz77_compress_with_backend(input, options)?;
+                let lz_len = lz_data.len();
+                let match_size = lz77::Match::SERIALIZED_SIZE; // 5
+                let num_matches = lz_len / match_size;
+
+                let mut offsets = Vec::with_capacity(num_matches * 2);
+                let mut lengths = Vec::with_capacity(num_matches * 2);
+                let mut literals = Vec::with_capacity(num_matches);
+
+                for i in 0..num_matches {
+                    let base = i * match_size;
+                    offsets.push(lz_data[base]);
+                    offsets.push(lz_data[base + 1]);
+                    lengths.push(lz_data[base + 2]);
+                    lengths.push(lz_data[base + 3]);
+                    literals.push(lz_data[base + 4]);
+                }
+
+                Ok(DemuxOutput {
+                    streams: vec![offsets, lengths, literals],
+                    pre_entropy_len: lz_len,
+                    meta: Vec::new(),
+                })
+            }
+            LzDemuxer::Lzss => {
+                let encoded = lzss::encode(input)?;
+                if encoded.len() < 12 {
+                    return Err(PzError::InvalidInput);
+                }
+                let num_tokens = u32::from_le_bytes(encoded[4..8].try_into().unwrap());
+                let flag_bytes_len =
+                    u32::from_le_bytes(encoded[8..12].try_into().unwrap()) as usize;
+
+                let flags_data = &encoded[12..12 + flag_bytes_len];
+                let token_data = &encoded[12 + flag_bytes_len..];
+
+                let flags_stream = flags_data.to_vec();
+                let mut literals = Vec::new();
+                let mut offsets = Vec::new();
+                let mut lengths = Vec::new();
+                let mut td_pos = 0;
+
+                for i in 0..num_tokens as usize {
+                    let is_literal = flags_data[i / 8] & (1 << (7 - (i % 8))) != 0;
+                    if is_literal {
+                        literals.push(token_data[td_pos]);
+                        td_pos += 1;
+                    } else {
+                        offsets.extend_from_slice(&token_data[td_pos..td_pos + 2]);
+                        lengths.extend_from_slice(&token_data[td_pos + 2..td_pos + 4]);
+                        td_pos += 4;
+                    }
+                }
+
+                Ok(DemuxOutput {
+                    streams: vec![flags_stream, literals, offsets, lengths],
+                    pre_entropy_len: encoded.len(),
+                    meta: num_tokens.to_le_bytes().to_vec(),
+                })
+            }
+            LzDemuxer::Lz78 => {
+                let encoded = lz78::encode(input)?;
+                let pre_entropy_len = encoded.len();
+                Ok(DemuxOutput {
+                    streams: vec![encoded],
+                    pre_entropy_len,
+                    meta: Vec::new(),
+                })
+            }
+        }
+    }
+
+    fn remux_and_decompress(
+        &self,
+        streams: Vec<Vec<u8>>,
+        meta: &[u8],
+        original_len: usize,
+    ) -> PzResult<Vec<u8>> {
+        match self {
+            LzDemuxer::Lz77 => {
+                if streams.len() != 3 {
+                    return Err(PzError::InvalidInput);
+                }
+                let offsets = &streams[0];
+                let lengths = &streams[1];
+                let literals = &streams[2];
+
+                if offsets.len() != lengths.len() || offsets.len() != literals.len() * 2 {
+                    return Err(PzError::InvalidInput);
+                }
+                let num_matches = literals.len();
+                let match_size = lz77::Match::SERIALIZED_SIZE;
+                let mut lz_data = Vec::with_capacity(num_matches * match_size);
+
+                for i in 0..num_matches {
+                    lz_data.push(offsets[i * 2]);
+                    lz_data.push(offsets[i * 2 + 1]);
+                    lz_data.push(lengths[i * 2]);
+                    lz_data.push(lengths[i * 2 + 1]);
+                    lz_data.push(literals[i]);
+                }
+
+                let mut output = vec![0u8; original_len];
+                let out_len = lz77::decompress_to_buf(&lz_data, &mut output)?;
+                if out_len != original_len {
+                    return Err(PzError::InvalidInput);
+                }
+                Ok(output)
+            }
+            LzDemuxer::Lzss => {
+                if streams.len() != 4 {
+                    return Err(PzError::InvalidInput);
+                }
+                if meta.len() < 4 {
+                    return Err(PzError::InvalidInput);
+                }
+                let num_tokens = u32::from_le_bytes(meta[..4].try_into().unwrap());
+
+                let flags_stream = &streams[0];
+                let literals = &streams[1];
+                let offsets = &streams[2];
+                let lengths = &streams[3];
+                let flag_bytes_len = flags_stream.len();
+
+                let mut token_data = Vec::new();
+                let mut lit_pos = 0;
+                let mut match_idx = 0;
+                for i in 0..num_tokens as usize {
+                    let is_literal = flags_stream[i / 8] & (1 << (7 - (i % 8))) != 0;
+                    if is_literal {
+                        if lit_pos >= literals.len() {
+                            return Err(PzError::InvalidInput);
+                        }
+                        token_data.push(literals[lit_pos]);
+                        lit_pos += 1;
+                    } else {
+                        let off_pos = match_idx * 2;
+                        if off_pos + 2 > offsets.len() || off_pos + 2 > lengths.len() {
+                            return Err(PzError::InvalidInput);
+                        }
+                        token_data.extend_from_slice(&offsets[off_pos..off_pos + 2]);
+                        token_data.extend_from_slice(&lengths[off_pos..off_pos + 2]);
+                        match_idx += 1;
+                    }
+                }
+
+                let mut lzss_blob = Vec::with_capacity(12 + flag_bytes_len + token_data.len());
+                lzss_blob.extend_from_slice(&(original_len as u32).to_le_bytes());
+                lzss_blob.extend_from_slice(&num_tokens.to_le_bytes());
+                lzss_blob.extend_from_slice(&(flag_bytes_len as u32).to_le_bytes());
+                lzss_blob.extend_from_slice(flags_stream);
+                lzss_blob.extend_from_slice(&token_data);
+
+                let decoded = lzss::decode(&lzss_blob)?;
+                if decoded.len() != original_len {
+                    return Err(PzError::InvalidInput);
+                }
+                Ok(decoded)
+            }
+            LzDemuxer::Lz78 => {
+                if streams.len() != 1 {
+                    return Err(PzError::InvalidInput);
+                }
+                let decoded = lz78::decode(&streams[0])?;
+                if decoded.len() != original_len {
+                    return Err(PzError::InvalidInput);
+                }
+                Ok(decoded)
+            }
+        }
+    }
 }
 
 /// Number of compression stages in a pipeline.
@@ -611,203 +848,117 @@ fn pipeline_stage_count(pipeline: Pipeline) -> usize {
     }
 }
 
-// --- Compression stage functions ---
+// --- Generic demux stage functions ---
 
-/// LZ-pipeline stage 0: LZ77 compression with multi-stream deinterleaving.
-///
-/// After LZ77 compression, the flat match stream (5 bytes per match:
-/// offset_lo, offset_hi, length_lo, length_hi, next) is split into 3
-/// independent streams for better entropy coding:
-///   - Stream 0: offsets (2 bytes per match, little-endian u16)
-///   - Stream 1: lengths (2 bytes per match, little-endian u16)
-///   - Stream 2: literals (1 byte per match, the `next` field)
-fn stage_lz77_compress(mut block: StageBlock, options: &CompressOptions) -> PzResult<StageBlock> {
-    let lz_data = lz77_compress_with_backend(&block.data, options)?;
-    let lz_len = lz_data.len();
-    block.metadata.lz_len = Some(lz_len);
-
-    // Deinterleave into 3 streams
-    let match_size = lz77::Match::SERIALIZED_SIZE; // 5
-    let num_matches = lz_len / match_size;
-
-    let mut offsets = Vec::with_capacity(num_matches * 2);
-    let mut lengths = Vec::with_capacity(num_matches * 2);
-    let mut literals = Vec::with_capacity(num_matches);
-
-    for i in 0..num_matches {
-        let base = i * match_size;
-        offsets.push(lz_data[base]);
-        offsets.push(lz_data[base + 1]);
-        lengths.push(lz_data[base + 2]);
-        lengths.push(lz_data[base + 3]);
-        literals.push(lz_data[base + 4]);
-    }
-
-    block.streams = Some(vec![offsets, lengths, literals]);
+/// Generic compress stage: compress with a demuxer, populating streams + metadata.
+fn stage_demux_compress(
+    mut block: StageBlock,
+    demuxer: &LzDemuxer,
+    options: &CompressOptions,
+) -> PzResult<StageBlock> {
+    let output = demuxer.compress_and_demux(&block.data, options)?;
+    block.metadata.pre_entropy_len = Some(output.pre_entropy_len);
+    block.metadata.demux_meta = output.meta;
+    block.streams = Some(output.streams);
     block.data.clear();
     Ok(block)
 }
 
-/// LZSS-pipeline stage 0: LZSS compression + 4-stream deinterleaving.
-///
-/// Encodes the block with LZSS, then splits the wire format into 4
-/// independent streams for entropy coding:
-///   stream 0: packed flag bits
-///   stream 1: literal bytes
-///   stream 2: match offsets (u16 LE pairs)
-///   stream 3: match lengths (u16 LE pairs)
-///
-/// Each stream has a homogeneous byte distribution, allowing the downstream
-/// entropy coder (FSE or rANS) to model it efficiently with a single
-/// frequency table per stream.
-fn stage_lzss_compress(mut block: StageBlock) -> PzResult<StageBlock> {
-    let encoded = lzss::encode(&block.data)?;
-
-    // Parse the LZSS header
-    if encoded.len() < 12 {
-        return Err(PzError::InvalidInput);
-    }
-    let num_tokens = u32::from_le_bytes(encoded[4..8].try_into().unwrap());
-    let flag_bytes_len = u32::from_le_bytes(encoded[8..12].try_into().unwrap()) as usize;
-
-    let flags_data = &encoded[12..12 + flag_bytes_len];
-    let token_data = &encoded[12 + flag_bytes_len..];
-
-    // Walk tokens using flags to split into 4 streams
-    let flags_stream = flags_data.to_vec();
-    let mut literals = Vec::new();
-    let mut offsets = Vec::new();
-    let mut lengths = Vec::new();
-    let mut td_pos = 0;
-
-    for i in 0..num_tokens as usize {
-        let is_literal = flags_data[i / 8] & (1 << (7 - (i % 8))) != 0;
-        if is_literal {
-            literals.push(token_data[td_pos]);
-            td_pos += 1;
-        } else {
-            offsets.extend_from_slice(&token_data[td_pos..td_pos + 2]);
-            lengths.extend_from_slice(&token_data[td_pos + 2..td_pos + 4]);
-            td_pos += 4;
-        }
-    }
-
-    block.metadata.lzss_num_tokens = Some(num_tokens);
-    block.metadata.lz_len = Some(encoded.len());
-    block.streams = Some(vec![flags_stream, literals, offsets, lengths]);
-    block.data.clear();
-    Ok(block)
-}
-
-/// LZSS-pipeline decompress: reinterleave 4 streams → LZSS wire format → decode.
-///
-/// Reconstructs the self-contained LZSS blob from the deinterleaved streams
-/// (flags, literals, offsets, lengths) then calls `lzss::decode`.
-fn stage_lzss_decompress(mut block: StageBlock) -> PzResult<StageBlock> {
-    if let Some(streams) = block.streams.take() {
-        if streams.len() != 4 {
-            return Err(PzError::InvalidInput);
-        }
-        let flags_stream = &streams[0];
-        let literals = &streams[1];
-        let offsets = &streams[2];
-        let lengths = &streams[3];
-        let num_tokens = block
-            .metadata
-            .lzss_num_tokens
-            .ok_or(PzError::InvalidInput)?;
-        let flag_bytes_len = flags_stream.len();
-
-        // Rebuild interleaved token_data by walking flags
-        let mut token_data = Vec::new();
-        let mut lit_pos = 0;
-        let mut match_idx = 0;
-        for i in 0..num_tokens as usize {
-            let is_literal = flags_stream[i / 8] & (1 << (7 - (i % 8))) != 0;
-            if is_literal {
-                if lit_pos >= literals.len() {
-                    return Err(PzError::InvalidInput);
-                }
-                token_data.push(literals[lit_pos]);
-                lit_pos += 1;
-            } else {
-                let off_pos = match_idx * 2;
-                if off_pos + 2 > offsets.len() || off_pos + 2 > lengths.len() {
-                    return Err(PzError::InvalidInput);
-                }
-                token_data.extend_from_slice(&offsets[off_pos..off_pos + 2]);
-                token_data.extend_from_slice(&lengths[off_pos..off_pos + 2]);
-                match_idx += 1;
-            }
-        }
-
-        // Rebuild full LZSS wire format: header + flags + token_data
-        let mut lzss_blob = Vec::with_capacity(12 + flag_bytes_len + token_data.len());
-        lzss_blob.extend_from_slice(&(block.original_len as u32).to_le_bytes());
-        lzss_blob.extend_from_slice(&num_tokens.to_le_bytes());
-        lzss_blob.extend_from_slice(&(flag_bytes_len as u32).to_le_bytes());
-        lzss_blob.extend_from_slice(flags_stream);
-        lzss_blob.extend_from_slice(&token_data);
-
-        let decoded = lzss::decode(&lzss_blob)?;
-        if decoded.len() != block.original_len {
-            return Err(PzError::InvalidInput);
-        }
-        block.data = decoded;
-    } else {
-        // Single-stream fallback (legacy)
-        let decoded = lzss::decode(&block.data)?;
-        if decoded.len() != block.original_len {
-            return Err(PzError::InvalidInput);
-        }
-        block.data = decoded;
-    }
-    Ok(block)
-}
-
-/// LZ78-pipeline stage 0: LZ78 compression (flat byte stream, no deinterleaving).
-///
-/// Encodes the block with LZ78 (incremental trie dictionary). The output is
-/// a self-contained byte stream including LZ78 headers. Stored as a single
-/// flat stream for the downstream entropy coder.
-fn stage_lz78_compress(mut block: StageBlock) -> PzResult<StageBlock> {
-    let encoded = lz78::encode(&block.data)?;
-    block.metadata.lz_len = Some(encoded.len());
-    block.data = encoded;
-    Ok(block)
-}
-
-/// LZ78-pipeline decompress: LZ78 decompress from flat byte stream.
-fn stage_lz78_decompress(mut block: StageBlock) -> PzResult<StageBlock> {
-    let decoded = lz78::decode(&block.data)?;
-    if decoded.len() != block.original_len {
-        return Err(PzError::InvalidInput);
-    }
+/// Generic decompress stage: reinterleave streams with a demuxer.
+fn stage_demux_decompress(mut block: StageBlock, demuxer: &LzDemuxer) -> PzResult<StageBlock> {
+    let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
+    let decoded =
+        demuxer.remux_and_decompress(streams, &block.metadata.demux_meta, block.original_len)?;
     block.data = decoded;
     Ok(block)
 }
 
-/// Deflate stage 1: Huffman encoding + serialization.
+// --- Multi-stream entropy container format ---
+//
+// Wire format:
+//   [num_streams: u8]
+//   [pre_entropy_len: u32 LE]
+//   [meta_len: u16 LE]
+//   [meta: meta_len bytes]
+//   for each stream: encoder-specific framing (see encode_one/decode_one closures)
+
+/// Multi-stream header size: num_streams(1) + pre_entropy_len(4) + meta_len(2) = 7
+const MULTISTREAM_HEADER_SIZE: usize = 7;
+
+/// Encode N streams into a multi-stream container.
 ///
-/// Multi-stream format (when `block.streams` is `Some`):
-///   [0u32: sentinel] [num_streams: u8] [lz_len: u32]
-///   For each stream:
-///     [stream_data_len: u32] [total_bits: u32] [freq_table: 256×u32] [huffman_data]
+/// `encode_one` encodes a single byte stream and returns (compressed_data, per_stream_header).
+/// For rANS/FSE: per_stream_header is [orig_len: u32][compressed_len: u32], data is the encoded bytes.
+/// For Huffman: per_stream_header includes freq table + total_bits.
+fn encode_multistream(
+    streams: &[Vec<u8>],
+    pre_entropy_len: usize,
+    meta: &[u8],
+    mut encode_one: impl FnMut(&[u8], &mut Vec<u8>) -> PzResult<()>,
+) -> PzResult<Vec<u8>> {
+    let mut output = Vec::new();
+    output.push(streams.len() as u8);
+    output.extend_from_slice(&(pre_entropy_len as u32).to_le_bytes());
+    output.extend_from_slice(&(meta.len() as u16).to_le_bytes());
+    output.extend_from_slice(meta);
+
+    for stream in streams {
+        encode_one(stream, &mut output)?;
+    }
+
+    Ok(output)
+}
+
+/// Decode a multi-stream container back to streams + metadata.
 ///
-/// Single-stream format (legacy, when `block.streams` is `None`):
-///   [lz_len: u32] [total_bits: u32] [freq_table: 256×u32] [huffman_data]
+/// `decode_one` reads one stream from `data[pos..]` and returns (decoded_bytes, bytes_consumed).
+fn decode_multistream(
+    data: &[u8],
+    mut decode_one: impl FnMut(&[u8]) -> PzResult<(Vec<u8>, usize)>,
+) -> PzResult<(Vec<Vec<u8>>, usize, Vec<u8>)> {
+    if data.len() < MULTISTREAM_HEADER_SIZE {
+        return Err(PzError::InvalidInput);
+    }
+    let num_streams = data[0] as usize;
+    let pre_entropy_len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+    let meta_len = u16::from_le_bytes([data[5], data[6]]) as usize;
+
+    let meta_end = MULTISTREAM_HEADER_SIZE + meta_len;
+    if data.len() < meta_end {
+        return Err(PzError::InvalidInput);
+    }
+    let meta = data[MULTISTREAM_HEADER_SIZE..meta_end].to_vec();
+
+    let mut pos = meta_end;
+    let mut decoded_streams = Vec::with_capacity(num_streams);
+
+    for _ in 0..num_streams {
+        if pos > data.len() {
+            return Err(PzError::InvalidInput);
+        }
+        let (decoded, consumed) = decode_one(&data[pos..])?;
+        decoded_streams.push(decoded);
+        pos += consumed;
+    }
+
+    Ok((decoded_streams, pre_entropy_len, meta))
+}
+
+// --- Entropy stage functions ---
+
+/// Huffman encoding stage: encode each stream independently with Huffman coding.
+///
+/// Per-stream framing:
+///   [stream_data_len: u32] [total_bits: u32] [freq_table: 256×u32] [huffman_data]
 fn stage_huffman_encode(mut block: StageBlock) -> PzResult<StageBlock> {
-    let lz_len = block.metadata.lz_len.unwrap();
+    let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
+    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
 
-    if let Some(streams) = block.streams.take() {
-        // Multi-stream encoding: encode each stream independently
-        let mut output = Vec::new();
-        // Sentinel: 0u32 distinguishes from single-stream (lz_len > 0)
-        output.extend_from_slice(&0u32.to_le_bytes());
-        output.push(streams.len() as u8);
-        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
-
-        for stream in &streams {
+    block.data = encode_multistream(
+        &streams,
+        pre_entropy_len,
+        &block.metadata.demux_meta,
+        |stream, output| {
             let tree = HuffmanTree::from_data(stream).ok_or(PzError::InvalidInput)?;
             let (huffman_data, total_bits) = tree.encode(stream)?;
             let freq_table = tree.serialize_frequencies();
@@ -818,25 +969,9 @@ fn stage_huffman_encode(mut block: StageBlock) -> PzResult<StageBlock> {
                 output.extend_from_slice(&freq.to_le_bytes());
             }
             output.extend_from_slice(&huffman_data);
-        }
-
-        block.data = output;
-    } else {
-        // Single-stream (legacy) path
-        let tree = HuffmanTree::from_data(&block.data).ok_or(PzError::InvalidInput)?;
-        let (huffman_data, total_bits) = tree.encode(&block.data)?;
-        let freq_table = tree.serialize_frequencies();
-
-        let mut output = Vec::new();
-        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
-        output.extend_from_slice(&(total_bits as u32).to_le_bytes());
-        for &freq in &freq_table {
-            output.extend_from_slice(&freq.to_le_bytes());
-        }
-        output.extend_from_slice(&huffman_data);
-
-        block.data = output;
-    }
+            Ok(())
+        },
+    )?;
 
     Ok(block)
 }
@@ -913,165 +1048,43 @@ fn stage_bwt_decode(mut block: StageBlock) -> PzResult<StageBlock> {
     Ok(block)
 }
 
-/// Deflate decompress stage 0: parse metadata + Huffman decode.
+/// Huffman decoding stage: parse multi-stream container + Huffman decode each stream.
 ///
-/// Detects multi-stream vs single-stream format by checking the first u32:
-///   - 0 → multi-stream (sentinel), followed by num_streams, lz_len, per-stream data
-///   - non-zero → single-stream (legacy), first u32 is lz_len
+/// Per-stream framing:
+///   [stream_data_len: u32] [total_bits: u32] [freq_table: 256×u32] [huffman_data]
 fn stage_huffman_decode(mut block: StageBlock) -> PzResult<StageBlock> {
-    if block.data.len() < 4 {
-        return Err(PzError::InvalidInput);
-    }
-
-    let first_u32 =
-        u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]);
-
-    if first_u32 == 0 {
-        // Multi-stream format
-        // Header: [0u32: sentinel][num_streams: u8][lz_len: u32]
-        if block.data.len() < 9 {
+    let (streams, pre_entropy_len, meta) = decode_multistream(&block.data, |data| {
+        // Per-stream: [stream_data_len: u32][total_bits: u32][freq_table: 256×u32][huffman_data]
+        if data.len() < 1032 {
             return Err(PzError::InvalidInput);
         }
-        let num_streams = block.data[4] as usize;
-        let lz_len =
-            u32::from_le_bytes([block.data[5], block.data[6], block.data[7], block.data[8]])
-                as usize;
-        block.metadata.lz_len = Some(lz_len);
-
-        let mut pos = 9;
-        let mut decoded_streams = Vec::with_capacity(num_streams);
-
-        for _ in 0..num_streams {
-            // Per-stream: [stream_data_len: u32][total_bits: u32][freq_table: 256×u32][huffman_data]
-            if pos + 1032 > block.data.len() {
-                return Err(PzError::InvalidInput);
-            }
-            let stream_data_len = u32::from_le_bytes([
-                block.data[pos],
-                block.data[pos + 1],
-                block.data[pos + 2],
-                block.data[pos + 3],
-            ]) as usize;
-            let total_bits = u32::from_le_bytes([
-                block.data[pos + 4],
-                block.data[pos + 5],
-                block.data[pos + 6],
-                block.data[pos + 7],
-            ]) as usize;
-
-            let mut freq_table = crate::frequency::FrequencyTable::new();
-            for i in 0..256 {
-                let off = pos + 8 + i * 4;
-                freq_table.byte[i] = u32::from_le_bytes([
-                    block.data[off],
-                    block.data[off + 1],
-                    block.data[off + 2],
-                    block.data[off + 3],
-                ]);
-            }
-            freq_table.total = freq_table.byte.iter().map(|&f| f as u64).sum();
-            freq_table.used = freq_table.byte.iter().filter(|&&f| f > 0).count() as u32;
-
-            let huff_start = pos + 1032;
-            if huff_start + stream_data_len > block.data.len() {
-                return Err(PzError::InvalidInput);
-            }
-            let tree =
-                HuffmanTree::from_frequency_table(&freq_table).ok_or(PzError::InvalidInput)?;
-            let decoded = tree.decode(
-                &block.data[huff_start..huff_start + stream_data_len],
-                total_bits,
-            )?;
-
-            decoded_streams.push(decoded);
-            pos = huff_start + stream_data_len;
-        }
-
-        block.streams = Some(decoded_streams);
-        block.data.clear();
-    } else {
-        // Single-stream (legacy) format
-        if block.data.len() < 1032 {
-            return Err(PzError::InvalidInput);
-        }
-        let lz_len = first_u32 as usize;
-        let total_bits =
-            u32::from_le_bytes([block.data[4], block.data[5], block.data[6], block.data[7]])
-                as usize;
+        let stream_data_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let total_bits = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
 
         let mut freq_table = crate::frequency::FrequencyTable::new();
         for i in 0..256 {
-            let offset = 8 + i * 4;
-            freq_table.byte[i] = u32::from_le_bytes([
-                block.data[offset],
-                block.data[offset + 1],
-                block.data[offset + 2],
-                block.data[offset + 3],
-            ]);
+            let off = 8 + i * 4;
+            freq_table.byte[i] =
+                u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
         }
         freq_table.total = freq_table.byte.iter().map(|&f| f as u64).sum();
         freq_table.used = freq_table.byte.iter().filter(|&&f| f > 0).count() as u32;
 
+        let huff_start = 1032;
+        if huff_start + stream_data_len > data.len() {
+            return Err(PzError::InvalidInput);
+        }
         let tree = HuffmanTree::from_frequency_table(&freq_table).ok_or(PzError::InvalidInput)?;
-        let mut lz_data = vec![0u8; lz_len];
-        let decoded_len = tree.decode_to_buf(&block.data[1032..], total_bits, &mut lz_data)?;
-        if decoded_len != lz_len {
-            return Err(PzError::InvalidInput);
-        }
+        let decoded = tree.decode(&data[huff_start..huff_start + stream_data_len], total_bits)?;
 
-        block.metadata.lz_len = Some(lz_len);
-        block.data = lz_data;
-    }
+        let consumed = huff_start + stream_data_len;
+        Ok((decoded, consumed))
+    })?;
 
-    Ok(block)
-}
-
-/// LZ-pipeline decompress: LZ77 decompress.
-///
-/// If `block.streams` is `Some` with 3 streams (offsets, lengths, literals),
-/// reinterleaves them into the flat LzMatch byte stream before decompressing.
-fn stage_lz77_decompress(mut block: StageBlock) -> PzResult<StageBlock> {
-    if let Some(streams) = block.streams.take() {
-        // Multi-stream: reinterleave offsets, lengths, literals into flat LzMatch bytes
-        if streams.len() != 3 {
-            return Err(PzError::InvalidInput);
-        }
-        let offsets = &streams[0];
-        let lengths = &streams[1];
-        let literals = &streams[2];
-
-        // offsets and lengths are 2 bytes per match, literals are 1 byte per match
-        if offsets.len() != lengths.len() || offsets.len() != literals.len() * 2 {
-            return Err(PzError::InvalidInput);
-        }
-        let num_matches = literals.len();
-        let match_size = lz77::Match::SERIALIZED_SIZE; // 5
-        let mut lz_data = Vec::with_capacity(num_matches * match_size);
-
-        for i in 0..num_matches {
-            lz_data.push(offsets[i * 2]);
-            lz_data.push(offsets[i * 2 + 1]);
-            lz_data.push(lengths[i * 2]);
-            lz_data.push(lengths[i * 2 + 1]);
-            lz_data.push(literals[i]);
-        }
-
-        let mut output = vec![0u8; block.original_len];
-        let out_len = lz77::decompress_to_buf(&lz_data, &mut output)?;
-        if out_len != block.original_len {
-            return Err(PzError::InvalidInput);
-        }
-        block.data = output;
-        block.streams = None;
-    } else {
-        // Single-stream (legacy) path
-        let mut output = vec![0u8; block.original_len];
-        let out_len = lz77::decompress_to_buf(&block.data, &mut output)?;
-        if out_len != block.original_len {
-            return Err(PzError::InvalidInput);
-        }
-        block.data = output;
-    }
+    block.metadata.pre_entropy_len = Some(pre_entropy_len);
+    block.metadata.demux_meta = meta;
+    block.streams = Some(streams);
+    block.data.clear();
     Ok(block)
 }
 
@@ -1083,7 +1096,7 @@ fn run_compress_stage(
     options: &CompressOptions,
 ) -> PzResult<StageBlock> {
     match (pipeline, stage_idx) {
-        (Pipeline::Deflate, 0) => stage_lz77_compress(block, options),
+        (Pipeline::Deflate, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
         (Pipeline::Deflate, 1) => stage_huffman_encode(block),
         (Pipeline::Bw, 0) => stage_bwt_encode(block, options),
         (Pipeline::Bw, 1) => stage_mtf_encode(block),
@@ -1093,13 +1106,13 @@ fn run_compress_stage(
         (Pipeline::Bbw, 1) => stage_mtf_encode(block),
         (Pipeline::Bbw, 2) => stage_rle_encode(block),
         (Pipeline::Bbw, 3) => stage_fse_encode_bbw(block),
-        (Pipeline::Lzr, 0) => stage_lz77_compress(block, options),
+        (Pipeline::Lzr, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
         (Pipeline::Lzr, 1) => stage_rans_encode(block),
-        (Pipeline::Lzf, 0) => stage_lz77_compress(block, options),
+        (Pipeline::Lzf, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
         (Pipeline::Lzf, 1) => stage_fse_encode(block),
-        (Pipeline::LzssR, 0) => stage_lzss_compress(block),
+        (Pipeline::LzssR, 0) => stage_demux_compress(block, &LzDemuxer::Lzss, options),
         (Pipeline::LzssR, 1) => stage_rans_encode(block),
-        (Pipeline::Lz78R, 0) => stage_lz78_compress(block),
+        (Pipeline::Lz78R, 0) => stage_demux_compress(block, &LzDemuxer::Lz78, options),
         (Pipeline::Lz78R, 1) => stage_rans_encode(block),
         _ => Err(PzError::Unsupported),
     }
@@ -1114,7 +1127,7 @@ fn run_decompress_stage(
     match (pipeline, stage_idx) {
         // Deflate: Huffman decode(0) → LZ77 decompress(1)
         (Pipeline::Deflate, 0) => stage_huffman_decode(block),
-        (Pipeline::Deflate, 1) => stage_lz77_decompress(block),
+        (Pipeline::Deflate, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
         // Bw: FSE decode(0) → RLE decode(1) → MTF decode(2) → BWT decode(3)
         (Pipeline::Bw, 0) => stage_fse_decode_bw(block),
         (Pipeline::Bw, 1) => stage_rle_decode(block),
@@ -1127,16 +1140,16 @@ fn run_decompress_stage(
         (Pipeline::Bbw, 3) => stage_bbwt_decode(block),
         // Lzr: rANS decode(0) → LZ77 decompress(1)
         (Pipeline::Lzr, 0) => stage_rans_decode(block),
-        (Pipeline::Lzr, 1) => stage_lz77_decompress(block),
+        (Pipeline::Lzr, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
         // Lzf: FSE decode(0) → LZ77 decompress(1)
         (Pipeline::Lzf, 0) => stage_fse_decode(block),
-        (Pipeline::Lzf, 1) => stage_lz77_decompress(block),
+        (Pipeline::Lzf, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
         // LzssR: rANS decode(0) → LZSS decompress(1)
         (Pipeline::LzssR, 0) => stage_rans_decode(block),
-        (Pipeline::LzssR, 1) => stage_lzss_decompress(block),
+        (Pipeline::LzssR, 1) => stage_demux_decompress(block, &LzDemuxer::Lzss),
         // Lz78R: rANS decode(0) → LZ78 decompress(1)
         (Pipeline::Lz78R, 0) => stage_rans_decode(block),
-        (Pipeline::Lz78R, 1) => stage_lz78_decompress(block),
+        (Pipeline::Lz78R, 1) => stage_demux_decompress(block, &LzDemuxer::Lz78),
         _ => Err(PzError::Unsupported),
     }
 }
@@ -1451,7 +1464,7 @@ fn compress_block_deflate(input: &[u8], options: &CompressOptions) -> PzResult<V
         streams: None,
         metadata: StageMetadata::default(),
     };
-    let block = stage_lz77_compress(block, options)?;
+    let block = stage_demux_compress(block, &LzDemuxer::Lz77, options)?;
     let block = stage_huffman_encode(block)?;
     Ok(block.data)
 }
@@ -1466,7 +1479,7 @@ fn decompress_block_deflate(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>
         metadata: StageMetadata::default(),
     };
     let block = stage_huffman_decode(block)?;
-    let block = stage_lz77_decompress(block)?;
+    let block = stage_demux_decompress(block, &LzDemuxer::Lz77)?;
     Ok(block.data)
 }
 
@@ -1729,130 +1742,50 @@ fn decompress_block_bbw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 
 // --- LZR pipeline: LZ77 + rANS ---
 
-/// Entropy stage (rANS): rANS encoding + serialization.
+/// rANS encoding stage: encode each stream independently with rANS.
 ///
-/// Multi-stream format (when `block.streams` is `Some`):
-///   [0u32: sentinel] [num_streams: u8] [lz_len: u32]
-///   If num_streams == 4 (LZSS deinterleaved): [lzss_num_tokens: u32]
-///   For each stream:
-///     [original_stream_len: u32] [compressed_stream_len: u32] [rans_data]
-///
-/// Single-stream format (legacy, when `block.streams` is `None`):
-///   [lz_len: u32] [rans_data]
+/// Per-stream framing: [orig_len: u32] [compressed_len: u32] [rans_data]
 fn stage_rans_encode(mut block: StageBlock) -> PzResult<StageBlock> {
-    let lz_len = block.metadata.lz_len.unwrap();
+    let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
+    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
 
-    if let Some(streams) = block.streams.take() {
-        // Multi-stream encoding: encode each stream independently with rANS
-        let mut output = Vec::new();
-        output.extend_from_slice(&0u32.to_le_bytes()); // sentinel
-        output.push(streams.len() as u8);
-        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
-
-        // LZSS 4-stream: serialize num_tokens so decompress can reconstruct flags
-        if streams.len() == 4 {
-            let num_tokens = block.metadata.lzss_num_tokens.unwrap();
-            output.extend_from_slice(&num_tokens.to_le_bytes());
-        }
-
-        for stream in &streams {
+    block.data = encode_multistream(
+        &streams,
+        pre_entropy_len,
+        &block.metadata.demux_meta,
+        |stream, output| {
             let rans_data = rans::encode(stream);
             output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
             output.extend_from_slice(&(rans_data.len() as u32).to_le_bytes());
             output.extend_from_slice(&rans_data);
-        }
-
-        block.data = output;
-    } else {
-        // Single-stream (legacy) path
-        let rans_data = rans::encode(&block.data);
-        let mut output = Vec::new();
-        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
-        output.extend_from_slice(&rans_data);
-        block.data = output;
-    }
+            Ok(())
+        },
+    )?;
 
     Ok(block)
 }
 
-/// Entropy stage (rANS): parse metadata + rANS decode.
+/// rANS decoding stage: parse multi-stream container + rANS decode each stream.
 ///
-/// Detects multi-stream vs single-stream format by checking the first u32:
-///   - 0 → multi-stream (sentinel)
-///   - non-zero → single-stream (legacy), first u32 is lz_len
+/// Per-stream framing: [orig_len: u32] [compressed_len: u32] [rans_data]
 fn stage_rans_decode(mut block: StageBlock) -> PzResult<StageBlock> {
-    if block.data.len() < 4 {
-        return Err(PzError::InvalidInput);
-    }
-
-    let first_u32 =
-        u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]);
-
-    if first_u32 == 0 {
-        // Multi-stream format
-        if block.data.len() < 9 {
+    let (streams, pre_entropy_len, meta) = decode_multistream(&block.data, |data| {
+        if data.len() < 8 {
             return Err(PzError::InvalidInput);
         }
-        let num_streams = block.data[4] as usize;
-        let lz_len =
-            u32::from_le_bytes([block.data[5], block.data[6], block.data[7], block.data[8]])
-                as usize;
-        block.metadata.lz_len = Some(lz_len);
-
-        let mut pos = 9;
-
-        // LZSS 4-stream: read num_tokens
-        if num_streams == 4 {
-            if block.data.len() < 13 {
-                return Err(PzError::InvalidInput);
-            }
-            let num_tokens = u32::from_le_bytes([
-                block.data[pos],
-                block.data[pos + 1],
-                block.data[pos + 2],
-                block.data[pos + 3],
-            ]);
-            block.metadata.lzss_num_tokens = Some(num_tokens);
-            pos += 4;
+        let orig_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let comp_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        if 8 + comp_len > data.len() {
+            return Err(PzError::InvalidInput);
         }
+        let decoded = rans::decode(&data[8..8 + comp_len], orig_len)?;
+        Ok((decoded, 8 + comp_len))
+    })?;
 
-        let mut decoded_streams = Vec::with_capacity(num_streams);
-
-        for _ in 0..num_streams {
-            if pos + 8 > block.data.len() {
-                return Err(PzError::InvalidInput);
-            }
-            let orig_stream_len = u32::from_le_bytes([
-                block.data[pos],
-                block.data[pos + 1],
-                block.data[pos + 2],
-                block.data[pos + 3],
-            ]) as usize;
-            let comp_stream_len = u32::from_le_bytes([
-                block.data[pos + 4],
-                block.data[pos + 5],
-                block.data[pos + 6],
-                block.data[pos + 7],
-            ]) as usize;
-            pos += 8;
-
-            if pos + comp_stream_len > block.data.len() {
-                return Err(PzError::InvalidInput);
-            }
-            let decoded = rans::decode(&block.data[pos..pos + comp_stream_len], orig_stream_len)?;
-            decoded_streams.push(decoded);
-            pos += comp_stream_len;
-        }
-
-        block.streams = Some(decoded_streams);
-        block.data.clear();
-    } else {
-        // Single-stream (legacy) format
-        let lz_len = first_u32 as usize;
-        block.metadata.lz_len = Some(lz_len);
-        block.data = rans::decode(&block.data[4..], lz_len)?;
-    }
-
+    block.metadata.pre_entropy_len = Some(pre_entropy_len);
+    block.metadata.demux_meta = meta;
+    block.streams = Some(streams);
+    block.data.clear();
     Ok(block)
 }
 
@@ -1865,7 +1798,7 @@ fn compress_block_lzr(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u
         streams: None,
         metadata: StageMetadata::default(),
     };
-    let block = stage_lz77_compress(block, options)?;
+    let block = stage_demux_compress(block, &LzDemuxer::Lz77, options)?;
     let block = stage_rans_encode(block)?;
     Ok(block.data)
 }
@@ -1880,7 +1813,7 @@ fn decompress_block_lzr(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
         metadata: StageMetadata::default(),
     };
     let block = stage_rans_decode(block)?;
-    let block = stage_lz77_decompress(block)?;
+    let block = stage_demux_decompress(block, &LzDemuxer::Lz77)?;
     Ok(block.data)
 }
 
@@ -1914,136 +1847,51 @@ fn adaptive_accuracy_log(data: &[u8]) -> u8 {
     log.clamp(fse::MIN_ACCURACY_LOG as u32, fse::MAX_ACCURACY_LOG as u32) as u8
 }
 
-/// Entropy stage (FSE): FSE encoding + serialization.
+/// FSE encoding stage: encode each stream independently with adaptive FSE.
 ///
-/// Uses adaptive accuracy_log per stream: streams with many distinct symbols
-/// (e.g., LZ77 offsets with 256 active bytes) get higher accuracy for better
-/// compression, while low-cardinality streams (e.g., lengths) use smaller tables.
-///
-/// Multi-stream format (when `block.streams` is `Some`):
-///   [0u32: sentinel] [num_streams: u8] [lz_len: u32]
-///   If num_streams == 4 (LZSS deinterleaved): [lzss_num_tokens: u32]
-///   For each stream:
-///     [original_stream_len: u32] [compressed_stream_len: u32] [fse_data]
-///
-/// Single-stream format (legacy, when `block.streams` is `None`):
-///   [lz_len: u32] [fse_data]
+/// Per-stream framing: [orig_len: u32] [compressed_len: u32] [fse_data]
 fn stage_fse_encode(mut block: StageBlock) -> PzResult<StageBlock> {
-    let lz_len = block.metadata.lz_len.unwrap();
+    let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
+    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
 
-    if let Some(streams) = block.streams.take() {
-        // Multi-stream encoding: encode each stream independently with FSE
-        let mut output = Vec::new();
-        output.extend_from_slice(&0u32.to_le_bytes()); // sentinel
-        output.push(streams.len() as u8);
-        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
-
-        // LZSS 4-stream: serialize num_tokens so decompress can reconstruct flags
-        if streams.len() == 4 {
-            let num_tokens = block.metadata.lzss_num_tokens.unwrap();
-            output.extend_from_slice(&num_tokens.to_le_bytes());
-        }
-
-        for stream in &streams {
+    block.data = encode_multistream(
+        &streams,
+        pre_entropy_len,
+        &block.metadata.demux_meta,
+        |stream, output| {
             let acc = adaptive_accuracy_log(stream);
             let fse_data = fse::encode_with_accuracy(stream, acc);
             output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
             output.extend_from_slice(&(fse_data.len() as u32).to_le_bytes());
             output.extend_from_slice(&fse_data);
-        }
-
-        block.data = output;
-    } else {
-        // Single-stream path: also use adaptive accuracy
-        let acc = adaptive_accuracy_log(&block.data);
-        let fse_data = fse::encode_with_accuracy(&block.data, acc);
-        let mut output = Vec::new();
-        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
-        output.extend_from_slice(&fse_data);
-        block.data = output;
-    }
+            Ok(())
+        },
+    )?;
 
     Ok(block)
 }
 
-/// Entropy stage (FSE): parse metadata + FSE decode.
+/// FSE decoding stage: parse multi-stream container + FSE decode each stream.
 ///
-/// Detects multi-stream vs single-stream format by checking the first u32:
-///   - 0 → multi-stream (sentinel)
-///   - non-zero → single-stream (legacy), first u32 is lz_len
+/// Per-stream framing: [orig_len: u32] [compressed_len: u32] [fse_data]
 fn stage_fse_decode(mut block: StageBlock) -> PzResult<StageBlock> {
-    if block.data.len() < 4 {
-        return Err(PzError::InvalidInput);
-    }
-
-    let first_u32 =
-        u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]);
-
-    if first_u32 == 0 {
-        // Multi-stream format
-        if block.data.len() < 9 {
+    let (streams, pre_entropy_len, meta) = decode_multistream(&block.data, |data| {
+        if data.len() < 8 {
             return Err(PzError::InvalidInput);
         }
-        let num_streams = block.data[4] as usize;
-        let lz_len =
-            u32::from_le_bytes([block.data[5], block.data[6], block.data[7], block.data[8]])
-                as usize;
-        block.metadata.lz_len = Some(lz_len);
-
-        let mut pos = 9;
-
-        // LZSS 4-stream: read num_tokens
-        if num_streams == 4 {
-            if block.data.len() < 13 {
-                return Err(PzError::InvalidInput);
-            }
-            let num_tokens = u32::from_le_bytes([
-                block.data[pos],
-                block.data[pos + 1],
-                block.data[pos + 2],
-                block.data[pos + 3],
-            ]);
-            block.metadata.lzss_num_tokens = Some(num_tokens);
-            pos += 4;
+        let orig_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let comp_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        if 8 + comp_len > data.len() {
+            return Err(PzError::InvalidInput);
         }
+        let decoded = fse::decode(&data[8..8 + comp_len], orig_len)?;
+        Ok((decoded, 8 + comp_len))
+    })?;
 
-        let mut decoded_streams = Vec::with_capacity(num_streams);
-
-        for _ in 0..num_streams {
-            if pos + 8 > block.data.len() {
-                return Err(PzError::InvalidInput);
-            }
-            let orig_stream_len = u32::from_le_bytes([
-                block.data[pos],
-                block.data[pos + 1],
-                block.data[pos + 2],
-                block.data[pos + 3],
-            ]) as usize;
-            let comp_stream_len = u32::from_le_bytes([
-                block.data[pos + 4],
-                block.data[pos + 5],
-                block.data[pos + 6],
-                block.data[pos + 7],
-            ]) as usize;
-            pos += 8;
-
-            if pos + comp_stream_len > block.data.len() {
-                return Err(PzError::InvalidInput);
-            }
-            let decoded = fse::decode(&block.data[pos..pos + comp_stream_len], orig_stream_len)?;
-            decoded_streams.push(decoded);
-            pos += comp_stream_len;
-        }
-
-        block.streams = Some(decoded_streams);
-        block.data.clear();
-    } else {
-        // Single-stream (legacy) format
-        let lz_len = first_u32 as usize;
-        block.metadata.lz_len = Some(lz_len);
-        block.data = fse::decode(&block.data[4..], lz_len)?;
-    }
-
+    block.metadata.pre_entropy_len = Some(pre_entropy_len);
+    block.metadata.demux_meta = meta;
+    block.streams = Some(streams);
+    block.data.clear();
     Ok(block)
 }
 
@@ -2056,7 +1904,7 @@ fn compress_block_lzf(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u
         streams: None,
         metadata: StageMetadata::default(),
     };
-    let block = stage_lz77_compress(block, options)?;
+    let block = stage_demux_compress(block, &LzDemuxer::Lz77, options)?;
     let block = stage_fse_encode(block)?;
     Ok(block.data)
 }
@@ -2071,7 +1919,7 @@ fn decompress_block_lzf(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
         metadata: StageMetadata::default(),
     };
     let block = stage_fse_decode(block)?;
-    let block = stage_lz77_decompress(block)?;
+    let block = stage_demux_decompress(block, &LzDemuxer::Lz77)?;
     Ok(block.data)
 }
 
@@ -2086,7 +1934,7 @@ fn compress_block_lzssr(input: &[u8]) -> PzResult<Vec<u8>> {
         streams: None,
         metadata: StageMetadata::default(),
     };
-    let block = stage_lzss_compress(block)?;
+    let block = stage_demux_compress(block, &LzDemuxer::Lzss, &CompressOptions::default())?;
     let block = stage_rans_encode(block)?;
     Ok(block.data)
 }
@@ -2101,7 +1949,7 @@ fn decompress_block_lzssr(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> 
         metadata: StageMetadata::default(),
     };
     let block = stage_rans_decode(block)?;
-    let block = stage_lzss_decompress(block)?;
+    let block = stage_demux_decompress(block, &LzDemuxer::Lzss)?;
     Ok(block.data)
 }
 
@@ -2116,7 +1964,7 @@ fn compress_block_lz78r(input: &[u8]) -> PzResult<Vec<u8>> {
         streams: None,
         metadata: StageMetadata::default(),
     };
-    let block = stage_lz78_compress(block)?;
+    let block = stage_demux_compress(block, &LzDemuxer::Lz78, &CompressOptions::default())?;
     let block = stage_rans_encode(block)?;
     Ok(block.data)
 }
@@ -2131,7 +1979,7 @@ fn decompress_block_lz78r(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> 
         metadata: StageMetadata::default(),
     };
     let block = stage_rans_decode(block)?;
-    let block = stage_lz78_decompress(block)?;
+    let block = stage_demux_decompress(block, &LzDemuxer::Lz78)?;
     Ok(block.data)
 }
 
@@ -3023,7 +2871,7 @@ mod tests {
         };
 
         // LZ77 compress → produces streams
-        let block = stage_lz77_compress(block, &opts).unwrap();
+        let block = stage_demux_compress(block, &LzDemuxer::Lz77, &opts).unwrap();
         assert!(block.streams.is_some());
         let streams = block.streams.as_ref().unwrap();
         assert_eq!(streams.len(), 3);
@@ -3035,11 +2883,8 @@ mod tests {
         let block = stage_huffman_encode(block).unwrap();
         assert!(block.streams.is_none());
         assert!(!block.data.is_empty());
-        // Verify multi-stream sentinel
-        let sentinel =
-            u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]);
-        assert_eq!(sentinel, 0, "expected multi-stream sentinel");
-        assert_eq!(block.data[4], 3, "expected 3 streams");
+        // Verify multi-stream header: [num_streams: u8][pre_entropy_len: u32][meta_len: u16]
+        assert_eq!(block.data[0], 3, "expected 3 streams");
 
         // Huffman decode → restores streams
         let block = stage_huffman_decode(block).unwrap();
@@ -3048,7 +2893,7 @@ mod tests {
         assert_eq!(streams.len(), 3);
 
         // LZ77 decompress → reinterleaves and decompresses
-        let block = stage_lz77_decompress(block).unwrap();
+        let block = stage_demux_decompress(block, &LzDemuxer::Lz77).unwrap();
         assert!(block.streams.is_none());
         assert_eq!(block.data, input);
     }
@@ -3143,7 +2988,7 @@ mod tests {
         };
 
         // LZ77 compress → produces streams
-        let block = stage_lz77_compress(block, &opts).unwrap();
+        let block = stage_demux_compress(block, &LzDemuxer::Lz77, &opts).unwrap();
         assert!(block.streams.is_some());
         let streams = block.streams.as_ref().unwrap();
         assert_eq!(streams.len(), 3);
@@ -3152,11 +2997,8 @@ mod tests {
         let block = stage_rans_encode(block).unwrap();
         assert!(block.streams.is_none());
         assert!(!block.data.is_empty());
-        // Verify multi-stream sentinel
-        let sentinel =
-            u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]);
-        assert_eq!(sentinel, 0, "expected multi-stream sentinel");
-        assert_eq!(block.data[4], 3, "expected 3 streams");
+        // Verify multi-stream header: [num_streams: u8][pre_entropy_len: u32][meta_len: u16]
+        assert_eq!(block.data[0], 3, "expected 3 streams");
 
         // rANS decode → restores streams
         let block = stage_rans_decode(block).unwrap();
@@ -3165,7 +3007,7 @@ mod tests {
         assert_eq!(streams.len(), 3);
 
         // LZ77 decompress → reinterleaves and decompresses
-        let block = stage_lz77_decompress(block).unwrap();
+        let block = stage_demux_decompress(block, &LzDemuxer::Lz77).unwrap();
         assert!(block.streams.is_none());
         assert_eq!(block.data, input);
     }
@@ -3288,7 +3130,7 @@ mod tests {
         };
 
         // LZ77 compress → produces streams
-        let block = stage_lz77_compress(block, &opts).unwrap();
+        let block = stage_demux_compress(block, &LzDemuxer::Lz77, &opts).unwrap();
         assert!(block.streams.is_some());
         let streams = block.streams.as_ref().unwrap();
         assert_eq!(streams.len(), 3);
@@ -3297,11 +3139,8 @@ mod tests {
         let block = stage_fse_encode(block).unwrap();
         assert!(block.streams.is_none());
         assert!(!block.data.is_empty());
-        // Verify multi-stream sentinel
-        let sentinel =
-            u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]);
-        assert_eq!(sentinel, 0, "expected multi-stream sentinel");
-        assert_eq!(block.data[4], 3, "expected 3 streams");
+        // Verify multi-stream header: [num_streams: u8][pre_entropy_len: u32][meta_len: u16]
+        assert_eq!(block.data[0], 3, "expected 3 streams");
 
         // FSE decode → restores streams
         let block = stage_fse_decode(block).unwrap();
@@ -3310,7 +3149,7 @@ mod tests {
         assert_eq!(streams.len(), 3);
 
         // LZ77 decompress → reinterleaves and decompresses
-        let block = stage_lz77_decompress(block).unwrap();
+        let block = stage_demux_decompress(block, &LzDemuxer::Lz77).unwrap();
         assert!(block.streams.is_none());
         assert_eq!(block.data, input);
     }
