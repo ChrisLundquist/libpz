@@ -12,6 +12,8 @@ PZ="$PROJECT_DIR/target/release/pz"
 ITERATIONS=3
 PIPELINES=()
 FILES=()
+FEATURES=""
+GPU_FLAG=""
 
 usage() {
     cat <<'EOF'
@@ -24,6 +26,8 @@ Options:
   -n, --iters N          Number of iterations per operation (default: 3)
   -p, --pipelines LIST   Comma-separated list of pipelines to benchmark
                          (default: deflate,lzr,lzf)
+  --webgpu               Build with WebGPU feature and pass --webgpu to pz
+  --features FEAT        Cargo features to enable (e.g. opencl,webgpu)
   -h, --help             Show this help
 
 If no FILEs are given, benchmarks all files in samples/cantrbry and samples/large.
@@ -33,6 +37,7 @@ Examples:
   ./scripts/bench.sh myfile.bin                   # specific file
   ./scripts/bench.sh -p deflate,lzf               # subset of pipelines
   ./scripts/bench.sh -n 10                        # more iterations
+  ./scripts/bench.sh --webgpu -p bw,bbw           # GPU-accelerated BWT
   ./scripts/bench.sh -n 1 -p deflate,lzf file.txt # combine options
 EOF
 }
@@ -58,6 +63,28 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             IFS=',' read -ra PIPELINES <<< "$2"
+            shift 2
+            ;;
+        --webgpu)
+            # Shorthand: enable webgpu feature and pass --webgpu to pz
+            if [[ -z "$FEATURES" ]]; then
+                FEATURES="webgpu"
+            else
+                FEATURES="$FEATURES,webgpu"
+            fi
+            GPU_FLAG="--webgpu"
+            shift
+            ;;
+        --features)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --features requires an argument" >&2
+                exit 1
+            fi
+            if [[ -z "$FEATURES" ]]; then
+                FEATURES="$2"
+            else
+                FEATURES="$FEATURES,$2"
+            fi
             shift 2
             ;;
         -*)
@@ -90,9 +117,15 @@ if [[ ${#FILES[@]} -eq 0 ]]; then
 fi
 
 # Build release binary
-echo "Building pz (release)..."
-cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml" --quiet 2>/dev/null || \
-    cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml"
+CARGO_FEATURES_ARG=()
+if [[ -n "$FEATURES" ]]; then
+    CARGO_FEATURES_ARG=(--features "$FEATURES")
+    echo "Building pz (release, features: $FEATURES)..."
+else
+    echo "Building pz (release)..."
+fi
+cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml" ${CARGO_FEATURES_ARG[@]+"${CARGO_FEATURES_ARG[@]}"} --quiet 2>/dev/null || \
+    cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml" ${CARGO_FEATURES_ARG[@]+"${CARGO_FEATURES_ARG[@]}"}
 
 if [[ ! -x "$PZ" ]]; then
     echo "ERROR: $PZ not found after build" >&2
@@ -145,6 +178,9 @@ fmt_ratio() {
 
 echo "Averaging over $ITERATIONS iterations per operation."
 echo "Pipelines: ${PIPELINES[*]}"
+if [[ -n "$GPU_FLAG" ]]; then
+    echo "GPU: $GPU_FLAG"
+fi
 echo ""
 
 # Build dynamic column header
@@ -194,7 +230,7 @@ for file in "${FILES[@]}"; do
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
         cp "$file" "$TMPDIR/$name"
-        pz_comp_ns=$(avg_ns "$PZ" -k -f -p "$p" "$TMPDIR/$name")
+        pz_comp_ns=$(avg_ns "$PZ" -k -f -p "$p" $GPU_FLAG "$TMPDIR/$name")
         pz_size=$(stat -c%s "$TMPDIR/$name.pz" 2>/dev/null || stat -f%z "$TMPDIR/$name.pz" 2>/dev/null)
         rm -f "$TMPDIR/$name" "$TMPDIR/$name.pz"
 
@@ -257,7 +293,7 @@ for file in "${FILES[@]}"; do
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
         cp "$TMPDIR/$name.src" "$TMPDIR/$name"
-        "$PZ" -f -p "$p" "$TMPDIR/$name"
+        "$PZ" -f -p "$p" $GPU_FLAG "$TMPDIR/$name"
         mv "$TMPDIR/$name.pz" "$TMPDIR/$name.$p.pz"
     done
 
@@ -273,7 +309,7 @@ for file in "${FILES[@]}"; do
 
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
-        pz_dec_ns=$(avg_ns "$PZ" -d -k -f "$TMPDIR/$name.$p.pz")
+        pz_dec_ns=$(avg_ns "$PZ" -d -k -f $GPU_FLAG "$TMPDIR/$name.$p.pz")
         drow+=$(printf " | %7s %8s" \
             "$(fmt_ms $pz_dec_ns)" "$(fmt_throughput $orig_size $pz_dec_ns)")
         dt_pz_ns[$pi]=$(( ${dt_pz_ns[$pi]} + pz_dec_ns ))
