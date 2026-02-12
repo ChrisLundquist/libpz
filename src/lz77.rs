@@ -552,4 +552,186 @@ mod tests {
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
+
+    // --- Parse quality regression tests ---
+    //
+    // These tests assert that the lazy parser produces at most N sequences
+    // (Match structs) for known inputs. Fewer sequences = better compression.
+    // If a change reduces the count, update the golden value downward.
+    // If a change increases the count, the test fails — investigate the regression.
+
+    /// Count total sequences and match sequences in serialized LZ77 output.
+    fn count_sequences(lz_data: &[u8]) -> (usize, usize) {
+        let total = lz_data.len() / Match::SERIALIZED_SIZE;
+        let mut matches = 0;
+        for chunk in lz_data.chunks_exact(Match::SERIALIZED_SIZE) {
+            let buf: &[u8; Match::SERIALIZED_SIZE] = chunk.try_into().unwrap();
+            let m = Match::from_bytes(buf);
+            if m.length > 0 && m.offset > 0 {
+                matches += 1;
+            }
+        }
+        (total, matches)
+    }
+
+    /// Sum of all match lengths (bytes covered by back-references).
+    fn total_match_bytes(lz_data: &[u8]) -> usize {
+        let mut total = 0;
+        for chunk in lz_data.chunks_exact(Match::SERIALIZED_SIZE) {
+            let buf: &[u8; Match::SERIALIZED_SIZE] = chunk.try_into().unwrap();
+            let m = Match::from_bytes(buf);
+            if m.length > 0 {
+                total += m.length as usize;
+            }
+        }
+        total
+    }
+
+    // -- Synthetic golden tests (always run) --
+    //
+    // These use exact equality so ANY change to the parser — improvement or
+    // regression — is immediately flagged. When you intentionally improve the
+    // parser, update the golden values to the new numbers.
+
+    #[test]
+    fn test_lazy_quality_repeated_pattern() {
+        // 200 repeats of a 38-byte pattern = 7600 bytes.
+        let pattern = b"Hello, World! This is a test pattern. ";
+        let mut input = Vec::new();
+        for _ in 0..200 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = compress_lazy(&input).unwrap();
+        let (total_seqs, match_seqs) = count_sequences(&compressed);
+        let matched = total_match_bytes(&compressed);
+
+        // Golden: 65 seqs, 31 matches, 7535 bytes matched.
+        assert_eq!(total_seqs, 65, "total sequences changed (was 65)");
+        assert_eq!(match_seqs, 31, "match count changed (was 31)");
+        assert_eq!(matched, 7535, "match coverage changed (was 7535)");
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lazy_quality_all_same() {
+        // 10000 identical bytes. Overlapping matches (length > offset)
+        // allow very long matches at offset=1, drastically reducing seqs.
+        let input = vec![b'A'; 10000];
+        let compressed = compress_lazy(&input).unwrap();
+        let (total_seqs, match_seqs) = count_sequences(&compressed);
+        let matched = total_match_bytes(&compressed);
+
+        // Golden: 40 seqs, 39 matches, 9960 bytes matched.
+        assert_eq!(total_seqs, 40, "total sequences changed (was 40)");
+        assert_eq!(match_seqs, 39, "match count changed (was 39)");
+        assert_eq!(matched, 9960, "match coverage changed (was 9960)");
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lazy_quality_cyclic_256() {
+        // 0,1,2,...,255 repeated 4 times = 1024 bytes.
+        let input: Vec<u8> = (0..=255u8).cycle().take(1024).collect();
+        let compressed = compress_lazy(&input).unwrap();
+        let (total_seqs, match_seqs) = count_sequences(&compressed);
+        let matched = total_match_bytes(&compressed);
+
+        // Golden: 259 seqs, 3 matches, 765 bytes matched.
+        assert_eq!(total_seqs, 259, "total sequences changed (was 259)");
+        assert_eq!(match_seqs, 3, "match count changed (was 3)");
+        assert_eq!(matched, 765, "match coverage changed (was 765)");
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    // -- Canterbury corpus golden tests (skip if samples not extracted) --
+
+    #[cfg(test)]
+    fn corpus_file(name: &str) -> Option<Vec<u8>> {
+        for dir in &["samples/cantrbry", "/home/user/libpz/samples/cantrbry"] {
+            let path = format!("{}/{}", dir, name);
+            if let Ok(data) = std::fs::read(&path) {
+                return Some(data);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_lazy_quality_alice29() {
+        let Some(data) = corpus_file("alice29.txt") else {
+            eprintln!("skipping: alice29.txt not found");
+            return;
+        };
+        assert_eq!(data.len(), 152089);
+        let compressed = compress_lazy(&data).unwrap();
+        let (total_seqs, match_seqs) = count_sequences(&compressed);
+        let matched = total_match_bytes(&compressed);
+
+        // Golden: 27564 seqs, 23951 matches, 124525 bytes matched.
+        assert_eq!(total_seqs, 27564, "alice29.txt total sequences changed");
+        assert_eq!(match_seqs, 23951, "alice29.txt match count changed");
+        assert_eq!(matched, 124525, "alice29.txt match coverage changed");
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_lazy_quality_fields_c() {
+        let Some(data) = corpus_file("fields.c") else {
+            eprintln!("skipping: fields.c not found");
+            return;
+        };
+        assert_eq!(data.len(), 11150);
+        let compressed = compress_lazy(&data).unwrap();
+        let (total_seqs, match_seqs) = count_sequences(&compressed);
+        let matched = total_match_bytes(&compressed);
+
+        // Golden: 1943 seqs, 1158 matches, 9207 bytes matched.
+        assert_eq!(total_seqs, 1943, "fields.c total sequences changed");
+        assert_eq!(match_seqs, 1158, "fields.c match count changed");
+        assert_eq!(matched, 9207, "fields.c match coverage changed");
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_lazy_quality_grammar_lsp() {
+        let Some(data) = corpus_file("grammar.lsp") else {
+            eprintln!("skipping: grammar.lsp not found");
+            return;
+        };
+        assert_eq!(data.len(), 3721);
+        let compressed = compress_lazy(&data).unwrap();
+        let (total_seqs, match_seqs) = count_sequences(&compressed);
+        let matched = total_match_bytes(&compressed);
+
+        // Golden: 867 seqs, 364 matches, 2854 bytes matched.
+        assert_eq!(total_seqs, 867, "grammar.lsp total sequences changed");
+        assert_eq!(match_seqs, 364, "grammar.lsp match count changed");
+        assert_eq!(matched, 2854, "grammar.lsp match coverage changed");
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_lazy_quality_xargs() {
+        let Some(data) = corpus_file("xargs.1") else {
+            eprintln!("skipping: xargs.1 not found");
+            return;
+        };
+        assert_eq!(data.len(), 4227);
+        let compressed = compress_lazy(&data).unwrap();
+        let (total_seqs, match_seqs) = count_sequences(&compressed);
+        let matched = total_match_bytes(&compressed);
+
+        // Golden: 1235 seqs, 509 matches, 2992 bytes matched.
+        assert_eq!(total_seqs, 1235, "xargs.1 total sequences changed");
+        assert_eq!(match_seqs, 509, "xargs.1 match count changed");
+        assert_eq!(matched, 2992, "xargs.1 match coverage changed");
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
 }
