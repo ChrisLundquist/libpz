@@ -590,11 +590,8 @@ pub fn rans_decode_4way(
             // State transition: freq * (state >> scale_bits) + slot - cum
             states[lane] = f * (states[lane] >> scale_bits) + slot - c;
 
-            // Renormalize
-            while states[lane] < rans_l {
-                if word_pos[lane] >= word_streams[lane].len() {
-                    break;
-                }
+            // Renormalize: single step suffices (32-bit state, 16-bit I/O)
+            if states[lane] < rans_l && word_pos[lane] < word_streams[lane].len() {
                 states[lane] =
                     (states[lane] << io_bits) | word_streams[lane][word_pos[lane]] as u32;
                 word_pos[lane] += 1;
@@ -617,10 +614,8 @@ pub fn rans_decode_4way(
 
         states[lane] = f * (states[lane] >> scale_bits) + slot - c;
 
-        while states[lane] < rans_l {
-            if word_pos[lane] >= word_streams[lane].len() {
-                break;
-            }
+        // Renormalize: single step suffices (32-bit state, 16-bit I/O)
+        if states[lane] < rans_l && word_pos[lane] < word_streams[lane].len() {
             states[lane] = (states[lane] << io_bits) | word_streams[lane][word_pos[lane]] as u32;
             word_pos[lane] += 1;
         }

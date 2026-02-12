@@ -343,12 +343,11 @@ fn rans_decode_internal(
         // Advance state: multiply-add (no division)
         state = freq * (state >> scale_bits) + slot - cum;
 
-        // Renormalize: read 16-bit words until state >= RANS_L
-        while state < RANS_L {
-            if word_pos >= words.len() {
-                // Ran out of words — still valid if this is the last symbol
-                break;
-            }
+        // Renormalize: read one 16-bit word if state dropped below RANS_L.
+        // With RANS_L = 2^16 and IO_BITS = 16, a single step always suffices:
+        // after decode, state >= 0 and state < 2^32; shifting left by 16 and
+        // OR-ing a 16-bit word guarantees state >= 2^16 = RANS_L.
+        if state < RANS_L && word_pos < words.len() {
             state = (state << IO_BITS) | words[word_pos] as u32;
             word_pos += 1;
         }
@@ -479,11 +478,8 @@ fn rans_decode_interleaved(
         // Advance state
         states[lane] = freq * (states[lane] >> scale_bits) + slot - cum;
 
-        // Renormalize from this lane's word stream
-        while states[lane] < RANS_L {
-            if word_positions[lane] >= word_streams[lane].len() {
-                break;
-            }
+        // Renormalize: single step suffices (32-bit state, 16-bit I/O)
+        if states[lane] < RANS_L && word_positions[lane] < word_streams[lane].len() {
             states[lane] =
                 (states[lane] << IO_BITS) | word_streams[lane][word_positions[lane]] as u32;
             word_positions[lane] += 1;
