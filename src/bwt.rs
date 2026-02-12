@@ -564,6 +564,33 @@ pub fn encode_bijective(input: &[u8]) -> Option<(Vec<u8>, Vec<usize>)> {
             continue;
         }
 
+        if len == 2 {
+            // Two rotations: [a,b] and [b,a]. Sort and take last column.
+            // For a Lyndon word, a < b always (otherwise it wouldn't be Lyndon).
+            // Sorted: [a,b], [b,a] → last column: b, a
+            output.push(factor[1]);
+            output.push(factor[0]);
+            continue;
+        }
+
+        if len == 3 {
+            // Three rotations — sort by circular comparison, emit last column.
+            let mut sa = [0usize, 1, 2];
+            sa.sort_by(|&x, &y| {
+                for i in 0..3 {
+                    match factor[(x + i) % 3].cmp(&factor[(y + i) % 3]) {
+                        std::cmp::Ordering::Equal => {}
+                        ord => return ord,
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            for &s in &sa {
+                output.push(factor[(s + 2) % 3]);
+            }
+            continue;
+        }
+
         // Build suffix array for this factor's rotations
         // For a Lyndon word, all rotations are distinct, so the SA is unique.
         let sa = build_suffix_array(factor);
@@ -1007,6 +1034,37 @@ mod tests {
         let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
         let decoded = decode_bijective(&bwt_data, &factor_lens).unwrap();
         assert_eq!(&decoded, &input[..]);
+    }
+
+    #[test]
+    fn test_bijective_small_factors() {
+        // Inputs that produce factors of various small lengths
+        let test_cases: &[&[u8]] = &[
+            b"dcba",   // 4 single-char factors (descending)
+            b"ab",     // one len-2 factor
+            b"abc",    // one len-3 factor
+            b"abcba",  // "abc" (len 3) + "b" (len 1) + "a" (len 1)
+            b"abd",    // one len-3 factor
+            b"zy",     // one len-2 factor (z < y? no, z > y, so two len-1 factors)
+            b"yz",     // one len-2 factor (y < z, Lyndon word)
+            b"abcabc", // "abcabc" or "abc","abc" — len-3 factors
+            b"ba",     // two len-1 factors (descending)
+            b"cba",    // three len-1 factors (descending)
+        ];
+        for input in test_cases {
+            let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
+            let decoded = decode_bijective(&bwt_data, &factor_lens).unwrap();
+            assert_eq!(
+                &decoded,
+                *input,
+                "Small factor round-trip failed on {:?}",
+                std::str::from_utf8(input).unwrap_or("<binary>")
+            );
+
+            // Verify factor lengths match expectations
+            let total: usize = factor_lens.iter().sum();
+            assert_eq!(total, input.len());
+        }
     }
 
     #[test]
