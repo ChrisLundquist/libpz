@@ -160,7 +160,7 @@ avg_ns() {
 }
 
 fmt_ms() {
-    awk "BEGIN { printf \"%.1f\", $1 / 1000000.0 }"
+    awk "BEGIN { printf \"%.1f\", $1 / 1000000.0; exit }" < /dev/null
 }
 
 fmt_throughput() {
@@ -168,12 +168,12 @@ fmt_throughput() {
     if [[ "$ns" -le 0 ]]; then
         echo "-.--"
     else
-        awk "BEGIN { printf \"%.1f\", ($bytes / 1048576.0) / ($ns / 1000000000.0) }"
+        awk "BEGIN { printf \"%.1f\", ($bytes / 1048576.0) / ($ns / 1000000000.0); exit }" < /dev/null
     fi
 }
 
 fmt_ratio() {
-    awk "BEGIN { printf \"%.1f%%\", ($1/$2)*100 }"
+    awk "BEGIN { printf \"%.1f%%\", ($1/$2)*100; exit }" < /dev/null
 }
 
 echo "Averaging over $ITERATIONS iterations per operation."
