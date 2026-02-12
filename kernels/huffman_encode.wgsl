@@ -19,7 +19,7 @@ fn read_symbol(pos: u32) -> u32 {
 
 @compute @workgroup_size(64)
 fn compute_bit_lengths(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let g = gid.x;
+    let g = gid.x + gid.y * huff_params.w;
     let num_symbols = huff_params.x;
     if (g >= num_symbols) {
         return;
@@ -46,7 +46,7 @@ fn read_wc_symbol(pos: u32) -> u32 {
 
 @compute @workgroup_size(64)
 fn write_codes(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let g = gid.x;
+    let g = gid.x + gid.y * wc_params.w;
     let num_symbols = wc_params.x;
     if (g >= num_symbols) {
         return;
@@ -84,7 +84,7 @@ fn read_hist_byte(pos: u32) -> u32 {
 
 @compute @workgroup_size(64)
 fn byte_histogram(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let g = gid.x;
+    let g = gid.x + gid.y * hist_params.w;
     let data_len = hist_params.x;
     if (g >= data_len) {
         return;

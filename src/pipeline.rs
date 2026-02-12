@@ -1273,7 +1273,7 @@ fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResu
                         let table = engine.find_topk_matches(input)?;
                         return crate::optimal::compress_optimal_with_table(input, &table);
                     }
-                    return engine.lz77_compress(input, crate::webgpu::KernelVariant::HashTable);
+                    return engine.lz77_compress(input);
                 }
             }
         }
