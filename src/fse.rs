@@ -659,6 +659,275 @@ pub fn decode_to_buf(input: &[u8], original_len: usize, output: &mut [u8]) -> Pz
     Ok(original_len)
 }
 
+// ---------------------------------------------------------------------------
+// Interleaved N-way FSE encode / decode
+// ---------------------------------------------------------------------------
+
+/// Default number of interleaved streams.
+const DEFAULT_INTERLEAVE: usize = 4;
+
+/// Encode input using N interleaved FSE streams.
+///
+/// Symbol `i` is processed by state `i % num_states`. Each state produces
+/// its own independent bitstream. This enables N-way parallelism on decode:
+/// each stream can be decoded independently (on separate GPU threads, etc.)
+/// with zero data dependencies.
+///
+/// Returns per-stream (bitstream, initial_state, total_bits).
+fn fse_encode_interleaved(
+    input: &[u8],
+    table: &FseTable,
+    num_states: usize,
+) -> Vec<(Vec<u8>, u16, u32)> {
+    let mut states: Vec<usize> = vec![0; num_states];
+
+    // Pre-allocate per-lane chunk buffers.
+    let cap = input.len().div_ceil(num_states);
+    let mut lane_chunks: Vec<Vec<(u32, u32)>> = (0..num_states)
+        .map(|_| vec![(0u32, 0u32); cap])
+        .collect();
+    let mut lane_counts = vec![0usize; num_states];
+
+    // Count how many symbols each lane will process, to fill chunks
+    // at the correct indices when processing in reverse.
+    for i in 0..input.len() {
+        let lane = i % num_states;
+        lane_counts[lane] += 1;
+    }
+
+    // Cursor per lane, starts at end, decrements as we process in reverse.
+    let mut lane_cursors: Vec<usize> = lane_counts.clone();
+
+    // Encode in reverse: for each symbol, find the encode mapping for
+    // this lane's current state, record the bit-chunk, transition state.
+    for (i, &byte) in input.iter().enumerate().rev() {
+        let lane = i % num_states;
+        let s = byte as usize;
+        let mapping = table.encode_tables[s].find(states[lane]);
+        let value = states[lane] as u32 - mapping.base as u32;
+        lane_cursors[lane] -= 1;
+        lane_chunks[lane][lane_cursors[lane]] = (value, mapping.bits as u32);
+        states[lane] = mapping.compressed_state as usize;
+    }
+
+    // Write each lane's chunks into its own BitWriter (forward order).
+    let mut results = Vec::with_capacity(num_states);
+    for lane in 0..num_states {
+        let mut writer = BitWriter::new();
+        for &(value, nb_bits) in lane_chunks[lane].iter().take(lane_counts[lane]) {
+            writer.write_bits(value, nb_bits);
+        }
+        let (bitstream, total_bits) = writer.finish();
+        results.push((bitstream, states[lane] as u16, total_bits));
+    }
+
+    results
+}
+
+/// Decode N interleaved FSE streams.
+///
+/// Symbol `i` is decoded from stream `i % num_states`. Each stream is
+/// independent, enabling N-way parallelism.
+fn fse_decode_interleaved(
+    streams: &[(Vec<u8>, u16, u32)],
+    table: &FseTable,
+    original_len: usize,
+) -> PzResult<Vec<u8>> {
+    let num_states = streams.len();
+    if num_states == 0 {
+        return Err(PzError::InvalidInput);
+    }
+
+    // Initialize per-stream readers and states.
+    let mut readers: Vec<BitReader> = streams
+        .iter()
+        .map(|(bs, _, _)| BitReader::new(bs))
+        .collect();
+    let mut states: Vec<usize> = streams.iter().map(|(_, st, _)| *st as usize).collect();
+
+    let mut output = Vec::with_capacity(original_len);
+
+    for i in 0..original_len {
+        let lane = i % num_states;
+
+        if states[lane] >= table.table_size {
+            return Err(PzError::InvalidInput);
+        }
+        let entry = &table.decode_table[states[lane]];
+        output.push(entry.symbol);
+        let bits = readers[lane].read_bits(entry.bits as u32);
+        states[lane] = entry.next_state_base as usize + bits as usize;
+    }
+
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
+// Public API — interleaved N-way
+// ---------------------------------------------------------------------------
+
+/// Encode data using 4-way interleaved FSE (default).
+pub fn encode_interleaved(input: &[u8]) -> Vec<u8> {
+    encode_interleaved_n(input, DEFAULT_INTERLEAVE, DEFAULT_ACCURACY_LOG)
+}
+
+/// Encode data using N-way interleaved FSE with configurable parameters.
+///
+/// `num_states`: number of interleaved FSE states (typically 4).
+/// `accuracy_log`: table accuracy (5..12).
+pub fn encode_interleaved_n(input: &[u8], num_states: usize, accuracy_log: u8) -> Vec<u8> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+
+    let num_states = num_states.max(1);
+    let accuracy_log = accuracy_log.clamp(MIN_ACCURACY_LOG, MAX_ACCURACY_LOG);
+
+    let mut freq = FrequencyTable::new();
+    freq.count(input);
+
+    let mut al = accuracy_log;
+    while (1u32 << al) < freq.used {
+        al += 1;
+        if al > MAX_ACCURACY_LOG {
+            break;
+        }
+    }
+
+    let norm = normalize_frequencies(&freq, al).expect("valid non-empty input");
+    let table = FseTable::from_normalized(&norm);
+    let stream_results = fse_encode_interleaved(input, &table, num_states);
+
+    // Serialize interleaved format:
+    // [accuracy_log: u8] [freq_table: 512B] [num_states: u8]
+    // per-state: [initial_state: u16] [total_bits: u32] [bitstream_len: u32] [bitstream_data]
+    let total_bitstream_bytes: usize = stream_results.iter().map(|(bs, _, _)| bs.len()).sum();
+    let header_size = 1 + FREQ_TABLE_BYTES + 1 + num_states * (2 + 4 + 4);
+    let mut output = Vec::with_capacity(header_size + total_bitstream_bytes);
+
+    output.push(al);
+    for &f in &norm.freq {
+        output.extend_from_slice(&f.to_le_bytes());
+    }
+    output.push(num_states as u8);
+
+    for (bitstream, initial_state, total_bits) in &stream_results {
+        output.extend_from_slice(&initial_state.to_le_bytes());
+        output.extend_from_slice(&total_bits.to_le_bytes());
+        output.extend_from_slice(&(bitstream.len() as u32).to_le_bytes());
+        output.extend_from_slice(bitstream);
+    }
+
+    output
+}
+
+/// Decode N-way interleaved FSE-encoded data.
+pub fn decode_interleaved(input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
+    if original_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Minimum header: accuracy_log(1) + freq_table(512) + num_states(1)
+    let min_header = 1 + FREQ_TABLE_BYTES + 1;
+    if input.len() < min_header {
+        return Err(PzError::InvalidInput);
+    }
+
+    let accuracy_log = input[0];
+    if !(MIN_ACCURACY_LOG..=MAX_ACCURACY_LOG).contains(&accuracy_log) {
+        return Err(PzError::InvalidInput);
+    }
+
+    // Read normalized frequency table.
+    let mut norm_freq = [0u16; NUM_SYMBOLS];
+    for (i, freq) in norm_freq.iter_mut().enumerate() {
+        let offset = 1 + i * 2;
+        *freq = u16::from_le_bytes([input[offset], input[offset + 1]]);
+    }
+
+    let table_size = 1u32 << accuracy_log;
+    let sum: u32 = norm_freq.iter().map(|&f| f as u32).sum();
+    if sum != table_size {
+        return Err(PzError::InvalidInput);
+    }
+
+    let norm = NormalizedFreqs {
+        freq: norm_freq,
+        accuracy_log,
+    };
+
+    let pos = 1 + FREQ_TABLE_BYTES;
+    let num_states = input[pos] as usize;
+    if num_states == 0 {
+        return Err(PzError::InvalidInput);
+    }
+
+    let mut cursor = pos + 1;
+
+    // Read per-stream metadata and bitstreams.
+    let mut streams = Vec::with_capacity(num_states);
+    for _ in 0..num_states {
+        if input.len() < cursor + 2 + 4 + 4 {
+            return Err(PzError::InvalidInput);
+        }
+        let initial_state = u16::from_le_bytes([input[cursor], input[cursor + 1]]);
+        cursor += 2;
+        let total_bits = u32::from_le_bytes([
+            input[cursor],
+            input[cursor + 1],
+            input[cursor + 2],
+            input[cursor + 3],
+        ]);
+        cursor += 4;
+        let bitstream_len = u32::from_le_bytes([
+            input[cursor],
+            input[cursor + 1],
+            input[cursor + 2],
+            input[cursor + 3],
+        ]) as usize;
+        cursor += 4;
+
+        if input.len() < cursor + bitstream_len {
+            return Err(PzError::InvalidInput);
+        }
+        let bitstream = input[cursor..cursor + bitstream_len].to_vec();
+        cursor += bitstream_len;
+
+        streams.push((bitstream, initial_state, total_bits));
+    }
+
+    let table = FseTable::from_normalized(&norm);
+
+    // Handle single-symbol case: all streams have total_bits == 0.
+    if streams.iter().all(|(_, _, tb)| *tb == 0) && original_len > 0 {
+        let state = streams[0].1 as usize;
+        if state >= table.table_size {
+            return Err(PzError::InvalidInput);
+        }
+        let entry = &table.decode_table[state];
+        return Ok(vec![entry.symbol; original_len]);
+    }
+
+    fse_decode_interleaved(&streams, &table, original_len)
+}
+
+/// Decode N-way interleaved FSE-encoded data into a pre-allocated buffer.
+pub fn decode_interleaved_to_buf(
+    input: &[u8],
+    original_len: usize,
+    output: &mut [u8],
+) -> PzResult<usize> {
+    if original_len == 0 {
+        return Ok(0);
+    }
+    if output.len() < original_len {
+        return Err(PzError::BufferTooSmall);
+    }
+    let decoded = decode_interleaved(input, original_len)?;
+    output[..original_len].copy_from_slice(&decoded);
+    Ok(original_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -975,6 +1244,152 @@ mod tests {
         }
         let encoded = encode(&input);
         let decoded = decode(&encoded, input.len()).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    // --- Interleaved round-trip tests ---
+
+    #[test]
+    fn test_interleaved_empty() {
+        assert_eq!(encode_interleaved(&[]), Vec::<u8>::new());
+        assert_eq!(decode_interleaved(&[], 0).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_interleaved_single_byte() {
+        let input = &[42u8];
+        let encoded = encode_interleaved(input);
+        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_interleaved_repeated_byte() {
+        let input = vec![b'a'; 100];
+        let encoded = encode_interleaved(&input);
+        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_interleaved_two_bytes() {
+        let input = b"ab";
+        let encoded = encode_interleaved(input);
+        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_interleaved_hello() {
+        let input = b"hello, world!";
+        let encoded = encode_interleaved(input);
+        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_interleaved_banana() {
+        let input = b"banana";
+        let encoded = encode_interleaved(input);
+        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_interleaved_all_bytes() {
+        let input: Vec<u8> = (0..=255).collect();
+        let encoded = encode_interleaved(&input);
+        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_interleaved_longer_text() {
+        let input =
+            b"the quick brown fox jumps over the lazy dog. the quick brown fox jumps over the lazy dog.";
+        let encoded = encode_interleaved(input);
+        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_interleaved_binary() {
+        let input: Vec<u8> = (0..500).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+        let encoded = encode_interleaved(&input);
+        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_interleaved_medium() {
+        let mut input = Vec::new();
+        for _ in 0..20 {
+            input.extend(b"The Burrows-Wheeler transform clusters bytes. ");
+        }
+        let encoded = encode_interleaved(&input);
+        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_interleaved_large_repeated_pattern() {
+        let pattern: Vec<u8> = (0..=127).collect();
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend(&pattern);
+        }
+        let encoded = encode_interleaved(&input);
+        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_interleaved_n_various() {
+        let input: Vec<u8> = (0..500).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+        for n in [1, 2, 4, 8] {
+            let encoded = encode_interleaved_n(&input, n, DEFAULT_ACCURACY_LOG);
+            let decoded = decode_interleaved(&encoded, input.len()).unwrap();
+            assert_eq!(decoded, input, "failed at num_states={}", n);
+        }
+    }
+
+    #[test]
+    fn test_interleaved_all_accuracy_logs() {
+        let input: Vec<u8> = (0..500).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+        for al in MIN_ACCURACY_LOG..=MAX_ACCURACY_LOG {
+            let encoded = encode_interleaved_n(&input, 4, al);
+            let decoded = decode_interleaved(&encoded, input.len()).unwrap();
+            assert_eq!(decoded, input, "failed at accuracy_log={}", al);
+        }
+    }
+
+    #[test]
+    fn test_interleaved_to_buf() {
+        let input = b"hello, world!";
+        let encoded = encode_interleaved(input);
+        let mut buf = vec![0u8; 100];
+        let size = decode_interleaved_to_buf(&encoded, input.len(), &mut buf).unwrap();
+        assert_eq!(&buf[..size], input);
+    }
+
+    #[test]
+    fn test_interleaved_to_buf_too_small() {
+        let input = b"hello, world!";
+        let encoded = encode_interleaved(input);
+        let mut buf = vec![0u8; 2];
+        assert_eq!(
+            decode_interleaved_to_buf(&encoded, input.len(), &mut buf),
+            Err(PzError::BufferTooSmall)
+        );
+    }
+
+    #[test]
+    fn test_interleaved_skewed() {
+        let mut input = vec![0u8; 2000];
+        input.push(1);
+        input.push(2);
+        let encoded = encode_interleaved(&input);
+        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
         assert_eq!(decoded, input);
     }
 }
