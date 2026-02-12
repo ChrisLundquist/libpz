@@ -535,6 +535,103 @@ mod avx2 {
 }
 
 // ---------------------------------------------------------------------------
+// rANS 4-way interleaved decode (batched — 4 lanes per iteration)
+// ---------------------------------------------------------------------------
+
+/// Decode 4-way interleaved rANS, processing all 4 lanes per iteration.
+///
+/// This is the core SIMD-friendly decode loop. Even without SIMD intrinsics,
+/// batching 4 lanes per iteration (vs round-robin one-at-a-time) keeps states
+/// in registers, reduces loop overhead 4x, and enables autovectorization.
+///
+/// # Arguments
+/// - `word_streams`: per-lane word data (4 slices)
+/// - `initial_states`: starting state for each lane (4 values)
+/// - `freq`: normalized frequencies [256]
+/// - `cum`: cumulative frequencies [256]
+/// - `lookup`: slot→symbol table (size = 1 << scale_bits)
+/// - `scale_bits`: frequency precision
+/// - `original_len`: total symbols to decode
+///
+/// # Returns
+/// Decoded bytes, or `None` on invalid input (slot out of bounds).
+pub fn rans_decode_4way(
+    word_streams: &[&[u16]; 4],
+    initial_states: &[u32; 4],
+    freq: &[u16; 256],
+    cum: &[u16; 256],
+    lookup: &[u8],
+    scale_bits: u32,
+    original_len: usize,
+) -> Option<Vec<u8>> {
+    let scale_mask = (1u32 << scale_bits) - 1;
+    let rans_l: u32 = 1 << 16;
+    let io_bits: u32 = 16;
+
+    let mut states = *initial_states;
+    let mut word_pos = [0usize; 4];
+    let mut output = Vec::with_capacity(original_len);
+
+    // Process in batches of 4 (one symbol per lane per iteration).
+    let full_quads = original_len / 4;
+    let remainder = original_len % 4;
+
+    for _ in 0..full_quads {
+        // Decode all 4 lanes
+        for lane in 0..4 {
+            let slot = states[lane] & scale_mask;
+            if slot as usize >= lookup.len() {
+                return None;
+            }
+            let s = lookup[slot as usize];
+            let f = freq[s as usize] as u32;
+            let c = cum[s as usize] as u32;
+
+            // State transition: freq * (state >> scale_bits) + slot - cum
+            states[lane] = f * (states[lane] >> scale_bits) + slot - c;
+
+            // Renormalize
+            while states[lane] < rans_l {
+                if word_pos[lane] >= word_streams[lane].len() {
+                    break;
+                }
+                states[lane] =
+                    (states[lane] << io_bits) | word_streams[lane][word_pos[lane]] as u32;
+                word_pos[lane] += 1;
+            }
+
+            output.push(s);
+        }
+    }
+
+    // Handle remaining symbols (< 4)
+    for r in 0..remainder {
+        let lane = r;
+        let slot = states[lane] & scale_mask;
+        if slot as usize >= lookup.len() {
+            return None;
+        }
+        let s = lookup[slot as usize];
+        let f = freq[s as usize] as u32;
+        let c = cum[s as usize] as u32;
+
+        states[lane] = f * (states[lane] >> scale_bits) + slot - c;
+
+        while states[lane] < rans_l {
+            if word_pos[lane] >= word_streams[lane].len() {
+                break;
+            }
+            states[lane] = (states[lane] << io_bits) | word_streams[lane][word_pos[lane]] as u32;
+            word_pos[lane] += 1;
+        }
+
+        output.push(s);
+    }
+
+    Some(output)
+}
+
+// ---------------------------------------------------------------------------
 // aarch64 NEON / SVE stubs
 // ---------------------------------------------------------------------------
 
