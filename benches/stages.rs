@@ -773,6 +773,65 @@ fn bench_deflate_webgpu_chained(c: &mut Criterion) {
 }
 
 #[cfg(feature = "webgpu")]
+fn bench_lz77_webgpu_batched(c: &mut Criterion) {
+    use pz::pipeline::{Backend, CompressOptions, Pipeline};
+    use pz::webgpu::WebGpuEngine;
+
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => {
+            eprintln!("stages: no WebGPU device, skipping batched LZ77 benchmarks");
+            return;
+        }
+    };
+
+    let mut group = c.benchmark_group("lz77_webgpu_batched");
+    cap(&mut group);
+    // Multi-block sizes: 4 blocks × 256KB = 1MB, 16 blocks × 256KB = 4MB
+    for &size in &[1_048_576, 4_194_304] {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // GPU batched: submit all blocks → single sync → readback → CPU entropy
+        let eng = engine.clone();
+        group.bench_with_input(
+            BenchmarkId::new("gpu_batched_deflate", size),
+            &data,
+            move |b, data| {
+                let opts = CompressOptions {
+                    backend: Backend::WebGpu,
+                    webgpu_engine: Some(eng.clone()),
+                    threads: 4,
+                    ..Default::default()
+                };
+                b.iter(|| {
+                    pz::pipeline::compress_with_options(data, Pipeline::Deflate, &opts).unwrap()
+                });
+            },
+        );
+
+        // CPU multi-threaded baseline (same thread count, no GPU)
+        group.bench_with_input(
+            BenchmarkId::new("cpu_parallel_deflate", size),
+            &data,
+            |b, data| {
+                let opts = CompressOptions {
+                    threads: 4,
+                    ..Default::default()
+                };
+                b.iter(|| {
+                    pz::pipeline::compress_with_options(data, Pipeline::Deflate, &opts).unwrap()
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "webgpu"))]
+fn bench_lz77_webgpu_batched(_c: &mut Criterion) {}
+
+#[cfg(feature = "webgpu")]
 fn bench_bwt_webgpu(c: &mut Criterion) {
     use pz::webgpu::WebGpuEngine;
 
@@ -902,6 +961,7 @@ criterion_group!(
     bench_deflate_gpu_chained,
     bench_bwt_webgpu,
     bench_lz77_webgpu,
+    bench_lz77_webgpu_batched,
     bench_huffman_webgpu,
     bench_deflate_webgpu_chained
 );
