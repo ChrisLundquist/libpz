@@ -619,7 +619,9 @@ fn run() -> Result<(), ()> {
     }
 
     for path in &opts.files {
-        let result = if opts.decompress {
+        let result = if path == "-" {
+            process_stdin_stdout(&opts, &compress_options)
+        } else if opts.decompress {
             process_decompress(&opts, path)
         } else {
             process_compress(&opts, path, &compress_options)
