@@ -93,6 +93,12 @@ cargo install samply                                # one-time setup
 - Error type: `PzError` (InvalidInput, BufferTooSmall, Unsupported, InternalError)
 - Tests go in `#[cfg(test)] mod tests` at the bottom of each module file
 
+## Commit discipline
+- **Commit at every logical completion point** — don't let work accumulate uncommitted.
+- A "logical completion point" is any self-contained change: a bug fix, a new feature, a refactor, a test addition, a docs update, etc.
+- Run the pre-commit checklist (`fmt`, `clippy`, `test`) before each commit.
+- If a task has multiple independent parts, commit each part separately rather than one giant commit at the end.
+
 ## Project status
 11 of 12 milestones complete. All core algorithms, pipelines, GPU kernels, auto-selection, optimal parsing, multi-threading, and tooling are implemented. Not started: fuzz testing (M5.3), Vulkan backend (M12).
 
