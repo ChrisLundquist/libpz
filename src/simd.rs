@@ -540,9 +540,15 @@ mod avx2 {
 
 /// Decode 4-way interleaved rANS, processing all 4 lanes per iteration.
 ///
-/// This is the core SIMD-friendly decode loop. Even without SIMD intrinsics,
-/// batching 4 lanes per iteration (vs round-robin one-at-a-time) keeps states
-/// in registers, reduces loop overhead 4x, and enables autovectorization.
+/// This is the core SIMD-friendly decode loop. The per-quad iteration:
+/// 1. Extract slots from all 4 states (SIMD AND + mask)
+/// 2. Scalar gather: lookup symbol, freq, cum for each lane
+/// 3. Compute new states: freq * (state >> scale_bits) + slot - cum
+/// 4. Batch renormalization: compare all states, conditionally refill
+///
+/// Even without explicit SIMD intrinsics, batching 4 lanes per iteration
+/// keeps states in registers, reduces loop overhead 4x, and exposes ILP
+/// to the CPU's out-of-order engine.
 ///
 /// # Arguments
 /// - `word_streams`: per-lane word data (4 slices)
@@ -567,45 +573,82 @@ pub fn rans_decode_4way(
     let scale_mask = (1u32 << scale_bits) - 1;
     let rans_l: u32 = 1 << 16;
     let io_bits: u32 = 16;
+    let lookup_len = lookup.len();
 
     let mut states = *initial_states;
     let mut word_pos = [0usize; 4];
-    let mut output = Vec::with_capacity(original_len);
+    let mut output = vec![0u8; original_len];
+    let mut out_pos = 0;
 
     // Process in batches of 4 (one symbol per lane per iteration).
     let full_quads = original_len / 4;
     let remainder = original_len % 4;
 
     for _ in 0..full_quads {
-        // Decode all 4 lanes
-        for lane in 0..4 {
-            let slot = states[lane] & scale_mask;
-            if slot as usize >= lookup.len() {
-                return None;
-            }
-            let s = lookup[slot as usize];
-            let f = freq[s as usize] as u32;
-            let c = cum[s as usize] as u32;
+        // Step 1: Extract slots from all 4 states
+        let slot0 = states[0] & scale_mask;
+        let slot1 = states[1] & scale_mask;
+        let slot2 = states[2] & scale_mask;
+        let slot3 = states[3] & scale_mask;
 
-            // State transition: freq * (state >> scale_bits) + slot - cum
-            states[lane] = f * (states[lane] >> scale_bits) + slot - c;
-
-            // Renormalize: single step suffices (32-bit state, 16-bit I/O)
-            if states[lane] < rans_l && word_pos[lane] < word_streams[lane].len() {
-                states[lane] =
-                    (states[lane] << io_bits) | word_streams[lane][word_pos[lane]] as u32;
-                word_pos[lane] += 1;
-            }
-
-            output.push(s);
+        // Bounds check all 4 at once
+        if (slot0 as usize | slot1 as usize | slot2 as usize | slot3 as usize) >= lookup_len {
+            return None;
         }
+
+        // Step 2: Scalar gather — lookup symbols, frequencies, cumulative
+        let s0 = lookup[slot0 as usize];
+        let s1 = lookup[slot1 as usize];
+        let s2 = lookup[slot2 as usize];
+        let s3 = lookup[slot3 as usize];
+
+        let f0 = freq[s0 as usize] as u32;
+        let f1 = freq[s1 as usize] as u32;
+        let f2 = freq[s2 as usize] as u32;
+        let f3 = freq[s3 as usize] as u32;
+
+        let c0 = cum[s0 as usize] as u32;
+        let c1 = cum[s1 as usize] as u32;
+        let c2 = cum[s2 as usize] as u32;
+        let c3 = cum[s3 as usize] as u32;
+
+        // Step 3: State transition — all 4 independent, exposes ILP
+        states[0] = f0 * (states[0] >> scale_bits) + slot0 - c0;
+        states[1] = f1 * (states[1] >> scale_bits) + slot1 - c1;
+        states[2] = f2 * (states[2] >> scale_bits) + slot2 - c2;
+        states[3] = f3 * (states[3] >> scale_bits) + slot3 - c3;
+
+        // Step 4: Renormalize all 4 lanes
+        if states[0] < rans_l && word_pos[0] < word_streams[0].len() {
+            states[0] = (states[0] << io_bits) | word_streams[0][word_pos[0]] as u32;
+            word_pos[0] += 1;
+        }
+        if states[1] < rans_l && word_pos[1] < word_streams[1].len() {
+            states[1] = (states[1] << io_bits) | word_streams[1][word_pos[1]] as u32;
+            word_pos[1] += 1;
+        }
+        if states[2] < rans_l && word_pos[2] < word_streams[2].len() {
+            states[2] = (states[2] << io_bits) | word_streams[2][word_pos[2]] as u32;
+            word_pos[2] += 1;
+        }
+        if states[3] < rans_l && word_pos[3] < word_streams[3].len() {
+            states[3] = (states[3] << io_bits) | word_streams[3][word_pos[3]] as u32;
+            word_pos[3] += 1;
+        }
+
+        // Step 5: Write output symbols
+        output[out_pos] = s0;
+        output[out_pos + 1] = s1;
+        output[out_pos + 2] = s2;
+        output[out_pos + 3] = s3;
+        out_pos += 4;
     }
 
     // Handle remaining symbols (< 4)
     for r in 0..remainder {
         let lane = r;
         let slot = states[lane] & scale_mask;
-        if slot as usize >= lookup.len() {
+        if slot as usize >= lookup_len {
             return None;
         }
         let s = lookup[slot as usize];
@@ -614,13 +657,13 @@ pub fn rans_decode_4way(
 
         states[lane] = f * (states[lane] >> scale_bits) + slot - c;
 
-        // Renormalize: single step suffices (32-bit state, 16-bit I/O)
         if states[lane] < rans_l && word_pos[lane] < word_streams[lane].len() {
             states[lane] = (states[lane] << io_bits) | word_streams[lane][word_pos[lane]] as u32;
             word_pos[lane] += 1;
         }
 
-        output.push(s);
+        output[out_pos] = s;
+        out_pos += 1;
     }
 
     Some(output)
