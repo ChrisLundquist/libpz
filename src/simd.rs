@@ -30,14 +30,15 @@
 //! let freqs = d.byte_frequencies(data);
 //! let a = b"hello world";
 //! let b = b"hello there";
-//! let match_len = d.compare_bytes(a, b);
+//! let match_len = d.compare_bytes(a, b, 258);
 //! assert_eq!(match_len, 6); // first 6 bytes match
 //! ```
 //!
 //! The dispatcher probes CPU features once and caches function pointers
 //! for the best available implementation.
 
-/// Maximum match length for SIMD comparison (matches LZ77 window constraints).
+/// Legacy DEFLATE max match length, kept for SIMD tests.
+#[cfg(test)]
 const MAX_COMPARE_LEN: usize = 258;
 
 // ---------------------------------------------------------------------------
@@ -131,13 +132,20 @@ impl Dispatcher {
     /// Find the length of the common prefix between `a` and `b`.
     ///
     /// Returns the number of leading bytes that are identical (up to
-    /// `MAX_COMPARE_LEN` or the shorter slice length). Used as the inner
-    /// loop of LZ77 match extension.
+    /// `limit` or the shorter slice length). Used as the inner loop of
+    /// LZ77 match extension.
+    ///
+    /// The caller controls the maximum comparison length: Deflate
+    /// pipelines pass 258 (RFC 1951 constraint), while other pipelines
+    /// can pass larger values (up to `u16::MAX`) for better compression
+    /// on repetitive data. SIMD implementations short-circuit on the
+    /// first byte mismatch, so larger limits add zero overhead for
+    /// typical short matches.
     ///
     /// Uses a resolved function pointer — no per-call match dispatch.
     #[inline]
-    pub fn compare_bytes(&self, a: &[u8], b: &[u8]) -> usize {
-        let max_len = a.len().min(b.len()).min(MAX_COMPARE_LEN);
+    pub fn compare_bytes(&self, a: &[u8], b: &[u8], limit: usize) -> usize {
+        let max_len = a.len().min(b.len()).min(limit);
         if max_len == 0 {
             return 0;
         }
@@ -906,12 +914,12 @@ mod tests {
     fn test_dispatcher_compare_bytes_matches_scalar() {
         let d = Dispatcher::new();
 
-        // Identical slices of various lengths
+        // Identical slices of various lengths (using legacy 258 limit)
         for len in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 100, 258] {
             let a: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
             let b = a.clone();
             let max = a.len().min(b.len()).min(MAX_COMPARE_LEN);
-            let simd_result = d.compare_bytes(&a, &b);
+            let simd_result = d.compare_bytes(&a, &b, MAX_COMPARE_LEN);
             assert_eq!(simd_result, max, "identical mismatch at len {}", len);
         }
 
@@ -921,7 +929,7 @@ mod tests {
             let a: Vec<u8> = (0..len).map(|i| (i % 200) as u8).collect();
             let mut b = a.clone();
             b[mismatch_pos] = 255; // force mismatch
-            let simd_result = d.compare_bytes(&a, &b);
+            let simd_result = d.compare_bytes(&a, &b, MAX_COMPARE_LEN);
             let scalar_result = scalar::compare_bytes(&a, &b, a.len().min(MAX_COMPARE_LEN));
             assert_eq!(
                 simd_result, scalar_result,
@@ -929,6 +937,30 @@ mod tests {
                 mismatch_pos, scalar_result
             );
         }
+    }
+
+    #[test]
+    fn test_compare_bytes_extended_limit() {
+        let d = Dispatcher::new();
+
+        // With a large limit, identical slices should match fully
+        for len in [500, 1000, 8192, 65535] {
+            let a: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+            let b = a.clone();
+            let result = d.compare_bytes(&a, &b, u16::MAX as usize);
+            assert_eq!(result, len, "full match expected at len {}", len);
+        }
+
+        // Mismatch at position 1000 with large limit
+        let a: Vec<u8> = vec![0xAA; 8192];
+        let mut b = a.clone();
+        b[1000] = 0xBB;
+        let result = d.compare_bytes(&a, &b, u16::MAX as usize);
+        assert_eq!(result, 1000, "should stop at mismatch pos 1000");
+
+        // Small limit still caps even on matching data
+        let result = d.compare_bytes(&a, &a, 258);
+        assert_eq!(result, 258, "limit=258 should cap at 258");
     }
 
     #[test]
@@ -968,8 +1000,8 @@ mod tests {
     #[test]
     fn test_compare_bytes_empty() {
         let d = Dispatcher::new();
-        assert_eq!(d.compare_bytes(&[], &[1, 2, 3]), 0);
-        assert_eq!(d.compare_bytes(&[1, 2, 3], &[]), 0);
-        assert_eq!(d.compare_bytes(&[], &[]), 0);
+        assert_eq!(d.compare_bytes(&[], &[1, 2, 3], MAX_COMPARE_LEN), 0);
+        assert_eq!(d.compare_bytes(&[1, 2, 3], &[], MAX_COMPARE_LEN), 0);
+        assert_eq!(d.compare_bytes(&[], &[], MAX_COMPARE_LEN), 0);
     }
 }

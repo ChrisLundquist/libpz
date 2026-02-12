@@ -27,6 +27,13 @@ pub(crate) const HASH_MASK: usize = HASH_SIZE - 1;
 /// Maximum number of chain links to follow per position.
 pub(crate) const MAX_CHAIN: usize = 64;
 
+/// Maximum match length for DEFLATE-compatible pipelines (RFC 1951).
+pub const DEFLATE_MAX_MATCH: u16 = 258;
+
+/// Default maximum match length for non-DEFLATE pipelines.
+/// Uses full u16 range since Match.length is u16.
+pub const DEFAULT_MAX_MATCH: u16 = u16::MAX;
+
 /// An LZ77 match: a (offset, length, next) triple.
 ///
 /// - `offset`: distance back from current position to match start (0 = no match)
@@ -192,14 +199,25 @@ pub(crate) struct HashChainFinder {
     prev: Vec<u32>,
     /// Cached SIMD dispatcher — resolved once, avoids per-call feature detection.
     dispatcher: crate::simd::Dispatcher,
+    /// Maximum match length to find. Deflate pipelines use 258 (RFC 1951);
+    /// other pipelines can use larger values (up to u16::MAX) for better
+    /// compression on repetitive data.
+    max_match_len: usize,
 }
 
 impl HashChainFinder {
+    /// Create a match finder with the DEFLATE-standard max match length (258).
     pub(crate) fn new() -> Self {
+        Self::with_max_match_len(DEFLATE_MAX_MATCH)
+    }
+
+    /// Create a match finder with a caller-specified max match length.
+    pub(crate) fn with_max_match_len(max_match_len: u16) -> Self {
         Self {
             head: vec![0; HASH_SIZE],
             prev: vec![0; MAX_WINDOW],
             dispatcher: crate::simd::Dispatcher::new(),
+            max_match_len: max_match_len as usize,
         }
     }
 
@@ -233,9 +251,11 @@ impl HashChainFinder {
             // for 1000 identical bytes). The decompressor's byte-by-byte copy loop
             // already handles the overlap correctly.
             let max_len = remaining;
-            let match_len =
-                self.dispatcher
-                    .compare_bytes(&input[chain_pos..], &input[pos..]) as u32;
+            let match_len = self.dispatcher.compare_bytes(
+                &input[chain_pos..],
+                &input[pos..],
+                self.max_match_len,
+            ) as u32;
             let match_len = match_len.min(max_len as u32);
 
             if match_len > best_length && match_len >= MIN_MATCH as u32 {
@@ -312,9 +332,11 @@ impl HashChainFinder {
         while chain_pos >= min_pos && chain_pos < pos && chain_count < MAX_CHAIN {
             // Allow overlapping matches (length > offset) for run compression.
             let max_len = remaining;
-            let match_len =
-                self.dispatcher
-                    .compare_bytes(&input[chain_pos..], &input[pos..]) as u32;
+            let match_len = self.dispatcher.compare_bytes(
+                &input[chain_pos..],
+                &input[pos..],
+                self.max_match_len,
+            ) as u32;
             let match_len = match_len.min(max_len as u32);
 
             if match_len >= MIN_MATCH as u32 {
@@ -359,13 +381,27 @@ impl HashChainFinder {
 /// This produces the best compression ratios of the greedy strategies,
 /// and is also faster than greedy hash-chain due to skipping matched
 /// positions during hash insertion.
+///
+/// Uses `DEFLATE_MAX_MATCH` (258) as the maximum match length.
+/// For configurable max match length, use `compress_lazy_to_matches_with_limit`.
 pub fn compress_lazy_to_matches(input: &[u8]) -> PzResult<Vec<Match>> {
+    compress_lazy_to_matches_with_limit(input, DEFLATE_MAX_MATCH)
+}
+
+/// Like `compress_lazy_to_matches` but with a caller-specified max match length.
+///
+/// Non-Deflate pipelines (Lzr, Lzf) can pass `DEFAULT_MAX_MATCH` to find
+/// longer matches on repetitive data without being constrained by DEFLATE.
+pub(crate) fn compress_lazy_to_matches_with_limit(
+    input: &[u8],
+    max_match_len: u16,
+) -> PzResult<Vec<Match>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut matches = Vec::with_capacity(input.len() / 4);
-    let mut finder = HashChainFinder::new();
+    let mut finder = HashChainFinder::with_max_match_len(max_match_len);
     let mut pos: usize = 0;
 
     while pos < input.len() {
@@ -418,8 +454,14 @@ pub fn compress_lazy_to_matches(input: &[u8]) -> PzResult<Vec<Match>> {
 ///
 /// This is the standard entry point for LZ77 compression. Uses
 /// `compress_lazy_to_matches` internally and serializes the result.
+/// Uses `DEFLATE_MAX_MATCH` (258) as the maximum match length.
 pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
-    let matches = compress_lazy_to_matches(input)?;
+    compress_lazy_with_limit(input, DEFLATE_MAX_MATCH)
+}
+
+/// Like `compress_lazy` but with a caller-specified max match length.
+pub(crate) fn compress_lazy_with_limit(input: &[u8], max_match_len: u16) -> PzResult<Vec<u8>> {
+    let matches = compress_lazy_to_matches_with_limit(input, max_match_len)?;
     let mut output = Vec::with_capacity(matches.len() * Match::SERIALIZED_SIZE);
     for m in &matches {
         output.extend_from_slice(&m.to_bytes());
@@ -774,29 +816,45 @@ mod tests {
         );
     }
 
-    /// Verify find_match respects MAX_COMPARE_LEN (258) from SIMD comparisons.
+    /// Verify find_match respects the default DEFLATE_MAX_MATCH (258).
     ///
-    /// The SIMD compare_bytes function caps at MAX_COMPARE_LEN=258 (matching
-    /// DEFLATE's max match length). This prevents CPU matches from exceeding
-    /// u16::MAX. The u16 cap in find_match is defensive (the SIMD cap makes
-    /// it unreachable on CPU, but the GPU path needs it).
+    /// The default HashChainFinder uses DEFLATE_MAX_MATCH, which is passed
+    /// as the limit to SIMD compare_bytes. This prevents matches from
+    /// exceeding 258 for DEFLATE-compatible output.
     #[test]
-    fn test_find_match_length_bounded() {
+    fn test_find_match_length_bounded_deflate() {
         let input = vec![0u8; 70_000];
         let mut finder = HashChainFinder::new();
         finder.insert(&input, 0);
         let m = finder.find_match(&input, 1);
-        // SIMD compare_bytes caps at MAX_COMPARE_LEN = 258
         assert_eq!(
             m.length, 258,
-            "find_match should be capped by MAX_COMPARE_LEN"
+            "default find_match should cap at DEFLATE_MAX_MATCH"
+        );
+        assert_eq!(m.offset, 1, "should match with offset 1");
+    }
+
+    /// Verify find_match with extended limit finds longer matches.
+    #[test]
+    fn test_find_match_extended_limit() {
+        let input = vec![0u8; 70_000];
+        let mut finder = HashChainFinder::with_max_match_len(DEFAULT_MAX_MATCH);
+        finder.insert(&input, 0);
+        let m = finder.find_match(&input, 1);
+        // With extended limit, match should be much longer than 258.
+        // Capped by remaining bytes (70000 - 1 - 1 for next byte = 69998)
+        // and u16::MAX (65535).
+        assert!(
+            m.length > 258,
+            "extended limit should find matches > 258, got {}",
+            m.length
         );
         assert_eq!(m.offset, 1, "should match with offset 1");
     }
 
     /// Verify compress_lazy round-trips 100KB of identical bytes.
     ///
-    /// Each match is capped at MAX_COMPARE_LEN=258 by the SIMD comparator,
+    /// Each match is capped at DEFLATE_MAX_MATCH=258 by the default finder,
     /// so many sequential matches are needed.
     #[test]
     fn test_compress_lazy_to_matches_large_all_same() {
@@ -811,5 +869,52 @@ mod tests {
         let compressed = compress_lazy(&input).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
+    }
+
+    /// Verify compress_lazy_with_limit produces longer matches and fewer tokens.
+    #[test]
+    fn test_compress_lazy_with_limit_extended() {
+        let input = vec![0xCCu8; 100_000];
+        let deflate_matches = compress_lazy_to_matches(&input).unwrap();
+        let extended_matches =
+            compress_lazy_to_matches_with_limit(&input, DEFAULT_MAX_MATCH).unwrap();
+
+        // Extended limit should produce far fewer matches (longer each)
+        assert!(
+            extended_matches.len() < deflate_matches.len(),
+            "extended ({}) should need fewer matches than deflate ({})",
+            extended_matches.len(),
+            deflate_matches.len()
+        );
+
+        // Verify extended matches have lengths > 258
+        let max_len = extended_matches.iter().map(|m| m.length).max().unwrap_or(0);
+        assert!(
+            max_len > 258,
+            "extended limit should find matches > 258, got max {}",
+            max_len
+        );
+
+        // Round-trip must still work
+        let compressed = compress_lazy_with_limit(&input, DEFAULT_MAX_MATCH).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    /// Verify compress_lazy_with_limit round-trips various data patterns.
+    #[test]
+    fn test_compress_lazy_with_limit_round_trip_patterns() {
+        // Repeating pattern
+        let pattern = b"hello world! ";
+        let input: Vec<u8> = pattern.iter().cycle().take(50_000).copied().collect();
+        let compressed = compress_lazy_with_limit(&input, DEFAULT_MAX_MATCH).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "repeating pattern round trip failed");
+
+        // Mixed data — shouldn't regress
+        let input: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+        let compressed = compress_lazy_with_limit(&input, DEFAULT_MAX_MATCH).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "sequential bytes round trip failed");
     }
 }

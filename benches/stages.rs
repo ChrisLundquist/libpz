@@ -496,7 +496,7 @@ fn bench_simd(c: &mut Criterion) {
         // Compare bytes: SIMD dispatch
         group.bench_with_input(BenchmarkId::new("compare_simd", size), &data, |b, data| {
             let d = Dispatcher::new();
-            b.iter(|| d.compare_bytes(data, &data2));
+            b.iter(|| d.compare_bytes(data, &data2, 258));
         });
     }
     group.finish();
