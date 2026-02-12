@@ -438,6 +438,7 @@ impl<'a> BitReader<'a> {
         reader
     }
 
+    #[inline]
     fn read_bits(&mut self, nb_bits: u32) -> u32 {
         debug_assert!(nb_bits <= 32);
         if nb_bits == 0 {
@@ -451,11 +452,33 @@ impl<'a> BitReader<'a> {
         value
     }
 
+    /// Refill the bit container from the byte stream.
+    ///
+    /// Fast path: single unaligned u64 load when ≥8 bytes remain,
+    /// replacing up to 7 byte-at-a-time loop iterations with one `mov`.
+    /// Falls back to byte-at-a-time for the last <8 bytes.
+    #[inline]
     fn refill(&mut self) {
-        while self.bits_available <= 56 && self.byte_pos < self.data.len() {
-            self.container |= (self.data[self.byte_pos] as u64) << self.bits_available;
-            self.byte_pos += 1;
-            self.bits_available += 8;
+        if self.bits_available <= 56 {
+            if self.byte_pos + 8 <= self.data.len() {
+                // Bulk load: one unaligned u64 read (single `mov` on x86).
+                let raw = u64::from_le_bytes(
+                    self.data[self.byte_pos..self.byte_pos + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                self.container |= raw << self.bits_available;
+                let bytes_consumed = ((64 - self.bits_available) / 8) as usize;
+                self.byte_pos += bytes_consumed;
+                self.bits_available += (bytes_consumed as u32) * 8;
+            } else {
+                // Tail: byte-at-a-time fallback for last <8 bytes.
+                while self.bits_available <= 56 && self.byte_pos < self.data.len() {
+                    self.container |= (self.data[self.byte_pos] as u64) << self.bits_available;
+                    self.byte_pos += 1;
+                    self.bits_available += 8;
+                }
+            }
         }
     }
 }
@@ -736,6 +759,22 @@ fn fse_decode_interleaved(
     if num_states == 0 {
         return Err(PzError::InvalidInput);
     }
+
+    // Fast path: 4-way batched decode.
+    if num_states == 4 {
+        let bitstreams: [&[u8]; 4] = [&streams[0].0, &streams[1].0, &streams[2].0, &streams[3].0];
+        let initial_states: [u16; 4] = [streams[0].1, streams[1].1, streams[2].1, streams[3].1];
+        return crate::simd::fse_decode_4way(
+            &bitstreams,
+            &initial_states,
+            &table.decode_table,
+            table.table_size,
+            original_len,
+        )
+        .ok_or(PzError::InvalidInput);
+    }
+
+    // Generic N-way path.
 
     // Initialize per-stream readers and states.
     let mut readers: Vec<BitReader> = streams

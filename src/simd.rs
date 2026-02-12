@@ -670,6 +670,150 @@ pub fn rans_decode_4way(
 }
 
 // ---------------------------------------------------------------------------
+// Batched 4-way FSE decode
+// ---------------------------------------------------------------------------
+
+/// Bulk refill helper for FSE 4-way decode: fills the bit container from
+/// the byte stream using a single unaligned u64 load when possible.
+#[inline(always)]
+fn fse_bulk_refill(
+    data: &[u8],
+    container: &mut u64,
+    bits_available: &mut u32,
+    byte_pos: &mut usize,
+) {
+    if *bits_available <= 56 {
+        if *byte_pos + 8 <= data.len() {
+            let raw = u64::from_le_bytes(data[*byte_pos..*byte_pos + 8].try_into().unwrap());
+            *container |= raw << *bits_available;
+            let bytes_consumed = ((64 - *bits_available) / 8) as usize;
+            *byte_pos += bytes_consumed;
+            *bits_available += (bytes_consumed as u32) * 8;
+        } else {
+            while *bits_available <= 56 && *byte_pos < data.len() {
+                *container |= (data[*byte_pos] as u64) << *bits_available;
+                *byte_pos += 1;
+                *bits_available += 8;
+            }
+        }
+    }
+}
+
+/// Decode 4-way interleaved FSE, processing all 4 lanes per iteration.
+///
+/// Mirrors `rans_decode_4way`: batches all 4 lanes per loop iteration to
+/// keep states in registers, reduce loop overhead 4×, and enable the
+/// compiler to autovectorize.
+///
+/// Each lane has its own inline BitReader state (container, bits_available,
+/// byte_pos) reading from independent bitstreams. Uses bulk u64 refill.
+///
+/// # Arguments
+/// - `bitstreams`: per-lane encoded bitstream data (4 slices)
+/// - `initial_states`: starting FSE state for each lane (4 values)
+/// - `decode_table`: the shared FSE decode table (indexed by state)
+/// - `table_size`: size of the decode table (1 << accuracy_log)
+/// - `original_len`: total symbols to decode
+///
+/// # Returns
+/// Decoded bytes, or `None` on invalid state.
+pub(crate) fn fse_decode_4way(
+    bitstreams: &[&[u8]; 4],
+    initial_states: &[u16; 4],
+    decode_table: &[crate::fse::DecodeEntry],
+    table_size: usize,
+    original_len: usize,
+) -> Option<Vec<u8>> {
+    let mut states = [
+        initial_states[0] as usize,
+        initial_states[1] as usize,
+        initial_states[2] as usize,
+        initial_states[3] as usize,
+    ];
+
+    // Inline BitReader state for each lane (avoids method call overhead).
+    let mut containers = [0u64; 4];
+    let mut bits_available = [0u32; 4];
+    let mut byte_positions = [0usize; 4];
+
+    // Initial refill for all 4 lanes.
+    for lane in 0..4 {
+        fse_bulk_refill(
+            bitstreams[lane],
+            &mut containers[lane],
+            &mut bits_available[lane],
+            &mut byte_positions[lane],
+        );
+    }
+
+    let mut output = Vec::with_capacity(original_len);
+
+    let full_quads = original_len / 4;
+    let remainder = original_len % 4;
+
+    for _ in 0..full_quads {
+        for lane in 0..4 {
+            if states[lane] >= table_size {
+                return None;
+            }
+            let entry = decode_table[states[lane]];
+            output.push(entry.symbol);
+
+            // Inline read_bits: refill + extract.
+            let nb_bits = entry.bits as u32;
+            fse_bulk_refill(
+                bitstreams[lane],
+                &mut containers[lane],
+                &mut bits_available[lane],
+                &mut byte_positions[lane],
+            );
+            let value = if nb_bits > 0 {
+                let mask = (1u64 << nb_bits) - 1;
+                let v = (containers[lane] & mask) as usize;
+                containers[lane] >>= nb_bits;
+                bits_available[lane] = bits_available[lane].saturating_sub(nb_bits);
+                v
+            } else {
+                0
+            };
+
+            states[lane] = entry.next_state_base as usize + value;
+        }
+    }
+
+    // Handle remaining symbols (< 4).
+    for r in 0..remainder {
+        let lane = r;
+        if states[lane] >= table_size {
+            return None;
+        }
+        let entry = decode_table[states[lane]];
+        output.push(entry.symbol);
+
+        let nb_bits = entry.bits as u32;
+        fse_bulk_refill(
+            bitstreams[lane],
+            &mut containers[lane],
+            &mut bits_available[lane],
+            &mut byte_positions[lane],
+        );
+        let value = if nb_bits > 0 {
+            let mask = (1u64 << nb_bits) - 1;
+            let v = (containers[lane] & mask) as usize;
+            containers[lane] >>= nb_bits;
+            bits_available[lane] = bits_available[lane].saturating_sub(nb_bits);
+            v
+        } else {
+            0
+        };
+
+        states[lane] = entry.next_state_base as usize + value;
+    }
+
+    Some(output)
+}
+
+// ---------------------------------------------------------------------------
 // aarch64 NEON / SVE stubs
 // ---------------------------------------------------------------------------
 
