@@ -95,6 +95,12 @@ cargo install samply                                # one-time setup
 - Error type: `PzError` (InvalidInput, BufferTooSmall, Unsupported, InternalError)
 - Tests go in `#[cfg(test)] mod tests` at the bottom of each module file
 
+## Shell command style
+- **Never use `git -C <path>`** — always run git commands from the repo root directly.
+- **Don't chain git commands with `echo`, `printf`, or `bash -c`** — these create compound commands that don't match permission allow-lists. Instead, run git commands as standalone Bash calls and use separate tool calls for any follow-up.
+- **Prefer multiple sequential tool calls** over `&&`-chained shell commands when the chain mixes git with non-git commands.
+- **Use HEREDOC syntax for multi-line commit messages** (see the commit instructions in your system prompt).
+
 ## Commit discipline
 - **Commit at every logical completion point** — don't let work accumulate uncommitted.
 - A "logical completion point" is any self-contained change: a bug fix, a new feature, a refactor, a test addition, a docs update, etc.
