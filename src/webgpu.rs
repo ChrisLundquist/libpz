@@ -83,6 +83,19 @@ struct GpuMatch {
 unsafe impl bytemuck::Pod for GpuMatch {}
 unsafe impl bytemuck::Zeroable for GpuMatch {}
 
+/// Handle to a submitted-but-not-yet-read-back GPU LZ77 computation.
+///
+/// Created by `submit_find_matches_lazy()`, consumed by `complete_find_matches_lazy()`.
+/// Owns the staging buffer and metadata needed to read back and deduplicate results.
+struct PendingLz77 {
+    staging_buf: wgpu::Buffer,
+    input_len: usize,
+}
+
+/// Maximum number of blocks to submit in a single GPU batch.
+/// Limits GPU memory pressure: 8 × 256KB × ~36 bytes/pos ≈ 72MB.
+const MAX_GPU_BATCH_SIZE: usize = 8;
+
 /// Information about a discovered WebGPU device.
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -997,6 +1010,283 @@ impl WebGpuEngine {
         let gpu_matches: Vec<GpuMatch> = bytemuck::cast_slice(&raw).to_vec();
 
         Ok(dedupe_gpu_matches(&gpu_matches, input))
+    }
+
+    /// Submit GPU LZ77 lazy matching work without blocking for results.
+    ///
+    /// Creates buffers, encodes 3 compute passes + staging copy in one
+    /// command buffer, and submits. Returns a handle to retrieve results
+    /// later with `complete_find_matches_lazy()`.
+    ///
+    /// The caller must call `device.poll(Wait)` before completing.
+    fn submit_find_matches_lazy(&self, input: &[u8]) -> PzResult<PendingLz77> {
+        let input_len = input.len();
+        let padded = Self::pad_input_bytes(input);
+        let match_buf_size = (input_len * std::mem::size_of::<GpuMatch>()) as u64;
+
+        let input_buf =
+            self.create_buffer_init("lz77_lazy_input", &padded, wgpu::BufferUsages::STORAGE);
+
+        let workgroups = (input_len as u32).div_ceil(64);
+        let params = [input_len as u32, 0, 0, self.dispatch_width(workgroups, 64)];
+        let params_buf = self.create_buffer_init(
+            "lz77_lazy_params",
+            bytemuck::cast_slice(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
+        let hash_counts_buf = self.create_buffer_init(
+            "lazy_hash_counts",
+            &vec![0u8; HASH_TABLE_SIZE * 4],
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        let hash_table_buf = self.create_buffer(
+            "lazy_hash_table",
+            (HASH_TABLE_SIZE * HASH_BUCKET_CAP * 4) as u64,
+            wgpu::BufferUsages::STORAGE,
+        );
+
+        let raw_match_buf = self.create_buffer(
+            "lazy_raw_matches",
+            match_buf_size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        let resolved_buf = self.create_buffer(
+            "lazy_resolved",
+            match_buf_size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        // Staging buffer for readback (copy encoded in same command buffer)
+        let staging_buf = self.create_buffer(
+            "lz77_lazy_staging",
+            match_buf_size,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
+
+        // Build bind groups (same as find_matches_lazy)
+        let build_bg_layout = self.pipeline_lz77_lazy_build.get_bind_group_layout(0);
+        let build_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lz77_lazy_build_bg"),
+            layout: &build_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: hash_counts_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: hash_table_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let find_bg_layout = self.pipeline_lz77_lazy_find.get_bind_group_layout(0);
+        let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lz77_lazy_find_bg"),
+            layout: &find_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: raw_match_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: hash_counts_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: hash_table_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let resolve_bg_layout = self.pipeline_lz77_lazy_resolve.get_bind_group_layout(0);
+        let resolve_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lz77_lazy_resolve_bg"),
+            layout: &resolve_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: resolved_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: raw_match_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Encode 3 compute passes + staging copy in one command buffer
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("lz77_lazy_submit"),
+            });
+        self.record_dispatch(
+            &mut encoder,
+            &self.pipeline_lz77_lazy_build,
+            &build_bg,
+            workgroups,
+            "lz77_lazy_build",
+        )?;
+        self.record_dispatch(
+            &mut encoder,
+            &self.pipeline_lz77_lazy_find,
+            &find_bg,
+            workgroups,
+            "lz77_lazy_find",
+        )?;
+        self.record_dispatch(
+            &mut encoder,
+            &self.pipeline_lz77_lazy_resolve,
+            &resolve_bg,
+            workgroups,
+            "lz77_lazy_resolve",
+        )?;
+        // Copy resolved matches to staging buffer (in same command buffer)
+        encoder.copy_buffer_to_buffer(&resolved_buf, 0, &staging_buf, 0, match_buf_size);
+
+        self.queue.submit(Some(encoder.finish()));
+
+        Ok(PendingLz77 {
+            staging_buf,
+            input_len,
+        })
+    }
+
+    /// Complete a previously submitted GPU LZ77 computation.
+    ///
+    /// The caller must ensure `device.poll(Wait)` has been called after
+    /// submitting all pending work.
+    fn complete_find_matches_lazy(
+        &self,
+        pending: PendingLz77,
+        input: &[u8],
+    ) -> PzResult<Vec<Match>> {
+        debug_assert_eq!(pending.input_len, input.len());
+
+        let slice = pending.staging_buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().map_err(|_| PzError::Unsupported)?;
+
+        let raw = slice.get_mapped_range().to_vec();
+        pending.staging_buf.unmap();
+
+        let gpu_matches: Vec<GpuMatch> = bytemuck::cast_slice(&raw).to_vec();
+        Ok(dedupe_gpu_matches(&gpu_matches, input))
+    }
+
+    /// GPU-accelerated LZ77 match finding for multiple blocks.
+    ///
+    /// Submits GPU work for all blocks before reading back any results,
+    /// hiding GPU-CPU transfer latency. Falls back to CPU lazy matching
+    /// for blocks that are too small or too large for GPU.
+    ///
+    /// # Phases
+    /// 1. **Submit**: Encode and submit all block dispatches (non-blocking).
+    /// 2. **Sync**: Single `device.poll(Wait)` for all blocks.
+    /// 3. **Readback**: Map each staging buffer, dedup matches.
+    pub fn find_matches_batched(&self, blocks: &[&[u8]]) -> PzResult<Vec<Vec<Match>>> {
+        if blocks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if blocks.len() == 1 {
+            return Ok(vec![self.find_matches(blocks[0])?]);
+        }
+
+        let max_dispatch = self.max_dispatch_input_size();
+        let mut all_results: Vec<Vec<Match>> = Vec::with_capacity(blocks.len());
+
+        // Process in batches to cap GPU memory usage
+        for chunk in blocks.chunks(MAX_GPU_BATCH_SIZE) {
+            // Phase 1: Submit all blocks in this batch
+            let mut pending: Vec<Option<PendingLz77>> = Vec::with_capacity(chunk.len());
+
+            for block in chunk {
+                if block.is_empty()
+                    || block.len() < MIN_GPU_INPUT_SIZE
+                    || block.len() > max_dispatch
+                {
+                    pending.push(None); // CPU fallback
+                } else {
+                    pending.push(Some(self.submit_find_matches_lazy(block)?));
+                }
+            }
+
+            // Phase 2: Wait for ALL GPU work in this batch to complete
+            self.device.poll(wgpu::Maintain::Wait);
+
+            // Phase 3: Read back + dedup
+            for (i, p) in pending.into_iter().enumerate() {
+                match p {
+                    Some(pending_lz77) => {
+                        all_results.push(self.complete_find_matches_lazy(pending_lz77, chunk[i])?);
+                    }
+                    None => {
+                        if chunk[i].is_empty() {
+                            all_results.push(Vec::new());
+                        } else {
+                            all_results.push(crate::lz77::compress_lazy_to_matches(chunk[i])?);
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.profiling {
+            eprintln!(
+                "[pz-gpu] lz77_lazy_batched: {} blocks processed",
+                blocks.len()
+            );
+        }
+
+        Ok(all_results)
+    }
+
+    /// GPU-accelerated batched LZ77 compression (serialized output).
+    pub fn lz77_compress_batched(&self, blocks: &[&[u8]]) -> PzResult<Vec<Vec<u8>>> {
+        let match_vecs = self.find_matches_batched(blocks)?;
+        let mut results = Vec::with_capacity(match_vecs.len());
+        for matches in &match_vecs {
+            let mut output = Vec::with_capacity(matches.len() * Match::SERIALIZED_SIZE);
+            for m in matches {
+                output.extend_from_slice(&m.to_bytes());
+            }
+            results.push(output);
+        }
+        Ok(results)
     }
 
     /// GPU-accelerated LZ77 compression using hash-table kernel.
@@ -2448,6 +2738,11 @@ fn dedupe_gpu_matches(gpu_matches: &[GpuMatch], input: &[u8]) -> Vec<Match> {
         if match_length >= remaining {
             match_length = if remaining > 0 { remaining - 1 } else { 0 };
         }
+        // Cap to u16::MAX since Match.length is u16. The next iteration will
+        // pick up a fresh per-position match from the GPU output.
+        if match_length > u16::MAX as usize {
+            match_length = u16::MAX as usize;
+        }
 
         let next = if index + match_length < input.len() {
             input[index + match_length]
@@ -2694,6 +2989,143 @@ mod tests {
             lazy_seqs <= greedy_seqs,
             "lazy ({lazy_seqs}) should produce <= sequences than greedy ({greedy_seqs})"
         );
+    }
+
+    #[test]
+    fn test_find_matches_batched_empty() {
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+        let result = engine.find_matches_batched(&[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_find_matches_batched_single_block() {
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+
+        let pattern = b"hello world hello world hello world hello ";
+        let big_input: Vec<u8> = pattern
+            .iter()
+            .cycle()
+            .take(MIN_GPU_INPUT_SIZE + 1024)
+            .copied()
+            .collect();
+
+        let batched = engine.find_matches_batched(&[&big_input]).unwrap();
+        let single = engine.find_matches(&big_input).unwrap();
+        assert_eq!(batched.len(), 1);
+        assert_eq!(batched[0], single);
+    }
+
+    #[test]
+    fn test_find_matches_batched_multi_block() {
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+
+        let block1: Vec<u8> = (0..MIN_GPU_INPUT_SIZE + 1024)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let block2: Vec<u8> = (0..MIN_GPU_INPUT_SIZE + 2048)
+            .map(|i| ((i * 7 + 13) % 251) as u8)
+            .collect();
+
+        let batched = engine.find_matches_batched(&[&block1, &block2]).unwrap();
+        let single1 = engine.find_matches(&block1).unwrap();
+        let single2 = engine.find_matches(&block2).unwrap();
+
+        assert_eq!(batched.len(), 2);
+        assert_eq!(batched[0], single1);
+        assert_eq!(batched[1], single2);
+    }
+
+    #[test]
+    fn test_find_matches_batched_with_small_block_fallback() {
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+
+        let big: Vec<u8> = (0..MIN_GPU_INPUT_SIZE + 1024)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let small = b"too small for GPU";
+
+        let batched = engine.find_matches_batched(&[&big, small]).unwrap();
+        assert_eq!(batched.len(), 2);
+
+        // Both should produce valid matches that round-trip
+        let big_compressed = {
+            let mut out = Vec::new();
+            for m in &batched[0] {
+                out.extend_from_slice(&m.to_bytes());
+            }
+            out
+        };
+        let dec = crate::lz77::decompress(&big_compressed).unwrap();
+        assert_eq!(dec, big);
+    }
+
+    #[test]
+    fn test_lz77_compress_batched_round_trip() {
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+
+        let pattern = b"the quick brown fox jumps over the lazy dog. ";
+        let block1: Vec<u8> = pattern
+            .iter()
+            .cycle()
+            .take(MIN_GPU_INPUT_SIZE + 512)
+            .copied()
+            .collect();
+        let block2: Vec<u8> = pattern
+            .iter()
+            .cycle()
+            .take(MIN_GPU_INPUT_SIZE + 4096)
+            .copied()
+            .collect();
+
+        let compressed = engine.lz77_compress_batched(&[&block1, &block2]).unwrap();
+        assert_eq!(compressed.len(), 2);
+
+        let dec1 = crate::lz77::decompress(&compressed[0]).unwrap();
+        let dec2 = crate::lz77::decompress(&compressed[1]).unwrap();
+        assert_eq!(dec1, block1);
+        assert_eq!(dec2, block2);
+    }
+
+    #[test]
+    fn test_lz77_single_large_round_trip() {
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+
+        // Repetitive pattern > MIN_GPU_INPUT_SIZE to exercise u16 clamping
+        let pattern = b"the quick brown fox jumps over the lazy dog. ";
+        let input: Vec<u8> = pattern
+            .iter()
+            .cycle()
+            .take(MIN_GPU_INPUT_SIZE + 512)
+            .copied()
+            .collect();
+        let compressed = engine.lz77_compress(&input).unwrap();
+        let decompressed = crate::lz77::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
     }
 
     #[test]
