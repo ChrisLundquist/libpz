@@ -499,6 +499,114 @@ fn build_suffix_array_naive(input: &[u8]) -> Vec<usize> {
     sa
 }
 
+// --- Circular suffix array via prefix-doubling with radix sort ---
+
+/// Build a circular suffix array using prefix-doubling with radix sort (O(n log n)).
+///
+/// Unlike `build_suffix_array` which doubles the input string for SA-IS,
+/// this uses circular `(i + k) % n` modulo comparisons — the same approach
+/// as the GPU BWT kernel. This eliminates the 2n+1 memory overhead.
+///
+/// Used by `encode_bijective` where factors are typically small (a few KB)
+/// and the allocation savings from avoiding doubling matter more than the
+/// theoretical O(n) vs O(n log n) complexity difference.
+pub(crate) fn build_circular_suffix_array(input: &[u8]) -> Vec<usize> {
+    let n = input.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![0];
+    }
+    if n == 2 {
+        return if input[0] <= input[1] {
+            vec![0, 1]
+        } else {
+            vec![1, 0]
+        };
+    }
+
+    let mut sa: Vec<usize> = (0..n).collect();
+    let mut tmp_sa = vec![0usize; n];
+    let mut rank = vec![0u32; n];
+    let mut tmp_rank = vec![0u32; n];
+
+    // Initial ranks from byte values.
+    for i in 0..n {
+        rank[i] = input[i] as u32;
+    }
+
+    let mut k = 1usize;
+    let mut max_rank = 255u32;
+
+    while k < n {
+        // Two-pass LSB radix sort on composite key (rank[i], rank[(i+k)%n]).
+        // Pass 1: sort by secondary key rank[(i+k)%n]
+        radix_sort_by_key(&sa, &mut tmp_sa, &rank, n, k, max_rank);
+        // Pass 2: sort by primary key rank[i] (stable preserves secondary order)
+        radix_sort_by_key(&tmp_sa, &mut sa, &rank, n, 0, max_rank);
+
+        // Assign new ranks based on sorted order.
+        tmp_rank[sa[0]] = 0;
+        for i in 1..n {
+            let prev = sa[i - 1];
+            let curr = sa[i];
+            if rank[curr] == rank[prev] && rank[(curr + k) % n] == rank[(prev + k) % n] {
+                tmp_rank[curr] = tmp_rank[prev];
+            } else {
+                tmp_rank[curr] = tmp_rank[prev] + 1;
+            }
+        }
+
+        std::mem::swap(&mut rank, &mut tmp_rank);
+        max_rank = rank[sa[n - 1]];
+
+        if max_rank as usize == n - 1 {
+            break; // All ranks unique — SA is final.
+        }
+        k *= 2;
+    }
+
+    sa
+}
+
+/// Counting-sort `src` into `dst` by the key `rank[(src[i] + offset) % n]`.
+///
+/// This is a stable radix sort on one component of the composite key.
+/// `max_rank` is the maximum value in the rank array (for bucket count).
+fn radix_sort_by_key(
+    src: &[usize],
+    dst: &mut [usize],
+    rank: &[u32],
+    n: usize,
+    offset: usize,
+    max_rank: u32,
+) {
+    let num_buckets = max_rank as usize + 2; // +1 for inclusive, +1 for safety
+    let mut counts = vec![0u32; num_buckets];
+
+    // Count occurrences of each key.
+    for &i in src {
+        let key = rank[(i + offset) % n] as usize;
+        counts[key] += 1;
+    }
+
+    // Compute exclusive prefix sum (starting positions).
+    let mut sum = 0u32;
+    for c in counts.iter_mut() {
+        let count = *c;
+        *c = sum;
+        sum += count;
+    }
+
+    // Scatter into destination (stable: left-to-right preserves input order).
+    for &i in src {
+        let key = rank[(i + offset) % n] as usize;
+        dst[counts[key] as usize] = i;
+        counts[key] += 1;
+    }
+}
+
 // --- Bijective BWT via Lyndon Factorization ---
 
 /// Lyndon factorization using Duval's algorithm (O(n), O(1) extra space).
@@ -591,9 +699,10 @@ pub fn encode_bijective(input: &[u8]) -> Option<(Vec<u8>, Vec<usize>)> {
             continue;
         }
 
-        // Build suffix array for this factor's rotations
-        // For a Lyndon word, all rotations are distinct, so the SA is unique.
-        let sa = build_suffix_array(factor);
+        // Build circular suffix array for this factor's rotations.
+        // Uses prefix-doubling with radix sort — avoids 2n+1 string doubling
+        // that build_suffix_array (SA-IS) requires.
+        let sa = build_circular_suffix_array(factor);
 
         // Extract last column of sorted rotation matrix
         for &sa_val in &sa {
@@ -1114,6 +1223,62 @@ mod tests {
         assert_eq!(
             decode_bijective_to_buf(&bwt_data, &factor_lens, &mut buf),
             Err(PzError::BufferTooSmall)
+        );
+    }
+
+    #[test]
+    fn test_circular_sa_produces_valid_bwt() {
+        // The circular prefix-doubling SA must produce a valid BWT that
+        // round-trips correctly. For inputs with distinct rotations, it must
+        // also match the doubled-string SA-IS exactly.
+        let test_cases: Vec<&[u8]> = vec![
+            b"banana",
+            b"abcabc",
+            b"abcdefghijklmnopqrstuvwxyz",
+            b"the quick brown fox",
+            b"abracadabra",
+            b"mississippi",
+            b"ab",
+            b"abc",
+            b"hello world hello world",
+        ];
+        for input in test_cases {
+            let sa = build_circular_suffix_array(input);
+            let n = input.len();
+
+            // Extract BWT from circular SA
+            let mut bwt_data = Vec::with_capacity(n);
+            let mut primary_index = 0u32;
+            for (i, &sa_val) in sa.iter().enumerate() {
+                if sa_val == 0 {
+                    primary_index = i as u32;
+                    bwt_data.push(input[n - 1]);
+                } else {
+                    bwt_data.push(input[sa_val - 1]);
+                }
+            }
+
+            // Round-trip: decode must recover original
+            let decoded = decode(&bwt_data, primary_index).unwrap();
+            assert_eq!(
+                decoded,
+                input,
+                "Circular SA BWT round-trip failed on {:?}",
+                std::str::from_utf8(input).unwrap_or("<binary>")
+            );
+        }
+    }
+
+    #[test]
+    fn test_circular_sa_matches_on_distinct_rotations() {
+        // For inputs where all rotations are distinct, the circular SA
+        // must be identical to the doubled-string SA-IS.
+        let input: Vec<u8> = (0..=255).collect();
+        let sa_doubled = build_suffix_array(&input);
+        let sa_circular = build_circular_suffix_array(&input);
+        assert_eq!(
+            sa_doubled, sa_circular,
+            "SA mismatch on all-bytes input (all rotations distinct)"
         );
     }
 
