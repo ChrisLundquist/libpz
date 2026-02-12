@@ -166,10 +166,19 @@ impl CostModel {
 /// Build a match table from input using the hash-chain finder.
 ///
 /// For each position, finds up to `k` match candidates using the
-/// existing hash-chain infrastructure.
+/// existing hash-chain infrastructure. Uses `DEFLATE_MAX_MATCH` (258).
 pub fn build_match_table_cpu(input: &[u8], k: usize) -> MatchTable {
+    build_match_table_cpu_with_limit(input, k, crate::lz77::DEFLATE_MAX_MATCH)
+}
+
+/// Like `build_match_table_cpu` but with a caller-specified max match length.
+pub(crate) fn build_match_table_cpu_with_limit(
+    input: &[u8],
+    k: usize,
+    max_match_len: u16,
+) -> MatchTable {
     let mut table = MatchTable::new(input.len(), k);
-    let mut finder = HashChainFinder::new();
+    let mut finder = HashChainFinder::with_max_match_len(max_match_len);
 
     for pos in 0..input.len() {
         let top_k = finder.find_top_k(input, pos, k);
@@ -274,8 +283,13 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
 ///
 /// Produces the same serialized `Match` format as `lz77::compress_lazy`,
 /// but selects matches via backward DP to minimize total encoding cost.
-/// Decompressible with `lz77::decompress()`.
+/// Decompressible with `lz77::decompress()`. Uses `DEFLATE_MAX_MATCH` (258).
 pub fn compress_optimal(input: &[u8]) -> PzResult<Vec<u8>> {
+    compress_optimal_with_limit(input, crate::lz77::DEFLATE_MAX_MATCH)
+}
+
+/// Like `compress_optimal` but with a caller-specified max match length.
+pub(crate) fn compress_optimal_with_limit(input: &[u8], max_match_len: u16) -> PzResult<Vec<u8>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
@@ -285,7 +299,7 @@ pub fn compress_optimal(input: &[u8]) -> PzResult<Vec<u8>> {
     let cost_model = CostModel::from_frequencies(&freq);
 
     // Step 2: Build match table using hash-chain finder
-    let table = build_match_table_cpu(input, K);
+    let table = build_match_table_cpu_with_limit(input, K, max_match_len);
 
     // Step 3: Run backward DP
     let matches = optimal_parse(input, &table, &cost_model);

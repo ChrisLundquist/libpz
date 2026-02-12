@@ -91,6 +91,13 @@ pub struct CompressOptions {
     pub block_size: usize,
     /// LZ77 match selection strategy (greedy, lazy, or optimal).
     pub parse_strategy: ParseStrategy,
+    /// Maximum match length for LZ77 compression.
+    ///
+    /// `None` = use the pipeline's default: 258 for Deflate (RFC 1951
+    /// constraint), `u16::MAX` for other LZ77-based pipelines (Lzr, Lzf).
+    /// Larger limits allow longer matches on repetitive data without
+    /// penalizing short-match performance (SIMD short-circuits).
+    pub max_match_len: Option<u16>,
     /// OpenCL engine handle, required when `backend` is `Backend::OpenCl`.
     #[cfg(feature = "opencl")]
     pub opencl_engine: Option<std::sync::Arc<crate::opencl::OpenClEngine>>,
@@ -106,12 +113,24 @@ impl Default for CompressOptions {
             threads: 0,
             block_size: DEFAULT_BLOCK_SIZE,
             parse_strategy: ParseStrategy::Auto,
+            max_match_len: None,
             #[cfg(feature = "opencl")]
             opencl_engine: None,
             #[cfg(feature = "webgpu")]
             webgpu_engine: None,
         }
     }
+}
+
+/// Resolve the effective max match length from options and pipeline type.
+///
+/// Deflate is hard-capped at 258 (RFC 1951). Other LZ77-based pipelines
+/// default to `u16::MAX` for better compression on repetitive data.
+pub(crate) fn resolve_max_match_len(pipeline: Pipeline, options: &CompressOptions) -> u16 {
+    options.max_match_len.unwrap_or(match pipeline {
+        Pipeline::Deflate => lz77::DEFLATE_MAX_MATCH,
+        _ => lz77::DEFAULT_MAX_MATCH,
+    })
 }
 
 /// Magic bytes for the libpz container format.
@@ -531,9 +550,12 @@ fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResu
 
     // CPU paths — lazy is the default (fastest single-thread + best ratio).
     // Multi-threading happens at the pipeline block level, not inside LZ77.
+    let max_match = options.max_match_len.unwrap_or(lz77::DEFLATE_MAX_MATCH);
     match options.parse_strategy {
-        ParseStrategy::Auto | ParseStrategy::Lazy => lz77::compress_lazy(input),
-        ParseStrategy::Optimal => crate::optimal::compress_optimal(input),
+        ParseStrategy::Auto | ParseStrategy::Lazy => {
+            lz77::compress_lazy_with_limit(input, max_match)
+        }
+        ParseStrategy::Optimal => crate::optimal::compress_optimal_with_limit(input, max_match),
     }
 }
 

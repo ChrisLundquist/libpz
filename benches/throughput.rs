@@ -229,6 +229,7 @@ fn bench_compress_gpu(c: &mut Criterion) {
         opencl_engine: Some(engine),
         #[cfg(feature = "webgpu")]
         webgpu_engine: None,
+        ..Default::default()
     };
 
     for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
@@ -394,6 +395,7 @@ fn bench_compress_webgpu(c: &mut Criterion) {
         #[cfg(feature = "opencl")]
         opencl_engine: None,
         webgpu_engine: Some(engine),
+        ..Default::default()
     };
 
     for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
