@@ -247,11 +247,12 @@ fn main() {
         let pipe = match pipeline_name.as_str() {
             "deflate" => Pipeline::Deflate,
             "bw" => Pipeline::Bw,
+            "bbw" => Pipeline::Bbw,
             "lzr" => Pipeline::Lzr,
             "lzf" => Pipeline::Lzf,
             other => {
                 eprintln!("unknown pipeline: {}", other);
-                eprintln!("valid pipelines: deflate, bw, lzr, lzf");
+                eprintln!("valid pipelines: deflate, bw, bbw, lzr, lzf");
                 std::process::exit(1);
             }
         };

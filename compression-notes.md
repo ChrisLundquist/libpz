@@ -272,3 +272,75 @@ This is because they are mostly about the Barrow's Wheeler Transform which can b
 Doing and undoing the BWT is most of the computation. After that it uses "Move to Front" (I think) with entropy encoding, Arithmetic Encoding (I think).
 
 
+---
+
+# Experiment Log
+
+## Experiment 1: Matrix RREF Compression — Disproven (7bc7dd4)
+
+**Hypothesis**: Fold input into a matrix, reduce toward RREF via row operations, journal the operations, and compress the journal + residual.
+
+**Result**: Disproven. The operation journal is larger than the input. Row operations on byte data don't produce compressible patterns — the journal entropy is at least as high as the original data. The RREF residual is small but the path to get there isn't.
+
+**Commit**: `7bc7dd4` Add Matrix RREF compression prototype — disproven
+
+## Experiment 2: LZ77 Fix-up Frames — Marginal (f07214f)
+
+**Hypothesis**: Add "fix-up frames" to LZ77 that patch a previous match with small insertions, allowing matches to continue across interruptions (e.g., "ABC...ABCDABC..." where the D breaks the match).
+
+**Result**: Marginal. Analysis of Canterbury corpus showed fix-up opportunities exist but are rare enough that the overhead of encoding the fix-up frame (offset, shift, literal) exceeds the savings from continuing the match. Standard LZ77's greedy/lazy matching already handles most practical cases well enough.
+
+**Commit**: `f07214f` Add LZ77 fix-up frames analysis and prototype codec
+
+## Experiment 3: Bijective BWT via Lyndon Factorization (31408bc → 12239ba)
+
+**Hypothesis**: Replace standard BWT with the bijective variant (Gil & Scott 2012). Factorize input into Lyndon words via Duval's algorithm, compute BWT per factor. No primary_index needed (always 0 for Lyndon words). Factors are independent → embarrassingly parallel encode/decode.
+
+**What worked**:
+- Decode is 10-37% faster than standard BWT decode at scale (commit cc5bc80)
+  - Buffer reuse (single LF table across factors, pre-allocated output) cuts allocations from 2k → 2
+  - primary_index is always 0 for Lyndon words — eliminates a lookup
+  - At 4MB: 58ms BBWT vs 92ms standard BWT decode (37% faster)
+- Small factor special cases (len ≤ 3) avoid full SA construction (commit b8ef384)
+- Factor-parallel decode works well with scoped threads (commit 0a96e1b)
+- GPU encode needs no kernel changes — existing circular prefix-doubling already works (commit 1c799f2)
+- Full pipeline wired as Pipeline::Bbw (commit 1055dc7, e15a8f2)
+
+**What failed**:
+- Circular prefix-doubling SA for CPU encode was 2.5-3× slower than SA-IS (commit 21052a0, reverted in 12239ba)
+  - O(n log n) vs O(n) matters: on typical factors (2-30 KB) the constant factor difference is large
+  - Memory savings (~50% per factor from avoiding doubled string) not worth the speed hit
+- Compression ratio is ~2.6 percentage points worse than standard BWT overall (35.3% vs 32.7%)
+  - Lyndon factorization breaks global byte-clustering that standard BWT achieves
+  - Pathological on some binary data: ptt5 went from 18.7% (BWT) to 46.6% (BBWT)
+
+**Benchmark summary** (Canterbury + Large corpus, Pipeline::Bbw vs Pipeline::Bw):
+```
+              Compress Ratio  Compress MB/s  Decompress MB/s
+Standard BW:     32.7%           6.2             23.6
+Bijective BBW:   35.3%           2.8             26.3
+```
+
+**Stage-level benchmarks** (criterion, BWT alone):
+```
+           BWT encode   BBWT encode   BWT decode   BBWT decode
+  8 KB:    11.3 MB/s     3.5 MB/s     274 MB/s     288 MB/s
+ 64 KB:     8.9 MB/s     2.9 MB/s     114 MB/s     129 MB/s
+256 KB:     7.2 MB/s     2.6 MB/s      72 MB/s      80 MB/s
+  4 MB:     2.6 MB/s     1.0 MB/s      44 MB/s      69 MB/s
+```
+
+**Verdict**: BBWT decode is a clear win. BBWT encode needs SA-IS (not prefix-doubling) or GPU acceleration to be competitive. Compression ratio is slightly worse but acceptable for write-once-read-many workloads. Not added to auto-selection yet.
+
+**Key commits**:
+- `31408bc` Initial prototype
+- `a80c296` Fix O(n²) decode bug
+- `b8ef384` Small factor special cases
+- `cc5bc80` Decode optimization (buffer reuse, inline LF-mapping)
+- `21052a0` Circular prefix-doubling SA (failed — 3× slower)
+- `1055dc7` Pipeline::Bbw wiring
+- `1c799f2` GPU bijective BWT encode
+- `0a96e1b` Factor-parallel decode
+- `e15a8f2` CLI, benchmarks, profiling harness
+- `12239ba` Revert encode back to SA-IS
+

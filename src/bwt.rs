@@ -499,6 +499,422 @@ fn build_suffix_array_naive(input: &[u8]) -> Vec<usize> {
     sa
 }
 
+// --- Circular suffix array via prefix-doubling with radix sort ---
+
+/// Build a circular suffix array using prefix-doubling with radix sort (O(n log n)).
+///
+/// Unlike `build_suffix_array` which doubles the input string for SA-IS,
+/// this uses circular `(i + k) % n` modulo comparisons — the same approach
+/// as the GPU BWT kernel. This eliminates the 2n+1 memory overhead.
+///
+/// Used by the WebGPU engine as a CPU fallback for small Lyndon factors
+/// (below the GPU dispatch threshold). Not used on the main CPU encode
+/// path — SA-IS is faster despite the doubled-string allocation.
+#[cfg(any(feature = "webgpu", test))]
+pub(crate) fn build_circular_suffix_array(input: &[u8]) -> Vec<usize> {
+    let n = input.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![0];
+    }
+    if n == 2 {
+        return if input[0] <= input[1] {
+            vec![0, 1]
+        } else {
+            vec![1, 0]
+        };
+    }
+
+    let mut sa: Vec<usize> = (0..n).collect();
+    let mut tmp_sa = vec![0usize; n];
+    let mut rank = vec![0u32; n];
+    let mut tmp_rank = vec![0u32; n];
+
+    // Initial ranks from byte values.
+    for i in 0..n {
+        rank[i] = input[i] as u32;
+    }
+
+    let mut k = 1usize;
+    let mut max_rank = 255u32;
+
+    while k < n {
+        // Two-pass LSB radix sort on composite key (rank[i], rank[(i+k)%n]).
+        // Pass 1: sort by secondary key rank[(i+k)%n]
+        radix_sort_by_key(&sa, &mut tmp_sa, &rank, n, k, max_rank);
+        // Pass 2: sort by primary key rank[i] (stable preserves secondary order)
+        radix_sort_by_key(&tmp_sa, &mut sa, &rank, n, 0, max_rank);
+
+        // Assign new ranks based on sorted order.
+        tmp_rank[sa[0]] = 0;
+        for i in 1..n {
+            let prev = sa[i - 1];
+            let curr = sa[i];
+            if rank[curr] == rank[prev] && rank[(curr + k) % n] == rank[(prev + k) % n] {
+                tmp_rank[curr] = tmp_rank[prev];
+            } else {
+                tmp_rank[curr] = tmp_rank[prev] + 1;
+            }
+        }
+
+        std::mem::swap(&mut rank, &mut tmp_rank);
+        max_rank = rank[sa[n - 1]];
+
+        if max_rank as usize == n - 1 {
+            break; // All ranks unique — SA is final.
+        }
+        k *= 2;
+    }
+
+    sa
+}
+
+/// Counting-sort `src` into `dst` by the key `rank[(src[i] + offset) % n]`.
+///
+/// This is a stable radix sort on one component of the composite key.
+/// `max_rank` is the maximum value in the rank array (for bucket count).
+#[cfg(any(feature = "webgpu", test))]
+fn radix_sort_by_key(
+    src: &[usize],
+    dst: &mut [usize],
+    rank: &[u32],
+    n: usize,
+    offset: usize,
+    max_rank: u32,
+) {
+    let num_buckets = max_rank as usize + 2; // +1 for inclusive, +1 for safety
+    let mut counts = vec![0u32; num_buckets];
+
+    // Count occurrences of each key.
+    for &i in src {
+        let key = rank[(i + offset) % n] as usize;
+        counts[key] += 1;
+    }
+
+    // Compute exclusive prefix sum (starting positions).
+    let mut sum = 0u32;
+    for c in counts.iter_mut() {
+        let count = *c;
+        *c = sum;
+        sum += count;
+    }
+
+    // Scatter into destination (stable: left-to-right preserves input order).
+    for &i in src {
+        let key = rank[(i + offset) % n] as usize;
+        dst[counts[key] as usize] = i;
+        counts[key] += 1;
+    }
+}
+
+// --- Bijective BWT via Lyndon Factorization ---
+
+/// Lyndon factorization using Duval's algorithm (O(n), O(1) extra space).
+///
+/// Returns a vector of (start, len) pairs representing the Lyndon factors.
+/// By the Chen-Fox-Lyndon theorem, every string has a unique factorization
+/// into non-increasing Lyndon words: w = l1 · l2 · ... · lk where
+/// l1 >= l2 >= ... >= lk lexicographically.
+pub fn lyndon_factorize(input: &[u8]) -> Vec<(usize, usize)> {
+    let n = input.len();
+    let mut factors = Vec::new();
+    let mut i = 0;
+
+    while i < n {
+        let mut j = i;
+        let mut k = i + 1;
+
+        while k < n && input[j] <= input[k] {
+            if input[j] < input[k] {
+                j = i;
+            } else {
+                j += 1;
+            }
+            k += 1;
+        }
+
+        let period = k - j;
+        while i + period <= k {
+            factors.push((i, period));
+            i += period;
+        }
+    }
+
+    factors
+}
+
+/// Bijective BWT forward transform.
+///
+/// Instead of a single rotation sort on the whole input (which requires a
+/// primary index to invert), bijective BWT:
+/// 1. Factorizes input into Lyndon factors via Duval's algorithm
+/// 2. For each factor, sorts all rotations and takes the last character
+/// 3. Concatenates the per-factor BWTs
+///
+/// Returns (transformed_data, factor_lengths). The factor_lengths are needed
+/// for the inverse transform.
+pub fn encode_bijective(input: &[u8]) -> Option<(Vec<u8>, Vec<usize>)> {
+    if input.is_empty() {
+        return None;
+    }
+
+    let factors = lyndon_factorize(input);
+    let mut output = Vec::with_capacity(input.len());
+    let mut factor_lengths = Vec::with_capacity(factors.len());
+
+    for &(start, len) in &factors {
+        let factor = &input[start..start + len];
+        factor_lengths.push(len);
+
+        if len == 1 {
+            // Single-byte factor: BWT is itself
+            output.push(factor[0]);
+            continue;
+        }
+
+        if len == 2 {
+            // Two rotations: [a,b] and [b,a]. Sort and take last column.
+            // For a Lyndon word, a < b always (otherwise it wouldn't be Lyndon).
+            // Sorted: [a,b], [b,a] → last column: b, a
+            output.push(factor[1]);
+            output.push(factor[0]);
+            continue;
+        }
+
+        if len == 3 {
+            // Three rotations — sort by circular comparison, emit last column.
+            let mut sa = [0usize, 1, 2];
+            sa.sort_by(|&x, &y| {
+                for i in 0..3 {
+                    match factor[(x + i) % 3].cmp(&factor[(y + i) % 3]) {
+                        std::cmp::Ordering::Equal => {}
+                        ord => return ord,
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            for &s in &sa {
+                output.push(factor[(s + 2) % 3]);
+            }
+            continue;
+        }
+
+        // Build suffix array using SA-IS on doubled string.
+        // Circular prefix-doubling was tried (commit 21052a0) but benchmarked
+        // 2.5-3× slower due to O(n log n) vs SA-IS's O(n).
+        let sa = build_suffix_array(factor);
+
+        // Extract last column of sorted rotation matrix
+        for &sa_val in &sa {
+            if sa_val == 0 {
+                output.push(factor[len - 1]);
+            } else {
+                output.push(factor[sa_val - 1]);
+            }
+        }
+    }
+
+    Some((output, factor_lengths))
+}
+
+/// Bijective BWT inverse transform.
+///
+/// Given the transformed data and the factor lengths from encode_bijective,
+/// reconstructs the original input by inverting each factor's BWT independently.
+///
+/// Key insight: each factor is a Lyndon word, which by definition is the
+/// lexicographically smallest rotation of itself. In the sorted rotation matrix,
+/// the original string is always at row 0, so `primary_index = 0` for every factor.
+///
+/// Optimized: pre-allocates a single output buffer and reuses a single LF table
+/// across all factors, reducing heap allocations from 2k to 2 (where k = factor count).
+pub fn decode_bijective(bwt: &[u8], factor_lengths: &[usize]) -> PzResult<Vec<u8>> {
+    if bwt.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let total: usize = factor_lengths.iter().sum();
+    if total != bwt.len() {
+        return Err(PzError::InvalidInput);
+    }
+
+    let mut output = vec![0u8; total];
+    decode_bijective_into(bwt, factor_lengths, &mut output)?;
+    Ok(output)
+}
+
+/// Perform the bijective BWT inverse into a pre-allocated output buffer.
+///
+/// Returns the number of bytes written.
+pub fn decode_bijective_to_buf(
+    bwt: &[u8],
+    factor_lengths: &[usize],
+    output: &mut [u8],
+) -> PzResult<usize> {
+    if bwt.is_empty() {
+        return Ok(0);
+    }
+
+    let total: usize = factor_lengths.iter().sum();
+    if total != bwt.len() {
+        return Err(PzError::InvalidInput);
+    }
+    if output.len() < total {
+        return Err(PzError::BufferTooSmall);
+    }
+
+    decode_bijective_into(bwt, factor_lengths, &mut output[..total])?;
+    Ok(total)
+}
+
+/// Minimum total size before enabling parallel factor decode.
+const PARALLEL_DECODE_THRESHOLD: usize = 32 * 1024;
+
+/// Core bijective decode: inline LF-mapping with buffer reuse (sequential).
+fn decode_bijective_into(bwt: &[u8], factor_lengths: &[usize], output: &mut [u8]) -> PzResult<()> {
+    let max_flen = factor_lengths.iter().copied().max().unwrap_or(0);
+    let mut lf = vec![0u32; max_flen];
+    let mut offset = 0;
+
+    for &flen in factor_lengths {
+        decode_single_factor(
+            &bwt[offset..offset + flen],
+            &mut output[offset..offset + flen],
+            &mut lf,
+        );
+        offset += flen;
+    }
+
+    Ok(())
+}
+
+/// Decode a single Lyndon factor's BWT using inline LF-mapping.
+///
+/// `lf_buf` must have length >= `factor_bwt.len()`.
+fn decode_single_factor(factor_bwt: &[u8], out: &mut [u8], lf_buf: &mut [u32]) {
+    let flen = factor_bwt.len();
+    debug_assert_eq!(out.len(), flen);
+
+    if flen == 1 {
+        out[0] = factor_bwt[0];
+        return;
+    }
+
+    // Build LF-mapping with primary_index = 0 (Lyndon property).
+    let mut counts = [0u32; 256];
+    for &byte in factor_bwt {
+        counts[byte as usize] += 1;
+    }
+
+    let mut cumul = [0u32; 256];
+    let mut sum = 0u32;
+    for (c, &count) in counts.iter().enumerate() {
+        cumul[c] = sum;
+        sum += count;
+    }
+
+    let lf = &mut lf_buf[..flen];
+    let mut running = cumul;
+    for (i, &byte) in factor_bwt.iter().enumerate() {
+        lf[i] = running[byte as usize];
+        running[byte as usize] += 1;
+    }
+
+    let mut idx: usize = 0;
+    for i in (0..flen).rev() {
+        out[i] = factor_bwt[idx];
+        idx = lf[idx] as usize;
+    }
+}
+
+/// Bijective BWT inverse with factor-parallel decoding.
+///
+/// When multiple non-trivial factors exist and the total size justifies
+/// the thread overhead, factors are decoded in parallel using scoped threads.
+/// Each thread gets its own LF buffer and a non-overlapping output slice.
+pub fn decode_bijective_parallel(
+    bwt: &[u8],
+    factor_lengths: &[usize],
+    num_threads: usize,
+) -> PzResult<Vec<u8>> {
+    if bwt.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let total: usize = factor_lengths.iter().sum();
+    if total != bwt.len() {
+        return Err(PzError::InvalidInput);
+    }
+
+    // Fall back to sequential for small inputs or single factors.
+    let non_trivial = factor_lengths.iter().filter(|&&l| l > 1).count();
+    if non_trivial <= 1 || total < PARALLEL_DECODE_THRESHOLD || num_threads <= 1 {
+        let mut output = vec![0u8; total];
+        decode_bijective_into(bwt, factor_lengths, &mut output)?;
+        return Ok(output);
+    }
+
+    let mut output = vec![0u8; total];
+
+    // Build (offset, length) list for each factor.
+    let mut factor_ranges: Vec<(usize, usize)> = Vec::with_capacity(factor_lengths.len());
+    let mut off = 0usize;
+    for &fl in factor_lengths {
+        factor_ranges.push((off, fl));
+        off += fl;
+    }
+
+    // Split factors into chunks for each thread.
+    let chunk_size = factor_ranges.len().div_ceil(num_threads);
+
+    std::thread::scope(|scope| {
+        let mut remaining_out = output.as_mut_slice();
+        let mut remaining_start = 0usize;
+        let mut handles = Vec::new();
+
+        for chunk in factor_ranges.chunks(chunk_size) {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            // Compute the byte range this chunk covers.
+            let chunk_start = chunk[0].0;
+            let chunk_end = chunk.last().map(|&(o, l)| o + l).unwrap();
+            let chunk_byte_len = chunk_end - chunk_start;
+
+            // Split off this chunk's output slice (safe, non-overlapping).
+            let skip = chunk_start - remaining_start;
+            let (_, rest) = remaining_out.split_at_mut(skip);
+            let (chunk_out, rest) = rest.split_at_mut(chunk_byte_len);
+            remaining_out = rest;
+            remaining_start = chunk_end;
+
+            let bwt_ref = bwt;
+            let handle = scope.spawn(move || {
+                let max_flen = chunk.iter().map(|&(_, l)| l).max().unwrap_or(0);
+                let mut lf_buf = vec![0u32; max_flen];
+                let mut local_off = 0usize;
+
+                for &(global_off, flen) in chunk {
+                    let factor_bwt = &bwt_ref[global_off..global_off + flen];
+                    let out_slice = &mut chunk_out[local_off..local_off + flen];
+                    decode_single_factor(factor_bwt, out_slice, &mut lf_buf);
+                    local_off += flen;
+                }
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,5 +1179,484 @@ mod tests {
         let result = encode(&input).unwrap();
         let decoded = decode(&result.data, result.primary_index).unwrap();
         assert_eq!(decoded, input);
+    }
+
+    // --- Lyndon factorization tests ---
+
+    #[test]
+    fn test_lyndon_factorize_basic() {
+        // "abab" → factors: "ab", "ab" (non-increasing Lyndon words)
+        let factors = lyndon_factorize(b"abab");
+        let words: Vec<&[u8]> = factors.iter().map(|&(s, l)| &b"abab"[s..s + l]).collect();
+        assert_eq!(words, vec![b"ab" as &[u8], b"ab"]);
+    }
+
+    #[test]
+    fn test_lyndon_factorize_single_char() {
+        let factors = lyndon_factorize(b"aaaa");
+        // Each 'a' is its own Lyndon word (can't be further decomposed)
+        assert_eq!(factors.len(), 4);
+        for &(_, len) in &factors {
+            assert_eq!(len, 1);
+        }
+    }
+
+    #[test]
+    fn test_lyndon_factorize_descending() {
+        // "dcba" → each char is a factor (strictly descending = all length 1)
+        let factors = lyndon_factorize(b"dcba");
+        assert_eq!(factors.len(), 4);
+    }
+
+    #[test]
+    fn test_lyndon_factorize_lyndon_word() {
+        // "abc" is itself a Lyndon word (lex smallest rotation)
+        let factors = lyndon_factorize(b"abc");
+        assert_eq!(factors, vec![(0, 3)]);
+    }
+
+    #[test]
+    fn test_lyndon_factorize_banana() {
+        let input = b"banana";
+        let factors = lyndon_factorize(input);
+        // Verify: concatenation of factors equals input
+        let mut reconstructed = Vec::new();
+        for &(start, len) in &factors {
+            reconstructed.extend_from_slice(&input[start..start + len]);
+        }
+        assert_eq!(reconstructed, input);
+
+        // Verify non-increasing property
+        for i in 1..factors.len() {
+            let prev = &input[factors[i - 1].0..factors[i - 1].0 + factors[i - 1].1];
+            let curr = &input[factors[i].0..factors[i].0 + factors[i].1];
+            assert!(
+                prev >= curr,
+                "Lyndon factors not non-increasing: {:?} < {:?}",
+                prev,
+                curr
+            );
+        }
+    }
+
+    // --- Bijective BWT tests ---
+
+    #[test]
+    fn test_bijective_bwt_empty() {
+        assert!(encode_bijective(&[]).is_none());
+    }
+
+    #[test]
+    fn test_bijective_bwt_single() {
+        let (data, factors) = encode_bijective(b"a").unwrap();
+        assert_eq!(data, vec![b'a']);
+        assert_eq!(factors, vec![1]);
+        let decoded = decode_bijective(&data, &factors).unwrap();
+        assert_eq!(decoded, b"a");
+    }
+
+    #[test]
+    fn test_bijective_bwt_round_trip_simple() {
+        let test_cases: &[&[u8]] = &[b"ab", b"abc", b"abcabc", b"hello", b"banana"];
+        for input in test_cases {
+            let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
+            let decoded = decode_bijective(&bwt_data, &factor_lens).unwrap();
+            assert_eq!(
+                &decoded,
+                *input,
+                "Bijective BWT round-trip failed on {:?}",
+                std::str::from_utf8(input).unwrap_or("<binary>")
+            );
+        }
+    }
+
+    #[test]
+    fn test_bijective_bwt_round_trip_all_same() {
+        let input = vec![b'x'; 20];
+        let (bwt_data, factor_lens) = encode_bijective(&input).unwrap();
+        let decoded = decode_bijective(&bwt_data, &factor_lens).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_bijective_bwt_round_trip_longer() {
+        let input = b"the quick brown fox jumps over the lazy dog";
+        let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
+        let decoded = decode_bijective(&bwt_data, &factor_lens).unwrap();
+        assert_eq!(&decoded, &input[..]);
+    }
+
+    #[test]
+    fn test_bijective_bwt_round_trip_binary() {
+        let input: Vec<u8> = (0..=255).collect();
+        let (bwt_data, factor_lens) = encode_bijective(&input).unwrap();
+        let decoded = decode_bijective(&bwt_data, &factor_lens).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_bijective_bwt_round_trip_repeating() {
+        let input = b"abababababab";
+        let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
+        let decoded = decode_bijective(&bwt_data, &factor_lens).unwrap();
+        assert_eq!(&decoded, &input[..]);
+    }
+
+    #[test]
+    fn test_bijective_decode_to_buf() {
+        let input = b"the quick brown fox jumps over the lazy dog";
+        let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
+        let mut buf = vec![0u8; 100];
+        let n = decode_bijective_to_buf(&bwt_data, &factor_lens, &mut buf).unwrap();
+        assert_eq!(&buf[..n], &input[..]);
+    }
+
+    #[test]
+    fn test_bijective_decode_to_buf_too_small() {
+        let input = b"hello";
+        let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
+        let mut buf = vec![0u8; 2];
+        assert_eq!(
+            decode_bijective_to_buf(&bwt_data, &factor_lens, &mut buf),
+            Err(PzError::BufferTooSmall)
+        );
+    }
+
+    #[test]
+    fn test_circular_sa_produces_valid_bwt() {
+        // The circular prefix-doubling SA must produce a valid BWT that
+        // round-trips correctly. For inputs with distinct rotations, it must
+        // also match the doubled-string SA-IS exactly.
+        let test_cases: Vec<&[u8]> = vec![
+            b"banana",
+            b"abcabc",
+            b"abcdefghijklmnopqrstuvwxyz",
+            b"the quick brown fox",
+            b"abracadabra",
+            b"mississippi",
+            b"ab",
+            b"abc",
+            b"hello world hello world",
+        ];
+        for input in test_cases {
+            let sa = build_circular_suffix_array(input);
+            let n = input.len();
+
+            // Extract BWT from circular SA
+            let mut bwt_data = Vec::with_capacity(n);
+            let mut primary_index = 0u32;
+            for (i, &sa_val) in sa.iter().enumerate() {
+                if sa_val == 0 {
+                    primary_index = i as u32;
+                    bwt_data.push(input[n - 1]);
+                } else {
+                    bwt_data.push(input[sa_val - 1]);
+                }
+            }
+
+            // Round-trip: decode must recover original
+            let decoded = decode(&bwt_data, primary_index).unwrap();
+            assert_eq!(
+                decoded,
+                input,
+                "Circular SA BWT round-trip failed on {:?}",
+                std::str::from_utf8(input).unwrap_or("<binary>")
+            );
+        }
+    }
+
+    #[test]
+    fn test_circular_sa_matches_on_distinct_rotations() {
+        // For inputs where all rotations are distinct, the circular SA
+        // must be identical to the doubled-string SA-IS.
+        let input: Vec<u8> = (0..=255).collect();
+        let sa_doubled = build_suffix_array(&input);
+        let sa_circular = build_circular_suffix_array(&input);
+        assert_eq!(
+            sa_doubled, sa_circular,
+            "SA mismatch on all-bytes input (all rotations distinct)"
+        );
+    }
+
+    #[test]
+    fn test_bijective_parallel_decode_matches_sequential() {
+        // Parallel decode must produce identical results to sequential decode.
+        let test_cases: &[&[u8]] = &[
+            b"the quick brown fox jumps over the lazy dog",
+            b"abracadabra abracadabra abracadabra",
+            b"hello world hello world hello world hello world",
+        ];
+        for input in test_cases {
+            let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
+            let sequential = decode_bijective(&bwt_data, &factor_lens).unwrap();
+            let parallel = decode_bijective_parallel(&bwt_data, &factor_lens, 4).unwrap();
+            assert_eq!(
+                sequential,
+                parallel,
+                "Parallel decode differs from sequential on {:?}",
+                std::str::from_utf8(input).unwrap_or("<binary>")
+            );
+            assert_eq!(&sequential, *input);
+        }
+    }
+
+    #[test]
+    fn test_bijective_parallel_decode_large() {
+        // Test parallel decode on data large enough to trigger parallelism.
+        let mut input = Vec::new();
+        for _ in 0..200 {
+            input.extend_from_slice(b"The quick brown fox jumps over the lazy dog. ");
+        }
+        let (bwt_data, factor_lens) = encode_bijective(&input).unwrap();
+        let decoded = decode_bijective_parallel(&bwt_data, &factor_lens, 4).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_bijective_small_factors() {
+        // Inputs that produce factors of various small lengths
+        let test_cases: &[&[u8]] = &[
+            b"dcba",   // 4 single-char factors (descending)
+            b"ab",     // one len-2 factor
+            b"abc",    // one len-3 factor
+            b"abcba",  // "abc" (len 3) + "b" (len 1) + "a" (len 1)
+            b"abd",    // one len-3 factor
+            b"zy",     // one len-2 factor (z < y? no, z > y, so two len-1 factors)
+            b"yz",     // one len-2 factor (y < z, Lyndon word)
+            b"abcabc", // "abcabc" or "abc","abc" — len-3 factors
+            b"ba",     // two len-1 factors (descending)
+            b"cba",    // three len-1 factors (descending)
+        ];
+        for input in test_cases {
+            let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
+            let decoded = decode_bijective(&bwt_data, &factor_lens).unwrap();
+            assert_eq!(
+                &decoded,
+                *input,
+                "Small factor round-trip failed on {:?}",
+                std::str::from_utf8(input).unwrap_or("<binary>")
+            );
+
+            // Verify factor lengths match expectations
+            let total: usize = factor_lens.iter().sum();
+            assert_eq!(total, input.len());
+        }
+    }
+
+    #[test]
+    fn test_bijective_vs_standard_compression() {
+        // Compare bijective vs standard BWT through MTF→RLE→FSE pipeline
+        // and report compression ratios
+        use crate::{fse, mtf, rle};
+
+        println!("\n=== Bijective BWT vs Standard BWT Compression Comparison ===\n");
+        println!(
+            "{:<30} {:>8} {:>8} {:>8} {:>8}",
+            "Input", "Std BWT", "Bij BWT", "Std Full", "Bij Full"
+        );
+        println!("{:-<30} {:->8} {:->8} {:->8} {:->8}", "", "", "", "", "");
+
+        let test_cases: Vec<(&str, Vec<u8>)> = vec![
+            ("zeros_100", vec![0u8; 100]),
+            ("all_same_1000", vec![b'a'; 1000]),
+            (
+                "repeating_text",
+                b"Hello, World! "
+                    .iter()
+                    .cycle()
+                    .take(1024)
+                    .copied()
+                    .collect(),
+            ),
+            (
+                "abracadabra_x100",
+                b"abracadabra ".iter().cycle().take(1200).copied().collect(),
+            ),
+            ("binary_256", (0..=255u8).collect()),
+            ("sawtooth", (0..1024u16).map(|i| (i % 64) as u8).collect()),
+        ];
+
+        for (name, input) in &test_cases {
+            // Standard BWT pipeline
+            let std_result = encode(input).unwrap();
+            let std_mtf = mtf::encode(&std_result.data);
+            let std_rle = rle::encode(&std_mtf);
+            let std_fse = fse::encode(&std_rle);
+
+            // Bijective BWT pipeline
+            let (bij_data, _bij_factors) = encode_bijective(input).unwrap();
+            let bij_mtf = mtf::encode(&bij_data);
+            let bij_rle = rle::encode(&bij_mtf);
+            let bij_fse = fse::encode(&bij_rle);
+
+            // Count runs in BWT output (clustering metric)
+            fn count_runs(data: &[u8]) -> usize {
+                if data.is_empty() {
+                    return 0;
+                }
+                let mut runs = 1;
+                for i in 1..data.len() {
+                    if data[i] != data[i - 1] {
+                        runs += 1;
+                    }
+                }
+                runs
+            }
+
+            let std_runs = count_runs(&std_result.data);
+            let bij_runs = count_runs(&bij_data);
+
+            println!(
+                "{:<30} {:>5}r/{:>4}B {:>5}r/{:>4}B {:>8}B {:>8}B",
+                format!("{name} ({}B)", input.len()),
+                std_runs,
+                std_result.data.len(),
+                bij_runs,
+                bij_data.len(),
+                std_fse.len(),
+                bij_fse.len(),
+            );
+        }
+
+        // Canterbury corpus — with timing
+        let cantrbry_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/cantrbry");
+        if cantrbry_dir.exists() {
+            println!("\n--- Canterbury Corpus (compression ratio) ---");
+            println!(
+                "{:<25} {:>8} {:>8} {:>8} {:>8} {:>7}",
+                "File", "Std Runs", "Bij Runs", "Std Size", "Bij Size", "Delta%"
+            );
+            println!(
+                "{:-<25} {:->8} {:->8} {:->8} {:->8} {:->7}",
+                "", "", "", "", "", ""
+            );
+
+            let files = [
+                "alice29.txt",
+                "asyoulik.txt",
+                "cp.html",
+                "fields.c",
+                "grammar.lsp",
+                "xargs.1",
+            ];
+
+            // First pass: compression ratios
+            for filename in &files {
+                let path = cantrbry_dir.join(filename);
+                if let Ok(data) = std::fs::read(&path) {
+                    let input = if data.len() > 65536 {
+                        &data[..65536]
+                    } else {
+                        &data
+                    };
+
+                    let std_result = encode(input).unwrap();
+                    let std_mtf = mtf::encode(&std_result.data);
+                    let std_rle = rle::encode(&std_mtf);
+                    let std_fse = fse::encode(&std_rle);
+
+                    let (bij_data, _) = encode_bijective(input).unwrap();
+                    let bij_mtf = mtf::encode(&bij_data);
+                    let bij_rle = rle::encode(&bij_mtf);
+                    let bij_fse = fse::encode(&bij_rle);
+
+                    fn count_runs2(data: &[u8]) -> usize {
+                        if data.is_empty() {
+                            return 0;
+                        }
+                        data.windows(2).filter(|w| w[0] != w[1]).count() + 1
+                    }
+
+                    let std_runs = count_runs2(&std_result.data);
+                    let bij_runs = count_runs2(&bij_data);
+                    let delta_pct = (bij_fse.len() as f64 / std_fse.len() as f64 - 1.0) * 100.0;
+
+                    println!(
+                        "{:<25} {:>8} {:>8} {:>8} {:>8} {:>+6.1}%",
+                        format!("{filename} ({}B)", input.len()),
+                        std_runs,
+                        bij_runs,
+                        std_fse.len(),
+                        bij_fse.len(),
+                        delta_pct,
+                    );
+                }
+            }
+
+            // Second pass: timing (encode + decode, 3 iterations, report median-ish)
+            println!("\n--- Canterbury Corpus (timing) ---");
+            println!(
+                "{:<25} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10}",
+                "File", "Std Enc", "Bij Enc", "Std Dec", "Bij Dec", "Factors", "Avg Flen"
+            );
+            println!(
+                "{:-<25} {:->10} {:->10} {:->10} {:->10} {:->8} {:->10}",
+                "", "", "", "", "", "", ""
+            );
+
+            for filename in &files {
+                let path = cantrbry_dir.join(filename);
+                if let Ok(data) = std::fs::read(&path) {
+                    let input = if data.len() > 65536 {
+                        &data[..65536]
+                    } else {
+                        &data
+                    };
+
+                    // Warm up + measure standard BWT encode (3 runs, take last)
+                    let mut std_enc_us = 0u128;
+                    let mut std_result = None;
+                    for _ in 0..3 {
+                        let t0 = std::time::Instant::now();
+                        std_result = Some(encode(input).unwrap());
+                        std_enc_us = t0.elapsed().as_micros();
+                    }
+                    let std_result = std_result.unwrap();
+
+                    // Measure standard BWT decode
+                    let mut std_dec_us = 0u128;
+                    for _ in 0..3 {
+                        let t0 = std::time::Instant::now();
+                        let _ = decode(&std_result.data, std_result.primary_index).unwrap();
+                        std_dec_us = t0.elapsed().as_micros();
+                    }
+
+                    // Measure bijective BWT encode
+                    let mut bij_enc_us = 0u128;
+                    let mut bij_result = None;
+                    for _ in 0..3 {
+                        let t0 = std::time::Instant::now();
+                        bij_result = Some(encode_bijective(input).unwrap());
+                        bij_enc_us = t0.elapsed().as_micros();
+                    }
+                    let (bij_data, bij_factors) = bij_result.unwrap();
+
+                    // Measure bijective BWT decode
+                    let mut bij_dec_us = 0u128;
+                    for _ in 0..3 {
+                        let t0 = std::time::Instant::now();
+                        let _ = decode_bijective(&bij_data, &bij_factors).unwrap();
+                        bij_dec_us = t0.elapsed().as_micros();
+                    }
+
+                    let num_factors = bij_factors.len();
+                    let avg_flen = input.len() as f64 / num_factors as f64;
+
+                    println!(
+                        "{:<25} {:>8}us {:>8}us {:>8}us {:>8}us {:>8} {:>9.1}",
+                        format!("{filename} ({}B)", input.len()),
+                        std_enc_us,
+                        bij_enc_us,
+                        std_dec_us,
+                        bij_dec_us,
+                        num_factors,
+                        avg_flen,
+                    );
+                }
+            }
+        } else {
+            println!("\n(Canterbury corpus not extracted — skipping)");
+        }
     }
 }
