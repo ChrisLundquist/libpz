@@ -6,12 +6,11 @@ use crate::mtf;
 use crate::rle;
 use crate::{PzError, PzResult};
 
-use super::demux::LzDemuxer;
+use super::demux::{demuxer_for_pipeline, LzDemuxer};
 use super::stages::*;
 #[cfg(any(feature = "opencl", feature = "webgpu"))]
 use super::Backend;
-use super::CompressOptions;
-use super::Pipeline;
+use super::{resolve_max_match_len, CompressOptions, Pipeline};
 
 /// Compress a single block using the appropriate pipeline (no container header).
 pub(crate) fn compress_block(
@@ -19,12 +18,25 @@ pub(crate) fn compress_block(
     pipeline: Pipeline,
     options: &CompressOptions,
 ) -> PzResult<Vec<u8>> {
+    // Resolve max match length for this pipeline (Deflate=258, others=u16::MAX).
+    // Clone options only when we need to override the default.
+    let resolved;
+    let opts = if options.max_match_len.is_none() && demuxer_for_pipeline(pipeline).is_some() {
+        resolved = CompressOptions {
+            max_match_len: Some(resolve_max_match_len(pipeline, options)),
+            ..options.clone()
+        };
+        &resolved
+    } else {
+        options
+    };
+
     match pipeline {
-        Pipeline::Deflate => compress_block_deflate(input, options),
-        Pipeline::Bw => compress_block_bw(input, options),
-        Pipeline::Bbw => compress_block_bbw(input, options),
-        Pipeline::Lzr => compress_block_lzr(input, options),
-        Pipeline::Lzf => compress_block_lzf(input, options),
+        Pipeline::Deflate => compress_block_deflate(input, opts),
+        Pipeline::Bw => compress_block_bw(input, opts),
+        Pipeline::Bbw => compress_block_bbw(input, opts),
+        Pipeline::Lzr => compress_block_lzr(input, opts),
+        Pipeline::Lzf => compress_block_lzf(input, opts),
         Pipeline::LzssR => compress_block_lzssr(input),
         Pipeline::Lz78R => compress_block_lz78r(input),
     }

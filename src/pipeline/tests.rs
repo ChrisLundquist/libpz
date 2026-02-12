@@ -1197,6 +1197,124 @@ fn test_trial_selection_includes_experimental() {
     let _pipeline = select_pipeline_trial(&input, &opts, 2048);
 }
 
+// --- Extended match length tests ---
+
+/// Verify Lzr pipeline benefits from extended match lengths on repetitive data.
+#[test]
+fn test_lzr_extended_match_length() {
+    let input = vec![0xAAu8; 100_000];
+
+    // Deflate should use 258-byte max matches
+    let deflate_compressed = compress(&input, Pipeline::Deflate).unwrap();
+
+    // Lzr should use extended matches (u16::MAX) and compress better
+    let lzr_compressed = compress(&input, Pipeline::Lzr).unwrap();
+
+    // Both must decompress correctly
+    let deflate_decompressed = decompress(&deflate_compressed).unwrap();
+    let lzr_decompressed = decompress(&lzr_compressed).unwrap();
+    assert_eq!(deflate_decompressed, input);
+    assert_eq!(lzr_decompressed, input);
+
+    // Lzr with extended matches should produce smaller output on highly
+    // repetitive data (fewer matches needed = fewer tokens = better ratio)
+    assert!(
+        lzr_compressed.len() < deflate_compressed.len(),
+        "Lzr ({} bytes) should compress better than Deflate ({} bytes) on repetitive data",
+        lzr_compressed.len(),
+        deflate_compressed.len()
+    );
+}
+
+/// Verify Lzf pipeline benefits from extended match lengths on repetitive data.
+#[test]
+fn test_lzf_extended_match_length() {
+    let input = vec![0xBBu8; 100_000];
+
+    let deflate_compressed = compress(&input, Pipeline::Deflate).unwrap();
+    let lzf_compressed = compress(&input, Pipeline::Lzf).unwrap();
+
+    // Both must decompress correctly
+    assert_eq!(decompress(&deflate_compressed).unwrap(), input);
+    assert_eq!(decompress(&lzf_compressed).unwrap(), input);
+
+    // Lzf with extended matches should produce smaller output
+    assert!(
+        lzf_compressed.len() < deflate_compressed.len(),
+        "Lzf ({} bytes) should compress better than Deflate ({} bytes) on repetitive data",
+        lzf_compressed.len(),
+        deflate_compressed.len()
+    );
+}
+
+/// Verify the max_match_len option is respected when explicitly set.
+#[test]
+fn test_explicit_max_match_len_option() {
+    use crate::lz77;
+
+    let input = vec![0xCCu8; 100_000];
+
+    // Force Lzr to use Deflate-style 258 limit
+    let opts_limited = CompressOptions {
+        max_match_len: Some(lz77::DEFLATE_MAX_MATCH),
+        threads: 1,
+        ..Default::default()
+    };
+    let limited = compress_with_options(&input, Pipeline::Lzr, &opts_limited).unwrap();
+
+    // Use default (extended) limit
+    let opts_extended = CompressOptions {
+        threads: 1,
+        ..Default::default()
+    };
+    let extended = compress_with_options(&input, Pipeline::Lzr, &opts_extended).unwrap();
+
+    // Both must decompress correctly
+    assert_eq!(decompress(&limited).unwrap(), input);
+    assert_eq!(decompress(&extended).unwrap(), input);
+
+    // Extended should compress better on highly repetitive data
+    assert!(
+        extended.len() < limited.len(),
+        "extended ({} bytes) should be smaller than limited ({} bytes)",
+        extended.len(),
+        limited.len()
+    );
+}
+
+/// Verify extended matches round-trip with various data patterns.
+#[test]
+fn test_extended_match_round_trip_patterns() {
+    let patterns: Vec<(&str, Vec<u8>)> = vec![
+        ("all_same", vec![0xDD; 50_000]),
+        (
+            "repeating_short",
+            b"abc".iter().cycle().take(50_000).copied().collect(),
+        ),
+        (
+            "repeating_long",
+            b"The quick brown fox jumps over the lazy dog. "
+                .iter()
+                .cycle()
+                .take(50_000)
+                .copied()
+                .collect(),
+        ),
+    ];
+
+    for (name, input) in &patterns {
+        for pipeline in [Pipeline::Lzr, Pipeline::Lzf] {
+            let compressed = compress(input, pipeline).unwrap();
+            let decompressed = decompress(&compressed).unwrap();
+            assert_eq!(
+                &decompressed, input,
+                "{:?} round-trip failed for pattern '{}'",
+                pipeline, name
+            );
+        }
+    }
+}
+
 #[cfg(feature = "webgpu")]
 mod gpu_batched_tests {
     use super::*;

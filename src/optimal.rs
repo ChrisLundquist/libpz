@@ -289,10 +289,7 @@ pub fn compress_optimal(input: &[u8]) -> PzResult<Vec<u8>> {
 }
 
 /// Like `compress_optimal` but with a caller-specified max match length.
-pub(crate) fn compress_optimal_with_limit(
-    input: &[u8],
-    max_match_len: u16,
-) -> PzResult<Vec<u8>> {
+pub(crate) fn compress_optimal_with_limit(input: &[u8], max_match_len: u16) -> PzResult<Vec<u8>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
