@@ -760,6 +760,22 @@ fn fse_decode_interleaved(
         return Err(PzError::InvalidInput);
     }
 
+    // Fast path: 4-way batched decode.
+    if num_states == 4 {
+        let bitstreams: [&[u8]; 4] = [&streams[0].0, &streams[1].0, &streams[2].0, &streams[3].0];
+        let initial_states: [u16; 4] = [streams[0].1, streams[1].1, streams[2].1, streams[3].1];
+        return crate::simd::fse_decode_4way(
+            &bitstreams,
+            &initial_states,
+            &table.decode_table,
+            table.table_size,
+            original_len,
+        )
+        .ok_or(PzError::InvalidInput);
+    }
+
+    // Generic N-way path.
+
     // Initialize per-stream readers and states.
     let mut readers: Vec<BitReader> = streams
         .iter()
