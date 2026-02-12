@@ -688,12 +688,40 @@ fn bench_lz77_webgpu(c: &mut Criterion) {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
+        // GPU lazy matching (default — 3-pass with lazy resolution)
         let eng = engine.clone();
         group.bench_with_input(
-            BenchmarkId::new("compress_webgpu_hash", size),
+            BenchmarkId::new("compress_webgpu_lazy", size),
             &data,
             move |b, data| {
                 b.iter(|| eng.lz77_compress(data).unwrap());
+            },
+        );
+
+        // GPU greedy matching (original 2-pass, for comparison)
+        let eng2 = engine.clone();
+        group.bench_with_input(
+            BenchmarkId::new("compress_webgpu_greedy", size),
+            &data,
+            move |b, data| {
+                b.iter(|| {
+                    let matches = eng2.find_matches_greedy(data).unwrap();
+                    let mut out =
+                        Vec::with_capacity(matches.len() * pz::lz77::Match::SERIALIZED_SIZE);
+                    for m in &matches {
+                        out.extend_from_slice(&m.to_bytes());
+                    }
+                    out
+                });
+            },
+        );
+
+        // CPU lazy matching (baseline)
+        group.bench_with_input(
+            BenchmarkId::new("compress_cpu_lazy", size),
+            &data,
+            |b, data| {
+                b.iter(|| pz::lz77::compress_lazy(data).unwrap());
             },
         );
     }

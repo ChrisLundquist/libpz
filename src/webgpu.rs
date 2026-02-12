@@ -39,6 +39,9 @@ const LZ77_TOPK_KERNEL_SOURCE: &str = include_str!("../kernels/lz77_topk.wgsl");
 /// Embedded WGSL kernel source: hash-table-based LZ77 match finding.
 const LZ77_HASH_KERNEL_SOURCE: &str = include_str!("../kernels/lz77_hash.wgsl");
 
+/// Embedded WGSL kernel source: LZ77 match finding with lazy matching emulation.
+const LZ77_LAZY_KERNEL_SOURCE: &str = include_str!("../kernels/lz77_lazy.wgsl");
+
 /// Embedded WGSL kernel source: GPU rank assignment for BWT prefix-doubling.
 const BWT_RANK_KERNEL_SOURCE: &str = include_str!("../kernels/bwt_rank.wgsl");
 
@@ -135,6 +138,9 @@ pub struct WebGpuEngine {
     pipeline_lz77_topk: wgpu::ComputePipeline,
     pipeline_lz77_hash_build: wgpu::ComputePipeline,
     pipeline_lz77_hash_find: wgpu::ComputePipeline,
+    pipeline_lz77_lazy_build: wgpu::ComputePipeline,
+    pipeline_lz77_lazy_find: wgpu::ComputePipeline,
+    pipeline_lz77_lazy_resolve: wgpu::ComputePipeline,
     pipeline_rank_compare: wgpu::ComputePipeline,
     pipeline_prefix_sum_local: wgpu::ComputePipeline,
     pipeline_prefix_sum_propagate: wgpu::ComputePipeline,
@@ -159,6 +165,8 @@ pub struct WebGpuEngine {
     is_cpu: bool,
     /// Scan workgroup size (power of 2, capped at 256).
     scan_workgroup_size: usize,
+    /// Maximum storage buffer binding size in bytes (device limit).
+    max_buffer_size: u32,
     /// Whether profiling is enabled (timestamp queries).
     profiling: bool,
     /// Query set for timestamp profiling (begin + end).
@@ -222,6 +230,7 @@ impl WebGpuEngine {
         let limits = adapter.limits();
         let max_work_group_size = limits.max_compute_workgroup_size_x as usize;
         let max_workgroups_per_dim = limits.max_compute_workgroups_per_dimension;
+        let max_buffer_size = limits.max_storage_buffer_binding_size;
 
         // Request TIMESTAMP_QUERY when profiling is desired; fall back if unsupported.
         // profiling stays true regardless — we'll use CPU-side wall-clock timing as fallback.
@@ -255,6 +264,11 @@ impl WebGpuEngine {
         let lz77_hash_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("lz77_hash"),
             source: wgpu::ShaderSource::Wgsl(LZ77_HASH_KERNEL_SOURCE.into()),
+        });
+
+        let lz77_lazy_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("lz77_lazy"),
+            source: wgpu::ShaderSource::Wgsl(LZ77_LAZY_KERNEL_SOURCE.into()),
         });
 
         let bwt_rank_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -296,6 +310,12 @@ impl WebGpuEngine {
             make_pipeline("lz77_hash_build", &lz77_hash_module, "build_hash_table");
         let pipeline_lz77_hash_find =
             make_pipeline("lz77_hash_find", &lz77_hash_module, "find_matches");
+        let pipeline_lz77_lazy_build =
+            make_pipeline("lz77_lazy_build", &lz77_lazy_module, "build_hash_table");
+        let pipeline_lz77_lazy_find =
+            make_pipeline("lz77_lazy_find", &lz77_lazy_module, "find_matches");
+        let pipeline_lz77_lazy_resolve =
+            make_pipeline("lz77_lazy_resolve", &lz77_lazy_module, "resolve_lazy");
         let pipeline_rank_compare = make_pipeline("rank_compare", &bwt_rank_module, "rank_compare");
         let pipeline_prefix_sum_local =
             make_pipeline("prefix_sum_local", &bwt_rank_module, "prefix_sum_local");
@@ -363,6 +383,9 @@ impl WebGpuEngine {
             pipeline_lz77_topk,
             pipeline_lz77_hash_build,
             pipeline_lz77_hash_find,
+            pipeline_lz77_lazy_build,
+            pipeline_lz77_lazy_find,
+            pipeline_lz77_lazy_resolve,
             pipeline_rank_compare,
             pipeline_prefix_sum_local,
             pipeline_prefix_sum_propagate,
@@ -382,6 +405,7 @@ impl WebGpuEngine {
             max_workgroups_per_dim,
             is_cpu,
             scan_workgroup_size,
+            max_buffer_size,
             profiling,
             query_set,
             resolve_buf,
@@ -411,10 +435,17 @@ impl WebGpuEngine {
 
     /// Maximum input size (bytes) that fits in a single GPU dispatch.
     ///
-    /// With 2D dispatch tiling, the limit is `max^2 * workgroup_size`.
+    /// Bounded by both the 2D workgroup dispatch limit (`max^2 * workgroup_size`)
+    /// and the maximum storage buffer binding size (the LZ77 match output
+    /// buffer is `input_len * 12` bytes).
     pub fn max_dispatch_input_size(&self) -> usize {
-        let max = self.max_workgroups_per_dim as usize;
-        max * max * 64
+        let dispatch_limit = {
+            let max = self.max_workgroups_per_dim as usize;
+            max * max * 64
+        };
+        // GpuMatch is 12 bytes per position; buffer must fit in max_buffer_size.
+        let buffer_limit = self.max_buffer_size as usize / std::mem::size_of::<GpuMatch>();
+        dispatch_limit.min(buffer_limit)
     }
 
     /// Compute the X dispatch width in invocations for 2D tiling.
@@ -646,8 +677,22 @@ impl WebGpuEngine {
 
     // --- LZ77 Match Finding ---
 
-    /// Find LZ77 matches for the entire input using the GPU hash-table kernel.
+    /// Find LZ77 matches for the entire input using the GPU lazy matching kernel.
+    ///
+    /// Uses a 3-pass approach: hash table build, per-position greedy matching,
+    /// then parallel lazy resolution (demoting positions where the next position
+    /// has a longer match). This produces compression quality comparable to
+    /// CPU lazy matching while retaining full GPU parallelism.
     pub fn find_matches(&self, input: &[u8]) -> PzResult<Vec<Match>> {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.find_matches_lazy(input)
+    }
+
+    /// Find LZ77 matches using the original greedy hash-table kernel (no lazy).
+    pub fn find_matches_greedy(&self, input: &[u8]) -> PzResult<Vec<Match>> {
         if input.is_empty() {
             return Ok(Vec::new());
         }
@@ -777,6 +822,178 @@ impl WebGpuEngine {
             &output_buf,
             (input_len * std::mem::size_of::<GpuMatch>()) as u64,
         );
+        let gpu_matches: Vec<GpuMatch> = bytemuck::cast_slice(&raw).to_vec();
+
+        Ok(dedupe_gpu_matches(&gpu_matches, input))
+    }
+
+    /// Find LZ77 matches using the 3-pass lazy matching kernel.
+    ///
+    /// Pass 1: Build hash table (parallel hash insertion with atomics).
+    /// Pass 2: Find best match per position (greedy, parallel).
+    /// Pass 3: Lazy resolve — demote positions where pos+1 has a longer match.
+    fn find_matches_lazy(&self, input: &[u8]) -> PzResult<Vec<Match>> {
+        let input_len = input.len();
+        let padded = Self::pad_input_bytes(input);
+        let match_buf_size = (input_len * std::mem::size_of::<GpuMatch>()) as u64;
+
+        let input_buf =
+            self.create_buffer_init("lz77_lazy_input", &padded, wgpu::BufferUsages::STORAGE);
+
+        let workgroups = (input_len as u32).div_ceil(64);
+        let params = [input_len as u32, 0, 0, self.dispatch_width(workgroups, 64)];
+        let params_buf = self.create_buffer_init(
+            "lz77_lazy_params",
+            bytemuck::cast_slice(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
+        // Hash counts and table buffers (pass 1)
+        let hash_counts_buf = self.create_buffer_init(
+            "lazy_hash_counts",
+            &vec![0u8; HASH_TABLE_SIZE * 4],
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        let hash_table_buf = self.create_buffer(
+            "lazy_hash_table",
+            (HASH_TABLE_SIZE * HASH_BUCKET_CAP * 4) as u64,
+            wgpu::BufferUsages::STORAGE,
+        );
+
+        // Raw match output (pass 2 writes, pass 3 reads)
+        let raw_match_buf = self.create_buffer(
+            "lazy_raw_matches",
+            match_buf_size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        // Resolved match output (pass 3 writes)
+        let resolved_buf = self.create_buffer(
+            "lazy_resolved",
+            match_buf_size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        // --- Pass 1 bind group: build_hash_table ---
+        let build_bg_layout = self.pipeline_lz77_lazy_build.get_bind_group_layout(0);
+        let build_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lz77_lazy_build_bg"),
+            layout: &build_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: hash_counts_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: hash_table_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // --- Pass 2 bind group: find_matches ---
+        let find_bg_layout = self.pipeline_lz77_lazy_find.get_bind_group_layout(0);
+        let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lz77_lazy_find_bg"),
+            layout: &find_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: raw_match_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: hash_counts_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: hash_table_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // --- Pass 3 bind group: resolve_lazy ---
+        let resolve_bg_layout = self.pipeline_lz77_lazy_resolve.get_bind_group_layout(0);
+        let resolve_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lz77_lazy_resolve_bg"),
+            layout: &resolve_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: resolved_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: raw_match_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Submit all 3 passes in a single command encoder
+        let t0 = if self.profiling {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("lz77_lazy"),
+            });
+        self.record_dispatch(
+            &mut encoder,
+            &self.pipeline_lz77_lazy_build,
+            &build_bg,
+            workgroups,
+            "lz77_lazy_build",
+        )?;
+        self.record_dispatch(
+            &mut encoder,
+            &self.pipeline_lz77_lazy_find,
+            &find_bg,
+            workgroups,
+            "lz77_lazy_find",
+        )?;
+        self.record_dispatch(
+            &mut encoder,
+            &self.pipeline_lz77_lazy_resolve,
+            &resolve_bg,
+            workgroups,
+            "lz77_lazy_resolve",
+        )?;
+        self.queue.submit(Some(encoder.finish()));
+        if let Some(t0) = t0 {
+            self.device.poll(wgpu::Maintain::Wait);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[pz-gpu] lz77_lazy (build+find+resolve): {ms:.3} ms");
+        }
+
+        let raw = self.read_buffer(&resolved_buf, match_buf_size);
         let gpu_matches: Vec<GpuMatch> = bytemuck::cast_slice(&raw).to_vec();
 
         Ok(dedupe_gpu_matches(&gpu_matches, input))
@@ -2377,6 +2594,106 @@ mod tests {
         let compressed = engine.lz77_compress(input).unwrap();
         let decompressed = crate::lz77::decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lz77_lazy_round_trip_repeats() {
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+
+        let input = b"abcabcabcabcabcabc";
+        let compressed = engine.lz77_compress(input).unwrap();
+        let decompressed = crate::lz77::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lz77_lazy_round_trip_all_same() {
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+
+        let input = vec![b'x'; 500];
+        let compressed = engine.lz77_compress(&input).unwrap();
+        let decompressed = crate::lz77::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lz77_lazy_round_trip_large() {
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+
+        let pattern = b"Hello, World! This is a test pattern. ";
+        let mut input = Vec::new();
+        for _ in 0..200 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = engine.lz77_compress(&input).unwrap();
+        let decompressed = crate::lz77::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lz77_lazy_round_trip_binary() {
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+
+        let input: Vec<u8> = (0..=255).cycle().take(1024).collect();
+        let compressed = engine.lz77_compress(&input).unwrap();
+        let decompressed = crate::lz77::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lz77_lazy_improves_over_greedy() {
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+
+        // Repetitive text where lazy matching should produce fewer sequences
+        let pattern = b"the quick brown fox jumps over the lazy dog. ";
+        let mut input = Vec::new();
+        for _ in 0..50 {
+            input.extend_from_slice(pattern);
+        }
+
+        let lazy_compressed = engine.lz77_compress(&input).unwrap();
+        let greedy_compressed = {
+            let matches = engine.find_matches_greedy(&input).unwrap();
+            let mut out = Vec::with_capacity(matches.len() * Match::SERIALIZED_SIZE);
+            for m in &matches {
+                out.extend_from_slice(&m.to_bytes());
+            }
+            out
+        };
+
+        // Both should round-trip correctly
+        let lazy_dec = crate::lz77::decompress(&lazy_compressed).unwrap();
+        let greedy_dec = crate::lz77::decompress(&greedy_compressed).unwrap();
+        assert_eq!(lazy_dec, input);
+        assert_eq!(greedy_dec, input);
+
+        // Lazy should produce <= sequences than greedy (fewer = better)
+        let lazy_seqs = lazy_compressed.len() / Match::SERIALIZED_SIZE;
+        let greedy_seqs = greedy_compressed.len() / Match::SERIALIZED_SIZE;
+        assert!(
+            lazy_seqs <= greedy_seqs,
+            "lazy ({lazy_seqs}) should produce <= sequences than greedy ({greedy_seqs})"
+        );
     }
 
     #[test]
