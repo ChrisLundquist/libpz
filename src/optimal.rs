@@ -272,7 +272,7 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
 
 /// Compress input using optimal parsing with hash-chain match finding.
 ///
-/// Produces the same serialized `Match` format as `lz77::compress_hashchain`,
+/// Produces the same serialized `Match` format as `lz77::compress_lazy`,
 /// but selects matches via backward DP to minimize total encoding cost.
 /// Decompressible with `lz77::decompress()`.
 pub fn compress_optimal(input: &[u8]) -> PzResult<Vec<u8>> {
@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_optimal_vs_greedy_correctness() {
-        // Both greedy and optimal should produce correct output.
+        // Both lazy and optimal should produce correct output.
         // Optimal may use different match/literal decisions to minimize
         // total encoding cost after entropy coding.
         let pattern = b"abcdefg abcxyz abcdefg abcxyz ";
@@ -415,11 +415,11 @@ mod tests {
         for _ in 0..100 {
             input.extend_from_slice(pattern);
         }
-        let greedy = lz77::compress_hashchain(&input).unwrap();
+        let lazy = lz77::compress_lazy(&input).unwrap();
         let optimal = compress_optimal(&input).unwrap();
 
         // Both must decompress correctly
-        assert_eq!(lz77::decompress(&greedy).unwrap(), input);
+        assert_eq!(lz77::decompress(&lazy).unwrap(), input);
         assert_eq!(lz77::decompress(&optimal).unwrap(), input);
     }
 

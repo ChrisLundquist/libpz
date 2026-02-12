@@ -108,7 +108,7 @@ fn parse_args() -> Opts {
             }
             "-O" | "--optimal" => opts.parse_strategy = ParseStrategy::Optimal,
             "--lazy" => opts.parse_strategy = ParseStrategy::Lazy,
-            "--greedy" => opts.parse_strategy = ParseStrategy::Greedy,
+            "--greedy" => opts.parse_strategy = ParseStrategy::Lazy, // greedy removed; lazy is strictly better
             "-h" | "--help" => {
                 usage();
                 process::exit(0);

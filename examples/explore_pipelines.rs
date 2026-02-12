@@ -328,10 +328,8 @@ fn main() {
     #[allow(unused_mut)]
     let mut pz_configs: Vec<(Pipeline, ParseStrategy, usize, Backend)> = vec![
         // Single-threaded CPU variants
-        (Pipeline::Deflate, ParseStrategy::Greedy, 1, Backend::Cpu),
         (Pipeline::Deflate, ParseStrategy::Lazy, 1, Backend::Cpu),
         (Pipeline::Deflate, ParseStrategy::Optimal, 1, Backend::Cpu),
-        (Pipeline::Lza, ParseStrategy::Greedy, 1, Backend::Cpu),
         (Pipeline::Lza, ParseStrategy::Lazy, 1, Backend::Cpu),
         (Pipeline::Lza, ParseStrategy::Optimal, 1, Backend::Cpu),
         (Pipeline::Bw, ParseStrategy::Auto, 1, Backend::Cpu),

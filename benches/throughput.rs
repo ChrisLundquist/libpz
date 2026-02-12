@@ -225,7 +225,7 @@ fn bench_compress_gpu(c: &mut Criterion) {
         backend: Backend::OpenCl,
         threads: 1,
         block_size: 0,
-        parse_strategy: pz::pipeline::ParseStrategy::Greedy,
+        parse_strategy: pz::pipeline::ParseStrategy::Auto,
         opencl_engine: Some(engine),
     };
 
@@ -417,7 +417,7 @@ fn bench_compress_webgpu(c: &mut Criterion) {
         backend: Backend::WebGpu,
         threads: 1,
         block_size: 0,
-        parse_strategy: pz::pipeline::ParseStrategy::Greedy,
+        parse_strategy: pz::pipeline::ParseStrategy::Auto,
         #[cfg(feature = "opencl")]
         opencl_engine: None,
         webgpu_engine: Some(engine),

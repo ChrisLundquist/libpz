@@ -55,12 +55,10 @@ pub enum Backend {
 pub enum ParseStrategy {
     /// Auto: choose the best strategy based on backend and input size.
     /// - GPU backend + large input: GPU hash-table kernel
-    /// - CPU backend: lazy matching (best compression)
+    /// - CPU backend: lazy matching (best speed + compression)
     /// - Equivalent to Lazy on CPU, HashTable on GPU.
     #[default]
     Auto,
-    /// Greedy: hash-chain match finder, pick the longest match.
-    Greedy,
     /// Lazy: check if the next position has a longer match (gzip-style).
     Lazy,
     /// Optimal: backward DP to minimize total encoding cost.
@@ -1281,17 +1279,10 @@ fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResu
         }
     }
 
-    // CPU paths — use parallel match finding when threads > 1 and input is large
-    let num_threads = resolve_thread_count(options.threads);
+    // CPU paths — lazy is the default (fastest single-thread + best ratio).
+    // Multi-threading happens at the pipeline block level, not inside LZ77.
     match options.parse_strategy {
-        ParseStrategy::Auto | ParseStrategy::Lazy => {
-            if num_threads > 1 {
-                lz77::compress_lazy_parallel(input, num_threads)
-            } else {
-                lz77::compress_lazy(input)
-            }
-        }
-        ParseStrategy::Greedy => lz77::compress_hashchain(input),
+        ParseStrategy::Auto | ParseStrategy::Lazy => lz77::compress_lazy(input),
         ParseStrategy::Optimal => crate::optimal::compress_optimal(input),
     }
 }

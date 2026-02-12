@@ -636,7 +636,7 @@ impl OpenClEngine {
     /// GPU-accelerated LZ77 compression.
     ///
     /// Uses the GPU to find matches, deduplicates them, and serializes
-    /// to the same byte format as the CPU `lz77::compress()`.
+    /// to the same byte format as the CPU `lz77::compress_lazy()`.
     /// The output is decompressible by `lz77::decompress()`.
     pub fn lz77_compress(&self, input: &[u8], variant: KernelVariant) -> PzResult<Vec<u8>> {
         let matches = self.find_matches(input, variant)?;
