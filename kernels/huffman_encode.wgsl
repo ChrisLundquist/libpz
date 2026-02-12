@@ -58,16 +58,35 @@ fn write_codes(@builtin(global_invocation_id) gid: vec3<u32>) {
     let codeword = entry & 0x00FFFFFFu;
     let start_bit = bit_offsets[g];
 
-    // Write each bit of the codeword, MSB first
-    for (var i = 0u; i < bits; i = i + 1u) {
-        let bit_idx = (bits - 1u) - i; // MSB first
-        let bit_val = (codeword >> bit_idx) & 1u;
-        if (bit_val != 0u) {
-            let global_bit = start_bit + i;
-            let uint_idx = global_bit / 32u;
-            let bit_in_uint = 31u - (global_bit % 32u);
-            atomicOr(&wc_output[uint_idx], 1u << bit_in_uint);
-        }
+    if (bits == 0u) {
+        return;
+    }
+
+    // Write all bits of the codeword using at most 2 atomicOr ops.
+    // Bits are stored MSB-first: start_bit is the position of the MSB.
+    let end_bit = start_bit + bits - 1u;
+    let first_word = start_bit / 32u;
+    let last_word = end_bit / 32u;
+
+    // Position of MSB within the first u32 word (bit 31 = leftmost)
+    let first_shift = 31u - (start_bit % 32u);
+    // Reverse the codeword so MSB is at position `first_shift`
+    // codeword has `bits` valid bits in the low end, MSB at bit (bits-1)
+    let reversed = codeword << (first_shift - (bits - 1u));
+
+    if (first_word == last_word) {
+        // All bits fit in a single u32 word
+        atomicOr(&wc_output[first_word], reversed);
+    } else {
+        // Bits span two u32 words
+        let bits_in_first = first_shift + 1u;
+        // High part: top `bits_in_first` bits go into first_word
+        let high_mask = codeword >> (bits - bits_in_first);
+        atomicOr(&wc_output[first_word], high_mask);
+        // Low part: remaining bits go into last_word, aligned to MSB
+        let remaining = bits - bits_in_first;
+        let low_mask = (codeword << (32u - remaining)) & 0xFFFFFFFFu;
+        atomicOr(&wc_output[last_word], low_mask);
     }
 }
 
