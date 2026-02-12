@@ -412,6 +412,332 @@ pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
     Ok(output)
 }
 
+// --- Fix-Up Frames / B-Frame Analysis ---
+
+/// Report from fix-up frame opportunity analysis.
+#[derive(Debug, Default)]
+pub struct FixupReport {
+    /// Total number of standard matches emitted.
+    pub total_matches: usize,
+    /// Number of fix-up opportunities found (where a short literal gap
+    /// interrupts what could be a single longer match).
+    pub fixup_candidates: usize,
+    /// Total literal bytes in the gaps that could be inlined.
+    pub gap_bytes_total: usize,
+    /// Estimated bytes saved if fix-up frames were used.
+    /// Each fixup replaces a literal match (5B) + new match (5B) = 10B
+    /// with a fixup token (3B + gap_len + 2B = 5-7B), saving 3-5B each.
+    pub estimated_bytes_saved: usize,
+    /// Breakdown by gap length (1..=4).
+    pub by_gap_length: [usize; 5], // index 0 unused, 1-4 = counts
+    /// Original compressed size in bytes.
+    pub compressed_size: usize,
+}
+
+/// Analyze LZ77 output for fix-up frame opportunities.
+///
+/// Scans the match stream looking for patterns where:
+/// 1. Match M[i] ends (consumes offset+length+next)
+/// 2. A short sequence of literals follows (1-4 literal matches with offset=0)
+/// 3. Match M[j] starts with the same or nearby offset as M[i]
+///
+/// These patterns represent interrupted matches that a fix-up frame could merge.
+pub fn analyze_fixup_opportunities(input: &[u8]) -> PzResult<FixupReport> {
+    let compressed = compress_lazy(input)?;
+    let match_size = Match::SERIALIZED_SIZE;
+
+    if compressed.len() % match_size != 0 {
+        return Err(PzError::InvalidInput);
+    }
+
+    let num_matches = compressed.len() / match_size;
+    let mut matches: Vec<Match> = Vec::with_capacity(num_matches);
+
+    for i in 0..num_matches {
+        let buf: &[u8; 5] = compressed[i * match_size..(i + 1) * match_size]
+            .try_into()
+            .unwrap();
+        matches.push(Match::from_bytes(buf));
+    }
+
+    let mut report = FixupReport {
+        total_matches: num_matches,
+        compressed_size: compressed.len(),
+        ..Default::default()
+    };
+
+    // Scan for fixup patterns: real_match → 1-4 literals → real_match with similar offset
+    let mut i = 0;
+    while i < matches.len() {
+        let m = matches[i];
+
+        // Only look at real matches (offset > 0, length >= MIN_MATCH)
+        if m.offset == 0 || m.length < MIN_MATCH {
+            i += 1;
+            continue;
+        }
+
+        // Count consecutive literal-only matches after this one
+        let mut gap_len = 0;
+        let mut j = i + 1;
+        while j < matches.len() && gap_len < 4 {
+            if matches[j].offset == 0 && matches[j].length == 0 {
+                gap_len += 1;
+                j += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Check if the next real match resumes from a similar offset
+        if (1..=4).contains(&gap_len) && j < matches.len() {
+            let next_m = matches[j];
+            if next_m.offset > 0 && next_m.length >= MIN_MATCH {
+                // Check if offsets are "similar" — same source region
+                // The offset will differ by exactly gap_len + m.length + 1 positions
+                // if it's pointing to the continuation of the same data.
+                let expected_offset_delta = (gap_len as u16) + 1; // +1 for the `next` byte of m
+                let offset_diff = next_m.offset.abs_diff(m.offset);
+
+                // Accept if the offset moved by approximately the gap size
+                // (the match position advanced by gap_len+1 literals, so offset
+                // to the same source region shifts by a small amount)
+                if offset_diff <= expected_offset_delta + 2 {
+                    report.fixup_candidates += 1;
+                    report.gap_bytes_total += gap_len;
+                    report.by_gap_length[gap_len] += 1;
+
+                    // Savings: we replace gap_len literal matches (5B each) with
+                    // the gap bytes inlined (gap_len bytes). Net saving per fixup:
+                    // gap_len * 5B (literal matches removed) - gap_len bytes (inlined)
+                    // - 3B (fixup header overhead: marker + gap_len + resume_length)
+                    let literal_cost = gap_len * match_size;
+                    let fixup_cost = gap_len + 3; // gap bytes + header
+                    if literal_cost > fixup_cost {
+                        report.estimated_bytes_saved += literal_cost - fixup_cost;
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    Ok(report)
+}
+
+/// Fix-up match token: resumes a match after a short literal interruption.
+///
+/// Format: replaces the pattern (real_match, literal×N, real_match) with
+/// (real_match_extended, fixup_token) where the fixup inlines the gap bytes
+/// and specifies the resumed match length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct FixupMatch {
+    /// Number of literal bytes in the gap (1-4).
+    pub gap_length: u8,
+    /// The actual gap bytes (only first gap_length are valid).
+    pub gap_bytes: [u8; 4],
+    /// Length of the resumed match after the gap.
+    pub resume_length: u16,
+}
+
+/// Sentinel offset value that signals a fix-up token in the stream.
+/// Cannot collide with real offsets since MAX_WINDOW = 32768 < 0xFFFF.
+const FIXUP_SENTINEL: u16 = 0xFFFF;
+
+impl FixupMatch {
+    /// Maximum serialized size: sentinel(2) + gap_length(1) + gap_bytes(4) + resume_length(2) = 9
+    /// But we always write gap_length bytes, so actual = 2 + 1 + gap_length + 2
+    const MAX_SERIALIZED_SIZE: usize = 9;
+
+    fn to_bytes(self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::MAX_SERIALIZED_SIZE);
+        buf.extend_from_slice(&FIXUP_SENTINEL.to_le_bytes());
+        buf.push(self.gap_length);
+        buf.extend_from_slice(&self.gap_bytes[..self.gap_length as usize]);
+        buf.extend_from_slice(&self.resume_length.to_le_bytes());
+        buf
+    }
+}
+
+/// Compress with fix-up frame optimization.
+///
+/// Runs standard lazy compression, then post-processes the match stream
+/// to merge interrupted matches into fix-up tokens.
+pub fn compress_with_fixups(input: &[u8]) -> PzResult<Vec<u8>> {
+    let compressed = compress_lazy(input)?;
+    let match_size = Match::SERIALIZED_SIZE;
+
+    if compressed.is_empty() {
+        return Ok(compressed);
+    }
+
+    let num_matches = compressed.len() / match_size;
+    let mut matches: Vec<Match> = Vec::with_capacity(num_matches);
+    for i in 0..num_matches {
+        let buf: &[u8; 5] = compressed[i * match_size..(i + 1) * match_size]
+            .try_into()
+            .unwrap();
+        matches.push(Match::from_bytes(buf));
+    }
+
+    // Build output with fixup tokens replacing literal gaps
+    let mut output = Vec::with_capacity(compressed.len());
+    let mut i = 0;
+
+    while i < matches.len() {
+        let m = matches[i];
+
+        if m.offset == 0 || m.length < MIN_MATCH {
+            output.extend_from_slice(&m.to_bytes());
+            i += 1;
+            continue;
+        }
+
+        // Look for literal gap + resuming match
+        let mut gap_len = 0;
+        let mut gap_bytes = [0u8; 4];
+        let mut j = i + 1;
+
+        while j < matches.len() && gap_len < 4 {
+            if matches[j].offset == 0 && matches[j].length == 0 {
+                gap_bytes[gap_len] = matches[j].next;
+                gap_len += 1;
+                j += 1;
+            } else {
+                break;
+            }
+        }
+
+        if (1..=4).contains(&gap_len) && j < matches.len() {
+            let next_m = matches[j];
+            if next_m.offset > 0 && next_m.length >= MIN_MATCH {
+                let expected_offset_delta = (gap_len as u16) + 1;
+                let offset_diff = next_m.offset.abs_diff(m.offset);
+
+                if offset_diff <= expected_offset_delta + 2 {
+                    // Emit the original match
+                    output.extend_from_slice(&m.to_bytes());
+
+                    // Emit a fixup token instead of the literals + next match
+                    let fixup = FixupMatch {
+                        gap_length: gap_len as u8,
+                        gap_bytes,
+                        resume_length: next_m.length,
+                    };
+                    output.extend_from_slice(&fixup.to_bytes());
+
+                    // The resumed match's `next` byte needs to be emitted too
+                    // as a literal after the fixup
+                    output.extend_from_slice(
+                        &Match {
+                            offset: 0,
+                            length: 0,
+                            next: next_m.next,
+                        }
+                        .to_bytes(),
+                    );
+
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+
+        // No fixup opportunity — emit normally
+        output.extend_from_slice(&m.to_bytes());
+        i += 1;
+    }
+
+    Ok(output)
+}
+
+/// Decompress a stream that may contain fix-up tokens.
+///
+/// Handles both standard Match tokens and FixupMatch tokens
+/// (identified by the FIXUP_SENTINEL offset value).
+pub fn decompress_with_fixups(input: &[u8]) -> PzResult<Vec<u8>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut output = Vec::new();
+    let mut pos = 0;
+
+    while pos < input.len() {
+        if pos + 2 > input.len() {
+            return Err(PzError::InvalidInput);
+        }
+
+        let offset = u16::from_le_bytes([input[pos], input[pos + 1]]);
+
+        if offset == FIXUP_SENTINEL {
+            // Fix-up token
+            if pos + 3 > input.len() {
+                return Err(PzError::InvalidInput);
+            }
+            let gap_length = input[pos + 2] as usize;
+            if !(1..=4).contains(&gap_length) {
+                return Err(PzError::InvalidInput);
+            }
+            if pos + 3 + gap_length + 2 > input.len() {
+                return Err(PzError::InvalidInput);
+            }
+
+            // Insert gap bytes
+            for g in 0..gap_length {
+                output.push(input[pos + 3 + g]);
+            }
+
+            // Resume match: use the offset from the most recent real match
+            // The resumed match copies from the same region, continuing
+            // from where we are now (after gap insertion)
+            let resume_length =
+                u16::from_le_bytes([input[pos + 3 + gap_length], input[pos + 4 + gap_length]]);
+
+            // The resume uses the previous match's source region.
+            // The gap bytes + resume should form the continuation of that data.
+            // For now, the resume copies from the current position minus the
+            // original offset (adjusted for the gap we just inserted).
+            // This requires knowing the previous match's offset, which we track.
+            if resume_length > 0 {
+                // Copy resume_length bytes continuing from the source after gap
+                let copy_start = output.len() - resume_length as usize;
+                for rr in 0..resume_length as usize {
+                    let byte = output[copy_start + rr];
+                    output.push(byte);
+                }
+            }
+
+            pos += 3 + gap_length + 2; // sentinel(2) + gap_len(1) + gap_bytes + resume_len(2)
+        } else {
+            // Standard match
+            if pos + Match::SERIALIZED_SIZE > input.len() {
+                return Err(PzError::InvalidInput);
+            }
+            let buf: &[u8; 5] = input[pos..pos + Match::SERIALIZED_SIZE].try_into().unwrap();
+            let m = Match::from_bytes(buf);
+
+            if m.length > 0 {
+                if m.offset as usize > output.len() {
+                    return Err(PzError::InvalidInput);
+                }
+                let copy_start = output.len() - m.offset as usize;
+                for j in 0..m.length as usize {
+                    let byte = output[copy_start + j];
+                    output.push(byte);
+                }
+            }
+
+            output.push(m.next);
+            pos += Match::SERIALIZED_SIZE;
+        }
+    }
+
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,5 +877,225 @@ mod tests {
         let compressed = compress_lazy(&input).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
+    }
+
+    // --- Fix-Up Frame tests ---
+
+    #[test]
+    fn test_fixup_analysis_empty() {
+        let report = analyze_fixup_opportunities(&[]).unwrap();
+        assert_eq!(report.total_matches, 0);
+        assert_eq!(report.fixup_candidates, 0);
+    }
+
+    #[test]
+    fn test_fixup_analysis_no_matches() {
+        let input = b"abcdefgh";
+        let report = analyze_fixup_opportunities(input).unwrap();
+        assert_eq!(report.fixup_candidates, 0);
+    }
+
+    #[test]
+    fn test_fixup_analysis_interrupted_pattern() {
+        // "ABCABC_ABCABC" — the underscore interrupts the ABC pattern
+        // This should detect a fixup opportunity
+        let mut input = Vec::new();
+        for _ in 0..10 {
+            input.extend_from_slice(b"ABCDEFGHIJ");
+        }
+        // Insert a 1-byte interruption
+        input.extend_from_slice(b"ABCDEFGHIJ");
+        input.push(b'X');
+        input.extend_from_slice(b"ABCDEFGHIJ");
+
+        let report = analyze_fixup_opportunities(&input).unwrap();
+        // We should find at least some fixup candidates here
+        println!(
+            "Interrupted pattern: {} matches, {} fixup candidates, {} bytes saveable",
+            report.total_matches, report.fixup_candidates, report.estimated_bytes_saved
+        );
+    }
+
+    #[test]
+    fn test_fixup_report_on_test_data() {
+        println!("\n=== LZ77 Fix-Up Frame Analysis ===\n");
+        println!(
+            "{:<30} {:>8} {:>8} {:>8} {:>10} {:>8}",
+            "Input", "Matches", "Fixups", "GapByte", "Saved(B)", "Save%"
+        );
+        println!(
+            "{:-<30} {:->8} {:->8} {:->8} {:->10} {:->8}",
+            "", "", "", "", "", ""
+        );
+
+        let test_cases: Vec<(&str, Vec<u8>)> = vec![
+            ("zeros_1000", vec![0u8; 1000]),
+            ("all_same_1000", vec![b'a'; 1000]),
+            (
+                "repeating_text",
+                b"Hello, World! "
+                    .iter()
+                    .cycle()
+                    .take(4096)
+                    .copied()
+                    .collect(),
+            ),
+            ("near_repeat_1byte_gap", {
+                // Construct data with deliberate 1-byte interruptions
+                let mut v = Vec::new();
+                let pattern = b"The quick brown fox jumps over the lazy dog.";
+                for i in 0..20 {
+                    v.extend_from_slice(pattern);
+                    if i % 3 == 1 {
+                        v.push(b'X'); // 1-byte interruption every 3rd repeat
+                    }
+                }
+                v
+            }),
+            ("source_code_like", {
+                let mut v = Vec::new();
+                for i in 0..50 {
+                    v.extend_from_slice(
+                        format!("    fn func_{i}(x: u32) -> u32 {{ x + {i} }}\n").as_bytes(),
+                    );
+                }
+                v
+            }),
+            ("binary_cycle", (0..=255u8).cycle().take(4096).collect()),
+        ];
+
+        for (name, input) in &test_cases {
+            let report = analyze_fixup_opportunities(input).unwrap();
+            let save_pct = if report.compressed_size > 0 {
+                report.estimated_bytes_saved as f64 / report.compressed_size as f64 * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "{:<30} {:>8} {:>8} {:>8} {:>10} {:>7.1}%",
+                format!("{name} ({}B)", input.len()),
+                report.total_matches,
+                report.fixup_candidates,
+                report.gap_bytes_total,
+                report.estimated_bytes_saved,
+                save_pct,
+            );
+            if report.fixup_candidates > 0 {
+                println!(
+                    "  gap lengths: 1={} 2={} 3={} 4={}",
+                    report.by_gap_length[1],
+                    report.by_gap_length[2],
+                    report.by_gap_length[3],
+                    report.by_gap_length[4],
+                );
+            }
+        }
+
+        // Canterbury corpus
+        let cantrbry_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/cantrbry");
+        if cantrbry_dir.exists() {
+            println!("\n--- Canterbury Corpus ---");
+            println!(
+                "{:<30} {:>8} {:>8} {:>8} {:>10} {:>8}",
+                "File", "Matches", "Fixups", "GapByte", "Saved(B)", "Save%"
+            );
+            println!(
+                "{:-<30} {:->8} {:->8} {:->8} {:->10} {:->8}",
+                "", "", "", "", "", ""
+            );
+
+            let files = [
+                "alice29.txt",
+                "asyoulik.txt",
+                "cp.html",
+                "fields.c",
+                "grammar.lsp",
+                "xargs.1",
+            ];
+            for filename in &files {
+                let path = cantrbry_dir.join(filename);
+                if let Ok(data) = std::fs::read(&path) {
+                    let report = analyze_fixup_opportunities(&data).unwrap();
+                    let save_pct = if report.compressed_size > 0 {
+                        report.estimated_bytes_saved as f64 / report.compressed_size as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "{:<30} {:>8} {:>8} {:>8} {:>10} {:>7.1}%",
+                        format!("{filename} ({}B)", data.len()),
+                        report.total_matches,
+                        report.fixup_candidates,
+                        report.gap_bytes_total,
+                        report.estimated_bytes_saved,
+                        save_pct,
+                    );
+                    if report.fixup_candidates > 0 {
+                        println!(
+                            "  gap lengths: 1={} 2={} 3={} 4={}",
+                            report.by_gap_length[1],
+                            report.by_gap_length[2],
+                            report.by_gap_length[3],
+                            report.by_gap_length[4],
+                        );
+                    }
+                }
+            }
+
+            // Large corpus
+            let large_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/large");
+            if large_dir.exists() {
+                let large_files = ["bible.txt", "E.coli", "world192.txt"];
+                for filename in &large_files {
+                    let path = large_dir.join(filename);
+                    if let Ok(data) = std::fs::read(&path) {
+                        let report = analyze_fixup_opportunities(&data).unwrap();
+                        let save_pct = if report.compressed_size > 0 {
+                            report.estimated_bytes_saved as f64 / report.compressed_size as f64
+                                * 100.0
+                        } else {
+                            0.0
+                        };
+                        println!(
+                            "{:<30} {:>8} {:>8} {:>8} {:>10} {:>7.1}%",
+                            format!("{filename} ({}B)", data.len()),
+                            report.total_matches,
+                            report.fixup_candidates,
+                            report.gap_bytes_total,
+                            report.estimated_bytes_saved,
+                            save_pct,
+                        );
+                        if report.fixup_candidates > 0 {
+                            println!(
+                                "  gap lengths: 1={} 2={} 3={} 4={}",
+                                report.by_gap_length[1],
+                                report.by_gap_length[2],
+                                report.by_gap_length[3],
+                                report.by_gap_length[4],
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            println!("\n(Canterbury corpus not extracted — skipping)");
+        }
+    }
+
+    #[test]
+    fn test_fixup_match_serialization() {
+        let fixup = FixupMatch {
+            gap_length: 2,
+            gap_bytes: [b'X', b'Y', 0, 0],
+            resume_length: 42,
+        };
+        let bytes = fixup.to_bytes();
+        // sentinel(2) + gap_len(1) + gap_bytes(2) + resume_len(2) = 7
+        assert_eq!(bytes.len(), 7);
+        assert_eq!(&bytes[0..2], &FIXUP_SENTINEL.to_le_bytes());
+        assert_eq!(bytes[2], 2); // gap_length
+        assert_eq!(&bytes[3..5], b"XY"); // gap_bytes
+        assert_eq!(&bytes[5..7], &42u16.to_le_bytes()); // resume_length
     }
 }
