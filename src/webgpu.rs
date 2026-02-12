@@ -746,6 +746,50 @@ impl WebGpuEngine {
         })
     }
 
+    /// GPU-accelerated bijective BWT forward transform.
+    ///
+    /// Factorizes input into Lyndon words on CPU, then dispatches GPU SA
+    /// construction per factor (falling back to CPU for factors below
+    /// [`MIN_GPU_BWT_SIZE`]).
+    pub fn bwt_encode_bijective(&self, input: &[u8]) -> PzResult<(Vec<u8>, Vec<usize>)> {
+        use crate::bwt;
+
+        if input.is_empty() {
+            return Err(PzError::InvalidInput);
+        }
+
+        let factors = bwt::lyndon_factorize(input);
+        let mut output = Vec::with_capacity(input.len());
+        let mut factor_lengths = Vec::with_capacity(factors.len());
+
+        for &(start, len) in &factors {
+            let factor = &input[start..start + len];
+            factor_lengths.push(len);
+
+            if len == 1 {
+                output.push(factor[0]);
+                continue;
+            }
+
+            // Use GPU for factors large enough to amortize launch overhead.
+            let sa = if len >= MIN_GPU_BWT_SIZE && len <= self.max_dispatch_input_size() {
+                self.bwt_build_suffix_array(factor)?
+            } else {
+                bwt::build_circular_suffix_array(factor)
+            };
+
+            for &sa_val in &sa {
+                if sa_val == 0 {
+                    output.push(factor[len - 1]);
+                } else {
+                    output.push(factor[sa_val - 1]);
+                }
+            }
+        }
+
+        Ok((output, factor_lengths))
+    }
+
     /// Build suffix array on the GPU using prefix-doubling with radix sort.
     fn bwt_build_suffix_array(&self, input: &[u8]) -> PzResult<Vec<usize>> {
         let n = input.len();
@@ -2023,6 +2067,41 @@ mod tests {
         let bwt_result = engine.bwt_encode(input).unwrap();
         let decoded = crate::bwt::decode(&bwt_result.data, bwt_result.primary_index).unwrap();
         assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_bijective_bwt_round_trip() {
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+
+        // Test with various inputs
+        let test_cases: Vec<(&str, Vec<u8>)> = vec![
+            ("banana", b"banana".to_vec()),
+            (
+                "hello_repeated",
+                b"hello world hello world hello world".to_vec(),
+            ),
+            ("binary", (0..=255u8).collect()),
+        ];
+
+        for (name, input) in &test_cases {
+            let (gpu_data, gpu_factors) = engine.bwt_encode_bijective(input).unwrap();
+
+            // Compare against CPU bijective BWT
+            let (cpu_data, cpu_factors) = crate::bwt::encode_bijective(input).unwrap();
+            assert_eq!(gpu_factors, cpu_factors, "factor lengths differ on {name}");
+            assert_eq!(gpu_data, cpu_data, "BWT data differs on {name}");
+
+            // Round-trip decode
+            let decoded = crate::bwt::decode_bijective(&gpu_data, &gpu_factors).unwrap();
+            assert_eq!(
+                decoded, *input,
+                "GPU bijective BWT round-trip failed on {name}"
+            );
+        }
     }
 
     #[test]
