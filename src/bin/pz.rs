@@ -11,12 +11,13 @@
 ///   cat file | pz -dc    → decompress stdin to stdout
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 
 use pz::gzip;
 use pz::pipeline::{self, CompressOptions, ParseStrategy, Pipeline};
+use pz::streaming;
 
 fn usage() {
     eprintln!("pz - lossless data compression tool");
@@ -213,14 +214,6 @@ fn decompress_output_path(input: &str) -> Option<PathBuf> {
     }
 }
 
-fn compress_data(
-    data: &[u8],
-    pipe: Pipeline,
-    options: &CompressOptions,
-) -> Result<Vec<u8>, String> {
-    pipeline::compress_with_options(data, pipe, options).map_err(|e| format!("{e}"))
-}
-
 /// Build compression options from CLI flags.
 fn build_cli_options(opts: &Opts) -> CompressOptions {
     let parse_strategy = opts.parse_strategy;
@@ -315,18 +308,6 @@ fn build_cli_options(opts: &Opts) -> CompressOptions {
     }
 }
 
-fn decompress_data(data: &[u8], threads: usize) -> Result<Vec<u8>, String> {
-    match detect_format(data) {
-        Format::Pz => pipeline::decompress_with_threads(data, threads).map_err(|e| format!("{e}")),
-        Format::Gzip => {
-            let (decompressed, _header) =
-                gzip::decompress(data).map_err(|e| format!("gzip: {e}"))?;
-            Ok(decompressed)
-        }
-        Format::Unknown => Err("unrecognized file format (not .pz or .gz)".to_string()),
-    }
-}
-
 fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
     match detect_format(data) {
         Format::Pz => {
@@ -342,17 +323,42 @@ fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
                 4 => "lzf",
                 _ => "unknown",
             };
-            let orig_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+            let mut orig_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+            let blocks_info = if version == 2 && data.len() >= 12 {
+                let num_blocks = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                if num_blocks == 0xFFFF_FFFF {
+                    // Framed mode: scan block frames to compute original length
+                    let mut pos = 12;
+                    let mut total_orig = 0u64;
+                    let mut n_blocks = 0u32;
+                    while pos + 4 <= data.len() {
+                        let comp_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+                        if comp_len == 0 {
+                            break; // EOS sentinel
+                        }
+                        if pos + 8 > data.len() {
+                            break;
+                        }
+                        let block_orig =
+                            u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
+                        total_orig += block_orig as u64;
+                        n_blocks += 1;
+                        pos += 8 + comp_len as usize;
+                    }
+                    if orig_len == 0 {
+                        orig_len = total_orig as u32;
+                    }
+                    format!(" [{n_blocks} blocks, framed]")
+                } else {
+                    format!(" [{num_blocks} blocks]")
+                }
+            } else {
+                String::new()
+            };
             let ratio = if orig_len > 0 {
                 (data.len() as f64 / orig_len as f64) * 100.0
             } else {
                 0.0
-            };
-            let blocks_info = if version == 2 && data.len() >= 12 {
-                let num_blocks = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-                format!(" [{} blocks]", num_blocks)
-            } else {
-                String::new()
             };
             println!(
                 "{:>12} {:>12} {:5.1}% {:8} {}{}",
@@ -400,31 +406,36 @@ fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_pipeline(opts: &Opts, data: &[u8], options: &CompressOptions) -> Pipeline {
-    if opts.auto_select {
-        let pipeline = if opts.trial_mode {
-            pipeline::select_pipeline_trial(data, options, 65536)
+fn process_compress(opts: &Opts, path: &str, options: &CompressOptions) -> Result<(), String> {
+    // Open input file
+    let mut file = fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+
+    // Determine pipeline: read a sample for auto-select, then seek back
+    let pipe = if opts.auto_select {
+        let mut sample = vec![0u8; 65536];
+        let n = file.read(&mut sample).map_err(|e| format!("{path}: {e}"))?;
+        sample.truncate(n);
+        file.seek(io::SeekFrom::Start(0))
+            .map_err(|e| format!("{path}: cannot seek: {e}"))?;
+        let selected = if opts.trial_mode {
+            pipeline::select_pipeline_trial(&sample, options, 65536)
         } else {
-            pipeline::select_pipeline(data)
+            pipeline::select_pipeline(&sample)
         };
         if opts.verbose {
-            eprintln!("pz: auto-selected pipeline: {:?}", pipeline);
+            eprintln!("pz: auto-selected pipeline: {:?}", selected);
         }
-        pipeline
+        selected
     } else {
         opts.pipeline
-    }
-}
+    };
 
-fn process_compress(opts: &Opts, path: &str, options: &CompressOptions) -> Result<(), String> {
-    let data = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    let pipe = resolve_pipeline(opts, &data, options);
-    let compressed = compress_data(&data, pipe, options)?;
+    let input = BufReader::new(file);
 
     if opts.to_stdout {
-        io::stdout()
-            .write_all(&compressed)
-            .map_err(|e| format!("stdout: {e}"))?;
+        let output = BufWriter::new(io::stdout().lock());
+        streaming::compress_stream(input, output, pipe, options)
+            .map_err(|e| format!("{path}: {e}"))?;
     } else {
         let out_path = compress_output_path(path);
         let out_str = out_path.display().to_string();
@@ -433,20 +444,20 @@ fn process_compress(opts: &Opts, path: &str, options: &CompressOptions) -> Resul
             return Err(format!("{out_str} already exists; use -f to overwrite"));
         }
 
-        fs::write(&out_path, &compressed).map_err(|e| format!("{out_str}: {e}"))?;
+        let out_file = fs::File::create(&out_path).map_err(|e| format!("{out_str}: {e}"))?;
+        let output = BufWriter::new(out_file);
+        streaming::compress_stream(input, output, pipe, options)
+            .map_err(|e| format!("{path}: {e}"))?;
 
         if opts.verbose {
-            let ratio = if !data.is_empty() {
-                (compressed.len() as f64 / data.len() as f64) * 100.0
+            let in_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let out_size = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+            let ratio = if in_size > 0 {
+                (out_size as f64 / in_size as f64) * 100.0
             } else {
                 0.0
             };
-            eprintln!(
-                "{path}: {:.1}% ({} → {} bytes)",
-                ratio,
-                data.len(),
-                compressed.len()
-            );
+            eprintln!("{path}: {ratio:.1}% ({in_size} → {out_size} bytes)");
         }
 
         if !opts.keep {
@@ -458,12 +469,62 @@ fn process_compress(opts: &Opts, path: &str, options: &CompressOptions) -> Resul
 }
 
 fn process_decompress(opts: &Opts, path: &str) -> Result<(), String> {
-    let data = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    let decompressed = decompress_data(&data, opts.threads)?;
+    // Peek first 2 bytes to detect format
+    let mut file = fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut magic = [0u8; 2];
+    let n = file.read(&mut magic).map_err(|e| format!("{path}: {e}"))?;
+    file.seek(io::SeekFrom::Start(0))
+        .map_err(|e| format!("{path}: cannot seek: {e}"))?;
 
+    let is_gzip = n >= 2 && gzip::is_gzip(&magic);
+
+    if is_gzip {
+        // Gzip: use in-memory decompress (gzip module is not streaming)
+        let data = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let (decompressed, _header) =
+            gzip::decompress(&data).map_err(|e| format!("{path}: gzip: {e}"))?;
+        write_decompressed_output(opts, path, &decompressed)?;
+    } else {
+        // PZ: use streaming decompress
+        let input = BufReader::new(file);
+        if opts.to_stdout {
+            let output = BufWriter::new(io::stdout().lock());
+            streaming::decompress_stream(input, output, opts.threads)
+                .map_err(|e| format!("{path}: {e}"))?;
+        } else {
+            let out_path = decompress_output_path(path)
+                .ok_or_else(|| format!("{path}: unknown suffix -- ignored"))?;
+            let out_str = out_path.display().to_string();
+
+            if out_path.exists() && !opts.force {
+                return Err(format!("{out_str} already exists; use -f to overwrite"));
+            }
+
+            let out_file = fs::File::create(&out_path).map_err(|e| format!("{out_str}: {e}"))?;
+            let output = BufWriter::new(out_file);
+            streaming::decompress_stream(input, output, opts.threads)
+                .map_err(|e| format!("{path}: {e}"))?;
+
+            if opts.verbose {
+                let in_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                let out_size = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+                eprintln!("{path}: {in_size} → {out_size} bytes");
+            }
+
+            if !opts.keep {
+                fs::remove_file(path).map_err(|e| format!("{path}: cannot remove: {e}"))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Write decompressed data to output (for gzip in-memory fallback).
+fn write_decompressed_output(opts: &Opts, path: &str, data: &[u8]) -> Result<(), String> {
     if opts.to_stdout {
         io::stdout()
-            .write_all(&decompressed)
+            .write_all(data)
             .map_err(|e| format!("stdout: {e}"))?;
     } else {
         let out_path = decompress_output_path(path)
@@ -474,36 +535,44 @@ fn process_decompress(opts: &Opts, path: &str) -> Result<(), String> {
             return Err(format!("{out_str} already exists; use -f to overwrite"));
         }
 
-        fs::write(&out_path, &decompressed).map_err(|e| format!("{out_str}: {e}"))?;
+        fs::write(&out_path, data).map_err(|e| format!("{out_str}: {e}"))?;
 
         if opts.verbose {
-            eprintln!("{path}: {} → {} bytes", data.len(), decompressed.len());
+            let in_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            eprintln!("{path}: {in_size} → {} bytes", data.len());
         }
 
         if !opts.keep {
             fs::remove_file(path).map_err(|e| format!("{path}: cannot remove: {e}"))?;
         }
     }
-
     Ok(())
 }
 
 fn process_stdin_stdout(opts: &Opts, options: &CompressOptions) -> Result<(), String> {
-    let mut data = Vec::new();
-    io::stdin()
-        .read_to_end(&mut data)
-        .map_err(|e| format!("stdin: {e}"))?;
+    // Use io::stdin() (not .lock()) so the BufReader is Send for the worker threads.
+    let stdin = io::stdin();
+    let stdout = io::stdout();
 
-    let output = if opts.decompress {
-        decompress_data(&data, opts.threads)?
+    if opts.decompress {
+        let input = BufReader::new(stdin);
+        let output = BufWriter::new(stdout.lock());
+        streaming::decompress_stream(input, output, opts.threads)
+            .map_err(|e| format!("stdin: {e}"))?;
     } else {
-        let pipe = resolve_pipeline(opts, &data, options);
-        compress_data(&data, pipe, options)?
-    };
-
-    io::stdout()
-        .write_all(&output)
-        .map_err(|e| format!("stdout: {e}"))?;
+        // For auto-select from stdin, we require explicit --pipeline since
+        // we cannot seek back. Use the default pipeline if not specified.
+        let pipe = if opts.auto_select && !opts.quiet {
+            eprintln!("pz: warning: auto-select requires a seekable input; using default pipeline");
+            opts.pipeline
+        } else {
+            opts.pipeline
+        };
+        let input = BufReader::new(stdin);
+        let output = BufWriter::new(stdout.lock());
+        streaming::compress_stream(input, output, pipe, options)
+            .map_err(|e| format!("stdin: {e}"))?;
+    }
 
     Ok(())
 }
