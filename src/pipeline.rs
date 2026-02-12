@@ -1908,7 +1908,39 @@ fn decompress_block_lzr(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 
 // --- LZF pipeline: LZ77 + FSE ---
 
+/// Choose FSE accuracy_log based on the number of distinct symbols in a stream.
+///
+/// FSE needs enough table slots to represent all active symbols with reasonable
+/// precision. With accuracy_log=7 (128 slots) and 256 active symbols, most get
+/// frequency=1 and the coder degrades to raw output. This function ensures
+/// at least ~4 table slots per distinct symbol, clamped to the FSE range [5, 12].
+fn adaptive_accuracy_log(data: &[u8]) -> u8 {
+    if data.is_empty() {
+        return fse::DEFAULT_ACCURACY_LOG;
+    }
+    let mut seen = [false; 256];
+    for &b in data {
+        seen[b as usize] = true;
+    }
+    let distinct = seen.iter().filter(|&&s| s).count() as u32;
+
+    // Target: table_size >= 4 * distinct_symbols
+    // table_size = 1 << accuracy_log
+    // So: accuracy_log = ceil(log2(4 * distinct))
+    let target = 4 * distinct;
+    let log = if target <= 1 {
+        0
+    } else {
+        32 - (target - 1).leading_zeros() // ceil(log2(target))
+    };
+    log.clamp(fse::MIN_ACCURACY_LOG as u32, fse::MAX_ACCURACY_LOG as u32) as u8
+}
+
 /// Entropy stage (FSE): FSE encoding + serialization.
+///
+/// Uses adaptive accuracy_log per stream: streams with many distinct symbols
+/// (e.g., LZ77 offsets with 256 active bytes) get higher accuracy for better
+/// compression, while low-cardinality streams (e.g., lengths) use smaller tables.
 ///
 /// Multi-stream format (when `block.streams` is `Some`):
 ///   [0u32: sentinel] [num_streams: u8] [lz_len: u32]
@@ -1935,7 +1967,8 @@ fn stage_fse_encode(mut block: StageBlock) -> PzResult<StageBlock> {
         }
 
         for stream in &streams {
-            let fse_data = fse::encode(stream);
+            let acc = adaptive_accuracy_log(stream);
+            let fse_data = fse::encode_with_accuracy(stream, acc);
             output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
             output.extend_from_slice(&(fse_data.len() as u32).to_le_bytes());
             output.extend_from_slice(&fse_data);
@@ -1943,8 +1976,9 @@ fn stage_fse_encode(mut block: StageBlock) -> PzResult<StageBlock> {
 
         block.data = output;
     } else {
-        // Single-stream (legacy) path
-        let fse_data = fse::encode(&block.data);
+        // Single-stream path: also use adaptive accuracy
+        let acc = adaptive_accuracy_log(&block.data);
+        let fse_data = fse::encode_with_accuracy(&block.data, acc);
         let mut output = Vec::new();
         output.extend_from_slice(&(lz_len as u32).to_le_bytes());
         output.extend_from_slice(&fse_data);
