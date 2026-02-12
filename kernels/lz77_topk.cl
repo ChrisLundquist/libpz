@@ -18,7 +18,7 @@ typedef struct {
 
 // Insert a new candidate into the top-K array (sorted by length desc).
 // For equal lengths, prefer the smaller offset.
-void insert_candidate(lz77_candidate_t top[K],
+static void insert_candidate(lz77_candidate_t top[K],
                       unsigned short offset,
                       unsigned short length) {
     // Find insertion point

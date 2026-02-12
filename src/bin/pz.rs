@@ -228,7 +228,12 @@ fn build_cli_options(opts: &Opts) -> CompressOptions {
     #[cfg(feature = "opencl")]
     {
         if opts.gpu {
-            match pz::opencl::OpenClEngine::new() {
+            let result = if opts.verbose {
+                pz::opencl::OpenClEngine::with_profiling(true)
+            } else {
+                pz::opencl::OpenClEngine::new()
+            };
+            match result {
                 Ok(engine) => {
                     if opts.verbose {
                         eprintln!("pz: using GPU device: {}", engine.device_name());

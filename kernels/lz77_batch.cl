@@ -15,7 +15,7 @@ typedef struct {
 #define MAX_WINDOW (1u << 15)
 #define STEP_SIZE 32u
 
-lz77_match_t FindMatchClassic(__global char* search,
+static lz77_match_t FindMatchClassic(__global char* search,
                               const unsigned search_size,
                               __global char* target,
                               const unsigned target_size) {

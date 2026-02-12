@@ -25,7 +25,7 @@ typedef struct {
 #define MIN_MATCH  3u
 
 // Same hash function as CPU: hash3
-inline unsigned int hash3(__global const unsigned char *data, unsigned int pos, unsigned int len) {
+static inline unsigned int hash3(__global const unsigned char *data, unsigned int pos, unsigned int len) {
     if (pos + 2 >= len) return 0;
     unsigned int h = ((unsigned int)data[pos] << 10)
                    ^ ((unsigned int)data[pos + 1] << 5)
