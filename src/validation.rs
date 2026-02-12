@@ -78,22 +78,6 @@ mod tests {
                 use super::*;
 
                 #[test]
-                fn lz77_brute() {
-                    let input = $data;
-                    let compressed = lz77::compress(&input).unwrap();
-                    let decompressed = lz77::decompress(&compressed).unwrap();
-                    assert_eq!(decompressed, input, "lz77 brute-force round-trip failed");
-                }
-
-                #[test]
-                fn lz77_hashchain() {
-                    let input = $data;
-                    let compressed = lz77::compress_hashchain(&input).unwrap();
-                    let decompressed = lz77::decompress(&compressed).unwrap();
-                    assert_eq!(decompressed, input, "lz77 hash-chain round-trip failed");
-                }
-
-                #[test]
                 fn lz77_lazy() {
                     let input = $data;
                     let compressed = lz77::compress_lazy(&input).unwrap();
@@ -216,7 +200,7 @@ mod tests {
         #[test]
         fn lz77_then_huffman() {
             let input = data_repeating_text();
-            let lz_data = lz77::compress_hashchain(&input).unwrap();
+            let lz_data = lz77::compress_lazy(&input).unwrap();
             let tree = HuffmanTree::from_data(&lz_data).unwrap();
             let (huff_data, bits) = tree.encode(&lz_data).unwrap();
             // Inverse
@@ -229,7 +213,7 @@ mod tests {
         #[test]
         fn lz77_then_rangecoder() {
             let input = data_repeating_text();
-            let lz_data = lz77::compress_hashchain(&input).unwrap();
+            let lz_data = lz77::compress_lazy(&input).unwrap();
             let rc_data = rangecoder::encode(&lz_data);
             // Inverse
             let inv_rc = rangecoder::decode(&rc_data, lz_data.len()).unwrap();
@@ -446,7 +430,7 @@ mod tests {
         fn lz77_finds_matches_in_repetitive_data() {
             // LZ77 should produce fewer matches than input bytes for repetitive data
             let input = data_repeating_text();
-            let compressed = lz77::compress_hashchain(&input).unwrap();
+            let compressed = lz77::compress_lazy(&input).unwrap();
             let num_matches = compressed.len() / lz77::Match::SERIALIZED_SIZE;
             // Each match covers at least 1 byte (literal), many cover more
             assert!(
@@ -458,20 +442,10 @@ mod tests {
         }
 
         #[test]
-        fn all_three_lz77_strategies_decompress_equivalently() {
-            // All LZ77 strategies produce different compressed representations
-            // but must all decompress back to the original
+        fn lz77_lazy_decompresses_correctly() {
             let input = data_repeating_text();
-            let brute = lz77::compress(&input).unwrap();
-            let hashchain = lz77::compress_hashchain(&input).unwrap();
             let lazy = lz77::compress_lazy(&input).unwrap();
-
-            let d_brute = lz77::decompress(&brute).unwrap();
-            let d_hashchain = lz77::decompress(&hashchain).unwrap();
             let d_lazy = lz77::decompress(&lazy).unwrap();
-
-            assert_eq!(d_brute, input);
-            assert_eq!(d_hashchain, input);
             assert_eq!(d_lazy, input);
         }
     }
@@ -521,16 +495,10 @@ mod tests {
                 return;
             }
 
-            // LZ77 (all strategies)
-            for compress_fn in &[
-                lz77::compress as fn(&[u8]) -> crate::PzResult<Vec<u8>>,
-                lz77::compress_hashchain,
-                lz77::compress_lazy,
-            ] {
-                let compressed = compress_fn(&input).unwrap();
-                let decompressed = lz77::decompress(&compressed).unwrap();
-                assert_eq!(decompressed, input, "LZ77 failed on {}", path);
-            }
+            // LZ77 (lazy matching)
+            let compressed = lz77::compress_lazy(&input).unwrap();
+            let decompressed = lz77::decompress(&compressed).unwrap();
+            assert_eq!(decompressed, input, "LZ77 failed on {}", path);
 
             // Huffman
             let tree = HuffmanTree::from_data(&input).unwrap();
@@ -724,7 +692,7 @@ mod tests {
             let mut input = vec![0u8; 4096]; // fill window
             input.extend(vec![1u8; 100]); // different data
             input.extend(vec![0u8; 200]); // should NOT match (too far back)
-            let compressed = lz77::compress_hashchain(&input).unwrap();
+            let compressed = lz77::compress_lazy(&input).unwrap();
             let decompressed = lz77::decompress(&compressed).unwrap();
             assert_eq!(decompressed, input);
         }

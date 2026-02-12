@@ -104,20 +104,12 @@ fn bench_lz77(c: &mut Criterion) {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("compress_hashchain", size),
-            &data,
-            |b, data| {
-                b.iter(|| pz::lz77::compress_hashchain(data).unwrap());
-            },
-        );
-
         group.bench_with_input(BenchmarkId::new("compress_lazy", size), &data, |b, data| {
             b.iter(|| pz::lz77::compress_lazy(data).unwrap());
         });
 
         // Decompress benchmark
-        let compressed = pz::lz77::compress_hashchain(&data).unwrap();
+        let compressed = pz::lz77::compress_lazy(&data).unwrap();
         group.bench_with_input(
             BenchmarkId::new("decompress", size),
             &compressed,
@@ -419,34 +411,8 @@ fn bench_lz77_gpu(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_lz77_parallel(c: &mut Criterion) {
-    let mut group = c.benchmark_group("lz77_parallel");
-    for &size in &[65536, 262144, 1048576] {
-        let data = get_test_data(size);
-        group.throughput(Throughput::Bytes(size as u64));
-
-        // Baseline: single-threaded lazy
-        group.bench_with_input(
-            BenchmarkId::new("compress_lazy_1t", size),
-            &data,
-            |b, data| {
-                b.iter(|| pz::lz77::compress_lazy(data).unwrap());
-            },
-        );
-
-        // Parallel with various thread counts
-        for &threads in &[2, 4, 8] {
-            group.bench_with_input(
-                BenchmarkId::new(format!("compress_lazy_{}t", threads), size),
-                &data,
-                |b, data| {
-                    b.iter(|| pz::lz77::compress_lazy_parallel(data, threads).unwrap());
-                },
-            );
-        }
-    }
-    group.finish();
-}
+// bench_lz77_parallel removed: parallel LZ77 match-finding was slower than
+// single-threaded lazy. Multi-threading now happens at the pipeline block level.
 
 fn bench_analysis(c: &mut Criterion) {
     let mut group = c.benchmark_group("analysis");
@@ -737,7 +703,6 @@ criterion_group!(
     bench_fse,
     bench_rans,
     bench_simd,
-    bench_lz77_parallel,
     bench_analysis,
     bench_auto_select,
     bench_bwt_gpu,

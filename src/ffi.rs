@@ -395,8 +395,14 @@ pub unsafe extern "C" fn pz_lz77_compress(
     let input_slice = slice::from_raw_parts(input, input_len);
     let output_slice = slice::from_raw_parts_mut(output, output_len);
 
-    match lz77::compress_to_buf(input_slice, output_slice) {
-        Ok(bytes_written) => bytes_written as i32,
+    match lz77::compress_lazy(input_slice) {
+        Ok(compressed) => {
+            if compressed.len() > output_slice.len() {
+                return error_to_code(crate::PzError::BufferTooSmall);
+            }
+            output_slice[..compressed.len()].copy_from_slice(&compressed);
+            compressed.len() as i32
+        }
         Err(e) => error_to_code(e),
     }
 }
