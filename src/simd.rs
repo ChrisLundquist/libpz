@@ -60,20 +60,45 @@ pub enum SimdLevel {
     Neon,
 }
 
+/// Function pointer type for SIMD byte comparison.
+///
+/// Signature: `(a_ptr, b_ptr, max_len) -> match_length`
+///
+/// # Safety
+/// Implementations require the appropriate SIMD feature to be available
+/// and `max_len` bytes to be readable from both pointers.
+type CompareFn = unsafe fn(*const u8, *const u8, usize) -> usize;
+
 /// Runtime SIMD dispatcher.
 ///
-/// Detects available SIMD features at construction time and dispatches
-/// to the best available implementation for each operation.
-#[derive(Debug, Clone, Copy)]
+/// Detects available SIMD features at construction time and resolves
+/// function pointers for hot-path operations. This eliminates per-call
+/// match dispatch overhead — the SIMD level is checked once at startup,
+/// not on every call.
+#[derive(Clone, Copy)]
 pub struct Dispatcher {
     level: SimdLevel,
+    /// Resolved function pointer for byte comparison (hot path).
+    compare_fn: CompareFn,
+}
+
+impl std::fmt::Debug for Dispatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Dispatcher")
+            .field("level", &self.level)
+            .finish()
+    }
 }
 
 impl Dispatcher {
     /// Detect the best available SIMD level for the current CPU.
+    ///
+    /// Resolves function pointers once — subsequent calls to `compare_bytes`
+    /// go through a direct function pointer with no match dispatch.
     pub fn new() -> Self {
         let level = detect_level();
-        Dispatcher { level }
+        let compare_fn = resolve_compare_fn(level);
+        Dispatcher { level, compare_fn }
     }
 
     /// Return the detected SIMD capability level.
@@ -108,26 +133,18 @@ impl Dispatcher {
     /// Returns the number of leading bytes that are identical (up to
     /// `MAX_COMPARE_LEN` or the shorter slice length). Used as the inner
     /// loop of LZ77 match extension.
+    ///
+    /// Uses a resolved function pointer — no per-call match dispatch.
+    #[inline]
     pub fn compare_bytes(&self, a: &[u8], b: &[u8]) -> usize {
         let max_len = a.len().min(b.len()).min(MAX_COMPARE_LEN);
         if max_len == 0 {
             return 0;
         }
-        match self.level {
-            #[cfg(target_arch = "x86_64")]
-            SimdLevel::Avx2 => {
-                // SAFETY: `detect_level` verified AVX2 is available
-                unsafe { avx2::compare_bytes(a, b, max_len) }
-            }
-            #[cfg(target_arch = "x86_64")]
-            SimdLevel::Sse2 => {
-                // SAFETY: SSE2 is always available on x86_64
-                unsafe { sse2::compare_bytes(a, b, max_len) }
-            }
-            #[cfg(target_arch = "aarch64")]
-            SimdLevel::Neon => scalar::compare_bytes(a, b, max_len),
-            SimdLevel::Scalar => scalar::compare_bytes(a, b, max_len),
-        }
+        // SAFETY: compare_fn was resolved from detect_level() which verified
+        // the required SIMD features are available. max_len is bounded by
+        // both slice lengths, so reads are in-bounds.
+        unsafe { (self.compare_fn)(a.as_ptr(), b.as_ptr(), max_len) }
     }
 
     /// Sum all values in a u32 slice. Used for prefix sum verification
@@ -176,6 +193,114 @@ fn detect_level() -> SimdLevel {
 
     #[allow(unreachable_code)]
     SimdLevel::Scalar
+}
+
+/// Resolve compare_bytes to a direct function pointer based on SIMD level.
+///
+/// This is called once at `Dispatcher::new()` time. The returned function
+/// pointer is stored and called directly on every `compare_bytes` invocation,
+/// eliminating the per-call match dispatch that was costing ~19% of samples.
+fn resolve_compare_fn(level: SimdLevel) -> CompareFn {
+    match level {
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx2 => compare_bytes_avx2,
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Sse2 => compare_bytes_sse2,
+        #[cfg(target_arch = "aarch64")]
+        SimdLevel::Neon => compare_bytes_scalar,
+        SimdLevel::Scalar => compare_bytes_scalar,
+    }
+}
+
+/// Scalar compare_bytes wrapper matching `CompareFn` signature.
+///
+/// # Safety
+/// Caller must ensure `max_len` bytes are readable from both `a` and `b`.
+unsafe fn compare_bytes_scalar(a: *const u8, b: *const u8, max_len: usize) -> usize {
+    let a = std::slice::from_raw_parts(a, max_len);
+    let b = std::slice::from_raw_parts(b, max_len);
+    scalar::compare_bytes(a, b, max_len)
+}
+
+/// SSE2 compare_bytes wrapper matching `CompareFn` signature.
+///
+/// Marked `#[target_feature(enable = "sse2")]` so the compiler can inline
+/// the SSE2 intrinsics directly without an extra call frame.
+///
+/// # Safety
+/// Caller must ensure SSE2 is available and `max_len` bytes are readable
+/// from both `a` and `b`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn compare_bytes_sse2(a: *const u8, b: *const u8, max_len: usize) -> usize {
+    use std::arch::x86_64::*;
+    let mut i = 0;
+
+    // Process 16 bytes at a time with SSE2
+    while i + 16 <= max_len {
+        let va = _mm_loadu_si128(a.add(i) as *const __m128i);
+        let vb = _mm_loadu_si128(b.add(i) as *const __m128i);
+        let cmp = _mm_cmpeq_epi8(va, vb);
+        let mask = _mm_movemask_epi8(cmp) as u32;
+        if mask != 0xFFFF {
+            let first_diff = (!mask).trailing_zeros() as usize;
+            return i + first_diff;
+        }
+        i += 16;
+    }
+
+    // Scalar tail
+    while i < max_len && *a.add(i) == *b.add(i) {
+        i += 1;
+    }
+    i
+}
+
+/// AVX2 compare_bytes wrapper matching `CompareFn` signature.
+///
+/// Marked `#[target_feature(enable = "avx2")]` so the compiler can inline
+/// the AVX2 intrinsics directly without an extra call frame.
+///
+/// # Safety
+/// Caller must ensure AVX2 is available and `max_len` bytes are readable
+/// from both `a` and `b`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn compare_bytes_avx2(a: *const u8, b: *const u8, max_len: usize) -> usize {
+    use std::arch::x86_64::*;
+    let mut i = 0;
+
+    // Process 32 bytes at a time with AVX2
+    while i + 32 <= max_len {
+        let va = _mm256_loadu_si256(a.add(i) as *const __m256i);
+        let vb = _mm256_loadu_si256(b.add(i) as *const __m256i);
+        let cmp = _mm256_cmpeq_epi8(va, vb);
+        let mask = _mm256_movemask_epi8(cmp) as u32;
+        if mask != 0xFFFFFFFF {
+            let first_diff = (!mask).trailing_zeros() as usize;
+            return i + first_diff;
+        }
+        i += 32;
+    }
+
+    // SSE2 16-byte tail
+    while i + 16 <= max_len {
+        let va = _mm_loadu_si128(a.add(i) as *const __m128i);
+        let vb = _mm_loadu_si128(b.add(i) as *const __m128i);
+        let cmp = _mm_cmpeq_epi8(va, vb);
+        let mask = _mm_movemask_epi8(cmp) as u32;
+        if mask != 0xFFFF {
+            let first_diff = (!mask).trailing_zeros() as usize;
+            return i + first_diff;
+        }
+        i += 16;
+    }
+
+    // Scalar tail
+    while i < max_len && *a.add(i) == *b.add(i) {
+        i += 1;
+    }
+    i
 }
 
 // ---------------------------------------------------------------------------
@@ -248,39 +373,6 @@ mod sse2 {
         }
 
         freqs
-    }
-
-    /// SSE2-accelerated byte comparison.
-    ///
-    /// Compares 16 bytes at a time using `_mm_cmpeq_epi8` + `_mm_movemask_epi8`.
-    /// When all 16 bytes match the mask is 0xFFFF; the first mismatch position
-    /// is found via `trailing_zeros`.
-    ///
-    /// # Safety
-    /// Requires SSE2 (always available on x86_64).
-    #[target_feature(enable = "sse2")]
-    pub unsafe fn compare_bytes(a: &[u8], b: &[u8], max_len: usize) -> usize {
-        let mut i = 0;
-
-        // Process 16 bytes at a time with SSE2
-        while i + 16 <= max_len {
-            let va = _mm_loadu_si128(a.as_ptr().add(i) as *const __m128i);
-            let vb = _mm_loadu_si128(b.as_ptr().add(i) as *const __m128i);
-            let cmp = _mm_cmpeq_epi8(va, vb);
-            let mask = _mm_movemask_epi8(cmp) as u32;
-            if mask != 0xFFFF {
-                // Found a mismatch — count trailing ones to find first differing byte
-                let first_diff = (!mask).trailing_zeros() as usize;
-                return i + first_diff;
-            }
-            i += 16;
-        }
-
-        // Scalar tail
-        while i < max_len && *a.get_unchecked(i) == *b.get_unchecked(i) {
-            i += 1;
-        }
-        i
     }
 
     /// SSE2-accelerated u32 sum using u64 accumulator lanes.
@@ -388,51 +480,6 @@ mod avx2 {
         }
 
         result
-    }
-
-    /// AVX2-accelerated byte comparison.
-    ///
-    /// Compares 32 bytes at a time using `_mm256_cmpeq_epi8` +
-    /// `_mm256_movemask_epi8`. When all 32 bytes match the mask is
-    /// `0xFFFFFFFF`; the first mismatch is found via `trailing_zeros`.
-    ///
-    /// # Safety
-    /// Requires AVX2.
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn compare_bytes(a: &[u8], b: &[u8], max_len: usize) -> usize {
-        let mut i = 0;
-
-        // Process 32 bytes at a time with AVX2
-        while i + 32 <= max_len {
-            let va = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
-            let vb = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
-            let cmp = _mm256_cmpeq_epi8(va, vb);
-            let mask = _mm256_movemask_epi8(cmp) as u32;
-            if mask != 0xFFFFFFFF {
-                let first_diff = (!mask).trailing_zeros() as usize;
-                return i + first_diff;
-            }
-            i += 32;
-        }
-
-        // SSE2 16-byte tail (always available on x86_64)
-        while i + 16 <= max_len {
-            let va = _mm_loadu_si128(a.as_ptr().add(i) as *const __m128i);
-            let vb = _mm_loadu_si128(b.as_ptr().add(i) as *const __m128i);
-            let cmp = _mm_cmpeq_epi8(va, vb);
-            let mask = _mm_movemask_epi8(cmp) as u32;
-            if mask != 0xFFFF {
-                let first_diff = (!mask).trailing_zeros() as usize;
-                return i + first_diff;
-            }
-            i += 16;
-        }
-
-        // Scalar tail
-        while i < max_len && *a.get_unchecked(i) == *b.get_unchecked(i) {
-            i += 1;
-        }
-        i
     }
 
     /// AVX2-accelerated u32 sum using u64 accumulator lanes.
