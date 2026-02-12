@@ -102,6 +102,6 @@ cargo install samply                                # one-time setup
 - If a task has multiple independent parts, commit each part separately rather than one giant commit at the end.
 
 ## Project status
-11 of 12 milestones complete. All core algorithms, pipelines, GPU kernels, auto-selection, optimal parsing, multi-threading, and tooling are implemented. Not started: fuzz testing (M5.3), Vulkan backend (M12).
+11 of 12 milestones complete. All core algorithms, pipelines, GPU kernels (OpenCL + WebGPU), auto-selection, optimal parsing, multi-threading, and tooling are implemented. Not started: fuzz testing (M5.3).
 
 For detailed GPU benchmarks, architecture notes, and roadmap see `ARCHITECTURE.md`.
