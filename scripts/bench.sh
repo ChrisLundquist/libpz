@@ -26,6 +26,7 @@ Options:
   -n, --iters N          Number of iterations per operation (default: 3)
   -p, --pipelines LIST   Comma-separated list of pipelines to benchmark
                          (default: deflate,lzr,lzf)
+  --all                  Benchmark all available pipelines
   --opencl               Build with OpenCL feature and pass --gpu to pz
   --webgpu               Build with WebGPU feature and pass --webgpu to pz
   --features FEAT        Cargo features to enable (e.g. opencl,webgpu)
@@ -40,6 +41,7 @@ Examples:
   ./scripts/bench.sh -n 10                        # more iterations
   ./scripts/bench.sh --opencl -p deflate           # GPU-accelerated via OpenCL
   ./scripts/bench.sh --webgpu -p bw,bbw           # GPU-accelerated via WebGPU
+  ./scripts/bench.sh --all                         # benchmark every pipeline
   ./scripts/bench.sh -n 1 -p deflate,lzf file.txt # combine options
 EOF
 }
@@ -66,6 +68,10 @@ while [[ $# -gt 0 ]]; do
             fi
             IFS=',' read -ra PIPELINES <<< "$2"
             shift 2
+            ;;
+        --all)
+            PIPELINES=(deflate bw bbw lzr lzf)
+            shift
             ;;
         --opencl)
             # Shorthand: enable opencl feature and pass --gpu to pz
