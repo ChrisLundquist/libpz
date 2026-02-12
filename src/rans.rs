@@ -414,6 +414,10 @@ fn rans_encode_interleaved(
 ///
 /// Symbol `i` is decoded from state `i % num_states`, enabling N-way
 /// SIMD parallelism. Each state reads from its own word stream.
+///
+/// When `num_states == 4`, dispatches to the batched 4-way decode path
+/// which processes all 4 lanes per iteration for better register usage
+/// and reduced loop overhead.
 fn rans_decode_interleaved(
     word_streams: &[Vec<u16>],
     initial_states: &[u32],
@@ -426,6 +430,33 @@ fn rans_decode_interleaved(
         return Err(PzError::InvalidInput);
     }
 
+    // Fast path: 4-way batched decode
+    if num_states == 4 {
+        let streams_arr: [&[u16]; 4] = [
+            &word_streams[0],
+            &word_streams[1],
+            &word_streams[2],
+            &word_streams[3],
+        ];
+        let states_arr: [u32; 4] = [
+            initial_states[0],
+            initial_states[1],
+            initial_states[2],
+            initial_states[3],
+        ];
+        return crate::simd::rans_decode_4way(
+            &streams_arr,
+            &states_arr,
+            &norm.freq,
+            &norm.cum,
+            lookup,
+            norm.scale_bits as u32,
+            original_len,
+        )
+        .ok_or(PzError::InvalidInput);
+    }
+
+    // Generic N-way path
     let scale_bits = norm.scale_bits as u32;
     let scale_mask = (1u32 << scale_bits) - 1;
 
