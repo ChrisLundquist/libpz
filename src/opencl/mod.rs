@@ -96,7 +96,7 @@ pub const MIN_GPU_BWT_SIZE: usize = 32 * 1024; // 32KB
 /// Must match the struct definition in the .cl files exactly.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
-struct GpuMatch {
+pub(crate) struct GpuMatch {
     offset: cl_uint,
     length: cl_uint,
     next: u8,
@@ -649,6 +649,23 @@ impl DeviceBuf {
     /// Whether this buffer is empty (zero-length data).
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+}
+
+/// An opaque GPU-resident buffer of LZ77 match results.
+///
+/// Produced by [`OpenClEngine::find_matches_to_device()`] and consumed by
+/// [`OpenClEngine::download_and_dedupe()`]. The match data stays on the GPU
+/// until explicitly downloaded, enabling zero-copy stage chaining.
+pub struct GpuMatchBuf {
+    pub(crate) buf: Buffer<GpuMatch>,
+    pub(crate) input_len: usize,
+}
+
+impl GpuMatchBuf {
+    /// The number of input positions this match buffer covers.
+    pub fn input_len(&self) -> usize {
+        self.input_len
     }
 }
 

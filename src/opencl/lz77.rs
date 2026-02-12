@@ -68,6 +68,94 @@ impl OpenClEngine {
         Ok(matches)
     }
 
+    /// Find LZ77 matches on the GPU, keeping the match buffer on-device.
+    ///
+    /// Unlike [`find_matches()`] which downloads and deduplicates immediately,
+    /// this returns a [`GpuMatchBuf`] that stays on the GPU. The caller can:
+    /// - Download later via [`download_and_dedupe()`] for CPU processing
+    /// - (future) Pass to a GPU demux kernel without any PCI transfer
+    ///
+    /// This is the building block for zero-copy GPU pipeline composition.
+    pub fn find_matches_to_device(
+        &self,
+        input: &[u8],
+        variant: KernelVariant,
+    ) -> PzResult<GpuMatchBuf> {
+        if input.is_empty() {
+            return Ok(GpuMatchBuf {
+                buf: unsafe {
+                    Buffer::<GpuMatch>::create(&self.context, CL_MEM_WRITE_ONLY, 1, ptr::null_mut())
+                        .map_err(|_| PzError::BufferTooSmall)?
+                },
+                input_len: 0,
+            });
+        }
+
+        let input_len = input.len();
+
+        let mut input_buf = unsafe {
+            Buffer::<u8>::create(&self.context, CL_MEM_READ_ONLY, input_len, ptr::null_mut())
+                .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        let output_buf = unsafe {
+            Buffer::<GpuMatch>::create(&self.context, CL_MEM_WRITE_ONLY, input_len, ptr::null_mut())
+                .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        // Write input to device
+        let write_event = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut input_buf, CL_BLOCKING, 0, input, &[])
+                .map_err(|_| PzError::InvalidInput)?
+        };
+        write_event.wait().map_err(|_| PzError::InvalidInput)?;
+        self.profile_event("find_matches_to_device: upload input", &write_event);
+
+        // Execute kernel
+        match variant {
+            KernelVariant::PerPosition => {
+                self.run_per_position_kernel(&input_buf, &output_buf, input_len)?;
+            }
+            KernelVariant::Batch => {
+                self.run_batch_kernel(&input_buf, &output_buf, input_len)?;
+            }
+            KernelVariant::HashTable => {
+                self.run_hash_kernel(&input_buf, &output_buf, input_len)?;
+            }
+        }
+
+        Ok(GpuMatchBuf {
+            buf: output_buf,
+            input_len,
+        })
+    }
+
+    /// Download a device-resident match buffer and deduplicate into `Match` structs.
+    ///
+    /// This is the download counterpart to [`find_matches_to_device()`].
+    pub fn download_and_dedupe(
+        &self,
+        match_buf: &GpuMatchBuf,
+        input: &[u8],
+    ) -> PzResult<Vec<Match>> {
+        if match_buf.input_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut gpu_matches = vec![GpuMatch::default(); match_buf.input_len];
+        let read_event = unsafe {
+            self.queue
+                .enqueue_read_buffer(&match_buf.buf, CL_BLOCKING, 0, &mut gpu_matches, &[])
+                .map_err(|_| PzError::InvalidInput)?
+        };
+        read_event.wait().map_err(|_| PzError::InvalidInput)?;
+        self.profile_event("download_and_dedupe: download matches", &read_event);
+
+        let matches = dedupe_gpu_matches(&gpu_matches, input);
+        Ok(matches)
+    }
+
     /// Execute the per-position kernel (one work-item per byte).
     fn run_per_position_kernel(
         &self,

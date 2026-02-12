@@ -170,6 +170,79 @@ fn test_gpu_lz77_empty_input() {
     assert!(result.is_empty());
 }
 
+// --- find_matches_to_device tests ---
+
+#[test]
+fn test_find_matches_to_device_matches_find_matches() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let input = b"hello world hello world hello world";
+
+    // Direct path: find_matches downloads and dedupes in one call
+    let direct = engine
+        .find_matches(input, KernelVariant::HashTable)
+        .unwrap();
+
+    // Device path: keep on GPU, then download
+    let match_buf = engine
+        .find_matches_to_device(input, KernelVariant::HashTable)
+        .unwrap();
+    assert_eq!(match_buf.input_len(), input.len());
+    let device = engine.download_and_dedupe(&match_buf, input).unwrap();
+
+    // Both paths should produce identical match sequences
+    assert_eq!(direct.len(), device.len(), "match count differs");
+    for (i, (d, v)) in direct.iter().zip(device.iter()).enumerate() {
+        assert_eq!(d.offset, v.offset, "offset mismatch at match {}", i);
+        assert_eq!(d.length, v.length, "length mismatch at match {}", i);
+        assert_eq!(d.next, v.next, "next mismatch at match {}", i);
+    }
+}
+
+#[test]
+fn test_find_matches_to_device_empty() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let match_buf = engine
+        .find_matches_to_device(b"", KernelVariant::HashTable)
+        .unwrap();
+    assert_eq!(match_buf.input_len(), 0);
+
+    let matches = engine.download_and_dedupe(&match_buf, b"").unwrap();
+    assert!(matches.is_empty());
+}
+
+#[test]
+fn test_find_matches_to_device_round_trip() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let input = b"the quick brown fox jumps over the lazy dog. the quick brown fox.";
+    let match_buf = engine
+        .find_matches_to_device(input, KernelVariant::Batch)
+        .unwrap();
+    let matches = engine.download_and_dedupe(&match_buf, input).unwrap();
+
+    // Serialize matches and verify LZ77 round-trip
+    let mut compressed = Vec::with_capacity(matches.len() * Match::SERIALIZED_SIZE);
+    for m in &matches {
+        compressed.extend_from_slice(&m.to_bytes());
+    }
+    let decompressed = crate::lz77::decompress(&compressed).unwrap();
+    assert_eq!(&decompressed, &input[..]);
+}
+
 // --- Hash-table LZ77 GPU tests ---
 
 #[test]
