@@ -26,8 +26,6 @@ pub mod webgpu;
 pub mod ffi;
 
 #[cfg(test)]
-mod matrix_compress;
-#[cfg(test)]
 mod validation;
 
 /// Error types for libpz operations.
