@@ -637,9 +637,10 @@ impl WebGpuEngine {
 
     fn pad_input_bytes(input: &[u8]) -> Vec<u8> {
         let mut padded = input.to_vec();
-        while !padded.len().is_multiple_of(4) {
-            padded.push(0);
-        }
+        // Pad to u32-aligned plus 4 extra bytes to allow safe read_u32_at()
+        // across word boundaries at the end of the buffer.
+        let target = ((input.len() + 3) & !3) + 4;
+        padded.resize(target, 0);
         padded
     }
 

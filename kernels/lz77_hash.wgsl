@@ -31,6 +31,18 @@ fn read_byte(pos: u32) -> u32 {
     return (input[word_idx] >> (byte_idx * 8u)) & 0xFFu;
 }
 
+// Read a u32 starting at any byte offset (may span two u32 words).
+fn read_u32_at(pos: u32) -> u32 {
+    let word_idx = pos / 4u;
+    let shift = (pos % 4u) * 8u;
+    if (shift == 0u) {
+        return input[word_idx];
+    }
+    let lo = input[word_idx] >> shift;
+    let hi = input[word_idx + 1u] << (32u - shift);
+    return lo | hi;
+}
+
 fn hash3(pos: u32, len: u32) -> u32 {
     if (pos + 2u >= len) {
         return 0u;
@@ -100,14 +112,14 @@ fn find_matches(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         checked = checked + 1u;
 
-        // Spot-check
+        // Spot-check: skip candidate if it doesn't match at best_length position
         if (best.length >= MIN_MATCH && best.length < remaining) {
             if (read_byte(candidate + best.length) != read_byte(pos + best.length)) {
                 continue;
             }
         }
 
-        // Compare bytes
+        // Compare 4 bytes at a time using u32 word loads
         var max_len = remaining;
         let dist = pos - candidate;
         if (dist < max_len) {
@@ -115,6 +127,25 @@ fn find_matches(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
 
         var match_len = 0u;
+        // Compare u32 words (4 bytes at a time) while safe
+        // We need at least 4 bytes remaining AND 4 bytes of padding in the
+        // input buffer to safely read a u32 at any byte offset.
+        let safe_limit = max_len & ~3u; // round down to u32 boundary
+        loop {
+            if (match_len >= safe_limit) {
+                break;
+            }
+            let a = read_u32_at(candidate + match_len);
+            let b = read_u32_at(pos + match_len);
+            let diff = a ^ b;
+            if (diff != 0u) {
+                // Find which byte differs (count trailing zero bits / 8)
+                match_len = match_len + countTrailingZeros(diff) / 8u;
+                break;
+            }
+            match_len = match_len + 4u;
+        }
+        // Handle remaining 0-3 bytes
         loop {
             if (match_len >= max_len) {
                 break;
@@ -128,6 +159,10 @@ fn find_matches(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (match_len > best.length && match_len >= MIN_MATCH) {
             best.offset = pos - candidate;
             best.length = match_len;
+            // Early exit: stop searching if we found a long-enough match
+            if (best.length >= 128u) {
+                break;
+            }
         }
     }
 
