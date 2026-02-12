@@ -224,9 +224,10 @@ impl WebGpuEngine {
         let max_workgroups_per_dim = limits.max_compute_workgroups_per_dimension;
 
         // Request TIMESTAMP_QUERY when profiling is desired; fall back if unsupported.
+        // profiling stays true regardless — we'll use CPU-side wall-clock timing as fallback.
         let supports_timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        let profiling = profiling && supports_timestamps;
-        let required_features = if profiling {
+        let use_timestamps = profiling && supports_timestamps;
+        let required_features = if use_timestamps {
             wgpu::Features::TIMESTAMP_QUERY
         } else {
             wgpu::Features::empty()
@@ -332,8 +333,8 @@ impl WebGpuEngine {
             make_pipeline("prefix_sum_apply", &huffman_module, "prefix_sum_apply");
         let pipeline_fse_decode = make_pipeline("fse_decode", &fse_decode_module, "fse_decode");
 
-        // Create profiling resources when enabled.
-        let (query_set, resolve_buf, staging_buf) = if profiling {
+        // Create profiling resources when GPU timestamps are available.
+        let (query_set, resolve_buf, staging_buf) = if use_timestamps {
             let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("timestamp_query_set"),
                 ty: wgpu::QueryType::Timestamp,
@@ -608,13 +609,26 @@ impl WebGpuEngine {
         workgroups_x: u32,
         label: &str,
     ) -> PzResult<()> {
+        let t0 = if self.profiling {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
         self.record_dispatch(&mut encoder, pipeline, bind_group, workgroups_x, label)?;
         self.queue.submit(Some(encoder.finish()));
         if self.profiling {
-            self.read_and_print_timestamps(label);
+            if self.query_set.is_some() {
+                // GPU timestamps available — use precise device timings.
+                self.read_and_print_timestamps(label);
+            } else {
+                // Fall back to CPU wall-clock (includes submit + sync overhead).
+                self.device.poll(wgpu::Maintain::Wait);
+                let ms = t0.unwrap().elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[pz-gpu] {label}: {ms:.3} ms");
+            }
         }
         Ok(())
     }
@@ -2302,6 +2316,25 @@ mod tests {
             Ok(engine) => {
                 assert!(!engine.device_name().is_empty());
                 assert!(engine.max_work_group_size() >= 1);
+            }
+            Err(PzError::Unsupported) => {
+                // Expected on systems without GPU
+            }
+            Err(e) => panic!("unexpected error: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_profiling_creation() {
+        match WebGpuEngine::with_profiling(true) {
+            Ok(engine) => {
+                eprintln!(
+                    "Device: {}, profiling={}",
+                    engine.device_name(),
+                    engine.profiling()
+                );
+                // profiling accessor must match what was actually negotiated
+                // (may be false if device doesn't support TIMESTAMP_QUERY)
             }
             Err(PzError::Unsupported) => {
                 // Expected on systems without GPU
