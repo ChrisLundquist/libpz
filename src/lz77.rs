@@ -257,6 +257,11 @@ impl HashChainFinder {
             best_length -= 1;
         }
 
+        // Cap to u16::MAX since Match.length is u16
+        if best_length > u16::MAX as u32 {
+            best_length = u16::MAX as u32;
+        }
+
         let next = if (best_length as usize) < remaining {
             input[pos + best_length as usize]
         } else {
@@ -314,7 +319,7 @@ impl HashChainFinder {
 
             if match_len >= MIN_MATCH as u32 {
                 let offset = (pos - chain_pos) as u16;
-                let length = match_len as u16;
+                let length = match_len.min(u16::MAX as u32) as u16;
 
                 // Check if we already have a candidate with this length
                 let existing = found.iter_mut().find(|(l, _)| *l == length);
@@ -347,19 +352,19 @@ impl HashChainFinder {
     }
 }
 
-/// Compress input using lazy matching (gzip-style).
+/// Compress input using lazy matching, returning the match sequence.
 ///
 /// After finding a match at position P, checks if position P+1 has a
 /// longer match. If so, emits a literal for P and uses the longer match.
 /// This produces the best compression ratios of the greedy strategies,
 /// and is also faster than greedy hash-chain due to skipping matched
 /// positions during hash insertion.
-pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
+pub fn compress_lazy_to_matches(input: &[u8]) -> PzResult<Vec<Match>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut output = Vec::with_capacity(input.len());
+    let mut matches = Vec::with_capacity(input.len() / 4);
     let mut finder = HashChainFinder::new();
     let mut pos: usize = 0;
 
@@ -375,14 +380,11 @@ pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
 
             if next_m.length > m.length {
                 // Emit current position as a literal, use the next match
-                output.extend_from_slice(
-                    &Match {
-                        offset: 0,
-                        length: 0,
-                        next: input[pos],
-                    }
-                    .to_bytes(),
-                );
+                matches.push(Match {
+                    offset: 0,
+                    length: 0,
+                    next: input[pos],
+                });
                 pos += 1;
 
                 // Insert positions covered by next_m (capped for long matches)
@@ -392,7 +394,7 @@ pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
                     finder.insert(input, pos + i);
                 }
 
-                output.extend_from_slice(&next_m.to_bytes());
+                matches.push(next_m);
                 pos += advance;
                 continue;
             }
@@ -405,10 +407,23 @@ pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
             finder.insert(input, pos + i);
         }
 
-        output.extend_from_slice(&m.to_bytes());
+        matches.push(m);
         pos += advance;
     }
 
+    Ok(matches)
+}
+
+/// Compress input using lazy matching (gzip-style), returning serialized bytes.
+///
+/// This is the standard entry point for LZ77 compression. Uses
+/// `compress_lazy_to_matches` internally and serializes the result.
+pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
+    let matches = compress_lazy_to_matches(input)?;
+    let mut output = Vec::with_capacity(matches.len() * Match::SERIALIZED_SIZE);
+    for m in &matches {
+        output.extend_from_slice(&m.to_bytes());
+    }
     Ok(output)
 }
 
@@ -733,5 +748,68 @@ mod tests {
         assert_eq!(matched, 2992, "xargs.1 match coverage changed");
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
+    }
+
+    /// Regression: all-same-byte input >65535 bytes would produce matches with
+    /// length exceeding u16::MAX, causing silent truncation and corrupt output.
+    #[test]
+    fn test_round_trip_long_run_all_same() {
+        let input = vec![0xAAu8; 70_000];
+        let compressed = compress_lazy(&input).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "70KB all-same-byte round trip failed");
+    }
+
+    /// Regression: short repeating pattern >65535 bytes creates overlapping
+    /// matches with length > u16::MAX via offset=pattern_len.
+    #[test]
+    fn test_round_trip_long_repeating_pattern() {
+        let pattern = b"abcde";
+        let input: Vec<u8> = pattern.iter().cycle().take(80_000).copied().collect();
+        let compressed = compress_lazy(&input).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(
+            decompressed, input,
+            "80KB repeating pattern round trip failed"
+        );
+    }
+
+    /// Verify find_match respects MAX_COMPARE_LEN (258) from SIMD comparisons.
+    ///
+    /// The SIMD compare_bytes function caps at MAX_COMPARE_LEN=258 (matching
+    /// DEFLATE's max match length). This prevents CPU matches from exceeding
+    /// u16::MAX. The u16 cap in find_match is defensive (the SIMD cap makes
+    /// it unreachable on CPU, but the GPU path needs it).
+    #[test]
+    fn test_find_match_length_bounded() {
+        let input = vec![0u8; 70_000];
+        let mut finder = HashChainFinder::new();
+        finder.insert(&input, 0);
+        let m = finder.find_match(&input, 1);
+        // SIMD compare_bytes caps at MAX_COMPARE_LEN = 258
+        assert_eq!(
+            m.length, 258,
+            "find_match should be capped by MAX_COMPARE_LEN"
+        );
+        assert_eq!(m.offset, 1, "should match with offset 1");
+    }
+
+    /// Verify compress_lazy round-trips 100KB of identical bytes.
+    ///
+    /// Each match is capped at MAX_COMPARE_LEN=258 by the SIMD comparator,
+    /// so many sequential matches are needed.
+    #[test]
+    fn test_compress_lazy_to_matches_large_all_same() {
+        let input = vec![0xBBu8; 100_000];
+        let matches = compress_lazy_to_matches(&input).unwrap();
+        // With 258-byte max matches, need ~100000/259 ≈ 386 entries
+        assert!(
+            matches.len() > 100,
+            "100KB all-same should need many matches, got {}",
+            matches.len()
+        );
+        let compressed = compress_lazy(&input).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
     }
 }
