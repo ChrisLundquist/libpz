@@ -741,6 +741,11 @@ impl WebGpuEngine {
             ],
         });
 
+        let t0 = if self.profiling {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -761,6 +766,11 @@ impl WebGpuEngine {
             "lz77_hash_find",
         )?;
         self.queue.submit(Some(encoder.finish()));
+        if let Some(t0) = t0 {
+            self.device.poll(wgpu::Maintain::Wait);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[pz-gpu] lz77_hash (build+find): {ms:.3} ms");
+        }
 
         let raw = self.read_buffer(
             &output_buf,
@@ -1365,6 +1375,11 @@ impl WebGpuEngine {
             });
 
             let global_wg = (padded_n as u32).div_ceil(256);
+            let t0 = if self.profiling {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1385,6 +1400,11 @@ impl WebGpuEngine {
                 "radix_histogram",
             )?;
             self.queue.submit(Some(encoder.finish()));
+            if let Some(t0) = t0 {
+                self.device.poll(wgpu::Maintain::Wait);
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[pz-gpu] radix_keys+hist (pass={pass}): {ms:.3} ms");
+            }
 
             // Phase 3: Prefix sum over histogram, then inclusive_to_exclusive
             let mut hist_scan_buf_temp = self.create_buffer(
