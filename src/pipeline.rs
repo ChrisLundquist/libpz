@@ -7,18 +7,22 @@
 ///
 /// **Supported pipelines:**
 ///
-/// | Pipeline      | Stages                           | Similar to |
-/// |---------------|----------------------------------|------------|
-/// | `Deflate`     | LZ77 → Huffman                   | gzip       |
-/// | `Bw`          | BWT → MTF → RLE → FSE            | bzip2      |
-/// | `Lzr`         | LZ77 → rANS                      | fast ANS   |
-/// | `Lzf`         | LZ77 → FSE                       | zstd-like  |
+/// | Pipeline      | Stages                           | Similar to      |
+/// |---------------|----------------------------------|-----------------|
+/// | `Deflate`     | LZ77 → Huffman                   | gzip            |
+/// | `Bw`          | BWT → MTF → RLE → FSE            | bzip2           |
+/// | `Lzr`         | LZ77 → rANS                      | fast ANS        |
+/// | `Lzf`         | LZ77 → FSE                       | zstd-like       |
+/// | `LzssF`       | LZSS → FSE                       | experimental    |
+/// | `LzssR`       | LZSS → rANS                      | experimental    |
+/// | `Lz78F`       | LZ78 → FSE                       | experimental    |
+/// | `Lz78R`       | LZ78 → rANS                      | experimental    |
 ///
 /// **Container format (V2, multi-block):**
 /// Each compressed stream starts with a header:
 /// - Magic bytes: `PZ` (2 bytes)
 /// - Version: 2 (1 byte)
-/// - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf (1 byte)
+/// - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 5=LzssF, 6=LzssR, 7=Lz78F, 8=Lz78R (1 byte)
 /// - Original length: u32 little-endian (4 bytes)
 /// - num_blocks: u32 little-endian (4 bytes)
 /// - Block table: \[compressed_len: u32, original_len: u32\] * num_blocks
@@ -27,6 +31,8 @@ use crate::bwt;
 use crate::fse;
 use crate::huffman::HuffmanTree;
 use crate::lz77;
+use crate::lz78;
+use crate::lzss;
 use crate::mtf;
 use crate::rans;
 use crate::rle;
@@ -134,6 +140,14 @@ pub enum Pipeline {
     Lzr = 3,
     /// LZ77 + FSE (finite state entropy, zstd-style)
     Lzf = 4,
+    /// LZSS + FSE (flag-bit LZ + tANS, experimental)
+    LzssF = 5,
+    /// LZSS + rANS (flag-bit LZ + arithmetic ANS, experimental)
+    LzssR = 6,
+    /// LZ78 + FSE (incremental trie + tANS, experimental)
+    Lz78F = 7,
+    /// LZ78 + rANS (incremental trie + rANS, experimental)
+    Lz78R = 8,
 }
 
 impl TryFrom<u8> for Pipeline {
@@ -146,6 +160,10 @@ impl TryFrom<u8> for Pipeline {
             2 => Ok(Self::Bbw),
             3 => Ok(Self::Lzr),
             4 => Ok(Self::Lzf),
+            5 => Ok(Self::LzssF),
+            6 => Ok(Self::LzssR),
+            7 => Ok(Self::Lz78F),
+            8 => Ok(Self::Lz78R),
             _ => Err(PzError::Unsupported),
         }
     }
@@ -313,6 +331,10 @@ pub(crate) fn compress_block(
         Pipeline::Bbw => compress_block_bbw(input, options),
         Pipeline::Lzr => compress_block_lzr(input, options),
         Pipeline::Lzf => compress_block_lzf(input, options),
+        Pipeline::LzssF => compress_block_lzssf(input),
+        Pipeline::LzssR => compress_block_lzssr(input),
+        Pipeline::Lz78F => compress_block_lz78f(input),
+        Pipeline::Lz78R => compress_block_lz78r(input),
     }
 }
 
@@ -328,6 +350,10 @@ pub(crate) fn decompress_block(
         Pipeline::Bbw => decompress_block_bbw(payload, orig_len),
         Pipeline::Lzr => decompress_block_lzr(payload, orig_len),
         Pipeline::Lzf => decompress_block_lzf(payload, orig_len),
+        Pipeline::LzssF => decompress_block_lzssf(payload, orig_len),
+        Pipeline::LzssR => decompress_block_lzssr(payload, orig_len),
+        Pipeline::Lz78F => decompress_block_lz78f(payload, orig_len),
+        Pipeline::Lz78R => decompress_block_lz78r(payload, orig_len),
     }
 }
 
@@ -591,6 +617,7 @@ fn pipeline_stage_count(pipeline: Pipeline) -> usize {
         Pipeline::Bbw => 4,
         Pipeline::Lzr => 2,
         Pipeline::Lzf => 2,
+        Pipeline::LzssF | Pipeline::LzssR | Pipeline::Lz78F | Pipeline::Lz78R => 2,
     }
 }
 
@@ -628,6 +655,50 @@ fn stage_lz77_compress(mut block: StageBlock, options: &CompressOptions) -> PzRe
 
     block.streams = Some(vec![offsets, lengths, literals]);
     block.data.clear();
+    Ok(block)
+}
+
+/// LZSS-pipeline stage 0: LZSS compression (flat byte stream, no deinterleaving).
+///
+/// Encodes the block with LZSS (flag-bit variant of LZ77). The output is
+/// a self-contained byte stream including LZSS headers. Stored as a single
+/// flat stream for the downstream entropy coder.
+fn stage_lzss_compress(mut block: StageBlock) -> PzResult<StageBlock> {
+    let encoded = lzss::encode(&block.data)?;
+    block.metadata.lz_len = Some(encoded.len());
+    block.data = encoded;
+    Ok(block)
+}
+
+/// LZSS-pipeline decompress: LZSS decompress from flat byte stream.
+fn stage_lzss_decompress(mut block: StageBlock) -> PzResult<StageBlock> {
+    let decoded = lzss::decode(&block.data)?;
+    if decoded.len() != block.original_len {
+        return Err(PzError::InvalidInput);
+    }
+    block.data = decoded;
+    Ok(block)
+}
+
+/// LZ78-pipeline stage 0: LZ78 compression (flat byte stream, no deinterleaving).
+///
+/// Encodes the block with LZ78 (incremental trie dictionary). The output is
+/// a self-contained byte stream including LZ78 headers. Stored as a single
+/// flat stream for the downstream entropy coder.
+fn stage_lz78_compress(mut block: StageBlock) -> PzResult<StageBlock> {
+    let encoded = lz78::encode(&block.data)?;
+    block.metadata.lz_len = Some(encoded.len());
+    block.data = encoded;
+    Ok(block)
+}
+
+/// LZ78-pipeline decompress: LZ78 decompress from flat byte stream.
+fn stage_lz78_decompress(mut block: StageBlock) -> PzResult<StageBlock> {
+    let decoded = lz78::decode(&block.data)?;
+    if decoded.len() != block.original_len {
+        return Err(PzError::InvalidInput);
+    }
+    block.data = decoded;
     Ok(block)
 }
 
@@ -941,6 +1012,14 @@ fn run_compress_stage(
         (Pipeline::Lzr, 1) => stage_rans_encode(block),
         (Pipeline::Lzf, 0) => stage_lz77_compress(block, options),
         (Pipeline::Lzf, 1) => stage_fse_encode(block),
+        (Pipeline::LzssF, 0) => stage_lzss_compress(block),
+        (Pipeline::LzssF, 1) => stage_fse_encode(block),
+        (Pipeline::LzssR, 0) => stage_lzss_compress(block),
+        (Pipeline::LzssR, 1) => stage_rans_encode(block),
+        (Pipeline::Lz78F, 0) => stage_lz78_compress(block),
+        (Pipeline::Lz78F, 1) => stage_fse_encode(block),
+        (Pipeline::Lz78R, 0) => stage_lz78_compress(block),
+        (Pipeline::Lz78R, 1) => stage_rans_encode(block),
         _ => Err(PzError::Unsupported),
     }
 }
@@ -971,6 +1050,18 @@ fn run_decompress_stage(
         // Lzf: FSE decode(0) → LZ77 decompress(1)
         (Pipeline::Lzf, 0) => stage_fse_decode(block),
         (Pipeline::Lzf, 1) => stage_lz77_decompress(block),
+        // LzssF: FSE decode(0) → LZSS decompress(1)
+        (Pipeline::LzssF, 0) => stage_fse_decode(block),
+        (Pipeline::LzssF, 1) => stage_lzss_decompress(block),
+        // LzssR: rANS decode(0) → LZSS decompress(1)
+        (Pipeline::LzssR, 0) => stage_rans_decode(block),
+        (Pipeline::LzssR, 1) => stage_lzss_decompress(block),
+        // Lz78F: FSE decode(0) → LZ78 decompress(1)
+        (Pipeline::Lz78F, 0) => stage_fse_decode(block),
+        (Pipeline::Lz78F, 1) => stage_lz78_decompress(block),
+        // Lz78R: rANS decode(0) → LZ78 decompress(1)
+        (Pipeline::Lz78R, 0) => stage_rans_decode(block),
+        (Pipeline::Lz78R, 1) => stage_lz78_decompress(block),
         _ => Err(PzError::Unsupported),
     }
 }
@@ -1829,6 +1920,126 @@ fn decompress_block_lzf(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     Ok(block.data)
 }
 
+// --- LZSS+FSE pipeline: LZSS + FSE ---
+
+/// Compress a single block using the LzssF pipeline (no container header).
+fn compress_block_lzssf(input: &[u8]) -> PzResult<Vec<u8>> {
+    let block = StageBlock {
+        block_index: 0,
+        original_len: input.len(),
+        data: input.to_vec(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+    let block = stage_lzss_compress(block)?;
+    let block = stage_fse_encode(block)?;
+    Ok(block.data)
+}
+
+/// Decompress a single LzssF block (no container header).
+fn decompress_block_lzssf(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    let block = StageBlock {
+        block_index: 0,
+        original_len: orig_len,
+        data: payload.to_vec(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+    let block = stage_fse_decode(block)?;
+    let block = stage_lzss_decompress(block)?;
+    Ok(block.data)
+}
+
+// --- LZSS+rANS pipeline: LZSS + rANS ---
+
+/// Compress a single block using the LzssR pipeline (no container header).
+fn compress_block_lzssr(input: &[u8]) -> PzResult<Vec<u8>> {
+    let block = StageBlock {
+        block_index: 0,
+        original_len: input.len(),
+        data: input.to_vec(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+    let block = stage_lzss_compress(block)?;
+    let block = stage_rans_encode(block)?;
+    Ok(block.data)
+}
+
+/// Decompress a single LzssR block (no container header).
+fn decompress_block_lzssr(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    let block = StageBlock {
+        block_index: 0,
+        original_len: orig_len,
+        data: payload.to_vec(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+    let block = stage_rans_decode(block)?;
+    let block = stage_lzss_decompress(block)?;
+    Ok(block.data)
+}
+
+// --- LZ78+FSE pipeline: LZ78 + FSE ---
+
+/// Compress a single block using the Lz78F pipeline (no container header).
+fn compress_block_lz78f(input: &[u8]) -> PzResult<Vec<u8>> {
+    let block = StageBlock {
+        block_index: 0,
+        original_len: input.len(),
+        data: input.to_vec(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+    let block = stage_lz78_compress(block)?;
+    let block = stage_fse_encode(block)?;
+    Ok(block.data)
+}
+
+/// Decompress a single Lz78F block (no container header).
+fn decompress_block_lz78f(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    let block = StageBlock {
+        block_index: 0,
+        original_len: orig_len,
+        data: payload.to_vec(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+    let block = stage_fse_decode(block)?;
+    let block = stage_lz78_decompress(block)?;
+    Ok(block.data)
+}
+
+// --- LZ78+rANS pipeline: LZ78 + rANS ---
+
+/// Compress a single block using the Lz78R pipeline (no container header).
+fn compress_block_lz78r(input: &[u8]) -> PzResult<Vec<u8>> {
+    let block = StageBlock {
+        block_index: 0,
+        original_len: input.len(),
+        data: input.to_vec(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+    let block = stage_lz78_compress(block)?;
+    let block = stage_rans_encode(block)?;
+    Ok(block.data)
+}
+
+/// Decompress a single Lz78R block (no container header).
+fn decompress_block_lz78r(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    let block = StageBlock {
+        block_index: 0,
+        original_len: orig_len,
+        data: payload.to_vec(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+    let block = stage_rans_decode(block)?;
+    let block = stage_lz78_decompress(block)?;
+    Ok(block.data)
+}
+
 // --- Pipeline auto-selection ---
 
 /// Automatically select the best pipeline for the given input data.
@@ -1912,6 +2123,10 @@ pub fn select_pipeline_trial(
         Pipeline::Bw,
         Pipeline::Lzr,
         Pipeline::Lzf,
+        Pipeline::LzssF,
+        Pipeline::LzssR,
+        Pipeline::Lz78F,
+        Pipeline::Lz78R,
     ];
     let mut best_pipeline = Pipeline::Deflate;
     let mut best_size = usize::MAX;
@@ -3032,6 +3247,191 @@ mod tests {
             ..CompressOptions::default()
         };
         // Just verify it doesn't crash — Lzf may or may not win
+        let _pipeline = select_pipeline_trial(&input, &opts, 2048);
+    }
+
+    // --- LzssF pipeline tests ---
+
+    #[test]
+    fn test_lzssf_empty() {
+        let result = compress(&[], Pipeline::LzssF).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_lzssf_round_trip_hello() {
+        let input = b"hello, world! hello, world!";
+        let compressed = compress(input, Pipeline::LzssF).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lzssf_round_trip_repeating() {
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = compress(&input, Pipeline::LzssF).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lzssf_round_trip_binary() {
+        let input: Vec<u8> = (0..=255).cycle().take(512).collect();
+        let compressed = compress(&input, Pipeline::LzssF).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lzssf_round_trip_all_same() {
+        let input = vec![0xAA_u8; 500];
+        let compressed = compress(&input, Pipeline::LzssF).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    // --- LzssR pipeline tests ---
+
+    #[test]
+    fn test_lzssr_empty() {
+        let result = compress(&[], Pipeline::LzssR).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_lzssr_round_trip_hello() {
+        let input = b"hello, world! hello, world!";
+        let compressed = compress(input, Pipeline::LzssR).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lzssr_round_trip_repeating() {
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = compress(&input, Pipeline::LzssR).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lzssr_round_trip_binary() {
+        let input: Vec<u8> = (0..=255).cycle().take(512).collect();
+        let compressed = compress(&input, Pipeline::LzssR).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    // --- Lz78F pipeline tests ---
+
+    #[test]
+    fn test_lz78f_empty() {
+        let result = compress(&[], Pipeline::Lz78F).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_lz78f_round_trip_hello() {
+        let input = b"hello, world! hello, world!";
+        let compressed = compress(input, Pipeline::Lz78F).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lz78f_round_trip_repeating() {
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = compress(&input, Pipeline::Lz78F).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lz78f_round_trip_binary() {
+        let input: Vec<u8> = (0..=255).cycle().take(512).collect();
+        let compressed = compress(&input, Pipeline::Lz78F).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lz78f_round_trip_all_same() {
+        let input = vec![0xAA_u8; 500];
+        let compressed = compress(&input, Pipeline::Lz78F).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    // --- Lz78R pipeline tests ---
+
+    #[test]
+    fn test_lz78r_empty() {
+        let result = compress(&[], Pipeline::Lz78R).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_lz78r_round_trip_hello() {
+        let input = b"hello, world! hello, world!";
+        let compressed = compress(input, Pipeline::Lz78R).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lz78r_round_trip_repeating() {
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend_from_slice(pattern);
+        }
+        let compressed = compress(&input, Pipeline::Lz78R).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lz78r_round_trip_binary() {
+        let input: Vec<u8> = (0..=255).cycle().take(512).collect();
+        let compressed = compress(&input, Pipeline::Lz78R).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_lz78r_round_trip_all_same() {
+        let input = vec![0xAA_u8; 500];
+        let compressed = compress(&input, Pipeline::Lz78R).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    // --- Trial selection with new pipelines ---
+
+    #[test]
+    fn test_trial_selection_includes_experimental() {
+        let pattern = b"Trial selection test data with experimental pipelines. ";
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend_from_slice(pattern);
+        }
+        let opts = CompressOptions {
+            threads: 1,
+            ..CompressOptions::default()
+        };
+        // Verify trial selection doesn't crash with new pipelines in candidates
         let _pipeline = select_pipeline_trial(&input, &opts, 2048);
     }
 }

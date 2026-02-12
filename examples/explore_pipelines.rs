@@ -333,6 +333,11 @@ fn main() {
         (Pipeline::Lzf, ParseStrategy::Lazy, 1, Backend::Cpu),
         (Pipeline::Lzf, ParseStrategy::Optimal, 1, Backend::Cpu),
         (Pipeline::Bw, ParseStrategy::Auto, 1, Backend::Cpu),
+        // Experimental: LZSS and LZ78 pipelines
+        (Pipeline::LzssF, ParseStrategy::Auto, 1, Backend::Cpu),
+        (Pipeline::LzssR, ParseStrategy::Auto, 1, Backend::Cpu),
+        (Pipeline::Lz78F, ParseStrategy::Auto, 1, Backend::Cpu),
+        (Pipeline::Lz78R, ParseStrategy::Auto, 1, Backend::Cpu),
         // Multi-threaded CPU
         (Pipeline::Deflate, ParseStrategy::Lazy, 0, Backend::Cpu),
         (Pipeline::Lzf, ParseStrategy::Lazy, 0, Backend::Cpu),
