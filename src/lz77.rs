@@ -226,8 +226,13 @@ impl HashChainFinder {
         let mut chain_count = 0;
 
         while chain_pos >= min_pos && chain_pos < pos && chain_count < MAX_CHAIN {
-            // SIMD-accelerated byte comparison
-            let max_len = remaining.min(pos - chain_pos);
+            // SIMD-accelerated byte comparison.
+            // max_len is capped only by remaining bytes (not by offset distance),
+            // allowing overlapping matches where length > offset. This enables
+            // efficient encoding of repeated-byte runs (e.g., offset=1, length=999
+            // for 1000 identical bytes). The decompressor's byte-by-byte copy loop
+            // already handles the overlap correctly.
+            let max_len = remaining;
             let match_len =
                 self.dispatcher
                     .compare_bytes(&input[chain_pos..], &input[pos..]) as u32;
@@ -300,7 +305,8 @@ impl HashChainFinder {
         let mut found: Vec<(u16, u16)> = Vec::new();
 
         while chain_pos >= min_pos && chain_pos < pos && chain_count < MAX_CHAIN {
-            let max_len = remaining.min(pos - chain_pos);
+            // Allow overlapping matches (length > offset) for run compression.
+            let max_len = remaining;
             let match_len =
                 self.dispatcher
                     .compare_bytes(&input[chain_pos..], &input[pos..]) as u32;

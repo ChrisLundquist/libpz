@@ -7,6 +7,8 @@ pub mod fse;
 pub mod gzip;
 pub mod huffman;
 pub mod lz77;
+pub mod lz78;
+pub mod lzss;
 pub mod mtf;
 pub mod optimal;
 pub mod pipeline;

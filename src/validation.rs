@@ -13,6 +13,8 @@ mod tests {
     use crate::frequency;
     use crate::huffman::HuffmanTree;
     use crate::lz77;
+    use crate::lz78;
+    use crate::lzss;
     use crate::mtf;
     use crate::pipeline::{self, Pipeline};
     use crate::rle;
@@ -122,6 +124,22 @@ mod tests {
                     let decoded = rle::decode(&encoded).unwrap();
                     assert_eq!(decoded, input, "rle round-trip failed");
                 }
+
+                #[test]
+                fn lzss() {
+                    let input = $data;
+                    let compressed = lzss::encode(&input).unwrap();
+                    let decompressed = lzss::decode(&compressed).unwrap();
+                    assert_eq!(decompressed, input, "lzss round-trip failed");
+                }
+
+                #[test]
+                fn lz78() {
+                    let input = $data;
+                    let compressed = lz78::encode(&input).unwrap();
+                    let decompressed = lz78::decode(&compressed).unwrap();
+                    assert_eq!(decompressed, input, "lz78 round-trip failed");
+                }
             }
         };
     }
@@ -213,6 +231,32 @@ mod tests {
             assert_eq!(inv_fse, lz_data);
             let inv_lz = lz77::decompress(&inv_fse).unwrap();
             assert_eq!(inv_lz, input);
+        }
+
+        #[test]
+        fn lzss_then_fse() {
+            use crate::fse;
+            let input = data_repeating_text();
+            let lzss_data = lzss::encode(&input).unwrap();
+            let fse_data = fse::encode(&lzss_data);
+            // Inverse
+            let inv_fse = fse::decode(&fse_data, lzss_data.len()).unwrap();
+            assert_eq!(inv_fse, lzss_data);
+            let inv_lzss = lzss::decode(&inv_fse).unwrap();
+            assert_eq!(inv_lzss, input);
+        }
+
+        #[test]
+        fn lz78_then_fse() {
+            use crate::fse;
+            let input = data_repeating_text();
+            let lz78_data = lz78::encode(&input).unwrap();
+            let fse_data = fse::encode(&lz78_data);
+            // Inverse
+            let inv_fse = fse::decode(&fse_data, lz78_data.len()).unwrap();
+            assert_eq!(inv_fse, lz78_data);
+            let inv_lz78 = lz78::decode(&inv_fse).unwrap();
+            assert_eq!(inv_lz78, input);
         }
 
         #[test]
@@ -420,6 +464,90 @@ mod tests {
             let lazy = lz77::compress_lazy(&input).unwrap();
             let d_lazy = lz77::decompress(&lazy).unwrap();
             assert_eq!(d_lazy, input);
+        }
+
+        #[test]
+        fn lzss_more_compact_on_literal_heavy_data() {
+            // LZSS should produce smaller output than LZ77 on data with many
+            // literals, because literals cost 1 byte instead of 5.
+            let input: Vec<u8> = (0..=255).collect(); // 256 unique bytes, mostly literals
+            let lz77_size = lz77::compress_lazy(&input).unwrap().len();
+            let lzss_size = lzss::encode(&input).unwrap().len();
+            assert!(
+                lzss_size <= lz77_size,
+                "LZSS should be <= LZ77 on literal-heavy data: {} vs {}",
+                lzss_size,
+                lz77_size
+            );
+        }
+
+        #[test]
+        fn lz78_dictionary_grows() {
+            let input = data_repeating_text();
+            let compressed = lz78::encode(&input).unwrap();
+            assert!(
+                compressed.len() < input.len(),
+                "LZ78 should compress repetitive text: {} >= {}",
+                compressed.len(),
+                input.len()
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Compression ratio comparison (LZ77 vs LZSS vs LZ78)
+    // ---------------------------------------------------------------
+
+    mod lz_comparison {
+        use super::*;
+        use crate::fse;
+
+        fn ratio_report(name: &str, input: &[u8]) {
+            let lz77_raw = lz77::compress_lazy(input).unwrap();
+            let lzss_raw = lzss::encode(input).unwrap();
+            let lz78_raw = lz78::encode(input).unwrap();
+
+            let lz77_fse = fse::encode(&lz77_raw);
+            let lzss_fse = fse::encode(&lzss_raw);
+            let lz78_fse = fse::encode(&lz78_raw);
+
+            eprintln!(
+                "  {:20} {:>6}B | LZ77 {:>6} ({:5.1}%) | LZSS {:>6} ({:5.1}%) | LZ78 {:>6} ({:5.1}%)",
+                name,
+                input.len(),
+                lz77_raw.len(),
+                100.0 * lz77_raw.len() as f64 / input.len() as f64,
+                lzss_raw.len(),
+                100.0 * lzss_raw.len() as f64 / input.len() as f64,
+                lz78_raw.len(),
+                100.0 * lz78_raw.len() as f64 / input.len() as f64,
+            );
+            eprintln!(
+                "  {:20} {:>6}  | +FSE {:>6} ({:5.1}%) | +FSE {:>6} ({:5.1}%) | +FSE {:>6} ({:5.1}%)",
+                "",
+                "",
+                lz77_fse.len(),
+                100.0 * lz77_fse.len() as f64 / input.len() as f64,
+                lzss_fse.len(),
+                100.0 * lzss_fse.len() as f64 / input.len() as f64,
+                lz78_fse.len(),
+                100.0 * lz78_fse.len() as f64 / input.len() as f64,
+            );
+        }
+
+        #[test]
+        fn lz_compression_ratio_comparison() {
+            eprintln!();
+            eprintln!("=== LZ Algorithm Compression Ratio Comparison ===");
+            eprintln!();
+
+            ratio_report("repeating_text", &data_repeating_text());
+            ratio_report("zeros_5000", &data_all_zeros(5000));
+            ratio_report("skewed_2000", &data_skewed(2000));
+            ratio_report("sawtooth_2048", &data_sawtooth(2048));
+            ratio_report("uniform_256", &data_uniform());
+
+            eprintln!();
         }
     }
 

@@ -486,6 +486,145 @@ fn bench_auto_select(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_lzss(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lzss");
+    cap(&mut group);
+    for &size in SIZES_ALL {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("encode", size), &data, |b, data| {
+            b.iter(|| pz::lzss::encode(data).unwrap());
+        });
+
+        let compressed = pz::lzss::encode(&data).unwrap();
+        group.bench_with_input(
+            BenchmarkId::new("decode", size),
+            &compressed,
+            |b, compressed| {
+                b.iter(|| pz::lzss::decode(compressed).unwrap());
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_lz78(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lz78");
+    cap(&mut group);
+    for &size in SIZES_ALL {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("encode", size), &data, |b, data| {
+            b.iter(|| pz::lz78::encode(data).unwrap());
+        });
+
+        let compressed = pz::lz78::encode(&data).unwrap();
+        group.bench_with_input(
+            BenchmarkId::new("decode", size),
+            &compressed,
+            |b, compressed| {
+                b.iter(|| pz::lz78::decode(compressed).unwrap());
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_lz_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lz_comparison");
+    cap(&mut group);
+
+    let size = 65536;
+    let data = get_test_data(size);
+    group.throughput(Throughput::Bytes(size as u64));
+
+    // Compression
+    group.bench_with_input(BenchmarkId::new("lz77_compress", size), &data, |b, data| {
+        b.iter(|| pz::lz77::compress_lazy(data).unwrap());
+    });
+    group.bench_with_input(BenchmarkId::new("lzss_compress", size), &data, |b, data| {
+        b.iter(|| pz::lzss::encode(data).unwrap());
+    });
+    group.bench_with_input(BenchmarkId::new("lz78_compress", size), &data, |b, data| {
+        b.iter(|| pz::lz78::encode(data).unwrap());
+    });
+
+    // Decompression
+    let lz77_c = pz::lz77::compress_lazy(&data).unwrap();
+    let lzss_c = pz::lzss::encode(&data).unwrap();
+    let lz78_c = pz::lz78::encode(&data).unwrap();
+
+    group.bench_with_input(
+        BenchmarkId::new("lz77_decompress", size),
+        &lz77_c,
+        |b, c| {
+            b.iter(|| pz::lz77::decompress(c).unwrap());
+        },
+    );
+    group.bench_with_input(
+        BenchmarkId::new("lzss_decompress", size),
+        &lzss_c,
+        |b, c| {
+            b.iter(|| pz::lzss::decode(c).unwrap());
+        },
+    );
+    group.bench_with_input(
+        BenchmarkId::new("lz78_decompress", size),
+        &lz78_c,
+        |b, c| {
+            b.iter(|| pz::lz78::decode(c).unwrap());
+        },
+    );
+
+    group.finish();
+}
+
+fn bench_lz_plus_fse(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lz_plus_fse");
+    cap(&mut group);
+
+    let size = 65536;
+    let data = get_test_data(size);
+    group.throughput(Throughput::Bytes(size as u64));
+
+    group.bench_with_input(
+        BenchmarkId::new("lz77_fse_compress", size),
+        &data,
+        |b, data| {
+            b.iter(|| {
+                let lz = pz::lz77::compress_lazy(data).unwrap();
+                pz::fse::encode(&lz)
+            });
+        },
+    );
+
+    group.bench_with_input(
+        BenchmarkId::new("lzss_fse_compress", size),
+        &data,
+        |b, data| {
+            b.iter(|| {
+                let lz = pz::lzss::encode(data).unwrap();
+                pz::fse::encode(&lz)
+            });
+        },
+    );
+
+    group.bench_with_input(
+        BenchmarkId::new("lz78_fse_compress", size),
+        &data,
+        |b, data| {
+            b.iter(|| {
+                let lz = pz::lz78::encode(data).unwrap();
+                pz::fse::encode(&lz)
+            });
+        },
+    );
+
+    group.finish();
+}
+
 #[cfg(not(feature = "opencl"))]
 fn bench_bwt_gpu(_c: &mut Criterion) {}
 
@@ -679,6 +818,10 @@ criterion_group!(
     bench_bwt,
     bench_bwt_large,
     bench_lz77,
+    bench_lzss,
+    bench_lz78,
+    bench_lz_comparison,
+    bench_lz_plus_fse,
     bench_huffman,
     bench_mtf,
     bench_rle,
