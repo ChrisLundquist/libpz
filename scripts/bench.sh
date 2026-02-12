@@ -79,12 +79,14 @@ fi
 
 # Collect input files from corpus if none given on command line
 if [[ ${#FILES[@]} -eq 0 ]]; then
+    # Auto-extract sample archives if needed
+    "$SCRIPT_DIR/setup.sh"
+
     for f in "$PROJECT_DIR"/samples/cantrbry/* "$PROJECT_DIR"/samples/large/*; do
         [[ -f "$f" ]] && FILES+=("$f")
     done
     if [[ ${#FILES[@]} -eq 0 ]]; then
-        echo "No sample files found. Run:" >&2
-        echo "  cd samples && mkdir -p cantrbry large && tar -xzf cantrbry.tar.gz -C cantrbry && tar -xzf large.tar.gz -C large" >&2
+        echo "ERROR: No sample files found even after extraction." >&2
         exit 1
     fi
 fi

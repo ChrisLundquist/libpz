@@ -3,8 +3,9 @@
 ## First-time setup
 Extract test sample data (needed for validation/benchmark tests):
 ```bash
-cd samples && mkdir -p cantrbry large && tar -xzf cantrbry.tar.gz -C cantrbry && tar -xzf large.tar.gz -C large && cd ..
+./scripts/setup.sh
 ```
+This is called automatically by `bench.sh` and other scripts, so manual extraction is rarely needed.
 
 ## Build & test commands
 ```bash
@@ -81,6 +82,7 @@ cargo install samply                                # one-time setup
 - `kernels/*.cl` — OpenCL kernel source
 - `benches/throughput.rs` — end-to-end pipeline benchmarks
 - `benches/stages.rs` — per-algorithm scaling benchmarks
+- `scripts/setup.sh` — extract sample archives (idempotent, called automatically by other scripts)
 - `scripts/bench.sh` — pz vs gzip comparison (ratio, throughput, all pipelines)
 - `scripts/profile.sh` — samply profiling wrapper
 - `examples/profile.rs` — profiling harness (pipeline or individual stage loops)
