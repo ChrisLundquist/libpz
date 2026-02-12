@@ -1872,8 +1872,9 @@ impl WebGpuEngine {
             "huff_gs_pass1",
         )?;
 
-        // Read last bit length before prefix sum overwrites it
-        let last_bit_length = self.read_buffer_scalar_u32(&bit_lengths_buf, n - 1);
+        // Compute last bit length on the CPU (avoids GPU→CPU readback sync).
+        // The kernel writes: bit_lengths[i] = code_lut[input[i]] >> 24
+        let last_bit_length = code_lut[input[n - 1] as usize] >> 24;
 
         // GPU exclusive prefix sum (in-place on bit_lengths_buf)
         self.run_exclusive_prefix_sum(&bit_lengths_buf, n)?;
