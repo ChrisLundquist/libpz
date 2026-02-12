@@ -95,6 +95,26 @@ cargo install samply                                # one-time setup
 - Error type: `PzError` (InvalidInput, BufferTooSmall, Unsupported, InternalError)
 - Tests go in `#[cfg(test)] mod tests` at the bottom of each module file
 
+## Feature flags
+- **Default (no features):** Pure CPU build. All tests pass everywhere.
+- **`opencl`:** GPU acceleration via OpenCL. Requires OpenCL SDK + GPU device. Tests gracefully skip if no device. Always compile-check GPU changes: `cargo build --features opencl`
+- **`webgpu`:** GPU acceleration via wgpu (Vulkan/Metal/DX12). Same graceful-skip behavior.
+- GPU is **not faster for small inputs** — LZ77 breaks even ~256KB, Huffman ~128KB. Don't optimize GPU paths for small data.
+
+## Common pitfalls
+1. **Forgetting `--features opencl` when modifying GPU code** — CPU-only build won't catch GPU compile errors.
+2. **Multi-stream format changes are subtle** — Deflate/Lzr/Lzf deinterleave LZ77 into 3 streams (offsets, lengths, literals). Format byte `0x01` = single-stream, `0x02` = multi-stream. Don't change without understanding round-trip implications.
+3. **Pre-commit hook auto-reformats and re-stages files** — `cargo fmt` runs automatically and modifies files in-place. If a commit fails on clippy, fix the warning and make a new commit (don't amend).
+4. **Use dedicated tools instead of shell pipelines** — Prefer Grep/Glob tools over `grep | cut | sort | uniq` shell pipelines. Dedicated tools are faster, don't need permission approval, and produce better-structured output.
+5. **All algorithms must be composable** — New algorithms must work both standalone and in pipelines. See `src/validation.rs` for test patterns.
+6. **In a worktree, run git from the worktree directory** — Never `cd` to the main repo to run git commands. Commits will land on the wrong branch.
+
+## Shell command style
+- **Never use `git -C <path>`** — always run git commands from the repo root directly.
+- **Don't chain git commands with `echo`, `printf`, or `bash -c`** — these create compound commands that don't match permission allow-lists. Instead, run git commands as standalone Bash calls and use separate tool calls for any follow-up.
+- **Prefer multiple sequential tool calls** over `&&`-chained shell commands when the chain mixes git with non-git commands.
+- **Use HEREDOC syntax for multi-line commit messages** (see the commit instructions in your system prompt).
+
 ## Commit discipline
 - **Commit at every logical completion point** — don't let work accumulate uncommitted.
 - A "logical completion point" is any self-contained change: a bug fix, a new feature, a refactor, a test addition, a docs update, etc.

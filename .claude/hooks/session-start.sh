@@ -8,5 +8,6 @@ fi
 
 cd "$CLAUDE_PROJECT_DIR"
 
-# Ensure clippy is available (quick no-op if already installed)
+# Ensure clippy and rustfmt are available (quick no-op if already installed)
 cargo clippy --version >/dev/null 2>&1 || rustup component add clippy
+cargo fmt --version >/dev/null 2>&1 || rustup component add rustfmt
