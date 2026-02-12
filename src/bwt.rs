@@ -767,56 +767,150 @@ pub fn decode_bijective_to_buf(
     Ok(total)
 }
 
-/// Core bijective decode: inline LF-mapping with buffer reuse.
+/// Minimum total size before enabling parallel factor decode.
+const PARALLEL_DECODE_THRESHOLD: usize = 32 * 1024;
+
+/// Core bijective decode: inline LF-mapping with buffer reuse (sequential).
 fn decode_bijective_into(bwt: &[u8], factor_lengths: &[usize], output: &mut [u8]) -> PzResult<()> {
-    // Pre-allocate LF table at max factor size — reused across all factors.
     let max_flen = factor_lengths.iter().copied().max().unwrap_or(0);
     let mut lf = vec![0u32; max_flen];
-
     let mut offset = 0;
 
     for &flen in factor_lengths {
-        let factor_bwt = &bwt[offset..offset + flen];
-        let out_slice = &mut output[offset..offset + flen];
+        decode_single_factor(
+            &bwt[offset..offset + flen],
+            &mut output[offset..offset + flen],
+            &mut lf,
+        );
         offset += flen;
-
-        if flen == 1 {
-            out_slice[0] = factor_bwt[0];
-            continue;
-        }
-
-        // Inline LF-mapping decode with primary_index = 0 (Lyndon property).
-        // Step 1: Count byte occurrences
-        let mut counts = [0u32; 256];
-        for &byte in factor_bwt {
-            counts[byte as usize] += 1;
-        }
-
-        // Step 2: Cumulative counts (starting positions in first column)
-        let mut cumul = [0u32; 256];
-        let mut sum = 0u32;
-        for (c, &count) in counts.iter().enumerate() {
-            cumul[c] = sum;
-            sum += count;
-        }
-
-        // Step 3: Build LF-mapping into reused buffer
-        let lf_slice = &mut lf[..flen];
-        let mut running = cumul;
-        for (i, &byte) in factor_bwt.iter().enumerate() {
-            lf_slice[i] = running[byte as usize];
-            running[byte as usize] += 1;
-        }
-
-        // Step 4: Follow LF-mapping from row 0, reading backwards
-        let mut idx: usize = 0;
-        for i in (0..flen).rev() {
-            out_slice[i] = factor_bwt[idx];
-            idx = lf_slice[idx] as usize;
-        }
     }
 
     Ok(())
+}
+
+/// Decode a single Lyndon factor's BWT using inline LF-mapping.
+///
+/// `lf_buf` must have length >= `factor_bwt.len()`.
+fn decode_single_factor(factor_bwt: &[u8], out: &mut [u8], lf_buf: &mut [u32]) {
+    let flen = factor_bwt.len();
+    debug_assert_eq!(out.len(), flen);
+
+    if flen == 1 {
+        out[0] = factor_bwt[0];
+        return;
+    }
+
+    // Build LF-mapping with primary_index = 0 (Lyndon property).
+    let mut counts = [0u32; 256];
+    for &byte in factor_bwt {
+        counts[byte as usize] += 1;
+    }
+
+    let mut cumul = [0u32; 256];
+    let mut sum = 0u32;
+    for (c, &count) in counts.iter().enumerate() {
+        cumul[c] = sum;
+        sum += count;
+    }
+
+    let lf = &mut lf_buf[..flen];
+    let mut running = cumul;
+    for (i, &byte) in factor_bwt.iter().enumerate() {
+        lf[i] = running[byte as usize];
+        running[byte as usize] += 1;
+    }
+
+    let mut idx: usize = 0;
+    for i in (0..flen).rev() {
+        out[i] = factor_bwt[idx];
+        idx = lf[idx] as usize;
+    }
+}
+
+/// Bijective BWT inverse with factor-parallel decoding.
+///
+/// When multiple non-trivial factors exist and the total size justifies
+/// the thread overhead, factors are decoded in parallel using scoped threads.
+/// Each thread gets its own LF buffer and a non-overlapping output slice.
+pub fn decode_bijective_parallel(
+    bwt: &[u8],
+    factor_lengths: &[usize],
+    num_threads: usize,
+) -> PzResult<Vec<u8>> {
+    if bwt.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let total: usize = factor_lengths.iter().sum();
+    if total != bwt.len() {
+        return Err(PzError::InvalidInput);
+    }
+
+    // Fall back to sequential for small inputs or single factors.
+    let non_trivial = factor_lengths.iter().filter(|&&l| l > 1).count();
+    if non_trivial <= 1 || total < PARALLEL_DECODE_THRESHOLD || num_threads <= 1 {
+        let mut output = vec![0u8; total];
+        decode_bijective_into(bwt, factor_lengths, &mut output)?;
+        return Ok(output);
+    }
+
+    let mut output = vec![0u8; total];
+
+    // Build (offset, length) list for each factor.
+    let mut factor_ranges: Vec<(usize, usize)> = Vec::with_capacity(factor_lengths.len());
+    let mut off = 0usize;
+    for &fl in factor_lengths {
+        factor_ranges.push((off, fl));
+        off += fl;
+    }
+
+    // Split factors into chunks for each thread.
+    let chunk_size = factor_ranges.len().div_ceil(num_threads);
+
+    std::thread::scope(|scope| {
+        let mut remaining_out = output.as_mut_slice();
+        let mut remaining_start = 0usize;
+        let mut handles = Vec::new();
+
+        for chunk in factor_ranges.chunks(chunk_size) {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            // Compute the byte range this chunk covers.
+            let chunk_start = chunk[0].0;
+            let chunk_end = chunk.last().map(|&(o, l)| o + l).unwrap();
+            let chunk_byte_len = chunk_end - chunk_start;
+
+            // Split off this chunk's output slice (safe, non-overlapping).
+            let skip = chunk_start - remaining_start;
+            let (_, rest) = remaining_out.split_at_mut(skip);
+            let (chunk_out, rest) = rest.split_at_mut(chunk_byte_len);
+            remaining_out = rest;
+            remaining_start = chunk_end;
+
+            let bwt_ref = bwt;
+            let handle = scope.spawn(move || {
+                let max_flen = chunk.iter().map(|&(_, l)| l).max().unwrap_or(0);
+                let mut lf_buf = vec![0u32; max_flen];
+                let mut local_off = 0usize;
+
+                for &(global_off, flen) in chunk {
+                    let factor_bwt = &bwt_ref[global_off..global_off + flen];
+                    let out_slice = &mut chunk_out[local_off..local_off + flen];
+                    decode_single_factor(factor_bwt, out_slice, &mut lf_buf);
+                    local_off += flen;
+                }
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -1280,6 +1374,40 @@ mod tests {
             sa_doubled, sa_circular,
             "SA mismatch on all-bytes input (all rotations distinct)"
         );
+    }
+
+    #[test]
+    fn test_bijective_parallel_decode_matches_sequential() {
+        // Parallel decode must produce identical results to sequential decode.
+        let test_cases: &[&[u8]] = &[
+            b"the quick brown fox jumps over the lazy dog",
+            b"abracadabra abracadabra abracadabra",
+            b"hello world hello world hello world hello world",
+        ];
+        for input in test_cases {
+            let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
+            let sequential = decode_bijective(&bwt_data, &factor_lens).unwrap();
+            let parallel = decode_bijective_parallel(&bwt_data, &factor_lens, 4).unwrap();
+            assert_eq!(
+                sequential,
+                parallel,
+                "Parallel decode differs from sequential on {:?}",
+                std::str::from_utf8(input).unwrap_or("<binary>")
+            );
+            assert_eq!(&sequential, *input);
+        }
+    }
+
+    #[test]
+    fn test_bijective_parallel_decode_large() {
+        // Test parallel decode on data large enough to trigger parallelism.
+        let mut input = Vec::new();
+        for _ in 0..200 {
+            input.extend_from_slice(b"The quick brown fox jumps over the lazy dog. ");
+        }
+        let (bwt_data, factor_lens) = encode_bijective(&input).unwrap();
+        let decoded = decode_bijective_parallel(&bwt_data, &factor_lens, 4).unwrap();
+        assert_eq!(decoded, input);
     }
 
     #[test]
