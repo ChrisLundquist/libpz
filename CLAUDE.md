@@ -35,8 +35,9 @@ Before every commit, **always** run (the pre-commit hook handles 1 and 2 automat
 ```bash
 ./scripts/bench.sh                              # all Canterbury + large corpus
 ./scripts/bench.sh myfile.bin                   # specific files
-BENCH_PIPELINES="deflate lza" ./scripts/bench.sh  # subset of pipelines
-BENCH_ITERS=10 ./scripts/bench.sh              # more iterations
+./scripts/bench.sh -p deflate,lza               # subset of pipelines
+./scripts/bench.sh -n 10                        # more iterations
+./scripts/bench.sh --help                       # full usage info
 ```
 
 ### Criterion microbenchmarks
@@ -71,7 +72,7 @@ cargo install samply                                # one-time setup
 - `src/{algorithm}.rs` — one file per composable algorithm (bwt, deflate, fse, huffman, lz77, mtf, rangecoder, rans, rle)
 - `src/analysis.rs` — data profiling for pipeline auto-selection (entropy, match density, etc.)
 - `src/optimal.rs` — optimal LZ77 parsing via backward DP (match table + cost model)
-- `src/pipeline.rs` — multi-stage compression pipelines (Deflate, Bw, Lza, Lzr), auto-selection
+- `src/pipeline.rs` — multi-stage compression pipelines (Deflate, Bw, Lza, Lzr, Lzf), auto-selection
 - `src/frequency.rs` — shared frequency table used by entropy coders (SIMD-accelerated counting)
 - `src/simd.rs` — SIMD-accelerated primitives (SSE2/AVX2 for x86_64, NEON stubs for aarch64)
 - `src/opencl.rs` — OpenCL GPU backend (feature-gated behind `opencl`)

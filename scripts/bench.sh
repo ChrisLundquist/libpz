@@ -1,13 +1,5 @@
 #!/usr/bin/env bash
 # bench.sh — Compare pz pipelines vs gzip: size, ratio, time, throughput.
-#
-# Usage:
-#   ./scripts/bench.sh                     # Canterbury + large corpus
-#   ./scripts/bench.sh file1.txt file2.bin  # specific files
-#   BENCH_ITERS=10 ./scripts/bench.sh      # more iterations
-#   BENCH_PIPELINES="deflate lza" ./scripts/bench.sh  # subset of pipelines
-#
-# Builds release binary automatically. Requires gzip on PATH.
 
 set -euo pipefail
 
@@ -15,8 +7,87 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PZ="$PROJECT_DIR/target/release/pz"
-ITERATIONS=${BENCH_ITERS:-3}
-PIPELINES=(${BENCH_PIPELINES:-deflate lza lzr lzf})
+
+# Defaults
+ITERATIONS=3
+PIPELINES=()
+FILES=()
+
+usage() {
+    cat <<'EOF'
+bench.sh — Compare pz pipelines vs gzip: size, ratio, time, throughput.
+
+Usage:
+  ./scripts/bench.sh [OPTIONS] [FILE ...]
+
+Options:
+  -n, --iters N          Number of iterations per operation (default: 3)
+  -p, --pipelines LIST   Comma-separated list of pipelines to benchmark
+                         (default: deflate,lza,lzr,lzf)
+  -h, --help             Show this help
+
+If no FILEs are given, benchmarks all files in samples/cantrbry and samples/large.
+
+Examples:
+  ./scripts/bench.sh                              # all corpus, all pipelines
+  ./scripts/bench.sh myfile.bin                   # specific file
+  ./scripts/bench.sh -p deflate,lza               # subset of pipelines
+  ./scripts/bench.sh -n 10                        # more iterations
+  ./scripts/bench.sh -n 1 -p deflate,lza file.txt # combine options
+EOF
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -n|--iters)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --iters requires an argument" >&2
+                exit 1
+            fi
+            ITERATIONS="$2"
+            shift 2
+            ;;
+        -p|--pipelines)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --pipelines requires an argument" >&2
+                exit 1
+            fi
+            IFS=',' read -ra PIPELINES <<< "$2"
+            shift 2
+            ;;
+        -*)
+            echo "ERROR: unknown option '$1'" >&2
+            echo "Run './scripts/bench.sh --help' for usage." >&2
+            exit 1
+            ;;
+        *)
+            FILES+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Default pipelines if none specified
+if [[ ${#PIPELINES[@]} -eq 0 ]]; then
+    PIPELINES=(deflate lza lzr lzf)
+fi
+
+# Collect input files from corpus if none given on command line
+if [[ ${#FILES[@]} -eq 0 ]]; then
+    for f in "$PROJECT_DIR"/samples/cantrbry/* "$PROJECT_DIR"/samples/large/*; do
+        [[ -f "$f" ]] && FILES+=("$f")
+    done
+    if [[ ${#FILES[@]} -eq 0 ]]; then
+        echo "No sample files found. Run:" >&2
+        echo "  cd samples && mkdir -p cantrbry large && tar -xzf cantrbry.tar.gz -C cantrbry && tar -xzf large.tar.gz -C large" >&2
+        exit 1
+    fi
+fi
 
 # Build release binary
 echo "Building pz (release)..."
@@ -31,21 +102,6 @@ fi
 if ! command -v gzip &>/dev/null; then
     echo "ERROR: gzip not found" >&2
     exit 1
-fi
-
-# Collect input files
-if [[ $# -gt 0 ]]; then
-    FILES=("$@")
-else
-    FILES=()
-    for f in "$PROJECT_DIR"/samples/cantrbry/* "$PROJECT_DIR"/samples/large/*; do
-        [[ -f "$f" ]] && FILES+=("$f")
-    done
-    if [[ ${#FILES[@]} -eq 0 ]]; then
-        echo "No sample files found. Run:" >&2
-        echo "  cd samples && mkdir -p cantrbry large && tar -xzf cantrbry.tar.gz -C cantrbry && tar -xzf large.tar.gz -C large" >&2
-        exit 1
-    fi
 fi
 
 TMPDIR=$(mktemp -d)

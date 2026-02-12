@@ -18,9 +18,7 @@
       "Bash(gh issue *)",
       "Bash(gh api *)",
       "Bash(./scripts/bench.sh*)",
-      "Bash(./scripts/profile.sh*)",
-      "Bash(BENCH_ITERS=* ./scripts/bench.sh*)",
-      "Bash(BENCH_PIPELINES=* ./scripts/bench.sh*)"
+      "Bash(./scripts/profile.sh*)"
     ],
     "deny": [
       "Bash(cargo publish *)",
