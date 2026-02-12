@@ -360,6 +360,28 @@ fn compress_parallel(
     options: &CompressOptions,
     num_threads: usize,
 ) -> PzResult<Vec<u8>> {
+    // Try batched GPU LZ77 path for LZ77-based pipelines with WebGPU backend
+    #[cfg(feature = "webgpu")]
+    {
+        if let Backend::WebGpu = options.backend {
+            if let Some(ref engine) = options.webgpu_engine {
+                let is_lz77_pipeline =
+                    matches!(pipeline, Pipeline::Deflate | Pipeline::Lzr | Pipeline::Lzf);
+                let is_batchable =
+                    is_lz77_pipeline && options.parse_strategy != ParseStrategy::Optimal;
+                if is_batchable {
+                    return compress_parallel_gpu_batched(
+                        input,
+                        pipeline,
+                        options,
+                        num_threads,
+                        engine,
+                    );
+                }
+            }
+        }
+    }
+
     let block_size = options.block_size;
 
     // Split input into blocks
@@ -419,6 +441,127 @@ fn compress_parallel(
     }
 
     Ok(output)
+}
+
+/// Batched GPU LZ77 compression for multi-block inputs.
+///
+/// Submits all blocks to the GPU for LZ77 matching in one batch (hiding
+/// transfer latency), then entropy-encodes each block on CPU threads.
+///
+/// This is used for LZ77-based pipelines (Deflate, Lzr, Lzf) when the
+/// WebGPU backend is active and there are multiple blocks.
+#[cfg(feature = "webgpu")]
+fn compress_parallel_gpu_batched(
+    input: &[u8],
+    pipeline: Pipeline,
+    options: &CompressOptions,
+    num_threads: usize,
+    engine: &crate::webgpu::WebGpuEngine,
+) -> PzResult<Vec<u8>> {
+    let block_size = options.block_size;
+    let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
+    let num_blocks = blocks.len();
+
+    // Phase 1: Batch GPU LZ77 matching (submit all → single sync → readback all)
+    let match_vecs = engine.find_matches_batched(&blocks)?;
+
+    // Phase 2: Demux + entropy encode each block in parallel on CPU threads
+    let compressed_blocks: Vec<PzResult<Vec<u8>>> =
+        std::thread::scope(|scope| {
+            let max_concurrent = num_threads.min(num_blocks);
+            let mut handles: Vec<std::thread::ScopedJoinHandle<PzResult<Vec<u8>>>> =
+                Vec::with_capacity(max_concurrent);
+            let mut results: Vec<PzResult<Vec<u8>>> = Vec::with_capacity(num_blocks);
+
+            for (i, matches) in match_vecs.into_iter().enumerate() {
+                if handles.len() >= max_concurrent {
+                    let handle = handles.remove(0);
+                    results.push(handle.join().unwrap_or(Err(PzError::InvalidInput)));
+                }
+                let block_input = blocks[i];
+                handles.push(scope.spawn(move || {
+                    entropy_encode_lz77_block(&matches, block_input.len(), pipeline)
+                }));
+            }
+
+            for handle in handles {
+                results.push(handle.join().unwrap_or(Err(PzError::InvalidInput)));
+            }
+
+            results
+        });
+
+    // Check for errors and collect
+    let mut block_data_vec: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
+    for result in compressed_blocks {
+        block_data_vec.push(result?);
+    }
+
+    // Build output: V2 header + num_blocks + block_table + block_data
+    let mut output = Vec::new();
+    write_header(&mut output, pipeline, input.len());
+    output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+    for (i, compressed) in block_data_vec.iter().enumerate() {
+        let orig_block_len = blocks[i].len() as u32;
+        let comp_block_len = compressed.len() as u32;
+        output.extend_from_slice(&comp_block_len.to_le_bytes());
+        output.extend_from_slice(&orig_block_len.to_le_bytes());
+    }
+    for compressed in &block_data_vec {
+        output.extend_from_slice(compressed);
+    }
+
+    Ok(output)
+}
+
+/// Demux LZ77 matches into 3 streams (offsets, lengths, literals) and apply
+/// the appropriate entropy encoder for the given pipeline.
+#[cfg(feature = "webgpu")]
+fn entropy_encode_lz77_block(
+    matches: &[lz77::Match],
+    original_len: usize,
+    pipeline: Pipeline,
+) -> PzResult<Vec<u8>> {
+    // Serialize matches
+    let match_size = lz77::Match::SERIALIZED_SIZE;
+    let num_matches = matches.len();
+    let lz_len = num_matches * match_size;
+
+    // Demux into 3 streams: offsets (2 bytes each), lengths (2 bytes each), literals (1 byte each)
+    let mut offsets = Vec::with_capacity(num_matches * 2);
+    let mut lengths = Vec::with_capacity(num_matches * 2);
+    let mut literals = Vec::with_capacity(num_matches);
+
+    for m in matches {
+        let bytes = m.to_bytes();
+        offsets.push(bytes[0]);
+        offsets.push(bytes[1]);
+        lengths.push(bytes[2]);
+        lengths.push(bytes[3]);
+        literals.push(bytes[4]);
+    }
+
+    let streams = vec![offsets, lengths, literals];
+
+    // Build a StageBlock with the demuxed streams
+    let mut block = StageBlock {
+        block_index: 0,
+        original_len,
+        data: Vec::new(),
+        streams: Some(streams),
+        metadata: StageMetadata::default(),
+    };
+    block.metadata.pre_entropy_len = Some(lz_len);
+
+    // Apply the appropriate entropy encoder
+    let block = match pipeline {
+        Pipeline::Deflate => stage_huffman_encode(block)?,
+        Pipeline::Lzr => stage_rans_encode(block)?,
+        Pipeline::Lzf => stage_fse_encode(block)?,
+        _ => return Err(PzError::Unsupported),
+    };
+
+    Ok(block.data)
 }
 
 /// Multi-block parallel decompression.
@@ -3277,5 +3420,67 @@ mod tests {
         };
         // Verify trial selection doesn't crash with new pipelines in candidates
         let _pipeline = select_pipeline_trial(&input, &opts, 2048);
+    }
+
+    #[cfg(feature = "webgpu")]
+    mod gpu_batched_tests {
+        use super::*;
+
+        fn make_webgpu_options() -> Option<CompressOptions> {
+            let engine = match crate::webgpu::WebGpuEngine::new() {
+                Ok(e) => std::sync::Arc::new(e),
+                Err(_) => return None,
+            };
+            Some(CompressOptions {
+                backend: Backend::WebGpu,
+                webgpu_engine: Some(engine),
+                // Small block size to force multiple blocks within GPU dispatch range
+                block_size: 64 * 1024,
+                threads: 2,
+                ..CompressOptions::default()
+            })
+        }
+
+        #[test]
+        fn test_gpu_batched_deflate_round_trip() {
+            let opts = match make_webgpu_options() {
+                Some(o) => o,
+                None => return,
+            };
+
+            let pattern = b"the quick brown fox jumps over the lazy dog. ";
+            let input: Vec<u8> = pattern.iter().cycle().take(256 * 1024).copied().collect();
+            let compressed = compress_with_options(&input, Pipeline::Deflate, &opts).unwrap();
+            let decompressed = decompress(&compressed).unwrap();
+            assert_eq!(decompressed, input);
+        }
+
+        #[test]
+        fn test_gpu_batched_lzr_round_trip() {
+            let opts = match make_webgpu_options() {
+                Some(o) => o,
+                None => return,
+            };
+
+            let input: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+            let compressed = compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
+            let decompressed = decompress(&compressed).unwrap();
+            assert_eq!(decompressed, input);
+        }
+
+        #[test]
+        fn test_gpu_batched_lzf_round_trip() {
+            let opts = match make_webgpu_options() {
+                Some(o) => o,
+                None => return,
+            };
+
+            let input: Vec<u8> = (0..256 * 1024)
+                .map(|i| ((i * 7 + 13) % 251) as u8)
+                .collect();
+            let compressed = compress_with_options(&input, Pipeline::Lzf, &opts).unwrap();
+            let decompressed = decompress(&compressed).unwrap();
+            assert_eq!(decompressed, input);
+        }
     }
 }

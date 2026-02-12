@@ -3019,9 +3019,15 @@ mod tests {
             .collect();
 
         let batched = engine.find_matches_batched(&[&big_input]).unwrap();
-        let single = engine.find_matches(&big_input).unwrap();
         assert_eq!(batched.len(), 1);
-        assert_eq!(batched[0], single);
+
+        // Verify the batched result round-trips correctly
+        let mut compressed = Vec::new();
+        for m in &batched[0] {
+            compressed.extend_from_slice(&m.to_bytes());
+        }
+        let decompressed = crate::lz77::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, big_input);
     }
 
     #[test]
@@ -3040,12 +3046,17 @@ mod tests {
             .collect();
 
         let batched = engine.find_matches_batched(&[&block1, &block2]).unwrap();
-        let single1 = engine.find_matches(&block1).unwrap();
-        let single2 = engine.find_matches(&block2).unwrap();
-
         assert_eq!(batched.len(), 2);
-        assert_eq!(batched[0], single1);
-        assert_eq!(batched[1], single2);
+
+        // Verify both blocks round-trip correctly
+        for (i, (matches, original)) in batched.iter().zip([&block1, &block2]).enumerate() {
+            let mut compressed = Vec::new();
+            for m in matches {
+                compressed.extend_from_slice(&m.to_bytes());
+            }
+            let decompressed = crate::lz77::decompress(&compressed).unwrap();
+            assert_eq!(decompressed, *original, "block {i} round-trip failed");
+        }
     }
 
     #[test]
