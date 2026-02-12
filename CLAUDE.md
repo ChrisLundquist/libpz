@@ -107,6 +107,7 @@ cargo install samply                                # one-time setup
 3. **Pre-commit hook auto-reformats and re-stages files** — `cargo fmt` runs automatically and modifies files in-place. If a commit fails on clippy, fix the warning and make a new commit (don't amend).
 4. **Use dedicated tools instead of shell pipelines** — Prefer Grep/Glob tools over `grep | cut | sort | uniq` shell pipelines. Dedicated tools are faster, don't need permission approval, and produce better-structured output.
 5. **All algorithms must be composable** — New algorithms must work both standalone and in pipelines. See `src/validation.rs` for test patterns.
+6. **In a worktree, run git from the worktree directory** — Never `cd` to the main repo to run git commands. Commits will land on the wrong branch.
 
 ## Shell command style
 - **Never use `git -C <path>`** — always run git commands from the repo root directly.
