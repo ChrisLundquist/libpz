@@ -317,20 +317,23 @@ fn rans_encode_internal(input: &[u8], norm: &NormalizedFreqs) -> (Vec<u16>, u32)
 /// if state < RANS_L: state = (state << 16) | read_u16()        // renormalize
 /// ```
 /// No divisions. One predictable branch. Word-aligned I/O.
-fn rans_decode_internal(
+/// Core single-stream rANS decode loop, writing directly into `output`.
+///
+/// Caller must ensure `output.len() >= original_len`.
+fn rans_decode_to_slice(
     words: &[u16],
     initial_state: u32,
     norm: &NormalizedFreqs,
     lookup: &[u8],
+    output: &mut [u8],
     original_len: usize,
-) -> PzResult<Vec<u8>> {
+) -> PzResult<()> {
     let scale_bits = norm.scale_bits as u32;
     let scale_mask = (1u32 << scale_bits) - 1;
     let mut state = initial_state;
     let mut word_pos = 0;
-    let mut output = Vec::with_capacity(original_len);
 
-    for _ in 0..original_len {
+    for out in output.iter_mut().take(original_len) {
         // Decode symbol
         let slot = state & scale_mask;
         if slot as usize >= lookup.len() {
@@ -352,9 +355,29 @@ fn rans_decode_internal(
             word_pos += 1;
         }
 
-        output.push(s);
+        *out = s;
     }
 
+    Ok(())
+}
+
+/// Decode rANS-encoded word stream, returning a new Vec.
+fn rans_decode_internal(
+    words: &[u16],
+    initial_state: u32,
+    norm: &NormalizedFreqs,
+    lookup: &[u8],
+    original_len: usize,
+) -> PzResult<Vec<u8>> {
+    let mut output = vec![0u8; original_len];
+    rans_decode_to_slice(
+        words,
+        initial_state,
+        norm,
+        lookup,
+        &mut output,
+        original_len,
+    )?;
     Ok(output)
 }
 
@@ -659,13 +682,15 @@ pub fn encode_with_scale(input: &[u8], scale_bits: u8) -> Vec<u8> {
     output
 }
 
-/// Decode rANS-encoded data.
-///
-/// `original_len` is the number of bytes in the original uncompressed data.
-pub fn decode(input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
-    if original_len == 0 {
-        return Ok(Vec::new());
-    }
+/// Parsed single-stream header: everything needed to start decoding.
+struct SingleStreamHeader<'a> {
+    norm: NormalizedFreqs,
+    initial_state: u32,
+    words: WordSlice<'a>,
+}
+
+/// Parse the single-stream header (shared by decode and decode_to_buf).
+fn parse_single_stream_header(input: &[u8]) -> PzResult<SingleStreamHeader<'_>> {
     if input.len() < HEADER_SIZE {
         return Err(PzError::InvalidInput);
     }
@@ -698,12 +723,34 @@ pub fn decode(input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
 
     let words = bytes_as_u16_le(&input[words_start..], num_words);
 
-    let lookup = build_symbol_lookup(&norm);
-    rans_decode_internal(&words, initial_state, &norm, &lookup, original_len)
+    Ok(SingleStreamHeader {
+        norm,
+        initial_state,
+        words,
+    })
+}
+
+/// Decode rANS-encoded data.
+///
+/// `original_len` is the number of bytes in the original uncompressed data.
+pub fn decode(input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
+    if original_len == 0 {
+        return Ok(Vec::new());
+    }
+    let hdr = parse_single_stream_header(input)?;
+    let lookup = build_symbol_lookup(&hdr.norm);
+    rans_decode_internal(
+        &hdr.words,
+        hdr.initial_state,
+        &hdr.norm,
+        &lookup,
+        original_len,
+    )
 }
 
 /// Decode rANS-encoded data into a pre-allocated buffer.
 ///
+/// Decodes directly into the output buffer without intermediate allocation.
 /// Returns the number of bytes written.
 pub fn decode_to_buf(input: &[u8], original_len: usize, output: &mut [u8]) -> PzResult<usize> {
     if original_len == 0 {
@@ -712,8 +759,16 @@ pub fn decode_to_buf(input: &[u8], original_len: usize, output: &mut [u8]) -> Pz
     if output.len() < original_len {
         return Err(PzError::BufferTooSmall);
     }
-    let decoded = decode(input, original_len)?;
-    output[..original_len].copy_from_slice(&decoded);
+    let hdr = parse_single_stream_header(input)?;
+    let lookup = build_symbol_lookup(&hdr.norm);
+    rans_decode_to_slice(
+        &hdr.words,
+        hdr.initial_state,
+        &hdr.norm,
+        &lookup,
+        output,
+        original_len,
+    )?;
     Ok(original_len)
 }
 
