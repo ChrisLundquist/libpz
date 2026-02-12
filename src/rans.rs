@@ -280,7 +280,12 @@ fn rans_encode_internal(input: &[u8], norm: &NormalizedFreqs) -> (Vec<u16>, u32)
     let scale_bits = norm.scale_bits as u32;
     let rcp_table = ReciprocalTable::from_normalized(norm);
     let mut state: u32 = RANS_L;
-    let mut words: Vec<u16> = Vec::with_capacity(input.len());
+
+    // Pre-allocate from the end: worst case is ~2 words per symbol
+    // (when freq=1 at scale_bits=14). We fill backwards and truncate.
+    let capacity = input.len() * 2;
+    let mut words = vec![0u16; capacity];
+    let mut cursor = capacity; // write position, decrements
 
     for &byte in input.iter().rev() {
         let s = byte as usize;
@@ -288,11 +293,10 @@ fn rans_encode_internal(input: &[u8], norm: &NormalizedFreqs) -> (Vec<u16>, u32)
         let cum = norm.cum[s] as u32;
 
         // Renormalize: output low 16 bits until state fits.
-        // x_max = ((RANS_L >> scale_bits) << IO_BITS) * freq
-        // Compute in u64 to avoid overflow (can reach 2^32 for max freq).
         let x_max = ((RANS_L as u64 >> scale_bits) << IO_BITS) * freq as u64;
         while (state as u64) >= x_max {
-            words.push(state as u16);
+            cursor -= 1;
+            words[cursor] = state as u16;
             state >>= IO_BITS;
         }
 
@@ -301,10 +305,9 @@ fn rans_encode_internal(input: &[u8], norm: &NormalizedFreqs) -> (Vec<u16>, u32)
         state = (q << scale_bits) + r + cum;
     }
 
-    // Reverse so decoder reads in forward order.
-    words.reverse();
-
-    (words, state)
+    // Return only the filled portion — already in forward order, no reverse needed.
+    let result = words[cursor..].to_vec();
+    (result, state)
 }
 
 /// Decode rANS-encoded word stream. Returns the decoded byte sequence.
@@ -402,8 +405,11 @@ fn rans_encode_interleaved(
     let rcp_table = ReciprocalTable::from_normalized(norm);
 
     let mut states = vec![RANS_L; num_states];
-    let mut word_streams: Vec<Vec<u16>> =
-        vec![Vec::with_capacity(input.len() / num_states); num_states];
+
+    // Pre-allocate per-lane buffers and fill backwards to avoid reversals.
+    let per_lane_cap = (input.len() / num_states) * 2 + 4;
+    let mut word_bufs: Vec<Vec<u16>> = (0..num_states).map(|_| vec![0u16; per_lane_cap]).collect();
+    let mut cursors: Vec<usize> = vec![per_lane_cap; num_states];
 
     // Assign symbols to states round-robin. Process in reverse.
     for (i, &byte) in input.iter().enumerate().rev() {
@@ -415,7 +421,8 @@ fn rans_encode_interleaved(
         // Renormalize this lane's state (u64 to avoid overflow)
         let x_max = ((RANS_L as u64 >> scale_bits) << IO_BITS) * freq as u64;
         while (states[lane] as u64) >= x_max {
-            word_streams[lane].push(states[lane] as u16);
+            cursors[lane] -= 1;
+            word_bufs[lane][cursors[lane]] = states[lane] as u16;
             states[lane] >>= IO_BITS;
         }
 
@@ -424,10 +431,12 @@ fn rans_encode_interleaved(
         states[lane] = (q << scale_bits) + r + cum;
     }
 
-    // Reverse each stream for forward reading by decoder.
-    for stream in &mut word_streams {
-        stream.reverse();
-    }
+    // Extract the filled portions — already in forward order, no reverse needed.
+    let word_streams: Vec<Vec<u16>> = word_bufs
+        .into_iter()
+        .zip(cursors.iter())
+        .map(|(buf, &cursor)| buf[cursor..].to_vec())
+        .collect();
 
     (word_streams, states)
 }
