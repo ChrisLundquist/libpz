@@ -347,19 +347,19 @@ impl HashChainFinder {
     }
 }
 
-/// Compress input using lazy matching (gzip-style).
+/// Compress input using lazy matching, returning the match sequence.
 ///
 /// After finding a match at position P, checks if position P+1 has a
 /// longer match. If so, emits a literal for P and uses the longer match.
 /// This produces the best compression ratios of the greedy strategies,
 /// and is also faster than greedy hash-chain due to skipping matched
 /// positions during hash insertion.
-pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
+pub fn compress_lazy_to_matches(input: &[u8]) -> PzResult<Vec<Match>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut output = Vec::with_capacity(input.len());
+    let mut matches = Vec::with_capacity(input.len() / 4);
     let mut finder = HashChainFinder::new();
     let mut pos: usize = 0;
 
@@ -375,14 +375,11 @@ pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
 
             if next_m.length > m.length {
                 // Emit current position as a literal, use the next match
-                output.extend_from_slice(
-                    &Match {
-                        offset: 0,
-                        length: 0,
-                        next: input[pos],
-                    }
-                    .to_bytes(),
-                );
+                matches.push(Match {
+                    offset: 0,
+                    length: 0,
+                    next: input[pos],
+                });
                 pos += 1;
 
                 // Insert positions covered by next_m (capped for long matches)
@@ -392,7 +389,7 @@ pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
                     finder.insert(input, pos + i);
                 }
 
-                output.extend_from_slice(&next_m.to_bytes());
+                matches.push(next_m);
                 pos += advance;
                 continue;
             }
@@ -405,10 +402,23 @@ pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
             finder.insert(input, pos + i);
         }
 
-        output.extend_from_slice(&m.to_bytes());
+        matches.push(m);
         pos += advance;
     }
 
+    Ok(matches)
+}
+
+/// Compress input using lazy matching (gzip-style), returning serialized bytes.
+///
+/// This is the standard entry point for LZ77 compression. Uses
+/// `compress_lazy_to_matches` internally and serializes the result.
+pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
+    let matches = compress_lazy_to_matches(input)?;
+    let mut output = Vec::with_capacity(matches.len() * Match::SERIALIZED_SIZE);
+    for m in &matches {
+        output.extend_from_slice(&m.to_bytes());
+    }
     Ok(output)
 }
 
