@@ -280,7 +280,12 @@ fn rans_encode_internal(input: &[u8], norm: &NormalizedFreqs) -> (Vec<u16>, u32)
     let scale_bits = norm.scale_bits as u32;
     let rcp_table = ReciprocalTable::from_normalized(norm);
     let mut state: u32 = RANS_L;
-    let mut words: Vec<u16> = Vec::with_capacity(input.len());
+
+    // Pre-allocate from the end: worst case is ~2 words per symbol
+    // (when freq=1 at scale_bits=14). We fill backwards and truncate.
+    let capacity = input.len() * 2;
+    let mut words = vec![0u16; capacity];
+    let mut cursor = capacity; // write position, decrements
 
     for &byte in input.iter().rev() {
         let s = byte as usize;
@@ -288,11 +293,10 @@ fn rans_encode_internal(input: &[u8], norm: &NormalizedFreqs) -> (Vec<u16>, u32)
         let cum = norm.cum[s] as u32;
 
         // Renormalize: output low 16 bits until state fits.
-        // x_max = ((RANS_L >> scale_bits) << IO_BITS) * freq
-        // Compute in u64 to avoid overflow (can reach 2^32 for max freq).
         let x_max = ((RANS_L as u64 >> scale_bits) << IO_BITS) * freq as u64;
         while (state as u64) >= x_max {
-            words.push(state as u16);
+            cursor -= 1;
+            words[cursor] = state as u16;
             state >>= IO_BITS;
         }
 
@@ -301,10 +305,9 @@ fn rans_encode_internal(input: &[u8], norm: &NormalizedFreqs) -> (Vec<u16>, u32)
         state = (q << scale_bits) + r + cum;
     }
 
-    // Reverse so decoder reads in forward order.
-    words.reverse();
-
-    (words, state)
+    // Return only the filled portion — already in forward order, no reverse needed.
+    let result = words[cursor..].to_vec();
+    (result, state)
 }
 
 /// Decode rANS-encoded word stream. Returns the decoded byte sequence.
@@ -317,20 +320,23 @@ fn rans_encode_internal(input: &[u8], norm: &NormalizedFreqs) -> (Vec<u16>, u32)
 /// if state < RANS_L: state = (state << 16) | read_u16()        // renormalize
 /// ```
 /// No divisions. One predictable branch. Word-aligned I/O.
-fn rans_decode_internal(
+/// Core single-stream rANS decode loop, writing directly into `output`.
+///
+/// Caller must ensure `output.len() >= original_len`.
+fn rans_decode_to_slice(
     words: &[u16],
     initial_state: u32,
     norm: &NormalizedFreqs,
     lookup: &[u8],
+    output: &mut [u8],
     original_len: usize,
-) -> PzResult<Vec<u8>> {
+) -> PzResult<()> {
     let scale_bits = norm.scale_bits as u32;
     let scale_mask = (1u32 << scale_bits) - 1;
     let mut state = initial_state;
     let mut word_pos = 0;
-    let mut output = Vec::with_capacity(original_len);
 
-    for _ in 0..original_len {
+    for out in output.iter_mut().take(original_len) {
         // Decode symbol
         let slot = state & scale_mask;
         if slot as usize >= lookup.len() {
@@ -343,19 +349,38 @@ fn rans_decode_internal(
         // Advance state: multiply-add (no division)
         state = freq * (state >> scale_bits) + slot - cum;
 
-        // Renormalize: read 16-bit words until state >= RANS_L
-        while state < RANS_L {
-            if word_pos >= words.len() {
-                // Ran out of words — still valid if this is the last symbol
-                break;
-            }
+        // Renormalize: read one 16-bit word if state dropped below RANS_L.
+        // With RANS_L = 2^16 and IO_BITS = 16, a single step always suffices:
+        // after decode, state >= 0 and state < 2^32; shifting left by 16 and
+        // OR-ing a 16-bit word guarantees state >= 2^16 = RANS_L.
+        if state < RANS_L && word_pos < words.len() {
             state = (state << IO_BITS) | words[word_pos] as u32;
             word_pos += 1;
         }
 
-        output.push(s);
+        *out = s;
     }
 
+    Ok(())
+}
+
+/// Decode rANS-encoded word stream, returning a new Vec.
+fn rans_decode_internal(
+    words: &[u16],
+    initial_state: u32,
+    norm: &NormalizedFreqs,
+    lookup: &[u8],
+    original_len: usize,
+) -> PzResult<Vec<u8>> {
+    let mut output = vec![0u8; original_len];
+    rans_decode_to_slice(
+        words,
+        initial_state,
+        norm,
+        lookup,
+        &mut output,
+        original_len,
+    )?;
     Ok(output)
 }
 
@@ -380,8 +405,11 @@ fn rans_encode_interleaved(
     let rcp_table = ReciprocalTable::from_normalized(norm);
 
     let mut states = vec![RANS_L; num_states];
-    let mut word_streams: Vec<Vec<u16>> =
-        vec![Vec::with_capacity(input.len() / num_states); num_states];
+
+    // Pre-allocate per-lane buffers and fill backwards to avoid reversals.
+    let per_lane_cap = (input.len() / num_states) * 2 + 4;
+    let mut word_bufs: Vec<Vec<u16>> = (0..num_states).map(|_| vec![0u16; per_lane_cap]).collect();
+    let mut cursors: Vec<usize> = vec![per_lane_cap; num_states];
 
     // Assign symbols to states round-robin. Process in reverse.
     for (i, &byte) in input.iter().enumerate().rev() {
@@ -393,7 +421,8 @@ fn rans_encode_interleaved(
         // Renormalize this lane's state (u64 to avoid overflow)
         let x_max = ((RANS_L as u64 >> scale_bits) << IO_BITS) * freq as u64;
         while (states[lane] as u64) >= x_max {
-            word_streams[lane].push(states[lane] as u16);
+            cursors[lane] -= 1;
+            word_bufs[lane][cursors[lane]] = states[lane] as u16;
             states[lane] >>= IO_BITS;
         }
 
@@ -402,10 +431,12 @@ fn rans_encode_interleaved(
         states[lane] = (q << scale_bits) + r + cum;
     }
 
-    // Reverse each stream for forward reading by decoder.
-    for stream in &mut word_streams {
-        stream.reverse();
-    }
+    // Extract the filled portions — already in forward order, no reverse needed.
+    let word_streams: Vec<Vec<u16>> = word_bufs
+        .into_iter()
+        .zip(cursors.iter())
+        .map(|(buf, &cursor)| buf[cursor..].to_vec())
+        .collect();
 
     (word_streams, states)
 }
@@ -419,7 +450,7 @@ fn rans_encode_interleaved(
 /// which processes all 4 lanes per iteration for better register usage
 /// and reduced loop overhead.
 fn rans_decode_interleaved(
-    word_streams: &[Vec<u16>],
+    word_streams: &[&[u16]],
     initial_states: &[u32],
     norm: &NormalizedFreqs,
     lookup: &[u8],
@@ -433,10 +464,10 @@ fn rans_decode_interleaved(
     // Fast path: 4-way batched decode
     if num_states == 4 {
         let streams_arr: [&[u16]; 4] = [
-            &word_streams[0],
-            &word_streams[1],
-            &word_streams[2],
-            &word_streams[3],
+            word_streams[0],
+            word_streams[1],
+            word_streams[2],
+            word_streams[3],
         ];
         let states_arr: [u32; 4] = [
             initial_states[0],
@@ -479,11 +510,8 @@ fn rans_decode_interleaved(
         // Advance state
         states[lane] = freq * (states[lane] >> scale_bits) + slot - cum;
 
-        // Renormalize from this lane's word stream
-        while states[lane] < RANS_L {
-            if word_positions[lane] >= word_streams[lane].len() {
-                break;
-            }
+        // Renormalize: single step suffices (32-bit state, 16-bit I/O)
+        if states[lane] < RANS_L && word_positions[lane] < word_streams[lane].len() {
             states[lane] =
                 (states[lane] << IO_BITS) | word_streams[lane][word_positions[lane]] as u32;
             word_positions[lane] += 1;
@@ -498,6 +526,80 @@ fn rans_decode_interleaved(
 // ---------------------------------------------------------------------------
 // Serialization helpers
 // ---------------------------------------------------------------------------
+
+/// Result of zero-copy word slice access: either borrowed or owned.
+enum WordSlice<'a> {
+    Borrowed(&'a [u16]),
+    Owned(Vec<u16>),
+}
+
+impl<'a> std::ops::Deref for WordSlice<'a> {
+    type Target = [u16];
+    #[inline]
+    fn deref(&self) -> &[u16] {
+        match self {
+            WordSlice::Borrowed(s) => s,
+            WordSlice::Owned(v) => v,
+        }
+    }
+}
+
+/// Reinterpret a byte slice as a slice of little-endian u16 values.
+///
+/// On little-endian platforms (x86_64, aarch64) this is a zero-copy pointer
+/// cast when alignment permits, returning a borrowed slice. Falls back to
+/// byte-at-a-time parsing only when the slice is misaligned or on big-endian.
+#[inline]
+fn bytes_as_u16_le(data: &[u8], count: usize) -> WordSlice<'_> {
+    debug_assert!(data.len() >= count * 2);
+
+    #[cfg(target_endian = "little")]
+    {
+        // Fast path: try zero-copy via align_to.
+        // SAFETY: u16 from LE bytes is valid for all bit patterns, and
+        // align_to returns the maximal aligned middle slice.
+        let (prefix, aligned, suffix) = unsafe { data[..count * 2].align_to::<u16>() };
+
+        if prefix.is_empty() && suffix.is_empty() && aligned.len() == count {
+            return WordSlice::Borrowed(aligned);
+        }
+    }
+
+    // Fallback: byte-at-a-time parsing
+    let mut words = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = i * 2;
+        words.push(u16::from_le_bytes([data[off], data[off + 1]]));
+    }
+    WordSlice::Owned(words)
+}
+
+/// Serialize a slice of u16 values as little-endian bytes in bulk.
+///
+/// On little-endian platforms, this is a single memcpy when aligned.
+#[inline]
+fn serialize_u16_le_bulk(words: &[u16], output: &mut Vec<u8>) {
+    #[cfg(target_endian = "little")]
+    {
+        let byte_len = words.len() * 2;
+        let start = output.len();
+        output.reserve(byte_len);
+        // SAFETY: we just reserved enough space, and u16→u8 reinterpret is
+        // always valid on little-endian. We set the length after the copy.
+        unsafe {
+            let src = words.as_ptr() as *const u8;
+            let dst = output.as_mut_ptr().add(start);
+            std::ptr::copy_nonoverlapping(src, dst, byte_len);
+            output.set_len(start + byte_len);
+        }
+    }
+    #[cfg(target_endian = "big")]
+    {
+        for &w in words {
+            output.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+}
 
 /// Serialize a normalized frequency table (256 × u16 LE).
 fn serialize_freq_table(norm: &NormalizedFreqs, output: &mut Vec<u8>) {
@@ -584,20 +686,20 @@ pub fn encode_with_scale(input: &[u8], scale_bits: u8) -> Vec<u8> {
     serialize_freq_table(&norm, &mut output);
     output.extend_from_slice(&final_state.to_le_bytes());
     output.extend_from_slice(&(words.len() as u32).to_le_bytes());
-    for &w in &words {
-        output.extend_from_slice(&w.to_le_bytes());
-    }
+    serialize_u16_le_bulk(&words, &mut output);
 
     output
 }
 
-/// Decode rANS-encoded data.
-///
-/// `original_len` is the number of bytes in the original uncompressed data.
-pub fn decode(input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
-    if original_len == 0 {
-        return Ok(Vec::new());
-    }
+/// Parsed single-stream header: everything needed to start decoding.
+struct SingleStreamHeader<'a> {
+    norm: NormalizedFreqs,
+    initial_state: u32,
+    words: WordSlice<'a>,
+}
+
+/// Parse the single-stream header (shared by decode and decode_to_buf).
+fn parse_single_stream_header(input: &[u8]) -> PzResult<SingleStreamHeader<'_>> {
     if input.len() < HEADER_SIZE {
         return Err(PzError::InvalidInput);
     }
@@ -628,18 +730,36 @@ pub fn decode(input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
         return Err(PzError::InvalidInput);
     }
 
-    let mut words = Vec::with_capacity(num_words);
-    for i in 0..num_words {
-        let off = words_start + i * 2;
-        words.push(u16::from_le_bytes([input[off], input[off + 1]]));
-    }
+    let words = bytes_as_u16_le(&input[words_start..], num_words);
 
-    let lookup = build_symbol_lookup(&norm);
-    rans_decode_internal(&words, initial_state, &norm, &lookup, original_len)
+    Ok(SingleStreamHeader {
+        norm,
+        initial_state,
+        words,
+    })
+}
+
+/// Decode rANS-encoded data.
+///
+/// `original_len` is the number of bytes in the original uncompressed data.
+pub fn decode(input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
+    if original_len == 0 {
+        return Ok(Vec::new());
+    }
+    let hdr = parse_single_stream_header(input)?;
+    let lookup = build_symbol_lookup(&hdr.norm);
+    rans_decode_internal(
+        &hdr.words,
+        hdr.initial_state,
+        &hdr.norm,
+        &lookup,
+        original_len,
+    )
 }
 
 /// Decode rANS-encoded data into a pre-allocated buffer.
 ///
+/// Decodes directly into the output buffer without intermediate allocation.
 /// Returns the number of bytes written.
 pub fn decode_to_buf(input: &[u8], original_len: usize, output: &mut [u8]) -> PzResult<usize> {
     if original_len == 0 {
@@ -648,8 +768,16 @@ pub fn decode_to_buf(input: &[u8], original_len: usize, output: &mut [u8]) -> Pz
     if output.len() < original_len {
         return Err(PzError::BufferTooSmall);
     }
-    let decoded = decode(input, original_len)?;
-    output[..original_len].copy_from_slice(&decoded);
+    let hdr = parse_single_stream_header(input)?;
+    let lookup = build_symbol_lookup(&hdr.norm);
+    rans_decode_to_slice(
+        &hdr.words,
+        hdr.initial_state,
+        &hdr.norm,
+        &lookup,
+        output,
+        original_len,
+    )?;
     Ok(original_len)
 }
 
@@ -707,9 +835,7 @@ pub fn encode_interleaved_n(input: &[u8], num_states: usize, scale_bits: u8) -> 
         output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
     }
     for stream in &word_streams {
-        for &w in stream {
-            output.extend_from_slice(&w.to_le_bytes());
-        }
+        serialize_u16_le_bulk(stream, &mut output);
     }
 
     output
@@ -773,19 +899,17 @@ pub fn decode_interleaved(input: &[u8], original_len: usize) -> PzResult<Vec<u8>
         cursor += 4;
     }
 
-    // Read word streams
-    let mut word_streams = Vec::with_capacity(num_states);
+    // Read word streams (zero-copy when aligned on little-endian)
+    let mut word_slices: Vec<WordSlice<'_>> = Vec::with_capacity(num_states);
     for &count in &word_counts {
         if input.len() < cursor + count * 2 {
             return Err(PzError::InvalidInput);
         }
-        let mut words = Vec::with_capacity(count);
-        for _ in 0..count {
-            words.push(u16::from_le_bytes([input[cursor], input[cursor + 1]]));
-            cursor += 2;
-        }
-        word_streams.push(words);
+        word_slices.push(bytes_as_u16_le(&input[cursor..], count));
+        cursor += count * 2;
     }
+    // Collect &[u16] references for the decode function
+    let word_streams: Vec<&[u16]> = word_slices.iter().map(|ws| &**ws).collect();
 
     let lookup = build_symbol_lookup(&norm);
     rans_decode_interleaved(&word_streams, &initial_states, &norm, &lookup, original_len)
