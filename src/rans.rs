@@ -214,21 +214,57 @@ fn build_symbol_lookup(norm: &NormalizedFreqs) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Division helper
+// Division helpers
 // ---------------------------------------------------------------------------
 
-/// Divide x by freq, returning (quotient, remainder).
+/// Pre-computed reciprocals for division-free rANS encoding.
 ///
-/// Future optimization: replace with reciprocal-multiply trick for GPU
-/// kernels where hardware division is 10-30x slower than multiply.
-/// The reciprocal approach precomputes `rcp = ceil(2^32 / freq)` per
-/// symbol, then `q ≈ hi32(x * rcp)` with a correction step.
-/// On CPU, the compiler already optimizes known-small-divisor patterns.
+/// For each symbol frequency f, stores `rcp = ceil(2^32 / f)` so that
+/// division can be approximated by `q = hi32(x * rcp)` with a single
+/// correction step. This is critical for GPU kernels where hardware
+/// division is 10-30x slower than multiply.
+struct ReciprocalTable {
+    rcp: [u32; NUM_SYMBOLS],
+}
+
+impl ReciprocalTable {
+    fn from_normalized(norm: &NormalizedFreqs) -> Self {
+        let mut rcp = [0u32; NUM_SYMBOLS];
+        for (i, &f) in norm.freq.iter().enumerate() {
+            if f > 0 {
+                // rcp = floor(2^32 / freq)
+                // Using floor avoids overestimating the quotient, so only a
+                // single upward correction is ever needed.
+                rcp[i] = ((1u64 << 32) / f as u64) as u32;
+            }
+        }
+        ReciprocalTable { rcp }
+    }
+}
+
+/// Division via reciprocal multiply: (x / freq, x % freq).
+///
+/// Uses a precomputed reciprocal to avoid hardware division.
+/// The reciprocal is floor(2^32 / freq), so the estimate q may be
+/// too low by at most 1. A single correction step suffices.
+///
+/// Special case: freq=1 has rcp=0 (2^32 doesn't fit in u32),
+/// but division by 1 is trivial.
 #[inline]
-fn rans_div(x: u32, freq: u32) -> (u32, u32) {
-    let q = x / freq;
-    let r = x % freq;
-    (q, r)
+fn rans_div_rcp(x: u32, freq: u32, rcp: u32) -> (u32, u32) {
+    if freq == 1 {
+        return (x, 0);
+    }
+    // q = floor(x * floor(2^32/freq) / 2^32)
+    // This can underestimate the true quotient by at most 1.
+    let q = ((x as u64 * rcp as u64) >> 32) as u32;
+    let r = x - q * freq;
+    // Correct if remainder is still >= freq (quotient was 1 too low)
+    if r >= freq {
+        (q + 1, r - freq)
+    } else {
+        (q, r)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +278,7 @@ fn rans_div(x: u32, freq: u32) -> (u32, u32) {
 /// The decoder reads words forward and emits symbols in forward order.
 fn rans_encode_internal(input: &[u8], norm: &NormalizedFreqs) -> (Vec<u16>, u32) {
     let scale_bits = norm.scale_bits as u32;
+    let rcp_table = ReciprocalTable::from_normalized(norm);
     let mut state: u32 = RANS_L;
     let mut words: Vec<u16> = Vec::with_capacity(input.len());
 
@@ -260,7 +297,7 @@ fn rans_encode_internal(input: &[u8], norm: &NormalizedFreqs) -> (Vec<u16>, u32)
         }
 
         // Encode: state = (state / freq) << scale_bits + state % freq + cum
-        let (q, r) = rans_div(state, freq);
+        let (q, r) = rans_div_rcp(state, freq, rcp_table.rcp[s]);
         state = (q << scale_bits) + r + cum;
     }
 
@@ -340,6 +377,7 @@ fn rans_encode_interleaved(
     num_states: usize,
 ) -> (Vec<Vec<u16>>, Vec<u32>) {
     let scale_bits = norm.scale_bits as u32;
+    let rcp_table = ReciprocalTable::from_normalized(norm);
 
     let mut states = vec![RANS_L; num_states];
     let mut word_streams: Vec<Vec<u16>> =
@@ -360,7 +398,7 @@ fn rans_encode_interleaved(
         }
 
         // Encode
-        let (q, r) = rans_div(states[lane], freq);
+        let (q, r) = rans_div_rcp(states[lane], freq, rcp_table.rcp[s]);
         states[lane] = (q << scale_bits) + r + cum;
     }
 
@@ -807,21 +845,47 @@ mod tests {
     // --- Division helper ---
 
     #[test]
-    fn test_rans_div_correctness() {
-        let mut freq = FrequencyTable::new();
-        freq.count(b"the quick brown fox jumps over the lazy dog");
-        let norm = normalize_frequencies(&freq, 12).unwrap();
+    fn test_rans_div_rcp_correctness() {
+        let input: Vec<u8> = (0..500).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+        // Test across all supported scale_bits
+        for sb in MIN_SCALE_BITS..=MAX_SCALE_BITS {
+            let mut freq = FrequencyTable::new();
+            freq.count(&input);
+            let norm = normalize_frequencies(&freq, sb).unwrap();
+            let rcp_table = ReciprocalTable::from_normalized(&norm);
 
-        // Test a range of state values
-        for sym in 0..NUM_SYMBOLS {
-            if norm.freq[sym] == 0 {
-                continue;
-            }
-            let f = norm.freq[sym] as u32;
-            for &x in &[RANS_L, RANS_L + 1, RANS_L * 2, 0xFFFF_u32, 0x1_0000] {
-                let (q, r) = rans_div(x, f);
-                assert_eq!(q, x / f, "rans_div q wrong for x={x}, f={f}");
-                assert_eq!(r, x % f, "rans_div r wrong for x={x}, f={f}");
+            for sym in 0..NUM_SYMBOLS {
+                if norm.freq[sym] == 0 {
+                    continue;
+                }
+                let f = norm.freq[sym] as u32;
+                let rcp = rcp_table.rcp[sym];
+                // Test across the full rANS state range
+                let test_vals: Vec<u32> = vec![
+                    1,
+                    f,
+                    f + 1,
+                    RANS_L - 1,
+                    RANS_L,
+                    RANS_L + 1,
+                    RANS_L * 2,
+                    0xFFFF,
+                    0x1_0000,
+                    0x7FFF_FFFF,
+                    0xFFFF_FFFE,
+                    0xFFFF_FFFF,
+                ];
+                for x in test_vals {
+                    if x == 0 {
+                        continue;
+                    }
+                    let (q, r) = rans_div_rcp(x, f, rcp);
+                    assert_eq!(
+                        (q, r),
+                        (x / f, x % f),
+                        "rans_div_rcp wrong for x={x}, f={f}, rcp={rcp}, sb={sb}"
+                    );
+                }
             }
         }
     }
