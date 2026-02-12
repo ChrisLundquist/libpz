@@ -37,6 +37,11 @@ pub struct HuffmanNode {
     pub right: Option<usize>,
 }
 
+/// Bits used for the fast decode lookup table.
+const DECODE_TABLE_BITS: u8 = 12;
+/// Number of entries in the fast decode table.
+const DECODE_TABLE_SIZE: usize = 1 << DECODE_TABLE_BITS;
+
 /// A Huffman tree for encoding and decoding byte streams.
 #[derive(Debug, Clone)]
 pub struct HuffmanTree {
@@ -50,6 +55,9 @@ pub struct HuffmanTree {
     lookup: [(u32, u8); 256],
     /// Number of distinct symbols in the tree.
     pub leaf_count: u32,
+    /// Fast decode table: peek DECODE_TABLE_BITS MSB bits → (symbol, code_length).
+    /// Codes longer than DECODE_TABLE_BITS fall back to tree walk.
+    decode_table: Vec<(u8, u8)>,
 }
 
 impl HuffmanTree {
@@ -116,11 +124,13 @@ impl HuffmanTree {
             nodes[leaf_idx].code_bits = 1;
             lookup[nodes[leaf_idx].value as usize] = (0, 1);
 
+            let decode_table = Self::build_decode_table(&lookup);
             return Some(HuffmanTree {
                 nodes,
                 root: Some(root_idx),
                 lookup,
                 leaf_count: 1,
+                decode_table,
             });
         }
 
@@ -148,11 +158,13 @@ impl HuffmanTree {
         let mut lookup = [(0u32, 0u8); 256];
         Self::generate_codes(&mut nodes, root_idx, 0, 0, &mut lookup);
 
+        let decode_table = Self::build_decode_table(&lookup);
         Some(HuffmanTree {
             nodes,
             root: Some(root_idx),
             lookup,
             leaf_count: freq.used,
+            decode_table,
         })
     }
 
@@ -181,6 +193,31 @@ impl HuffmanTree {
         if left.is_none() && right.is_none() {
             lookup[nodes[idx].value as usize] = (nodes[idx].codeword, nodes[idx].code_bits);
         }
+    }
+
+    /// Build a flat decode lookup table for fast O(1) symbol resolution.
+    ///
+    /// For each symbol with code_bits <= DECODE_TABLE_BITS, fills
+    /// 2^(TABLE_BITS - code_bits) entries so that peeking TABLE_BITS
+    /// bits from the MSB of the bitstream directly yields (symbol, length).
+    fn build_decode_table(lookup: &[(u32, u8); 256]) -> Vec<(u8, u8)> {
+        let mut table = vec![(0u8, 0u8); DECODE_TABLE_SIZE];
+
+        for sym in 0..256u16 {
+            let (codeword, code_bits) = lookup[sym as usize];
+            if code_bits == 0 || code_bits > DECODE_TABLE_BITS {
+                continue;
+            }
+            // The codeword occupies the top code_bits bits of the peek window.
+            // Fill all entries where the top code_bits bits match.
+            let num_entries = 1usize << (DECODE_TABLE_BITS - code_bits);
+            let base = (codeword as usize) << (DECODE_TABLE_BITS - code_bits);
+            for i in 0..num_entries {
+                table[base + i] = (sym as u8, code_bits);
+            }
+        }
+
+        table
     }
 
     /// Encode input bytes using this Huffman tree.
@@ -289,59 +326,54 @@ impl HuffmanTree {
     /// `total_bits` is the number of valid bits in `input` (needed because
     /// the last byte may have padding bits).
     ///
-    /// This is the complete implementation that fixes BUG-09 (the C version
-    /// was an unimplemented stub).
+    /// Uses a flat lookup table for O(1) per-symbol decode. Peek
+    /// DECODE_TABLE_BITS from the MSB accumulator, look up (symbol, length),
+    /// advance by length bits. Codes longer than DECODE_TABLE_BITS fall back
+    /// to tree walk (extremely rare in practice).
     pub fn decode(&self, input: &[u8], total_bits: usize) -> PzResult<Vec<u8>> {
-        let root_idx = match self.root {
-            Some(idx) => idx,
-            None => return Err(PzError::InvalidInput),
-        };
+        if self.root.is_none() {
+            return Err(PzError::InvalidInput);
+        }
 
         let mut output = Vec::new();
-        let mut bit_pos: usize = 0;
-        let mut node_idx = root_idx;
+        // MSB-first bit accumulator: new bytes enter at the bottom,
+        // we peek/consume from the top.
+        let mut accumulator: u64 = 0;
+        let mut bits_avail: u32 = 0;
+        let mut byte_pos: usize = 0;
+        let mut bits_consumed: usize = 0;
 
-        while bit_pos < total_bits {
-            // Read one bit
-            let byte_idx = bit_pos / 8;
-            if byte_idx >= input.len() {
-                return Err(PzError::InvalidInput);
+        // Refill the accumulator from the MSB side
+        while bits_avail <= 56 && byte_pos < input.len() {
+            accumulator |= (input[byte_pos] as u64) << (56 - bits_avail);
+            bits_avail += 8;
+            byte_pos += 1;
+        }
+
+        while bits_consumed < total_bits {
+            // Refill when we might not have enough for a table peek
+            while bits_avail <= 56 && byte_pos < input.len() {
+                accumulator |= (input[byte_pos] as u64) << (56 - bits_avail);
+                bits_avail += 8;
+                byte_pos += 1;
             }
-            let bit_offset = 7 - (bit_pos % 8);
-            let bit = (input[byte_idx] >> bit_offset) & 1;
-            bit_pos += 1;
 
-            // Traverse: left on 0, right on 1
-            let next = if bit == 0 {
-                self.nodes[node_idx].left
-            } else {
-                self.nodes[node_idx].right
-            };
-
-            match next {
-                Some(child_idx) => {
-                    let child = &self.nodes[child_idx];
-                    if child.left.is_none() && child.right.is_none() {
-                        // Leaf node: emit byte value
-                        output.push(child.value);
-                        node_idx = root_idx;
-                    } else {
-                        node_idx = child_idx;
-                    }
-                }
-                None => {
-                    // We're at a leaf already (single-symbol case) or invalid
-                    // For the single-symbol tree, the root has only a left child
-                    // which is the leaf. If we get None, it means the current
-                    // node is a leaf.
-                    if self.nodes[node_idx].left.is_none() && self.nodes[node_idx].right.is_none() {
-                        output.push(self.nodes[node_idx].value);
-                        node_idx = root_idx;
-                    } else {
-                        return Err(PzError::InvalidInput);
-                    }
+            if bits_avail >= DECODE_TABLE_BITS as u32 {
+                // Fast path: peek top DECODE_TABLE_BITS bits
+                let peek = (accumulator >> (64 - DECODE_TABLE_BITS as u32)) as usize;
+                let (sym, len) = self.decode_table[peek];
+                if len > 0 {
+                    output.push(sym);
+                    accumulator <<= len as u32;
+                    bits_avail -= len as u32;
+                    bits_consumed += len as usize;
+                    continue;
                 }
             }
+
+            // Slow path: tree walk for codes > DECODE_TABLE_BITS or
+            // when accumulator is nearly empty
+            return self.decode_tree_walk(input, total_bits, bits_consumed, output);
         }
 
         Ok(output)
@@ -356,13 +388,70 @@ impl HuffmanTree {
         total_bits: usize,
         output: &mut [u8],
     ) -> PzResult<usize> {
-        let root_idx = match self.root {
-            Some(idx) => idx,
-            None => return Err(PzError::InvalidInput),
-        };
+        if self.root.is_none() {
+            return Err(PzError::InvalidInput);
+        }
 
         let mut out_pos: usize = 0;
-        let mut bit_pos: usize = 0;
+        let mut accumulator: u64 = 0;
+        let mut bits_avail: u32 = 0;
+        let mut byte_pos: usize = 0;
+        let mut bits_consumed: usize = 0;
+
+        while bits_avail <= 56 && byte_pos < input.len() {
+            accumulator |= (input[byte_pos] as u64) << (56 - bits_avail);
+            bits_avail += 8;
+            byte_pos += 1;
+        }
+
+        while bits_consumed < total_bits {
+            while bits_avail <= 56 && byte_pos < input.len() {
+                accumulator |= (input[byte_pos] as u64) << (56 - bits_avail);
+                bits_avail += 8;
+                byte_pos += 1;
+            }
+
+            if bits_avail >= DECODE_TABLE_BITS as u32 {
+                let peek = (accumulator >> (64 - DECODE_TABLE_BITS as u32)) as usize;
+                let (sym, len) = self.decode_table[peek];
+                if len > 0 {
+                    if out_pos >= output.len() {
+                        return Err(PzError::BufferTooSmall);
+                    }
+                    output[out_pos] = sym;
+                    out_pos += 1;
+                    accumulator <<= len as u32;
+                    bits_avail -= len as u32;
+                    bits_consumed += len as usize;
+                    continue;
+                }
+            }
+
+            // Slow path: tree walk for remaining symbols
+            let remaining = self.decode_tree_walk(input, total_bits, bits_consumed, Vec::new())?;
+            for &sym in &remaining {
+                if out_pos >= output.len() {
+                    return Err(PzError::BufferTooSmall);
+                }
+                output[out_pos] = sym;
+                out_pos += 1;
+            }
+            return Ok(out_pos);
+        }
+
+        Ok(out_pos)
+    }
+
+    /// Fallback tree-walk decoder for codes longer than DECODE_TABLE_BITS.
+    fn decode_tree_walk(
+        &self,
+        input: &[u8],
+        total_bits: usize,
+        start_bit: usize,
+        mut output: Vec<u8>,
+    ) -> PzResult<Vec<u8>> {
+        let root_idx = self.root.unwrap();
+        let mut bit_pos = start_bit;
         let mut node_idx = root_idx;
 
         while bit_pos < total_bits {
@@ -384,11 +473,7 @@ impl HuffmanTree {
                 Some(child_idx) => {
                     let child = &self.nodes[child_idx];
                     if child.left.is_none() && child.right.is_none() {
-                        if out_pos >= output.len() {
-                            return Err(PzError::BufferTooSmall);
-                        }
-                        output[out_pos] = child.value;
-                        out_pos += 1;
+                        output.push(child.value);
                         node_idx = root_idx;
                     } else {
                         node_idx = child_idx;
@@ -396,11 +481,7 @@ impl HuffmanTree {
                 }
                 None => {
                     if self.nodes[node_idx].left.is_none() && self.nodes[node_idx].right.is_none() {
-                        if out_pos >= output.len() {
-                            return Err(PzError::BufferTooSmall);
-                        }
-                        output[out_pos] = self.nodes[node_idx].value;
-                        out_pos += 1;
+                        output.push(self.nodes[node_idx].value);
                         node_idx = root_idx;
                     } else {
                         return Err(PzError::InvalidInput);
@@ -409,7 +490,7 @@ impl HuffmanTree {
             }
         }
 
-        Ok(out_pos)
+        Ok(output)
     }
 
     /// Get the codeword and number of bits for a given byte value.
