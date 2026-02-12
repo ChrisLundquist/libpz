@@ -513,15 +513,54 @@ fn test_deflate_chained_round_trip() {
         Err(e) => panic!("unexpected error: {:?}", e),
     };
 
-    let pattern = b"the quick brown fox jumps over the lazy dog. ";
+    let input = b"the quick brown fox jumps over the lazy dog. the quick brown fox.";
+    let block_data = engine.deflate_chained(input).unwrap();
+
+    // Decompress using the standard CPU Deflate decoder
+    let decompressed = crate::pipeline::decompress(&{
+        let mut container = Vec::new();
+        container.extend_from_slice(&[b'P', b'Z', 2, 0]); // magic + version=2 + pipeline=Deflate
+        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
+        container.extend_from_slice(&1u32.to_le_bytes()); // num_blocks = 1
+        container.extend_from_slice(&(block_data.len() as u32).to_le_bytes());
+        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
+        container.extend_from_slice(&block_data);
+        container
+    })
+    .unwrap();
+
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_deflate_chained_larger() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
     let mut input = Vec::new();
-    for _ in 0..50 {
+    for _ in 0..200 {
         input.extend_from_slice(pattern);
     }
 
-    let compressed = engine.deflate_chained(&input).unwrap();
-    // Verify it produces valid output (non-empty)
-    assert!(!compressed.is_empty());
+    let block_data = engine.deflate_chained(&input).unwrap();
+
+    let decompressed = crate::pipeline::decompress(&{
+        let mut container = Vec::new();
+        container.extend_from_slice(&[b'P', b'Z', 2, 0]);
+        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
+        container.extend_from_slice(&1u32.to_le_bytes());
+        container.extend_from_slice(&(block_data.len() as u32).to_le_bytes());
+        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
+        container.extend_from_slice(&block_data);
+        container
+    })
+    .unwrap();
+
+    assert_eq!(decompressed, input);
 }
 
 #[test]
