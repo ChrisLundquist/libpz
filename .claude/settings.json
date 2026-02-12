@@ -8,6 +8,7 @@
       "Bash(cargo)",
       "Bash(cat *)",
       "Bash(cp *)",
+      "Bash(cut *)",
       "Bash(diff *)",
       "Bash(file *)",
       "Bash(find *)",
