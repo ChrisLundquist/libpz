@@ -30,7 +30,8 @@ fn usage() {
     eprintln!("  -k, --keep         Keep original file");
     eprintln!("  -f, --force        Overwrite existing output files");
     eprintln!("  -l, --list         List info about compressed file");
-    eprintln!("  -p, --pipeline P   Compression pipeline: deflate (default), bw, lzr, lzf");
+    eprintln!("  -p, --pipeline P   Compression pipeline (default: deflate)");
+    eprintln!("  --list-pipelines   List all available pipelines and exit");
     eprintln!("  -a, --auto         Auto-select best pipeline based on data analysis");
     eprintln!("  --trial            Auto-select by trial compression (slower, more accurate)");
     eprintln!("  -t, --threads N    Number of threads (0=auto, 1=single-threaded)");
@@ -48,6 +49,31 @@ fn usage() {
     eprintln!("If no FILE is given, reads from stdin and writes to stdout.");
     eprintln!("Compressed files use the .pz extension.");
     eprintln!("Gzip (.gz) files are auto-detected during decompression.");
+}
+
+fn list_pipelines() {
+    println!("Available compression pipelines:");
+    println!();
+    println!("  NAME        ID  DESCRIPTION");
+    println!("  ----        --  -----------");
+    let pipelines: &[(&str, &str, &str)] = &[
+        ("deflate", "0", "LZ77 + Huffman (gzip-like, default)"),
+        ("bw", "1", "BWT + MTF + RLE + FSE (bzip2-like, best ratio)"),
+        (
+            "bbw",
+            "2",
+            "Bijective BWT + MTF + RLE + FSE (parallelizable BWT)",
+        ),
+        ("lzr", "3", "LZ77 + rANS (fastest compression)"),
+        ("lzf", "4", "LZ77 + FSE (zstd-style entropy coding)"),
+        ("lzssr", "6", "LZSS + rANS (experimental)"),
+        ("lz78r", "8", "LZ78 + rANS (experimental)"),
+    ];
+    for (name, id, desc) in pipelines {
+        println!("  {name:10} {id:>2}  {desc}");
+    }
+    println!();
+    println!("Use -p <name> to select a pipeline, or -a for auto-selection.");
 }
 
 #[derive(Debug)]
@@ -110,6 +136,10 @@ fn parse_args() -> Opts {
             "-O" | "--optimal" => opts.parse_strategy = ParseStrategy::Optimal,
             "--lazy" => opts.parse_strategy = ParseStrategy::Lazy,
             "--greedy" => opts.parse_strategy = ParseStrategy::Lazy, // greedy removed; lazy is strictly better
+            "--list-pipelines" => {
+                list_pipelines();
+                process::exit(0);
+            }
             "-h" | "--help" => {
                 usage();
                 process::exit(0);
@@ -126,9 +156,11 @@ fn parse_args() -> Opts {
                     "bbw" | "2" => Pipeline::Bbw,
                     "lzr" | "3" => Pipeline::Lzr,
                     "lzf" | "4" => Pipeline::Lzf,
+                    "lzssr" | "6" => Pipeline::LzssR,
+                    "lz78r" | "8" => Pipeline::Lz78R,
                     other => {
                         eprintln!("pz: unknown pipeline '{other}'");
-                        eprintln!("pz: valid pipelines: deflate, bw, bbw, lzr, lzf");
+                        eprintln!("pz: run 'pz --list-pipelines' to see available pipelines");
                         process::exit(1);
                     }
                 };

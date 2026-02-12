@@ -15,7 +15,6 @@ For day-to-day development instructions, see `CLAUDE.md`.
 
 ### Not started
 - M5.3: Fuzz testing (`cargo-fuzz`)
-- M12: Vulkan compute backend
 
 ### Partially complete
 - **rANS SIMD decode paths** — N-way interleaved rANS decode in `src/simd.rs` (SSE2 4-way, AVX2 8-way). The scalar interleaved encoder/decoder is implemented; SIMD intrinsics for the hot decode loop are not yet wired.

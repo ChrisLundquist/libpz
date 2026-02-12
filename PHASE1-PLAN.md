@@ -2,6 +2,11 @@
 
 ## Status: COMPLETE - Rust Migration Finalized
 
+> **Note:** This document is a historical planning artifact. References to a
+> future "Vulkan backend" were superseded by the WebGPU (wgpu) backend, which
+> provides cross-platform GPU compute via Vulkan, Metal, and DX12.
+> See `GPU_BACKEND_MIGRATION_EVAL.md` for the evaluation.
+
 ## Executive Summary
 
 Phase 1 established the foundation for libpz. The key outcomes:
@@ -178,7 +183,7 @@ The hybrid approach was followed and the migration decision has been made:
 
 ### Requirements
 
-1. **Multi-backend support:** OpenCL (primary), Vulkan (future)
+1. **Multi-backend support:** OpenCL (primary), WebGPU via wgpu (done)
 2. **Runtime detection:** Probe available devices, gracefully fall back
 3. **Shared kernel code:** Same algorithms across backends
 4. **C-callable API:** External code shouldn't know about Rust/GPU internals
@@ -317,36 +322,11 @@ impl LZ77Matcher {
 - No more manual `CL_SUCCESS` checks everywhere
 - Propagate errors cleanly with `?` operator
 
-### Vulkan Integration (Phase 5)
+### WebGPU Integration (Done — replaced Vulkan plan)
 
-**Why Vulkan:**
-- Better driver support on consumer hardware (gaming GPUs)
-- Mobile/embedded support (Android, Switch, etc.)
-- More control over memory and synchronization
-- Compute shaders in SPIR-V (compiled GLSL)
-
-**Rust crates:**
-- `ash`: Low-level Vulkan FFI bindings
-- `vulkano`: Safe, high-level wrapper (recommended)
-- `gpu-allocator`: Memory management
-
-**Shader compilation:**
-```bash
-# GLSL compute shader -> SPIR-V
-glslc lz77.comp -o lz77.comp.spv
-
-# Or use shaderc crate at build time
-```
-
-**Implementation pattern (similar to OpenCL):**
-```rust
-pub struct VulkanLZ77Matcher {
-    instance: Arc<Instance>,
-    device: Arc<Device>,
-    pipeline: Arc<ComputePipeline>,
-    descriptor_pool: Arc<DescriptorPool>,
-}
-```
+The originally planned Vulkan backend was replaced with WebGPU via the `wgpu`
+crate, which provides Vulkan/Metal/DX12 support through a single API.
+See `src/webgpu.rs` and `GPU_BACKEND_MIGRATION_EVAL.md`.
 
 ---
 

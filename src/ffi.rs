@@ -43,7 +43,6 @@ pub enum PzPipeline {
 #[repr(C)]
 pub struct PzDeviceInfo {
     pub opencl_devices: i32,
-    pub vulkan_devices: i32,
     pub webgpu_devices: i32,
     pub cpu_threads: i32,
 }
@@ -125,9 +124,8 @@ pub unsafe extern "C" fn pz_destroy(ctx: *mut PzContext) {
 
 /// Query available compute devices.
 ///
-/// Reports the number of OpenCL devices found during `pz_init()`,
-/// the number of Vulkan devices (0 until Phase 5), and the number
-/// of CPU threads available.
+/// Reports the number of OpenCL devices, WebGPU devices, and
+/// CPU threads available.
 ///
 /// # Safety
 ///
@@ -142,7 +140,6 @@ pub unsafe extern "C" fn pz_query_devices(ctx: *const PzContext, info: *mut PzDe
     let ctx = &*ctx;
     let info = &mut *info;
     info.opencl_devices = ctx.opencl_device_count;
-    info.vulkan_devices = 0; // Phase 5
     info.webgpu_devices = ctx.webgpu_device_count;
     info.cpu_threads = std::thread::available_parallelism()
         .map(|n| n.get() as i32)
@@ -561,14 +558,12 @@ mod tests {
             let ctx = pz_init();
             let mut info = PzDeviceInfo {
                 opencl_devices: -1,
-                vulkan_devices: -1,
                 webgpu_devices: -1,
                 cpu_threads: -1,
             };
             let result = pz_query_devices(ctx, &mut info);
             assert_eq!(result, PZ_OK);
             assert!(info.opencl_devices >= 0);
-            assert_eq!(info.vulkan_devices, 0);
             assert!(info.cpu_threads >= 1);
             pz_destroy(ctx);
         }

@@ -88,7 +88,7 @@ minimum-entropy chain via DP**.
 
 At startup, libpz probes available compute resources:
 1. Query OpenCL platforms/devices (GPU, CPU accelerators)
-2. Query Vulkan compute devices (future)
+2. Query WebGPU devices (via wgpu)
 3. Count CPU cores (for pthread backends)
 4. Fall back to reference single-threaded implementation
 
@@ -409,17 +409,11 @@ The C OpenCL engine was replaced by a Rust implementation using the `opencl3` cr
 
 ---
 
-## Phase 5: Vulkan Compute Backend (Future)
+## Phase 5: WebGPU Backend (Done)
 
-### 5.1 Motivation
-- Vulkan compute shaders are more widely available than OpenCL on consumer hardware
-- Better driver support on mobile GPUs, game consoles, embedded
-- SPIR-V shader format, explicit memory management
-
-### 5.2 Implementation
-- Port OpenCL kernels to GLSL compute shaders compiled to SPIR-V
-- Vulkan compute pipeline setup (descriptor sets, command buffers)
-- Same algorithms, different API surface
+WebGPU (via wgpu) was chosen over a direct Vulkan backend. wgpu provides
+cross-platform GPU compute (Vulkan, Metal, DX12) with a simpler API surface.
+See `GPU_BACKEND_MIGRATION_EVAL.md` for the evaluation.
 
 ---
 
@@ -478,8 +472,8 @@ without sidecar metadata).
 - **Performance benchmarks:** Throughput (MB/s) and compression ratio vs gzip/zstd/bzip2
 
 ### Build System
-- Autotools (existing) with feature detection for OpenCL, Vulkan, pthreads
-- `./configure --with-opencl --with-vulkan --with-pthreads`
+- Cargo features for OpenCL, WebGPU
+- `cargo build --features opencl,webgpu`
 - Backends compile conditionally based on available libraries
 - Reference backend always builds (no external dependencies beyond libc + libm)
 
@@ -504,7 +498,7 @@ without sidecar metadata).
 | **M9** | pthread block-parallel compression | M5 | **Done** (V2 container, `-t` flag, pipeline parallelism) |
 | **M10** | File format defined, CLI tool works end-to-end | M5 | **Done** (`pz` CLI with .pz format, `--gpu` flag) |
 | **M11** | Benchmark suite vs gzip/zstd/bzip2/lz4 | M8, M9, M10 | **Done** (throughput.rs compares gzip/pigz/zstd) |
-| **M12** | Vulkan compute backend | M8 | Pending |
+| **M12** | ~~Vulkan compute backend~~ → WebGPU backend | M8 | **Done** (wgpu) |
 | **M13** | zstd (.zst) format support | M7, FSE | Pending |
 
 ---
