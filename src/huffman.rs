@@ -187,8 +187,9 @@ impl HuffmanTree {
     ///
     /// Returns a tuple of (encoded_bytes, total_bits_encoded).
     ///
-    /// This is the complete implementation that fixes BUG-08 (the C version
-    /// never wrote to the output buffer) and BUG-12 (no bounds checking).
+    /// Uses a 64-bit accumulator to pack entire codewords per symbol
+    /// (MSB-first), flushing complete bytes from the top. This avoids
+    /// the per-bit loop and branch that the naive implementation requires.
     pub fn encode(&self, input: &[u8]) -> PzResult<(Vec<u8>, usize)> {
         if input.is_empty() {
             return Ok((Vec::new(), 0));
@@ -206,20 +207,33 @@ impl HuffmanTree {
 
         let output_len = total_bits.div_ceil(8);
         let mut output = vec![0u8; output_len];
-        let mut bit_pos: usize = 0;
+        let mut byte_pos: usize = 0;
+        // 64-bit accumulator: bits packed from MSB downward.
+        // bits_in_acc counts valid bits from the MSB side.
+        let mut accumulator: u64 = 0;
+        let mut bits_in_acc: u32 = 0;
 
         for &byte in input {
             let (codeword, code_bits) = self.lookup[byte as usize];
-            // Write codeword bits into output, MSB first
-            for bit_idx in (0..code_bits).rev() {
-                let bit = (codeword >> bit_idx) & 1;
-                if bit == 1 {
-                    let byte_idx = bit_pos / 8;
-                    let bit_offset = 7 - (bit_pos % 8);
-                    output[byte_idx] |= 1 << bit_offset;
-                }
-                bit_pos += 1;
+            // Pack entire codeword into accumulator in one operation.
+            // Place it at position (64 - bits_in_acc - code_bits) from the LSB,
+            // which is right-justified under the existing bits.
+            let shift = 64 - bits_in_acc - code_bits as u32;
+            accumulator |= (codeword as u64) << shift;
+            bits_in_acc += code_bits as u32;
+
+            // Flush complete bytes from the MSB side
+            while bits_in_acc >= 8 {
+                output[byte_pos] = (accumulator >> 56) as u8;
+                accumulator <<= 8;
+                bits_in_acc -= 8;
+                byte_pos += 1;
             }
+        }
+
+        // Flush any remaining partial byte
+        if bits_in_acc > 0 {
+            output[byte_pos] = (accumulator >> 56) as u8;
         }
 
         Ok((output, total_bits))
@@ -233,7 +247,10 @@ impl HuffmanTree {
             return Ok(0);
         }
 
-        let mut bit_pos: usize = 0;
+        let mut byte_pos: usize = 0;
+        let mut accumulator: u64 = 0;
+        let mut bits_in_acc: u32 = 0;
+        let mut total_bits: usize = 0;
 
         for &byte in input {
             let (codeword, code_bits) = self.lookup[byte as usize];
@@ -241,24 +258,30 @@ impl HuffmanTree {
                 return Err(PzError::InvalidInput);
             }
 
+            total_bits += code_bits as usize;
+
             // BUG-12 fix: check output buffer has room
-            if (bit_pos + code_bits as usize).div_ceil(8) > output.len() {
+            if total_bits.div_ceil(8) > output.len() {
                 return Err(PzError::BufferTooSmall);
             }
 
-            // Write codeword bits into output, MSB first
-            for bit_idx in (0..code_bits).rev() {
-                let bit = (codeword >> bit_idx) & 1;
-                if bit == 1 {
-                    let byte_idx = bit_pos / 8;
-                    let bit_offset = 7 - (bit_pos % 8);
-                    output[byte_idx] |= 1 << bit_offset;
-                }
-                bit_pos += 1;
+            let shift = 64 - bits_in_acc - code_bits as u32;
+            accumulator |= (codeword as u64) << shift;
+            bits_in_acc += code_bits as u32;
+
+            while bits_in_acc >= 8 {
+                output[byte_pos] = (accumulator >> 56) as u8;
+                accumulator <<= 8;
+                bits_in_acc -= 8;
+                byte_pos += 1;
             }
         }
 
-        Ok(bit_pos)
+        if bits_in_acc > 0 {
+            output[byte_pos] = (accumulator >> 56) as u8;
+        }
+
+        Ok(total_bits)
     }
 
     /// Decode Huffman-encoded data back to the original bytes.
