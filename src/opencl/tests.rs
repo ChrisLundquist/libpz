@@ -758,6 +758,72 @@ fn test_gpu_prefix_sum_large() {
     assert_eq!(result, expected);
 }
 
+// --- GPU Huffman on-device tests ---
+
+#[test]
+fn test_gpu_huffman_encode_on_device_matches_gpu_scan() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let input = b"hello world hello world hello world!";
+    let tree = crate::huffman::HuffmanTree::from_data(input).unwrap();
+
+    let mut code_lut = [0u32; 256];
+    for byte in 0..=255u8 {
+        let (codeword, bits) = tree.get_code(byte);
+        code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+    }
+
+    // Host-upload path
+    let (scan_encoded, scan_bits) = engine.huffman_encode_gpu_scan(input, &code_lut).unwrap();
+
+    // Device-buffer path
+    let device_buf = DeviceBuf::from_host(&engine, input).unwrap();
+    let (device_encoded, device_bits) = engine
+        .huffman_encode_on_device(&device_buf, &code_lut)
+        .unwrap();
+
+    assert_eq!(scan_bits, device_bits, "bit counts differ");
+    assert_eq!(scan_encoded, device_encoded, "encoded data differs");
+
+    // Verify round-trip
+    let decoded = tree.decode(&device_encoded, device_bits).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_gpu_huffman_encode_on_device_larger() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+
+    let tree = crate::huffman::HuffmanTree::from_data(&input).unwrap();
+    let mut code_lut = [0u32; 256];
+    for byte in 0..=255u8 {
+        let (codeword, bits) = tree.get_code(byte);
+        code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+    }
+
+    let device_buf = DeviceBuf::from_host(&engine, &input).unwrap();
+    let (device_encoded, device_bits) = engine
+        .huffman_encode_on_device(&device_buf, &code_lut)
+        .unwrap();
+
+    let decoded = tree.decode(&device_encoded, device_bits).unwrap();
+    assert_eq!(decoded, input);
+}
+
 // --- GPU Huffman with GPU scan tests ---
 
 #[test]

@@ -580,6 +580,154 @@ impl OpenClEngine {
         Ok((output_bytes, total_bits))
     }
 
+    /// Encode data already on the GPU using Huffman coding with GPU prefix sum.
+    ///
+    /// Same as [`huffman_encode_gpu_scan()`] but the input is a [`DeviceBuf`]
+    /// that's already resident on the GPU — no host→device upload for the
+    /// symbol data. This saves one PCI transfer per call when chaining stages.
+    pub fn huffman_encode_on_device(
+        &self,
+        input: &DeviceBuf,
+        code_lut: &[u32; 256],
+    ) -> PzResult<(Vec<u8>, usize)> {
+        if input.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let n = input.len();
+
+        let mut lut_buf = unsafe {
+            Buffer::<cl_uint>::create(&self.context, CL_MEM_READ_ONLY, 256, ptr::null_mut())
+                .map_err(|_| PzError::Unsupported)?
+        };
+
+        // bit_lengths_buf will also serve as bit_offsets_buf after prefix sum
+        let mut bit_lengths_buf = unsafe {
+            Buffer::<cl_uint>::create(&self.context, CL_MEM_READ_WRITE, n, ptr::null_mut())
+                .map_err(|_| PzError::Unsupported)?
+        };
+
+        // Upload LUT only — input data is already on device
+        let write_lut = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut lut_buf, CL_BLOCKING, 0, code_lut, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        write_lut.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Pass 1: compute bit lengths per symbol (input buffer is on-device)
+        let n_arg = n as cl_uint;
+        let pass1_event = unsafe {
+            ExecuteKernel::new(&self.kernel_huffman_bit_lengths)
+                .set_arg(&input.buf)
+                .set_arg(&lut_buf)
+                .set_arg(&bit_lengths_buf)
+                .set_arg(&n_arg)
+                .set_global_work_size(n)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        pass1_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Read the last bit_length before prefix sum overwrites it
+        let mut last_val = vec![0u32; 1];
+        let read_last = unsafe {
+            self.queue
+                .enqueue_read_buffer(
+                    &bit_lengths_buf,
+                    CL_BLOCKING,
+                    (n - 1) * std::mem::size_of::<cl_uint>(),
+                    &mut last_val,
+                    &[],
+                )
+                .map_err(|_| PzError::Unsupported)?
+        };
+        read_last.wait().map_err(|_| PzError::Unsupported)?;
+        let last_bit_length = last_val[0];
+
+        // GPU prefix sum (exclusive): bit_lengths → bit_offsets
+        self.prefix_sum_gpu(&mut bit_lengths_buf, n)?;
+
+        // Read the last offset to compute total_bits
+        let mut last_offset = vec![0u32; 1];
+        let read_offset = unsafe {
+            self.queue
+                .enqueue_read_buffer(
+                    &bit_lengths_buf,
+                    CL_BLOCKING,
+                    (n - 1) * std::mem::size_of::<cl_uint>(),
+                    &mut last_offset,
+                    &[],
+                )
+                .map_err(|_| PzError::Unsupported)?
+        };
+        read_offset.wait().map_err(|_| PzError::Unsupported)?;
+        let total_bits = (last_offset[0] + last_bit_length) as usize;
+
+        // Allocate output buffer
+        let output_uints = total_bits.div_ceil(32);
+        if output_uints == 0 {
+            return Ok((Vec::new(), 0));
+        }
+
+        let mut output_buf = unsafe {
+            Buffer::<cl_uint>::create(
+                &self.context,
+                CL_MEM_READ_WRITE,
+                output_uints,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::Unsupported)?
+        };
+
+        // Zero the output buffer
+        let zeros = vec![0u32; output_uints];
+        let zero_event = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut output_buf, CL_BLOCKING, 0, &zeros, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        zero_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Pass 2: write codewords at GPU-computed offsets (input is on-device)
+        let pass2_event = unsafe {
+            ExecuteKernel::new(&self.kernel_huffman_write_codes)
+                .set_arg(&input.buf)
+                .set_arg(&lut_buf)
+                .set_arg(&bit_lengths_buf) // now contains bit_offsets
+                .set_arg(&output_buf)
+                .set_arg(&n_arg)
+                .set_global_work_size(n)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        pass2_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Download output
+        let mut output_data = vec![0u32; output_uints];
+        let read_out = unsafe {
+            self.queue
+                .enqueue_read_buffer(&output_buf, CL_BLOCKING, 0, &mut output_data, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        read_out.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Convert uint array to bytes (big-endian to match MSB-first packing)
+        let output_bytes_len = total_bits.div_ceil(8);
+        let mut output_bytes = vec![0u8; output_bytes_len];
+        for (i, &val) in output_data.iter().enumerate() {
+            let base = i * 4;
+            let bytes = val.to_be_bytes();
+            for (j, &b) in bytes.iter().enumerate() {
+                if base + j < output_bytes_len {
+                    output_bytes[base + j] = b;
+                }
+            }
+        }
+
+        Ok((output_bytes, total_bits))
+    }
+
     /// GPU-chained Deflate compression: LZ77 + Huffman on GPU.
     ///
     /// Performs GPU LZ77 match finding followed by GPU Huffman encoding.
