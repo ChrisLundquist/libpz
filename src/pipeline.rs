@@ -15,14 +15,15 @@
 /// | `Lzr`         | LZ77 → rANS                      | fast ANS   |
 /// | `Lzf`         | LZ77 → FSE                       | zstd-like  |
 ///
-/// **Container format:**
+/// **Container format (V2, multi-block):**
 /// Each compressed stream starts with a header:
 /// - Magic bytes: `PZ` (2 bytes)
-/// - Version: 1 (1 byte)
+/// - Version: 2 (1 byte)
 /// - Pipeline ID: 0=Deflate, 1=Bw, 2=Lza, 3=Lzr, 4=Lzf (1 byte)
 /// - Original length: u32 little-endian (4 bytes)
-/// - Pipeline-specific metadata (variable)
-/// - Compressed data
+/// - num_blocks: u32 little-endian (4 bytes)
+/// - Block table: \[compressed_len: u32, original_len: u32\] * num_blocks
+/// - Block data: concatenated compressed block bytes
 use crate::bwt;
 use crate::fse;
 use crate::huffman::HuffmanTree;
@@ -75,7 +76,7 @@ pub struct CompressOptions {
     /// BWT suffix array, Huffman encoding).
     pub backend: Backend,
     /// Number of threads to use. 0 = auto (use all available cores),
-    /// 1 = single-threaded (produces legacy single-block format).
+    /// 1 = single-threaded.
     pub threads: usize,
     /// Block size for multi-threaded compression. Input is split into
     /// blocks of this size, each compressed independently.
@@ -107,10 +108,8 @@ impl Default for CompressOptions {
 
 /// Magic bytes for the libpz container format.
 const MAGIC: [u8; 2] = [b'P', b'Z'];
-/// Format version for single-block streams (legacy).
-const VERSION_V1: u8 = 1;
-/// Format version for multi-block streams (parallel compression).
-const VERSION_V2: u8 = 2;
+/// Format version for multi-block streams.
+const VERSION: u8 = 2;
 
 /// Minimum header size: magic(2) + version(1) + pipeline(1) + orig_len(4) = 8
 const MIN_HEADER_SIZE: usize = 8;
@@ -157,8 +156,11 @@ pub fn compress(input: &[u8], pipeline: Pipeline) -> PzResult<Vec<u8>> {
 ///
 /// When `options.threads` is 0 (auto) or > 1, input larger than one block
 /// is split into blocks and compressed in parallel using scoped threads.
-/// The output uses a multi-block container format. When `threads` is 1 or
-/// the input fits in a single block, the legacy single-block format is used.
+/// When `threads` is 1 or the input fits in a single block, a single block
+/// is compressed without thread overhead.
+///
+/// The output always uses the multi-block container format (V2) with a
+/// block table, even for single-block streams.
 ///
 /// When `options.backend` is `Backend::OpenCl` and an engine is provided,
 /// GPU-amenable stages (e.g., LZ77 match finding) run on the GPU.
@@ -177,13 +179,14 @@ pub fn compress_with_options(
 
     // Use single-block path if single-threaded or input fits in one block
     if num_threads <= 1 || input.len() <= block_size {
-        return match pipeline {
-            Pipeline::Deflate => compress_deflate_with_options(input, options),
-            Pipeline::Bw => compress_bw_with_options(input, options),
-            Pipeline::Lza => compress_lza_with_options(input, options),
-            Pipeline::Lzr => compress_lzr_with_options(input, options),
-            Pipeline::Lzf => compress_lzf_with_options(input, options),
-        };
+        let block_data = compress_block(input, pipeline, options)?;
+        let mut output = Vec::new();
+        write_header(&mut output, pipeline, input.len());
+        output.extend_from_slice(&1u32.to_le_bytes()); // num_blocks = 1
+        output.extend_from_slice(&(block_data.len() as u32).to_le_bytes()); // compressed_len
+        output.extend_from_slice(&(input.len() as u32).to_le_bytes()); // original_len
+        output.extend_from_slice(&block_data);
+        return Ok(output);
     }
 
     // Multi-block compression: choose between pipeline-parallel and block-parallel.
@@ -202,8 +205,7 @@ pub fn compress_with_options(
 /// Decompress data produced by `compress`.
 ///
 /// Reads the header to determine the pipeline, then applies the
-/// inverse stages. Automatically detects multi-block format and
-/// decompresses blocks in parallel when applicable.
+/// inverse stages. Decompresses blocks in parallel when applicable.
 pub fn decompress(input: &[u8]) -> PzResult<Vec<u8>> {
     decompress_with_threads(input, 0)
 }
@@ -226,7 +228,7 @@ pub fn decompress_with_threads(input: &[u8], threads: usize) -> PzResult<Vec<u8>
     }
 
     let version = input[2];
-    if version != VERSION_V1 && version != VERSION_V2 {
+    if version != VERSION {
         return Err(PzError::Unsupported);
     }
 
@@ -239,48 +241,27 @@ pub fn decompress_with_threads(input: &[u8], threads: usize) -> PzResult<Vec<u8>
 
     let payload = &input[MIN_HEADER_SIZE..];
 
-    if version == VERSION_V2 {
-        // V2 multi-block format
-        if payload.len() < 4 {
-            return Err(PzError::InvalidInput);
-        }
-        let num_blocks =
-            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-        if num_blocks == 0 {
-            return Err(PzError::InvalidInput);
-        }
-
-        let num_threads = resolve_thread_count(threads);
-        let stage_count = pipeline_stage_count(pipeline);
-
-        if num_threads > 1 && num_blocks >= stage_count {
-            return decompress_pipeline_parallel(payload, pipeline, orig_len, num_blocks);
-        }
-        return decompress_parallel(payload, pipeline, orig_len, num_blocks, threads);
+    if payload.len() < 4 {
+        return Err(PzError::InvalidInput);
+    }
+    let num_blocks = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    if num_blocks == 0 {
+        return Err(PzError::InvalidInput);
     }
 
-    // V1 single-block format
-    match pipeline {
-        Pipeline::Deflate => decompress_deflate(payload, orig_len),
-        Pipeline::Bw => decompress_bw(payload, orig_len),
-        Pipeline::Lza => decompress_lza(payload, orig_len),
-        Pipeline::Lzr => decompress_lzr(payload, orig_len),
-        Pipeline::Lzf => decompress_lzf(payload, orig_len),
+    let num_threads = resolve_thread_count(threads);
+    let stage_count = pipeline_stage_count(pipeline);
+
+    if num_threads > 1 && num_blocks >= stage_count {
+        return decompress_pipeline_parallel(payload, pipeline, orig_len, num_blocks);
     }
+    decompress_parallel(payload, pipeline, orig_len, num_blocks, threads)
 }
 
-/// Write the standard header to output (V1 single-block format).
+/// Write the container header to output.
 fn write_header(output: &mut Vec<u8>, pipeline: Pipeline, orig_len: usize) {
     output.extend_from_slice(&MAGIC);
-    output.push(VERSION_V1);
-    output.push(pipeline as u8);
-    output.extend_from_slice(&(orig_len as u32).to_le_bytes());
-}
-
-/// Write the V2 multi-block header to output.
-fn write_header_v2(output: &mut Vec<u8>, pipeline: Pipeline, orig_len: usize) {
-    output.extend_from_slice(&MAGIC);
-    output.push(VERSION_V2);
+    output.push(VERSION);
     output.push(pipeline as u8);
     output.extend_from_slice(&(orig_len as u32).to_le_bytes());
 }
@@ -377,7 +358,7 @@ fn compress_parallel(
 
     // Build output: V2 header + num_blocks + block_table + block_data
     let mut output = Vec::new();
-    write_header_v2(&mut output, pipeline, input.len());
+    write_header(&mut output, pipeline, input.len());
 
     // num_blocks
     output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
@@ -1089,14 +1070,14 @@ fn compress_pipeline_parallel(
         results
     });
 
-    // Build V2 container from collected block data
+    // Build container from collected block data
     let mut block_data_vec: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
     for result in results {
         block_data_vec.push(result?);
     }
 
     let mut output = Vec::new();
-    write_header_v2(&mut output, pipeline, input.len());
+    write_header(&mut output, pipeline, input.len());
     output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
 
     for (i, compressed) in block_data_vec.iter().enumerate() {
@@ -1330,14 +1311,6 @@ fn compress_block_deflate(input: &[u8], options: &CompressOptions) -> PzResult<V
     Ok(block.data)
 }
 
-fn compress_deflate_with_options(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    let block_data = compress_block_deflate(input, options)?;
-    let mut output = Vec::new();
-    write_header(&mut output, Pipeline::Deflate, input.len());
-    output.extend_from_slice(&block_data);
-    Ok(output)
-}
-
 /// Decompress a single Deflate block (no container header).
 fn decompress_block_deflate(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     let block = StageBlock {
@@ -1350,10 +1323,6 @@ fn decompress_block_deflate(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>
     let block = stage_huffman_decode(block)?;
     let block = stage_lz77_decompress(block)?;
     Ok(block.data)
-}
-
-fn decompress_deflate(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    decompress_block_deflate(payload, orig_len)
 }
 
 // --- BWT helper: select GPU or CPU backend for suffix array construction ---
@@ -1411,14 +1380,6 @@ fn compress_block_bw(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8
     Ok(block.data)
 }
 
-fn compress_bw_with_options(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    let block_data = compress_block_bw(input, options)?;
-    let mut output = Vec::new();
-    write_header(&mut output, Pipeline::Bw, input.len());
-    output.extend_from_slice(&block_data);
-    Ok(output)
-}
-
 /// Decompress a single BW block (no container header).
 fn decompress_block_bw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     if payload.len() < 8 {
@@ -1449,10 +1410,6 @@ fn decompress_block_bw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     Ok(output)
 }
 
-fn decompress_bw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    decompress_block_bw(payload, orig_len)
-}
-
 // --- LZA pipeline: LZ77 + Range coder ---
 
 /// Compress a single block using the LZA pipeline (no container header).
@@ -1469,14 +1426,6 @@ fn compress_block_lza(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u
     Ok(block.data)
 }
 
-fn compress_lza_with_options(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    let block_data = compress_block_lza(input, options)?;
-    let mut output = Vec::new();
-    write_header(&mut output, Pipeline::Lza, input.len());
-    output.extend_from_slice(&block_data);
-    Ok(output)
-}
-
 /// Decompress a single LZA block (no container header).
 fn decompress_block_lza(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     let block = StageBlock {
@@ -1489,10 +1438,6 @@ fn decompress_block_lza(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     let block = stage_rangecoder_decode_lza(block)?;
     let block = stage_lz77_decompress(block)?;
     Ok(block.data)
-}
-
-fn decompress_lza(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    decompress_block_lza(payload, orig_len)
 }
 
 // --- LZR pipeline: LZ77 + rANS ---
@@ -1615,14 +1560,6 @@ fn compress_block_lzr(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u
     Ok(block.data)
 }
 
-fn compress_lzr_with_options(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    let block_data = compress_block_lzr(input, options)?;
-    let mut output = Vec::new();
-    write_header(&mut output, Pipeline::Lzr, input.len());
-    output.extend_from_slice(&block_data);
-    Ok(output)
-}
-
 /// Decompress a single Lzr block (no container header).
 fn decompress_block_lzr(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     let block = StageBlock {
@@ -1635,10 +1572,6 @@ fn decompress_block_lzr(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     let block = stage_rans_decode(block)?;
     let block = stage_lz77_decompress(block)?;
     Ok(block.data)
-}
-
-fn decompress_lzr(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    decompress_block_lzr(payload, orig_len)
 }
 
 // --- LZF pipeline: LZ77 + FSE ---
@@ -1761,14 +1694,6 @@ fn compress_block_lzf(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u
     Ok(block.data)
 }
 
-fn compress_lzf_with_options(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    let block_data = compress_block_lzf(input, options)?;
-    let mut output = Vec::new();
-    write_header(&mut output, Pipeline::Lzf, input.len());
-    output.extend_from_slice(&block_data);
-    Ok(output)
-}
-
 /// Decompress a single Lzf block (no container header).
 fn decompress_block_lzf(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     let block = StageBlock {
@@ -1781,10 +1706,6 @@ fn decompress_block_lzf(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     let block = stage_fse_decode(block)?;
     let block = stage_lz77_decompress(block)?;
     Ok(block.data)
-}
-
-fn decompress_lzf(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    decompress_block_lzf(payload, orig_len)
 }
 
 // --- Pipeline auto-selection ---
@@ -2043,7 +1964,7 @@ mod tests {
 
     #[test]
     fn test_invalid_pipeline() {
-        let result = decompress(&[b'P', b'Z', 1, 99, 0, 0, 0, 0]);
+        let result = decompress(&[b'P', b'Z', VERSION, 99, 0, 0, 0, 0]);
         assert_eq!(result, Err(PzError::Unsupported));
     }
 
@@ -2055,7 +1976,7 @@ mod tests {
 
     #[test]
     fn test_zero_original_length() {
-        let result = decompress(&[b'P', b'Z', 1, 0, 0, 0, 0, 0]);
+        let result = decompress(&[b'P', b'Z', VERSION, 0, 0, 0, 0, 0]);
         assert_eq!(result.unwrap(), Vec::<u8>::new());
     }
 
@@ -2124,8 +2045,7 @@ mod tests {
 
         for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
             let compressed = compress_mt(&input, pipeline, 4, 512).unwrap();
-            // Should be V2 format
-            assert_eq!(compressed[2], VERSION_V2, "expected V2 for {:?}", pipeline);
+            assert_eq!(compressed[2], VERSION, "expected V2 for {:?}", pipeline);
             let decompressed = decompress(&compressed).unwrap();
             assert_eq!(decompressed, input, "round-trip failed for {:?}", pipeline);
         }
@@ -2133,35 +2053,25 @@ mod tests {
 
     #[test]
     fn test_multiblock_single_block_fallback() {
-        // Input smaller than block_size → should use single-block V1 format
+        // Input smaller than block_size → single block in V2 format
         let input = b"small input data";
         let compressed = compress_mt(input, Pipeline::Deflate, 4, 65536).unwrap();
-        assert_eq!(compressed[2], VERSION_V1, "expected V1 for small input");
+        assert_eq!(compressed[2], VERSION, "expected V2 for small input");
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
 
     #[test]
     fn test_multiblock_single_thread() {
-        // threads=1 → always single-block V1 format
+        // threads=1 → single block in V2 format
         let pattern = b"The quick brown fox jumps over the lazy dog. ";
         let mut input = Vec::new();
         for _ in 0..50 {
             input.extend_from_slice(pattern);
         }
         let compressed = compress_mt(&input, Pipeline::Bw, 1, 512).unwrap();
-        assert_eq!(compressed[2], VERSION_V1, "expected V1 for single-threaded");
+        assert_eq!(compressed[2], VERSION, "expected V2 for single-threaded");
         let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input);
-    }
-
-    #[test]
-    fn test_multiblock_v1_backward_compat() {
-        // Compress with V1 (single-threaded), verify decompression works
-        let input = b"hello, world! hello, world!";
-        let compressed_v1 = compress(input, Pipeline::Bw).unwrap();
-        assert_eq!(compressed_v1[2], VERSION_V1);
-        let decompressed = decompress(&compressed_v1).unwrap();
         assert_eq!(decompressed, input);
     }
 
@@ -2188,10 +2098,10 @@ mod tests {
 
     #[test]
     fn test_multiblock_exact_one_block() {
-        // Input exactly equal to block_size → single block, should use V1
+        // Input exactly equal to block_size → single block in V2 format
         let input = vec![b'x'; 1024];
         let compressed = compress_mt(&input, Pipeline::Bw, 4, 1024).unwrap();
-        assert_eq!(compressed[2], VERSION_V1, "exact one block should be V1");
+        assert_eq!(compressed[2], VERSION, "exact one block should be V2");
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
@@ -2211,7 +2121,7 @@ mod tests {
             input.extend_from_slice(pattern);
         }
         let compressed = compress_mt(&input, Pipeline::Lza, 2, 1024).unwrap();
-        assert_eq!(compressed[2], VERSION_V2);
+        assert_eq!(compressed[2], VERSION);
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
@@ -2239,7 +2149,7 @@ mod tests {
         }
         for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
             let compressed = compress_mt(&input, pipeline, 4, 16384).unwrap();
-            assert_eq!(compressed[2], VERSION_V2);
+            assert_eq!(compressed[2], VERSION);
             let decompressed = decompress(&compressed).unwrap();
             assert_eq!(decompressed, input, "large input failed for {:?}", pipeline);
         }
