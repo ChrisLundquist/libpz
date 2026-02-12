@@ -150,14 +150,25 @@ pub fn device_count() -> usize {
 pub struct WebGpuEngine {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    // Compiled shader modules
-    lz77_module: wgpu::ShaderModule,
-    lz77_batch_module: wgpu::ShaderModule,
-    lz77_topk_module: wgpu::ShaderModule,
-    lz77_hash_module: wgpu::ShaderModule,
-    bwt_rank_module: wgpu::ShaderModule,
-    bwt_radix_module: wgpu::ShaderModule,
-    huffman_module: wgpu::ShaderModule,
+    // Cached compute pipelines (created once at init, like OpenCL kernel objects)
+    pipeline_lz77_encode: wgpu::ComputePipeline,
+    pipeline_lz77_batch_encode: wgpu::ComputePipeline,
+    pipeline_lz77_topk: wgpu::ComputePipeline,
+    pipeline_lz77_hash_build: wgpu::ComputePipeline,
+    pipeline_lz77_hash_find: wgpu::ComputePipeline,
+    pipeline_rank_compare: wgpu::ComputePipeline,
+    pipeline_prefix_sum_local: wgpu::ComputePipeline,
+    pipeline_prefix_sum_propagate: wgpu::ComputePipeline,
+    pipeline_rank_scatter: wgpu::ComputePipeline,
+    pipeline_radix_compute_keys: wgpu::ComputePipeline,
+    pipeline_radix_histogram: wgpu::ComputePipeline,
+    pipeline_inclusive_to_exclusive: wgpu::ComputePipeline,
+    pipeline_radix_scatter: wgpu::ComputePipeline,
+    pipeline_byte_histogram: wgpu::ComputePipeline,
+    pipeline_compute_bit_lengths: wgpu::ComputePipeline,
+    pipeline_write_codes: wgpu::ComputePipeline,
+    pipeline_prefix_sum_block: wgpu::ComputePipeline,
+    pipeline_prefix_sum_apply: wgpu::ComputePipeline,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum compute workgroup size.
@@ -261,16 +272,84 @@ impl WebGpuEngine {
             source: wgpu::ShaderSource::Wgsl(HUFFMAN_ENCODE_KERNEL_SOURCE.into()),
         });
 
+        // Helper to create a compute pipeline from a module + entry point.
+        let make_pipeline =
+            |label: &str, module: &wgpu::ShaderModule, entry: &str| -> wgpu::ComputePipeline {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(label),
+                    layout: None,
+                    module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+            };
+
+        // Cache all 18 compute pipelines at init time (mirroring OpenCL kernel caching).
+        let pipeline_lz77_encode = make_pipeline("lz77_per_pos", &lz77_module, "encode");
+        let pipeline_lz77_batch_encode = make_pipeline("lz77_batch", &lz77_batch_module, "encode");
+        let pipeline_lz77_topk = make_pipeline("lz77_topk", &lz77_topk_module, "encode_topk");
+        let pipeline_lz77_hash_build =
+            make_pipeline("lz77_hash_build", &lz77_hash_module, "build_hash_table");
+        let pipeline_lz77_hash_find =
+            make_pipeline("lz77_hash_find", &lz77_hash_module, "find_matches");
+        let pipeline_rank_compare = make_pipeline("rank_compare", &bwt_rank_module, "rank_compare");
+        let pipeline_prefix_sum_local =
+            make_pipeline("prefix_sum_local", &bwt_rank_module, "prefix_sum_local");
+        let pipeline_prefix_sum_propagate = make_pipeline(
+            "prefix_sum_propagate",
+            &bwt_rank_module,
+            "prefix_sum_propagate",
+        );
+        let pipeline_rank_scatter = make_pipeline("rank_scatter", &bwt_rank_module, "rank_scatter");
+        let pipeline_radix_compute_keys = make_pipeline(
+            "radix_compute_keys",
+            &bwt_radix_module,
+            "radix_compute_keys",
+        );
+        let pipeline_radix_histogram =
+            make_pipeline("radix_histogram", &bwt_radix_module, "radix_histogram");
+        let pipeline_inclusive_to_exclusive = make_pipeline(
+            "inclusive_to_exclusive",
+            &bwt_radix_module,
+            "inclusive_to_exclusive",
+        );
+        let pipeline_radix_scatter =
+            make_pipeline("radix_scatter", &bwt_radix_module, "radix_scatter");
+        let pipeline_byte_histogram =
+            make_pipeline("byte_histogram", &huffman_module, "byte_histogram");
+        let pipeline_compute_bit_lengths = make_pipeline(
+            "compute_bit_lengths",
+            &huffman_module,
+            "compute_bit_lengths",
+        );
+        let pipeline_write_codes = make_pipeline("write_codes", &huffman_module, "write_codes");
+        let pipeline_prefix_sum_block =
+            make_pipeline("prefix_sum_block", &huffman_module, "prefix_sum_block");
+        let pipeline_prefix_sum_apply =
+            make_pipeline("prefix_sum_apply", &huffman_module, "prefix_sum_apply");
+
         Ok(WebGpuEngine {
             device,
             queue,
-            lz77_module,
-            lz77_batch_module,
-            lz77_topk_module,
-            lz77_hash_module,
-            bwt_rank_module,
-            bwt_radix_module,
-            huffman_module,
+            pipeline_lz77_encode,
+            pipeline_lz77_batch_encode,
+            pipeline_lz77_topk,
+            pipeline_lz77_hash_build,
+            pipeline_lz77_hash_find,
+            pipeline_rank_compare,
+            pipeline_prefix_sum_local,
+            pipeline_prefix_sum_propagate,
+            pipeline_rank_scatter,
+            pipeline_radix_compute_keys,
+            pipeline_radix_histogram,
+            pipeline_inclusive_to_exclusive,
+            pipeline_radix_scatter,
+            pipeline_byte_histogram,
+            pipeline_compute_bit_lengths,
+            pipeline_write_codes,
+            pipeline_prefix_sum_block,
+            pipeline_prefix_sum_apply,
             device_name,
             max_work_group_size,
             max_workgroups_per_dim,
@@ -296,10 +375,22 @@ impl WebGpuEngine {
 
     /// Maximum input size (bytes) that fits in a single GPU dispatch.
     ///
-    /// Computed from the device's `max_compute_workgroups_per_dimension`
-    /// and the smallest workgroup size used by our kernels (64).
+    /// With 2D dispatch tiling, the limit is `max^2 * workgroup_size`.
     pub fn max_dispatch_input_size(&self) -> usize {
-        self.max_workgroups_per_dim as usize * 64
+        let max = self.max_workgroups_per_dim as usize;
+        max * max * 64
+    }
+
+    /// Compute the X dispatch width in invocations for 2D tiling.
+    /// Kernels use `gid.x + gid.y * dispatch_width` to linearize.
+    fn dispatch_width(&self, workgroups_x: u32, workgroup_size: u32) -> u32 {
+        let max = self.max_workgroups_per_dim;
+        let wx = if workgroups_x <= max {
+            workgroups_x
+        } else {
+            max
+        };
+        wx * workgroup_size
     }
 
     // --- Helper: create buffer with data ---
@@ -359,10 +450,44 @@ impl WebGpuEngine {
         data
     }
 
+    /// Read a single u32 from a buffer at the given element offset.
+    /// Only transfers 4 bytes instead of the entire buffer.
+    fn read_buffer_scalar_u32(&self, buffer: &wgpu::Buffer, element_offset: usize) -> u32 {
+        let byte_offset = (element_offset * 4) as u64;
+        let staging = self.create_buffer(
+            "scalar_staging",
+            4,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("read_scalar"),
+            });
+        encoder.copy_buffer_to_buffer(buffer, byte_offset, &staging, 0, 4);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+
+        let data = slice.get_mapped_range();
+        let val = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+        drop(data);
+        staging.unmap();
+        val
+    }
+
     /// Dispatch a compute pass with the given pipeline and bind group.
     ///
-    /// Returns `Err(Unsupported)` if the dispatch would exceed the WebGPU
-    /// per-dimension workgroup limit of 65535.
+    /// Uses 2D tiling when `workgroups_x` exceeds the per-dimension limit.
+    /// Kernels must linearize their global ID as `gid.x + gid.y * params.w`
+    /// where `params.w` is set to `wx * workgroup_size` by the caller.
     fn dispatch(
         &self,
         pipeline: &wgpu::ComputePipeline,
@@ -370,9 +495,16 @@ impl WebGpuEngine {
         workgroups_x: u32,
         label: &str,
     ) -> PzResult<()> {
-        if workgroups_x > self.max_workgroups_per_dim {
-            return Err(PzError::Unsupported);
-        }
+        let max = self.max_workgroups_per_dim;
+        let (wx, wy) = if workgroups_x <= max {
+            (workgroups_x, 1u32)
+        } else {
+            let wy = workgroups_x.div_ceil(max);
+            if wy > max {
+                return Err(PzError::Unsupported);
+            }
+            (max, wy)
+        };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
@@ -383,7 +515,7 @@ impl WebGpuEngine {
             });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bind_group, &[]);
-            pass.dispatch_workgroups(workgroups_x, 1, 1);
+            pass.dispatch_workgroups(wx, wy, 1);
         }
         self.queue.submit(Some(encoder.finish()));
         Ok(())
@@ -426,25 +558,15 @@ impl WebGpuEngine {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
 
-        let params = [input_len as u32, 0, 0, 0];
+        let workgroups = (input_len as u32).div_ceil(64);
+        let params = [input_len as u32, 0, 0, self.dispatch_width(workgroups, 64)];
         let params_buf = self.create_buffer_init(
             "lz77_params",
             bytemuck::cast_slice(&params),
             wgpu::BufferUsages::UNIFORM,
         );
 
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("lz77_per_pos"),
-                layout: None,
-                module: &self.lz77_module,
-                entry_point: Some("encode"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        let bind_group_layout = pipeline.get_bind_group_layout(0);
+        let bind_group_layout = self.pipeline_lz77_encode.get_bind_group_layout(0);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_per_pos_bg"),
             layout: &bind_group_layout,
@@ -463,9 +585,12 @@ impl WebGpuEngine {
                 },
             ],
         });
-
-        let workgroups = (input_len as u32).div_ceil(64);
-        self.dispatch(&pipeline, &bind_group, workgroups, "lz77_per_pos")?;
+        self.dispatch(
+            &self.pipeline_lz77_encode,
+            &bind_group,
+            workgroups,
+            "lz77_per_pos",
+        )?;
 
         let raw = self.read_buffer(
             &output_buf,
@@ -489,25 +614,16 @@ impl WebGpuEngine {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
 
-        let params = [input_len as u32, 0, 0, 0];
+        let num_work_items = input_len.div_ceil(BATCH_STEP_SIZE);
+        let workgroups = (num_work_items as u32).div_ceil(64);
+        let params = [input_len as u32, 0, 0, self.dispatch_width(workgroups, 64)];
         let params_buf = self.create_buffer_init(
             "lz77_batch_params",
             bytemuck::cast_slice(&params),
             wgpu::BufferUsages::UNIFORM,
         );
 
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("lz77_batch"),
-                layout: None,
-                module: &self.lz77_batch_module,
-                entry_point: Some("encode"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        let bind_group_layout = pipeline.get_bind_group_layout(0);
+        let bind_group_layout = self.pipeline_lz77_batch_encode.get_bind_group_layout(0);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_batch_bg"),
             layout: &bind_group_layout,
@@ -526,10 +642,12 @@ impl WebGpuEngine {
                 },
             ],
         });
-
-        let num_work_items = input_len.div_ceil(BATCH_STEP_SIZE);
-        let workgroups = (num_work_items as u32).div_ceil(64);
-        self.dispatch(&pipeline, &bind_group, workgroups, "lz77_batch")?;
+        self.dispatch(
+            &self.pipeline_lz77_batch_encode,
+            &bind_group,
+            workgroups,
+            "lz77_batch",
+        )?;
 
         let raw = self.read_buffer(
             &output_buf,
@@ -547,7 +665,8 @@ impl WebGpuEngine {
         let input_buf =
             self.create_buffer_init("lz77_hash_input", &padded, wgpu::BufferUsages::STORAGE);
 
-        let params = [input_len as u32, 0, 0, 0];
+        let workgroups = (input_len as u32).div_ceil(64);
+        let params = [input_len as u32, 0, 0, self.dispatch_width(workgroups, 64)];
         let params_buf = self.create_buffer_init(
             "lz77_hash_params",
             bytemuck::cast_slice(&params),
@@ -574,18 +693,7 @@ impl WebGpuEngine {
         );
 
         // Pass 1: Build hash table
-        let build_pipeline =
-            self.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("lz77_hash_build"),
-                    layout: None,
-                    module: &self.lz77_hash_module,
-                    entry_point: Some("build_hash_table"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
-
-        let build_bg_layout = build_pipeline.get_bind_group_layout(0);
+        let build_bg_layout = self.pipeline_lz77_hash_build.get_bind_group_layout(0);
         let build_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_hash_build_bg"),
             layout: &build_bg_layout,
@@ -608,25 +716,17 @@ impl WebGpuEngine {
                 },
             ],
         });
-
-        let workgroups = (input_len as u32).div_ceil(64);
-        self.dispatch(&build_pipeline, &build_bg, workgroups, "lz77_hash_build")?;
+        self.dispatch(
+            &self.pipeline_lz77_hash_build,
+            &build_bg,
+            workgroups,
+            "lz77_hash_build",
+        )?;
 
         // Pass 2: Find matches — uses a separate pipeline with different bindings
         // We need to read back hash_counts for the find pass (read-only)
         // The find_matches entry point uses bindings 0,1,4,5,6
-        let find_pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("lz77_hash_find"),
-                layout: None,
-                module: &self.lz77_hash_module,
-                entry_point: Some("find_matches"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        let find_bg_layout = find_pipeline.get_bind_group_layout(0);
+        let find_bg_layout = self.pipeline_lz77_hash_find.get_bind_group_layout(0);
         let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_hash_find_bg"),
             layout: &find_bg_layout,
@@ -654,7 +754,12 @@ impl WebGpuEngine {
             ],
         });
 
-        self.dispatch(&find_pipeline, &find_bg, workgroups, "lz77_hash_find")?;
+        self.dispatch(
+            &self.pipeline_lz77_hash_find,
+            &find_bg,
+            workgroups,
+            "lz77_hash_find",
+        )?;
 
         let raw = self.read_buffer(
             &output_buf,
@@ -696,25 +801,15 @@ impl WebGpuEngine {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
 
-        let params = [input_len as u32, 0, 0, 0];
+        let workgroups = (input_len as u32).div_ceil(64);
+        let params = [input_len as u32, 0, 0, self.dispatch_width(workgroups, 64)];
         let params_buf = self.create_buffer_init(
             "topk_params",
             bytemuck::cast_slice(&params),
             wgpu::BufferUsages::UNIFORM,
         );
 
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("lz77_topk"),
-                layout: None,
-                module: &self.lz77_topk_module,
-                entry_point: Some("encode_topk"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        let bind_group_layout = pipeline.get_bind_group_layout(0);
+        let bind_group_layout = self.pipeline_lz77_topk.get_bind_group_layout(0);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_topk_bg"),
             layout: &bind_group_layout,
@@ -734,8 +829,12 @@ impl WebGpuEngine {
             ],
         });
 
-        let workgroups = (input_len as u32).div_ceil(64);
-        self.dispatch(&pipeline, &bind_group, workgroups, "lz77_topk")?;
+        self.dispatch(
+            &self.pipeline_lz77_topk,
+            &bind_group,
+            workgroups,
+            "lz77_topk",
+        )?;
 
         let raw = self.read_buffer(&output_buf, (output_len * 4) as u64);
         let packed: &[u32] = bytemuck::cast_slice(&raw);
@@ -895,10 +994,8 @@ impl WebGpuEngine {
             // Phase 3: Scatter ranks
             self.run_rank_scatter(&sa_buf, &prefix_buf, &rank_buf_alt, n_arg, padded_n_arg)?;
 
-            // Read convergence scalar
-            let prefix_data = self.read_buffer(&prefix_buf, (padded_n * 4) as u64);
-            let prefix_vals: &[u32] = bytemuck::cast_slice(&prefix_data);
-            max_rank = prefix_vals[n - 1];
+            // Read convergence scalar (4 bytes instead of full buffer)
+            max_rank = self.read_buffer_scalar_u32(&prefix_buf, n - 1);
 
             // Swap rank buffers
             std::mem::swap(&mut rank_buf, &mut rank_buf_alt);
@@ -942,18 +1039,7 @@ impl WebGpuEngine {
             wgpu::BufferUsages::UNIFORM,
         );
 
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("rank_compare"),
-                layout: None,
-                module: &self.bwt_rank_module,
-                entry_point: Some("rank_compare"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        let bg_layout = pipeline.get_bind_group_layout(0);
+        let bg_layout = self.pipeline_rank_compare.get_bind_group_layout(0);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rank_compare_bg"),
             layout: &bg_layout,
@@ -978,7 +1064,7 @@ impl WebGpuEngine {
         });
 
         let workgroups = padded_n.div_ceil(256);
-        self.dispatch(&pipeline, &bg, workgroups, "rank_compare")?;
+        self.dispatch(&self.pipeline_rank_compare, &bg, workgroups, "rank_compare")?;
         Ok(())
     }
 
@@ -1007,18 +1093,7 @@ impl WebGpuEngine {
                 | wgpu::BufferUsages::COPY_DST,
         );
 
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("prefix_sum_local"),
-                layout: None,
-                module: &self.bwt_rank_module,
-                entry_point: Some("prefix_sum_local"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        let bg_layout = pipeline.get_bind_group_layout(0);
+        let bg_layout = self.pipeline_prefix_sum_local.get_bind_group_layout(0);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ps_local_bg"),
             layout: &bg_layout,
@@ -1043,7 +1118,12 @@ impl WebGpuEngine {
         });
 
         let workgroups = num_blocks as u32;
-        self.dispatch(&pipeline, &bg, workgroups.max(1), "prefix_sum_local")?;
+        self.dispatch(
+            &self.pipeline_prefix_sum_local,
+            &bg,
+            workgroups.max(1),
+            "prefix_sum_local",
+        )?;
 
         if num_blocks > 1 {
             // Recursively scan block sums, then propagate
@@ -1064,18 +1144,7 @@ impl WebGpuEngine {
                 wgpu::BufferUsages::UNIFORM,
             );
 
-            let prop_pipeline =
-                self.device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some("prefix_sum_propagate"),
-                        layout: None,
-                        module: &self.bwt_rank_module,
-                        entry_point: Some("prefix_sum_propagate"),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    });
-
-            let prop_bg_layout = prop_pipeline.get_bind_group_layout(0);
+            let prop_bg_layout = self.pipeline_prefix_sum_propagate.get_bind_group_layout(0);
             let prop_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ps_propagate_bg"),
                 layout: &prop_bg_layout,
@@ -1096,7 +1165,12 @@ impl WebGpuEngine {
             });
 
             let prop_wg = (count as u32).div_ceil(256);
-            self.dispatch(&prop_pipeline, &prop_bg, prop_wg, "prefix_sum_propagate")?;
+            self.dispatch(
+                &self.pipeline_prefix_sum_propagate,
+                &prop_bg,
+                prop_wg,
+                "prefix_sum_propagate",
+            )?;
         }
 
         Ok(())
@@ -1117,18 +1191,7 @@ impl WebGpuEngine {
             wgpu::BufferUsages::UNIFORM,
         );
 
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("rank_scatter"),
-                layout: None,
-                module: &self.bwt_rank_module,
-                entry_point: Some("rank_scatter"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        let bg_layout = pipeline.get_bind_group_layout(0);
+        let bg_layout = self.pipeline_rank_scatter.get_bind_group_layout(0);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scatter_bg"),
             layout: &bg_layout,
@@ -1153,7 +1216,7 @@ impl WebGpuEngine {
         });
 
         let workgroups = padded_n.div_ceil(256);
-        self.dispatch(&pipeline, &bg, workgroups, "rank_scatter")?;
+        self.dispatch(&self.pipeline_rank_scatter, &bg, workgroups, "rank_scatter")?;
         Ok(())
     }
 
@@ -1199,18 +1262,7 @@ impl WebGpuEngine {
                 wgpu::BufferUsages::UNIFORM,
             );
 
-            let key_pipeline =
-                self.device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some("radix_compute_keys"),
-                        layout: None,
-                        module: &self.bwt_radix_module,
-                        entry_point: Some("radix_compute_keys"),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    });
-
-            let key_bg_layout = key_pipeline.get_bind_group_layout(0);
+            let key_bg_layout = self.pipeline_radix_compute_keys.get_bind_group_layout(0);
             let key_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rk_bg"),
                 layout: &key_bg_layout,
@@ -1235,7 +1287,12 @@ impl WebGpuEngine {
             });
 
             let global_wg = (padded_n as u32).div_ceil(256);
-            self.dispatch(&key_pipeline, &key_bg, global_wg, "radix_keys")?;
+            self.dispatch(
+                &self.pipeline_radix_compute_keys,
+                &key_bg,
+                global_wg,
+                "radix_keys",
+            )?;
 
             // Phase 2: Histogram
             let hist_params = [padded_n as u32, num_groups as u32, 0, 0];
@@ -1250,18 +1307,7 @@ impl WebGpuEngine {
             self.queue
                 .write_buffer(histogram_buf, 0, bytemuck::cast_slice(&hist_zeros));
 
-            let hist_pipeline =
-                self.device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some("radix_histogram"),
-                        layout: None,
-                        module: &self.bwt_radix_module,
-                        entry_point: Some("radix_histogram"),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    });
-
-            let hist_bg_layout = hist_pipeline.get_bind_group_layout(0);
+            let hist_bg_layout = self.pipeline_radix_histogram.get_bind_group_layout(0);
             let hist_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("hist_bg"),
                 layout: &hist_bg_layout,
@@ -1282,7 +1328,7 @@ impl WebGpuEngine {
             });
 
             self.dispatch(
-                &hist_pipeline,
+                &self.pipeline_radix_histogram,
                 &hist_bg,
                 num_groups as u32,
                 "radix_histogram",
@@ -1306,18 +1352,9 @@ impl WebGpuEngine {
                 wgpu::BufferUsages::UNIFORM,
             );
 
-            let ite_pipeline =
-                self.device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some("inclusive_to_exclusive"),
-                        layout: None,
-                        module: &self.bwt_radix_module,
-                        entry_point: Some("inclusive_to_exclusive"),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    });
-
-            let ite_bg_layout = ite_pipeline.get_bind_group_layout(0);
+            let ite_bg_layout = self
+                .pipeline_inclusive_to_exclusive
+                .get_bind_group_layout(0);
             let ite_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ite_bg"),
                 layout: &ite_bg_layout,
@@ -1338,7 +1375,12 @@ impl WebGpuEngine {
             });
 
             let ite_wg = (histogram_len as u32).div_ceil(256);
-            self.dispatch(&ite_pipeline, &ite_bg, ite_wg, "ite")?;
+            self.dispatch(
+                &self.pipeline_inclusive_to_exclusive,
+                &ite_bg,
+                ite_wg,
+                "ite",
+            )?;
 
             // Phase 4: Scatter
             let scat_params = [padded_n as u32, num_groups as u32, 0, 0];
@@ -1348,18 +1390,7 @@ impl WebGpuEngine {
                 wgpu::BufferUsages::UNIFORM,
             );
 
-            let scat_pipeline =
-                self.device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some("radix_scatter"),
-                        layout: None,
-                        module: &self.bwt_radix_module,
-                        entry_point: Some("radix_scatter"),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    });
-
-            let scat_bg_layout = scat_pipeline.get_bind_group_layout(0);
+            let scat_bg_layout = self.pipeline_radix_scatter.get_bind_group_layout(0);
             let scat_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("scat_bg"),
                 layout: &scat_bg_layout,
@@ -1387,7 +1418,12 @@ impl WebGpuEngine {
                 ],
             });
 
-            self.dispatch(&scat_pipeline, &scat_bg, num_groups as u32, "radix_scatter")?;
+            self.dispatch(
+                &self.pipeline_radix_scatter,
+                &scat_bg,
+                num_groups as u32,
+                "radix_scatter",
+            )?;
 
             // Swap sa buffers
             std::mem::swap(sa_buf, sa_buf_alt);
@@ -1413,25 +1449,15 @@ impl WebGpuEngine {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
 
-        let params = [n as u32, 0, 0, 0];
+        let workgroups = (n as u32).div_ceil(64);
+        let params = [n as u32, 0, 0, self.dispatch_width(workgroups, 64)];
         let params_buf = self.create_buffer_init(
             "hist_params",
             bytemuck::cast_slice(&params),
             wgpu::BufferUsages::UNIFORM,
         );
 
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("byte_histogram"),
-                layout: None,
-                module: &self.huffman_module,
-                entry_point: Some("byte_histogram"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        let bg_layout = pipeline.get_bind_group_layout(0);
+        let bg_layout = self.pipeline_byte_histogram.get_bind_group_layout(0);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("hist_bg"),
             layout: &bg_layout,
@@ -1451,8 +1477,12 @@ impl WebGpuEngine {
             ],
         });
 
-        let workgroups = (n as u32).div_ceil(64);
-        self.dispatch(&pipeline, &bg, workgroups, "byte_histogram")?;
+        self.dispatch(
+            &self.pipeline_byte_histogram,
+            &bg,
+            workgroups,
+            "byte_histogram",
+        )?;
 
         let raw = self.read_buffer(&hist_buf, (256 * 4) as u64);
         let hist: &[u32] = bytemuck::cast_slice(&raw);
@@ -1488,7 +1518,8 @@ impl WebGpuEngine {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
 
-        let params = [n as u32, 0, 0, 0];
+        let workgroups = (n as u32).div_ceil(64);
+        let params = [n as u32, 0, 0, self.dispatch_width(workgroups, 64)];
         let params_buf = self.create_buffer_init(
             "huff_params",
             bytemuck::cast_slice(&params),
@@ -1496,18 +1527,7 @@ impl WebGpuEngine {
         );
 
         // Pass 1: compute bit lengths
-        let pipeline1 = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("compute_bit_lengths"),
-                layout: None,
-                module: &self.huffman_module,
-                entry_point: Some("compute_bit_lengths"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        let bg1_layout = pipeline1.get_bind_group_layout(0);
+        let bg1_layout = self.pipeline_compute_bit_lengths.get_bind_group_layout(0);
         let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("huff_pass1_bg"),
             layout: &bg1_layout,
@@ -1531,8 +1551,12 @@ impl WebGpuEngine {
             ],
         });
 
-        let workgroups = (n as u32).div_ceil(64);
-        self.dispatch(&pipeline1, &bg1, workgroups, "huff_pass1")?;
+        self.dispatch(
+            &self.pipeline_compute_bit_lengths,
+            &bg1,
+            workgroups,
+            "huff_pass1",
+        )?;
 
         // Download bit lengths and compute prefix sum on CPU
         let raw_lengths = self.read_buffer(&bit_lengths_buf, (n * 4) as u64);
@@ -1564,18 +1588,7 @@ impl WebGpuEngine {
         );
 
         // Pass 2: write codes
-        let pipeline2 = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("write_codes"),
-                layout: None,
-                module: &self.huffman_module,
-                entry_point: Some("write_codes"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        let bg2_layout = pipeline2.get_bind_group_layout(0);
+        let bg2_layout = self.pipeline_write_codes.get_bind_group_layout(0);
         let bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("huff_pass2_bg"),
             layout: &bg2_layout,
@@ -1603,7 +1616,245 @@ impl WebGpuEngine {
             ],
         });
 
-        self.dispatch(&pipeline2, &bg2, workgroups, "huff_pass2")?;
+        self.dispatch(&self.pipeline_write_codes, &bg2, workgroups, "huff_pass2")?;
+
+        // Download output
+        let raw_output = self.read_buffer(&output_buf, (output_uints * 4) as u64);
+        let output_data: &[u32] = bytemuck::cast_slice(&raw_output);
+
+        let output_bytes_len = total_bits.div_ceil(8);
+        let mut output_bytes = vec![0u8; output_bytes_len];
+        for (i, &val) in output_data.iter().enumerate() {
+            let base = i * 4;
+            let bytes = val.to_be_bytes();
+            for (j, &b) in bytes.iter().enumerate() {
+                if base + j < output_bytes_len {
+                    output_bytes[base + j] = b;
+                }
+            }
+        }
+
+        Ok((output_bytes, total_bits))
+    }
+
+    /// Run an in-place exclusive prefix sum on a GPU buffer using Blelloch scan.
+    fn run_exclusive_prefix_sum(&self, data_buf: &wgpu::Buffer, count: usize) -> PzResult<()> {
+        let block_size = 512usize; // workgroup_size(256) * 2
+        let num_blocks = count.div_ceil(block_size);
+
+        let block_sums_buf = self.create_buffer(
+            "eps_block_sums",
+            (num_blocks.max(1) * 4) as u64,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+
+        let params = [count as u32, 0, 0, 0];
+        let params_buf = self.create_buffer_init(
+            "eps_params",
+            bytemuck::cast_slice(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
+        // Phase 1: Block-level exclusive scan
+        let bg_layout = self.pipeline_prefix_sum_block.get_bind_group_layout(0);
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("eps_block_bg"),
+            layout: &bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: data_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: block_sums_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        self.dispatch(
+            &self.pipeline_prefix_sum_block,
+            &bg,
+            num_blocks.max(1) as u32,
+            "eps_block",
+        )?;
+
+        if num_blocks > 1 {
+            // Recursively scan block sums
+            self.run_exclusive_prefix_sum(&block_sums_buf, num_blocks)?;
+
+            // Apply block offsets
+            let apply_params = [count as u32, block_size as u32, 0, 0];
+            let apply_params_buf = self.create_buffer_init(
+                "eps_apply_params",
+                bytemuck::cast_slice(&apply_params),
+                wgpu::BufferUsages::UNIFORM,
+            );
+
+            let apply_bg_layout = self.pipeline_prefix_sum_apply.get_bind_group_layout(0);
+            let apply_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("eps_apply_bg"),
+                layout: &apply_bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: data_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: block_sums_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: apply_params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let apply_wg = (count as u32).div_ceil(256);
+            self.dispatch(
+                &self.pipeline_prefix_sum_apply,
+                &apply_bg,
+                apply_wg,
+                "eps_apply",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Encode data using Huffman coding with GPU Blelloch prefix sum.
+    /// Only transfers 8 bytes for prefix sum instead of downloading/uploading the full array.
+    pub fn huffman_encode_gpu_scan(
+        &self,
+        input: &[u8],
+        code_lut: &[u32; 256],
+    ) -> PzResult<(Vec<u8>, usize)> {
+        if input.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let n = input.len();
+        let padded = Self::pad_input_bytes(input);
+
+        let input_buf =
+            self.create_buffer_init("huff_gs_input", &padded, wgpu::BufferUsages::STORAGE);
+
+        let lut_buf = self.create_buffer_init(
+            "huff_gs_lut",
+            bytemuck::cast_slice(code_lut),
+            wgpu::BufferUsages::STORAGE,
+        );
+
+        let bit_lengths_buf = self.create_buffer(
+            "huff_gs_bit_lengths",
+            (n * 4) as u64,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+
+        let workgroups = (n as u32).div_ceil(64);
+        let params = [n as u32, 0, 0, self.dispatch_width(workgroups, 64)];
+        let params_buf = self.create_buffer_init(
+            "huff_gs_params",
+            bytemuck::cast_slice(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
+        // Pass 1: compute bit lengths
+        let bg1_layout = self.pipeline_compute_bit_lengths.get_bind_group_layout(0);
+        let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("huff_gs_pass1_bg"),
+            layout: &bg1_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: lut_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bit_lengths_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.dispatch(
+            &self.pipeline_compute_bit_lengths,
+            &bg1,
+            workgroups,
+            "huff_gs_pass1",
+        )?;
+
+        // Read last bit length before prefix sum overwrites it
+        let last_bit_length = self.read_buffer_scalar_u32(&bit_lengths_buf, n - 1);
+
+        // GPU exclusive prefix sum (in-place on bit_lengths_buf)
+        self.run_exclusive_prefix_sum(&bit_lengths_buf, n)?;
+
+        // Read last offset to compute total bits
+        let last_offset = self.read_buffer_scalar_u32(&bit_lengths_buf, n - 1);
+        let total_bits = (last_offset + last_bit_length) as usize;
+
+        let output_uints = total_bits.div_ceil(32);
+        if output_uints == 0 {
+            return Ok((Vec::new(), 0));
+        }
+
+        let output_buf = self.create_buffer_init(
+            "huff_gs_output",
+            &vec![0u8; output_uints * 4],
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        // Pass 2: write codes (bit_lengths_buf now contains offsets)
+        let bg2_layout = self.pipeline_write_codes.get_bind_group_layout(0);
+        let bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("huff_gs_pass2_bg"),
+            layout: &bg2_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: lut_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bit_lengths_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        self.dispatch(
+            &self.pipeline_write_codes,
+            &bg2,
+            workgroups,
+            "huff_gs_pass2",
+        )?;
 
         // Download output
         let raw_output = self.read_buffer(&output_buf, (output_uints * 4) as u64);
@@ -1659,8 +1910,8 @@ impl WebGpuEngine {
             code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
         }
 
-        // Stage 3: GPU Huffman encoding
-        let (huffman_data, total_bits) = self.huffman_encode(&lz_data, &code_lut)?;
+        // Stage 3: GPU Huffman encoding with GPU prefix sum
+        let (huffman_data, total_bits) = self.huffman_encode_gpu_scan(&lz_data, &code_lut)?;
 
         // Serialize in the same format as the CPU Deflate block
         let mut output = Vec::new();
@@ -1888,6 +2139,31 @@ mod tests {
         }
 
         let (encoded, total_bits) = engine.huffman_encode(input, &code_lut).unwrap();
+        let mut decoded = vec![0u8; input.len()];
+        let decoded_len = tree
+            .decode_to_buf(&encoded, total_bits, &mut decoded)
+            .unwrap();
+        assert_eq!(&decoded[..decoded_len], input);
+    }
+
+    #[test]
+    fn test_huffman_gpu_scan_round_trip() {
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+
+        let input = b"hello, world!";
+        let tree = crate::huffman::HuffmanTree::from_data(input).unwrap();
+
+        let mut code_lut = [0u32; 256];
+        for byte in 0..=255u8 {
+            let (codeword, bits) = tree.get_code(byte);
+            code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+        }
+
+        let (encoded, total_bits) = engine.huffman_encode_gpu_scan(input, &code_lut).unwrap();
         let mut decoded = vec![0u8; input.len()];
         let decoded_len = tree
             .decode_to_buf(&encoded, total_bits, &mut decoded)

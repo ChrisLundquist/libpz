@@ -27,7 +27,7 @@ fn read_byte(pos: u32) -> u32 {
 
 @compute @workgroup_size(64)
 fn encode_topk(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let pos = gid.x;
+    let pos = gid.x + gid.y * params.w;
     let in_len = params.x;
     if (pos >= in_len) {
         return;

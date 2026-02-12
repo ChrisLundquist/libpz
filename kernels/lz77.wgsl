@@ -65,7 +65,7 @@ fn find_match_classic(search_start: u32, search_size: u32, tgt: u32, tgt_size: u
 
 @compute @workgroup_size(64)
 fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+    let i = gid.x + gid.y * params.w;
     let count = params.x;
     if (i >= count) {
         return;

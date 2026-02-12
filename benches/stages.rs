@@ -683,7 +683,7 @@ fn bench_huffman_webgpu(c: &mut Criterion) {
             },
         );
 
-        // WebGPU encode
+        // WebGPU encode (CPU prefix sum)
         let eng = engine.clone();
         let lut = code_lut;
         group.bench_with_input(
@@ -691,6 +691,17 @@ fn bench_huffman_webgpu(c: &mut Criterion) {
             &data,
             move |b, data| {
                 b.iter(|| eng.huffman_encode(data, &lut).unwrap());
+            },
+        );
+
+        // WebGPU encode (GPU prefix sum — Blelloch scan)
+        let eng2 = engine.clone();
+        let lut2 = code_lut;
+        group.bench_with_input(
+            BenchmarkId::new("encode_webgpu_gpu_scan", size),
+            &data,
+            move |b, data| {
+                b.iter(|| eng2.huffman_encode_gpu_scan(data, &lut2).unwrap());
             },
         );
     }

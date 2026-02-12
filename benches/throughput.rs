@@ -215,6 +215,8 @@ fn bench_compress_gpu(c: &mut Criterion) {
         block_size: 0,
         parse_strategy: pz::pipeline::ParseStrategy::Greedy,
         opencl_engine: Some(engine),
+        #[cfg(feature = "webgpu")]
+        webgpu_engine: None,
     };
 
     for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {

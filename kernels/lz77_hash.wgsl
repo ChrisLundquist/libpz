@@ -41,7 +41,7 @@ fn hash3(pos: u32, len: u32) -> u32 {
 
 @compute @workgroup_size(64)
 fn build_hash_table(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let pos = gid.x;
+    let pos = gid.x + gid.y * params.w;
     let in_len = params.x;
     if (pos + 2u >= in_len) {
         return;
@@ -61,7 +61,7 @@ fn build_hash_table(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn find_matches(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let pos = gid.x;
+    let pos = gid.x + gid.y * params.w;
     let in_len = params.x;
     if (pos >= in_len) {
         return;
