@@ -300,26 +300,31 @@ impl OpenClEngine {
             return Err(PzError::Unsupported);
         }
 
-        // Select device: prefer GPU if requested
-        let selected_id = if prefer_gpu {
-            let gpu_ids = get_all_devices(CL_DEVICE_TYPE_GPU).unwrap_or_default();
-            if gpu_ids.is_empty() {
-                all_ids[0]
-            } else {
-                gpu_ids[0]
-            }
+        // Select device: prefer discrete GPU over integrated.
+        // Among GPUs, pick the one with the most global memory (a reliable
+        // heuristic for discrete vs integrated — discrete GPUs have dedicated
+        // VRAM while integrated GPUs share system RAM and report less).
+        // Sort candidates best-first but try each in order, since on macOS
+        // some GPUs (e.g. AMD via deprecated OpenCL) may fail context creation.
+        let gpu_ids = if prefer_gpu {
+            let mut ids = get_all_devices(CL_DEVICE_TYPE_GPU).unwrap_or_default();
+            // Sort by global memory descending (discrete > integrated)
+            ids.sort_by(|a, b| {
+                let mem_a = Device::new(*a).global_mem_size().unwrap_or(0);
+                let mem_b = Device::new(*b).global_mem_size().unwrap_or(0);
+                mem_b.cmp(&mem_a)
+            });
+            ids
         } else {
-            all_ids[0]
+            Vec::new()
         };
 
-        let device = Device::new(selected_id);
-        let device_name = device.name().unwrap_or_default().trim().to_string();
-        let max_work_group_size = device.max_work_group_size().unwrap_or(1);
-        let dev_type: cl_device_type = device.dev_type().unwrap_or(0);
-        let is_cpu = (dev_type & CL_DEVICE_TYPE_GPU) == 0;
-
-        // Create context and command queue
-        let context = Context::from_device(&device).map_err(|_| PzError::Unsupported)?;
+        // Candidate list: sorted GPUs first, then all devices as fallback
+        let candidates: Vec<_> = gpu_ids
+            .iter()
+            .copied()
+            .chain(all_ids.iter().copied())
+            .collect();
 
         // Use the OpenCL 1.2 API (create_default) instead of the 2.0
         // create_default_with_properties, because macOS only supports OpenCL 1.2.
@@ -328,9 +333,43 @@ impl OpenClEngine {
         } else {
             0
         };
-        #[allow(deprecated)]
-        let queue = CommandQueue::create_default(&context, queue_props)
-            .map_err(|_| PzError::Unsupported)?;
+
+        // Try each candidate device until one successfully creates a context,
+        // command queue, and compiles a test kernel. On macOS, some GPUs
+        // (e.g. AMD discrete) pass context/queue creation but fail kernel
+        // compilation because Apple only ships an Intel OpenCL driver.
+        let mut device = None;
+        let mut context = None;
+        let mut queue = None;
+        for &id in &candidates {
+            let dev = Device::new(id);
+            let Ok(ctx) = Context::from_device(&dev) else {
+                continue;
+            };
+            #[allow(deprecated)]
+            let Ok(q) = CommandQueue::create_default(&ctx, queue_props) else {
+                continue;
+            };
+            // Smoke-test: compile a real kernel to catch drivers that accept
+            // context/queue creation but fail on actual kernel code (e.g. AMD
+            // on macOS where Apple only ships an Intel OpenCL driver).
+            if Program::create_and_build_from_source(&ctx, LZ77_KERNEL_SOURCE, "-Werror").is_err() {
+                continue;
+            }
+            device = Some(dev);
+            context = Some(ctx);
+            queue = Some(q);
+            break;
+        }
+
+        let device = device.ok_or(PzError::Unsupported)?;
+        let context = context.ok_or(PzError::Unsupported)?;
+        let queue = queue.ok_or(PzError::Unsupported)?;
+
+        let device_name = device.name().unwrap_or_default().trim().to_string();
+        let max_work_group_size = device.max_work_group_size().unwrap_or(1);
+        let dev_type: cl_device_type = device.dev_type().unwrap_or(0);
+        let is_cpu = (dev_type & CL_DEVICE_TYPE_GPU) == 0;
 
         // Compile both kernel variants
         let program_per_pos =
