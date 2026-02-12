@@ -238,7 +238,7 @@ fn should_skip_for_large(pipe: Pipeline, strategy: ParseStrategy, data_len: usiz
         return true;
     }
     // BWT on >500KB is very slow in prototype
-    if pipe == Pipeline::Bw && data_len > 500_000 {
+    if (pipe == Pipeline::Bw || pipe == Pipeline::Bbw) && data_len > 500_000 {
         return true;
     }
     false
@@ -333,10 +333,17 @@ fn main() {
         (Pipeline::Lzf, ParseStrategy::Lazy, 1, Backend::Cpu),
         (Pipeline::Lzf, ParseStrategy::Optimal, 1, Backend::Cpu),
         (Pipeline::Bw, ParseStrategy::Auto, 1, Backend::Cpu),
+        (Pipeline::Bbw, ParseStrategy::Auto, 1, Backend::Cpu),
+        // Experimental: LZSS and LZ78 pipelines
+        (Pipeline::LzssR, ParseStrategy::Auto, 1, Backend::Cpu),
+        (Pipeline::Lz78R, ParseStrategy::Auto, 1, Backend::Cpu),
         // Multi-threaded CPU
         (Pipeline::Deflate, ParseStrategy::Lazy, 0, Backend::Cpu),
         (Pipeline::Lzf, ParseStrategy::Lazy, 0, Backend::Cpu),
         (Pipeline::Bw, ParseStrategy::Auto, 0, Backend::Cpu),
+        (Pipeline::Bbw, ParseStrategy::Auto, 0, Backend::Cpu),
+        (Pipeline::LzssR, ParseStrategy::Auto, 0, Backend::Cpu),
+        (Pipeline::Lz78R, ParseStrategy::Auto, 0, Backend::Cpu),
     ];
 
     // OpenCL GPU variants (if available)
