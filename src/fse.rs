@@ -60,11 +60,11 @@ const HEADER_SIZE: usize = 1 + FREQ_TABLE_BYTES + 2 + 4;
 
 /// Normalized frequency table where frequencies sum to a power of 2.
 #[derive(Debug, Clone, PartialEq)]
-struct NormalizedFreqs {
+pub(crate) struct NormalizedFreqs {
     /// Normalized frequency for each symbol. Sum = 1 << accuracy_log.
-    freq: [u16; NUM_SYMBOLS],
+    pub(crate) freq: [u16; NUM_SYMBOLS],
     /// The accuracy log. table_size = 1 << accuracy_log.
-    accuracy_log: u8,
+    pub(crate) accuracy_log: u8,
 }
 
 /// Normalize raw frequencies so they sum to exactly `1 << accuracy_log`.
@@ -159,7 +159,7 @@ fn highest_bit_set(x: u32) -> u8 {
 ///
 /// Uses step = `(table_size >> 1) + (table_size >> 3) + 3` to produce
 /// quasi-random interleaving.
-fn spread_symbols(norm: &NormalizedFreqs) -> Vec<u8> {
+pub(crate) fn spread_symbols(norm: &NormalizedFreqs) -> Vec<u8> {
     let table_size = 1usize << norm.accuracy_log;
     let mask = table_size - 1;
 
@@ -206,17 +206,17 @@ fn spread_symbols(norm: &NormalizedFreqs) -> Vec<u8> {
 /// 3. `state = table[state].next_state_base + value`
 /// 4. Emit `symbol`
 #[derive(Debug, Clone, Copy, Default)]
-struct DecodeEntry {
-    symbol: u8,
-    bits: u8,
-    next_state_base: u16,
+pub(crate) struct DecodeEntry {
+    pub(crate) symbol: u8,
+    pub(crate) bits: u8,
+    pub(crate) next_state_base: u16,
 }
 
 /// Build the decode table from the spread symbol assignment.
 ///
 /// For each state, tracks a per-symbol destination state starting at
 /// `freq[s]` and incrementing. Bits and base are derived from this.
-fn build_decode_table(norm: &NormalizedFreqs, spread: &[u8]) -> Vec<DecodeEntry> {
+pub(crate) fn build_decode_table(norm: &NormalizedFreqs, spread: &[u8]) -> Vec<DecodeEntry> {
     let table_size = 1usize << norm.accuracy_log;
     let mut decode = vec![DecodeEntry::default(); table_size];
 
@@ -683,9 +683,8 @@ fn fse_encode_interleaved(
 
     // Pre-allocate per-lane chunk buffers.
     let cap = input.len().div_ceil(num_states);
-    let mut lane_chunks: Vec<Vec<(u32, u32)>> = (0..num_states)
-        .map(|_| vec![(0u32, 0u32); cap])
-        .collect();
+    let mut lane_chunks: Vec<Vec<(u32, u32)>> =
+        (0..num_states).map(|_| vec![(0u32, 0u32); cap]).collect();
     let mut lane_counts = vec![0usize; num_states];
 
     // Count how many symbols each lane will process, to fill chunks
