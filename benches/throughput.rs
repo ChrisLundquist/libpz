@@ -111,7 +111,13 @@ fn bench_compress(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(data.len() as u64));
 
     // pz pipelines
-    for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+    for &pipeline in &[
+        Pipeline::Deflate,
+        Pipeline::Bw,
+        Pipeline::Lza,
+        Pipeline::Lzr,
+        Pipeline::Lzf,
+    ] {
         group.bench_with_input(
             BenchmarkId::new("pz", format!("{:?}", pipeline)),
             &data,
@@ -155,7 +161,13 @@ fn bench_decompress(c: &mut Criterion) {
     // Criterion calls all group functions during enumeration even when a
     // filter is active; eagerly compressing with BWT/SA-IS on large data
     // would block for minutes.
-    for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+    for &pipeline in &[
+        Pipeline::Deflate,
+        Pipeline::Bw,
+        Pipeline::Lza,
+        Pipeline::Lzr,
+        Pipeline::Lzf,
+    ] {
         group.bench_function(BenchmarkId::new("pz", format!("{:?}", pipeline)), |b| {
             let compressed = pipeline::compress(&data, pipeline).unwrap();
             b.iter(|| pipeline::decompress(&compressed).unwrap());
@@ -239,7 +251,13 @@ fn bench_compress_parallel(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(data.len() as u64));
 
     // Single-threaded baseline
-    for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+    for &pipe in &[
+        Pipeline::Deflate,
+        Pipeline::Bw,
+        Pipeline::Lza,
+        Pipeline::Lzr,
+        Pipeline::Lzf,
+    ] {
         group.bench_with_input(
             BenchmarkId::new("pz_1t", format!("{:?}", pipe)),
             &data,
@@ -254,7 +272,13 @@ fn bench_compress_parallel(c: &mut Criterion) {
     }
 
     // Multi-threaded (auto thread count)
-    for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+    for &pipe in &[
+        Pipeline::Deflate,
+        Pipeline::Bw,
+        Pipeline::Lza,
+        Pipeline::Lzr,
+        Pipeline::Lzf,
+    ] {
         group.bench_with_input(
             BenchmarkId::new("pz_mt", format!("{:?}", pipe)),
             &data,
@@ -283,7 +307,12 @@ fn bench_compress_large(c: &mut Criterion) {
         let data = get_test_data_sized(size);
         group.throughput(Throughput::Bytes(size as u64));
 
-        for &pipe in &[Pipeline::Deflate, Pipeline::Lza] {
+        for &pipe in &[
+            Pipeline::Deflate,
+            Pipeline::Lza,
+            Pipeline::Lzr,
+            Pipeline::Lzf,
+        ] {
             group.bench_with_input(
                 BenchmarkId::new(format!("{:?}", pipe), size),
                 &data,
@@ -305,7 +334,12 @@ fn bench_decompress_large(c: &mut Criterion) {
         let data = get_test_data_sized(size);
         group.throughput(Throughput::Bytes(size as u64));
 
-        for &pipe in &[Pipeline::Deflate, Pipeline::Lza] {
+        for &pipe in &[
+            Pipeline::Deflate,
+            Pipeline::Lza,
+            Pipeline::Lzr,
+            Pipeline::Lzf,
+        ] {
             group.bench_function(BenchmarkId::new(format!("{:?}", pipe), size), |b| {
                 let compressed = pipeline::compress(&data, pipe).unwrap();
                 b.iter(|| pipeline::decompress(&compressed).unwrap());

@@ -227,6 +227,25 @@ fn bench_fse(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_rans(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rans");
+    cap(&mut group);
+    for &size in SIZES_ALL {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("encode", size), &data, |b, data| {
+            b.iter(|| pz::rans::encode(data));
+        });
+
+        let encoded = pz::rans::encode(&data);
+        group.bench_with_input(BenchmarkId::new("decode", size), &encoded, |b, enc| {
+            b.iter(|| pz::rans::decode(enc, size).unwrap());
+        });
+    }
+    group.finish();
+}
+
 #[cfg(feature = "opencl")]
 fn bench_bwt_gpu(c: &mut Criterion) {
     use pz::opencl::OpenClEngine;
@@ -716,6 +735,7 @@ criterion_group!(
     bench_rle,
     bench_rangecoder,
     bench_fse,
+    bench_rans,
     bench_simd,
     bench_lz77_parallel,
     bench_analysis,
