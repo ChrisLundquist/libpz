@@ -70,6 +70,60 @@ impl OpenClEngine {
         Ok(result)
     }
 
+    /// Compute a byte histogram from data already on the GPU device.
+    ///
+    /// Same as [`byte_histogram()`] but avoids uploading the input — the data
+    /// is already in a [`DeviceBuf`]. This saves one host→device transfer
+    /// when chaining GPU stages.
+    pub fn byte_histogram_on_device(&self, input: &DeviceBuf) -> PzResult<[u32; 256]> {
+        if input.is_empty() {
+            return Ok([0u32; 256]);
+        }
+
+        let n = input.len();
+
+        // Create histogram buffer (256 uints, zeroed)
+        let mut hist_buf = unsafe {
+            Buffer::<cl_uint>::create(&self.context, CL_MEM_READ_WRITE, 256, ptr::null_mut())
+                .map_err(|_| PzError::Unsupported)?
+        };
+
+        // Zero the histogram buffer
+        let zeros = vec![0u32; 256];
+        let zero_event = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut hist_buf, CL_BLOCKING, 0, &zeros, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        zero_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Run histogram kernel — input buffer is already on device
+        let n_arg = n as cl_uint;
+        let kernel_event = unsafe {
+            ExecuteKernel::new(&self.kernel_byte_histogram)
+                .set_arg(&input.buf)
+                .set_arg(&hist_buf)
+                .set_arg(&n_arg)
+                .set_global_work_size(n)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        kernel_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Download histogram
+        let mut histogram = vec![0u32; 256];
+        let read_event = unsafe {
+            self.queue
+                .enqueue_read_buffer(&hist_buf, CL_BLOCKING, 0, &mut histogram, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        read_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        let mut result = [0u32; 256];
+        result.copy_from_slice(&histogram);
+        Ok(result)
+    }
+
     /// Encode data using Huffman coding on the GPU.
     ///
     /// Takes a code lookup table (from a HuffmanTree) and the input symbols.

@@ -535,6 +535,123 @@ impl OpenClEngine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DeviceBuf — data residing on the GPU, not read back unless requested
+// ---------------------------------------------------------------------------
+
+/// A buffer residing on the GPU device.
+///
+/// Data stays on-device until explicitly downloaded via [`read_to_host()`].
+/// This avoids unnecessary PCI-bus round-trips when one GPU stage feeds
+/// directly into another (e.g., LZ77 output → Huffman histogram on the
+/// same device buffer).
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # #[cfg(feature = "opencl")]
+/// # fn example() -> pz::PzResult<()> {
+/// use pz::opencl::{OpenClEngine, DeviceBuf};
+///
+/// let engine = OpenClEngine::new()?;
+/// let data = b"hello world";
+/// let device_buf = DeviceBuf::from_host(&engine, data)?;
+///
+/// // Data lives on GPU — use it with on-device methods
+/// let histogram = engine.byte_histogram_on_device(&device_buf)?;
+///
+/// // Only download when you actually need the bytes on the host
+/// let host_data = device_buf.read_to_host(&engine)?;
+/// assert_eq!(&host_data, data);
+/// # Ok(())
+/// # }
+/// ```
+pub struct DeviceBuf {
+    pub(crate) buf: Buffer<u8>,
+    pub(crate) len: usize,
+}
+
+impl DeviceBuf {
+    /// Upload host data to the GPU, returning a device-resident buffer.
+    pub fn from_host(engine: &OpenClEngine, data: &[u8]) -> PzResult<Self> {
+        if data.is_empty() {
+            // Allocate a 1-byte buffer to avoid zero-size allocation issues
+            let buf = unsafe {
+                Buffer::<u8>::create(&engine.context, CL_MEM_READ_WRITE, 1, ptr::null_mut())
+                    .map_err(|_| PzError::BufferTooSmall)?
+            };
+            return Ok(DeviceBuf { buf, len: 0 });
+        }
+
+        let mut buf = unsafe {
+            Buffer::<u8>::create(
+                &engine.context,
+                CL_MEM_READ_WRITE,
+                data.len(),
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        let write_event = unsafe {
+            engine
+                .queue
+                .enqueue_write_buffer(&mut buf, CL_BLOCKING, 0, data, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        write_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        Ok(DeviceBuf {
+            buf,
+            len: data.len(),
+        })
+    }
+
+    /// Allocate a zero-initialized device buffer of the given size.
+    pub fn alloc(engine: &OpenClEngine, len: usize) -> PzResult<Self> {
+        let actual_len = len.max(1); // avoid zero-size allocation
+        let buf = unsafe {
+            Buffer::<u8>::create(
+                &engine.context,
+                CL_MEM_READ_WRITE,
+                actual_len,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        Ok(DeviceBuf { buf, len })
+    }
+
+    /// Download the buffer contents from the GPU to host memory.
+    pub fn read_to_host(&self, engine: &OpenClEngine) -> PzResult<Vec<u8>> {
+        if self.len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut host_data = vec![0u8; self.len];
+        let read_event = unsafe {
+            engine
+                .queue
+                .enqueue_read_buffer(&self.buf, CL_BLOCKING, 0, &mut host_data, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        read_event.wait().map_err(|_| PzError::Unsupported)?;
+
+        Ok(host_data)
+    }
+
+    /// The logical length of the data in this buffer.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether this buffer is empty (zero-length data).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// Deduplicate raw GPU match output into a non-overlapping match sequence.
 ///
 /// The GPU kernel produces a match for every input position, but many of

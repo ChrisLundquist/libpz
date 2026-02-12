@@ -494,6 +494,77 @@ fn test_gpu_topk_optimal_large_round_trip() {
     assert_eq!(decompressed, input);
 }
 
+// --- DeviceBuf tests ---
+
+#[test]
+fn test_device_buf_round_trip() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let data = b"hello world this is a test of device buffers";
+    let device_buf = DeviceBuf::from_host(&engine, data).unwrap();
+    assert_eq!(device_buf.len(), data.len());
+    assert!(!device_buf.is_empty());
+
+    let host_data = device_buf.read_to_host(&engine).unwrap();
+    assert_eq!(&host_data, data);
+}
+
+#[test]
+fn test_device_buf_empty() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let device_buf = DeviceBuf::from_host(&engine, &[]).unwrap();
+    assert_eq!(device_buf.len(), 0);
+    assert!(device_buf.is_empty());
+
+    let host_data = device_buf.read_to_host(&engine).unwrap();
+    assert!(host_data.is_empty());
+}
+
+#[test]
+fn test_byte_histogram_on_device_matches_host() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let input = b"aabbccdd hello world aabbccdd";
+
+    // Host-upload path
+    let hist_host = engine.byte_histogram(input).unwrap();
+
+    // Device-buffer path
+    let device_buf = DeviceBuf::from_host(&engine, input).unwrap();
+    let hist_device = engine.byte_histogram_on_device(&device_buf).unwrap();
+
+    assert_eq!(
+        hist_host, hist_device,
+        "histogram mismatch between host and device paths"
+    );
+}
+
+#[test]
+fn test_byte_histogram_on_device_empty() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let device_buf = DeviceBuf::from_host(&engine, &[]).unwrap();
+    let hist = engine.byte_histogram_on_device(&device_buf).unwrap();
+    assert!(hist.iter().all(|&c| c == 0));
+}
+
 // --- GPU Huffman encoding tests ---
 
 #[test]
