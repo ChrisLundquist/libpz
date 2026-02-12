@@ -3139,6 +3139,23 @@ mod tests {
         assert_eq!(decompressed, input);
     }
 
+    /// Regression: all-same-byte input >65535 bytes produces matches with
+    /// length exceeding u16::MAX in the raw GPU output. dedupe_gpu_matches
+    /// must clamp to u16::MAX to prevent silent truncation.
+    #[test]
+    fn test_lz77_gpu_all_same_byte_large() {
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+
+        let input = vec![0xAAu8; MIN_GPU_INPUT_SIZE + 4096];
+        let compressed = engine.lz77_compress(&input).unwrap();
+        let decompressed = crate::lz77::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
     #[test]
     fn test_byte_histogram() {
         let engine = match WebGpuEngine::new() {
