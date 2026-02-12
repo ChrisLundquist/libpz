@@ -29,7 +29,7 @@ fn usage() {
     eprintln!("  -k, --keep         Keep original file");
     eprintln!("  -f, --force        Overwrite existing output files");
     eprintln!("  -l, --list         List info about compressed file");
-    eprintln!("  -p, --pipeline P   Compression pipeline: deflate (default), bw, lza, lzr, lzf");
+    eprintln!("  -p, --pipeline P   Compression pipeline: deflate (default), bw, lzr, lzf");
     eprintln!("  -a, --auto         Auto-select best pipeline based on data analysis");
     eprintln!("  --trial            Auto-select by trial compression (slower, more accurate)");
     eprintln!("  -t, --threads N    Number of threads (0=auto, 1=single-threaded)");
@@ -122,12 +122,11 @@ fn parse_args() -> Opts {
                 opts.pipeline = match args[i].as_str() {
                     "deflate" | "0" => Pipeline::Deflate,
                     "bw" | "1" => Pipeline::Bw,
-                    "lza" | "2" => Pipeline::Lza,
                     "lzr" | "3" => Pipeline::Lzr,
                     "lzf" | "4" => Pipeline::Lzf,
                     other => {
                         eprintln!("pz: unknown pipeline '{other}'");
-                        eprintln!("pz: valid pipelines: deflate, bw, lza, lzr, lzf");
+                        eprintln!("pz: valid pipelines: deflate, bw, lzr, lzf");
                         process::exit(1);
                     }
                 };
@@ -332,7 +331,6 @@ fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
             let pipe = match data[3] {
                 0 => "deflate",
                 1 => "bw",
-                2 => "lza",
                 3 => "lzr",
                 4 => "lzf",
                 _ => "unknown",

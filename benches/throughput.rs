@@ -114,7 +114,6 @@ fn bench_compress(c: &mut Criterion) {
     for &pipeline in &[
         Pipeline::Deflate,
         Pipeline::Bw,
-        Pipeline::Lza,
         Pipeline::Lzr,
         Pipeline::Lzf,
     ] {
@@ -164,7 +163,6 @@ fn bench_decompress(c: &mut Criterion) {
     for &pipeline in &[
         Pipeline::Deflate,
         Pipeline::Bw,
-        Pipeline::Lza,
         Pipeline::Lzr,
         Pipeline::Lzf,
     ] {
@@ -231,7 +229,7 @@ fn bench_compress_gpu(c: &mut Criterion) {
         webgpu_engine: None,
     };
 
-    for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+    for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
         let opts = options.clone();
         group.bench_with_input(
             BenchmarkId::new("pz_gpu", format!("{:?}", pipe)),
@@ -258,7 +256,6 @@ fn bench_compress_parallel(c: &mut Criterion) {
     for &pipe in &[
         Pipeline::Deflate,
         Pipeline::Bw,
-        Pipeline::Lza,
         Pipeline::Lzr,
         Pipeline::Lzf,
     ] {
@@ -290,12 +287,7 @@ fn bench_compress_large(c: &mut Criterion) {
         let data = get_test_data_sized(size);
         group.throughput(Throughput::Bytes(size as u64));
 
-        for &pipe in &[
-            Pipeline::Deflate,
-            Pipeline::Lza,
-            Pipeline::Lzr,
-            Pipeline::Lzf,
-        ] {
+        for &pipe in &[Pipeline::Deflate, Pipeline::Lzr, Pipeline::Lzf] {
             group.bench_with_input(
                 BenchmarkId::new(format!("{:?}", pipe), size),
                 &data,
@@ -317,12 +309,7 @@ fn bench_decompress_large(c: &mut Criterion) {
         let data = get_test_data_sized(size);
         group.throughput(Throughput::Bytes(size as u64));
 
-        for &pipe in &[
-            Pipeline::Deflate,
-            Pipeline::Lza,
-            Pipeline::Lzr,
-            Pipeline::Lzf,
-        ] {
+        for &pipe in &[Pipeline::Deflate, Pipeline::Lzr, Pipeline::Lzf] {
             group.bench_function(BenchmarkId::new(format!("{:?}", pipe), size), |b| {
                 let compressed = pipeline::compress(&data, pipe).unwrap();
                 b.iter(|| pipeline::decompress(&compressed).unwrap());
@@ -359,7 +346,7 @@ fn bench_compress_gpu_large(c: &mut Criterion) {
             ..CompressOptions::default()
         };
 
-        for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+        for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
             let opts = options.clone();
             group.bench_with_input(
                 BenchmarkId::new(format!("{:?}_gpu", pipe), size),
@@ -406,7 +393,7 @@ fn bench_compress_webgpu(c: &mut Criterion) {
         webgpu_engine: Some(engine),
     };
 
-    for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+    for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
         let opts = options.clone();
         group.bench_with_input(
             BenchmarkId::new("pz_webgpu", format!("{:?}", pipe)),
@@ -450,7 +437,7 @@ fn bench_compress_webgpu_large(c: &mut Criterion) {
             ..CompressOptions::default()
         };
 
-        for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+        for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
             let opts = options.clone();
             group.bench_with_input(
                 BenchmarkId::new(format!("{:?}_webgpu", pipe), size),

@@ -10,8 +10,7 @@
 /// | Pipeline      | Stages                           | Similar to |
 /// |---------------|----------------------------------|------------|
 /// | `Deflate`     | LZ77 → Huffman                   | gzip       |
-/// | `Bw`          | BWT → MTF → RLE → Range coder    | bzip2      |
-/// | `Lza`         | LZ77 → Range coder               | lzma-like  |
+/// | `Bw`          | BWT → MTF → RLE → FSE            | bzip2      |
 /// | `Lzr`         | LZ77 → rANS                      | fast ANS   |
 /// | `Lzf`         | LZ77 → FSE                       | zstd-like  |
 ///
@@ -19,7 +18,7 @@
 /// Each compressed stream starts with a header:
 /// - Magic bytes: `PZ` (2 bytes)
 /// - Version: 2 (1 byte)
-/// - Pipeline ID: 0=Deflate, 1=Bw, 2=Lza, 3=Lzr, 4=Lzf (1 byte)
+/// - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf (1 byte)
 /// - Original length: u32 little-endian (4 bytes)
 /// - num_blocks: u32 little-endian (4 bytes)
 /// - Block table: \[compressed_len: u32, original_len: u32\] * num_blocks
@@ -29,7 +28,6 @@ use crate::fse;
 use crate::huffman::HuffmanTree;
 use crate::lz77;
 use crate::mtf;
-use crate::rangecoder;
 use crate::rans;
 use crate::rle;
 use crate::{PzError, PzResult};
@@ -120,10 +118,8 @@ const MIN_HEADER_SIZE: usize = 8;
 pub enum Pipeline {
     /// LZ77 + Huffman (gzip-like)
     Deflate = 0,
-    /// BWT + MTF + RLE + Range coder (bzip2-like)
+    /// BWT + MTF + RLE + FSE (bzip2-like)
     Bw = 1,
-    /// LZ77 + Range coder (lzma-like)
-    Lza = 2,
     /// LZ77 + rANS (fast entropy coding, SIMD/GPU friendly)
     Lzr = 3,
     /// LZ77 + FSE (finite state entropy, zstd-style)
@@ -137,7 +133,6 @@ impl TryFrom<u8> for Pipeline {
         match v {
             0 => Ok(Self::Deflate),
             1 => Ok(Self::Bw),
-            2 => Ok(Self::Lza),
             3 => Ok(Self::Lzr),
             4 => Ok(Self::Lzf),
             _ => Err(PzError::Unsupported),
@@ -286,7 +281,6 @@ fn compress_block(
     match pipeline {
         Pipeline::Deflate => compress_block_deflate(input, options),
         Pipeline::Bw => compress_block_bw(input, options),
-        Pipeline::Lza => compress_block_lza(input, options),
         Pipeline::Lzr => compress_block_lzr(input, options),
         Pipeline::Lzf => compress_block_lzf(input, options),
     }
@@ -297,7 +291,6 @@ fn decompress_block(payload: &[u8], pipeline: Pipeline, orig_len: usize) -> PzRe
     match pipeline {
         Pipeline::Deflate => decompress_block_deflate(payload, orig_len),
         Pipeline::Bw => decompress_block_bw(payload, orig_len),
-        Pipeline::Lza => decompress_block_lza(payload, orig_len),
         Pipeline::Lzr => decompress_block_lzr(payload, orig_len),
         Pipeline::Lzf => decompress_block_lzf(payload, orig_len),
     }
@@ -497,7 +490,7 @@ struct StageMetadata {
     /// BWT primary index (Bw pipeline, set by BWT stage).
     bwt_primary_index: Option<u32>,
     /// Length of data before entropy coding.
-    /// Bw: RLE output length. Lza: LZ77 output length.
+    /// Bw: RLE output length.
     pre_entropy_len: Option<usize>,
     /// Deflate: LZ77 output length.
     lz_len: Option<usize>,
@@ -508,7 +501,6 @@ fn pipeline_stage_count(pipeline: Pipeline) -> usize {
     match pipeline {
         Pipeline::Deflate => 2,
         Pipeline::Bw => 4,
-        Pipeline::Lza => 2,
         Pipeline::Lzr => 2,
         Pipeline::Lzf => 2,
     }
@@ -516,7 +508,7 @@ fn pipeline_stage_count(pipeline: Pipeline) -> usize {
 
 // --- Compression stage functions ---
 
-/// Deflate/Lza stage 0: LZ77 compression with multi-stream deinterleaving.
+/// LZ-pipeline stage 0: LZ77 compression with multi-stream deinterleaving.
 ///
 /// After LZ77 compression, the flat match stream (5 bytes per match:
 /// offset_lo, offset_hi, length_lo, length_hi, next) is split into 3
@@ -626,64 +618,25 @@ fn stage_rle_encode(mut block: StageBlock) -> PzResult<StageBlock> {
     Ok(block)
 }
 
-/// Bw stage 3: Range coder encoding + serialization.
-fn stage_rangecoder_encode_bw(mut block: StageBlock) -> PzResult<StageBlock> {
+/// Bw stage 3: FSE encoding + serialization.
+fn stage_fse_encode_bw(mut block: StageBlock) -> PzResult<StageBlock> {
     let primary_index = block.metadata.bwt_primary_index.unwrap();
     let rle_len = block.metadata.pre_entropy_len.unwrap();
-    let rc_data = rangecoder::encode(&block.data);
+    let fse_data = fse::encode(&block.data);
 
     let mut output = Vec::new();
     output.extend_from_slice(&primary_index.to_le_bytes());
     output.extend_from_slice(&(rle_len as u32).to_le_bytes());
-    output.extend_from_slice(&rc_data);
+    output.extend_from_slice(&fse_data);
 
     block.data = output;
     Ok(block)
 }
 
-/// Lza stage 1: Range coder encoding + serialization.
-///
-/// Multi-stream format (when `block.streams` is `Some`):
-///   [0u32: sentinel] [num_streams: u8] [lz_len: u32]
-///   For each stream:
-///     [original_stream_len: u32] [compressed_stream_len: u32] [rc_data]
-///
-/// Single-stream format (legacy, when `block.streams` is `None`):
-///   [lz_len: u32] [rc_data]
-fn stage_rangecoder_encode_lza(mut block: StageBlock) -> PzResult<StageBlock> {
-    let lz_len = block.metadata.lz_len.unwrap();
-
-    if let Some(streams) = block.streams.take() {
-        // Multi-stream encoding
-        let mut output = Vec::new();
-        output.extend_from_slice(&0u32.to_le_bytes()); // sentinel
-        output.push(streams.len() as u8);
-        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
-
-        for stream in &streams {
-            let rc_data = rangecoder::encode(stream);
-            output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
-            output.extend_from_slice(&(rc_data.len() as u32).to_le_bytes());
-            output.extend_from_slice(&rc_data);
-        }
-
-        block.data = output;
-    } else {
-        // Single-stream (legacy) path
-        let rc_data = rangecoder::encode(&block.data);
-        let mut output = Vec::new();
-        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
-        output.extend_from_slice(&rc_data);
-        block.data = output;
-    }
-
-    Ok(block)
-}
-
 // --- Decompression stage functions ---
 
-/// Bw decompress stage 0: parse metadata + range decode.
-fn stage_rangecoder_decode_bw(mut block: StageBlock) -> PzResult<StageBlock> {
+/// Bw decompress stage 0: parse metadata + FSE decode.
+fn stage_fse_decode_bw(mut block: StageBlock) -> PzResult<StageBlock> {
     if block.data.len() < 8 {
         return Err(PzError::InvalidInput);
     }
@@ -693,7 +646,7 @@ fn stage_rangecoder_decode_bw(mut block: StageBlock) -> PzResult<StageBlock> {
         u32::from_le_bytes([block.data[4], block.data[5], block.data[6], block.data[7]]) as usize;
 
     block.metadata.bwt_primary_index = Some(primary_index);
-    block.data = rangecoder::decode(&block.data[8..], rle_len)?;
+    block.data = fse::decode(&block.data[8..], rle_len)?;
     Ok(block)
 }
 
@@ -829,7 +782,7 @@ fn stage_huffman_decode(mut block: StageBlock) -> PzResult<StageBlock> {
     Ok(block)
 }
 
-/// Deflate/Lza decompress: LZ77 decompress.
+/// LZ-pipeline decompress: LZ77 decompress.
 ///
 /// If `block.streams` is `Some` with 3 streams (offsets, lengths, literals),
 /// reinterleaves them into the flat LzMatch byte stream before decompressing.
@@ -878,72 +831,6 @@ fn stage_lz77_decompress(mut block: StageBlock) -> PzResult<StageBlock> {
     Ok(block)
 }
 
-/// Lza decompress stage 0: parse metadata + range decode.
-///
-/// Detects multi-stream vs single-stream format by checking the first u32:
-///   - 0 → multi-stream (sentinel)
-///   - non-zero → single-stream (legacy), first u32 is lz_len
-fn stage_rangecoder_decode_lza(mut block: StageBlock) -> PzResult<StageBlock> {
-    if block.data.len() < 4 {
-        return Err(PzError::InvalidInput);
-    }
-
-    let first_u32 =
-        u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]);
-
-    if first_u32 == 0 {
-        // Multi-stream format
-        if block.data.len() < 9 {
-            return Err(PzError::InvalidInput);
-        }
-        let num_streams = block.data[4] as usize;
-        let lz_len =
-            u32::from_le_bytes([block.data[5], block.data[6], block.data[7], block.data[8]])
-                as usize;
-        block.metadata.lz_len = Some(lz_len);
-
-        let mut pos = 9;
-        let mut decoded_streams = Vec::with_capacity(num_streams);
-
-        for _ in 0..num_streams {
-            if pos + 8 > block.data.len() {
-                return Err(PzError::InvalidInput);
-            }
-            let orig_stream_len = u32::from_le_bytes([
-                block.data[pos],
-                block.data[pos + 1],
-                block.data[pos + 2],
-                block.data[pos + 3],
-            ]) as usize;
-            let comp_stream_len = u32::from_le_bytes([
-                block.data[pos + 4],
-                block.data[pos + 5],
-                block.data[pos + 6],
-                block.data[pos + 7],
-            ]) as usize;
-            pos += 8;
-
-            if pos + comp_stream_len > block.data.len() {
-                return Err(PzError::InvalidInput);
-            }
-            let decoded =
-                rangecoder::decode(&block.data[pos..pos + comp_stream_len], orig_stream_len)?;
-            decoded_streams.push(decoded);
-            pos += comp_stream_len;
-        }
-
-        block.streams = Some(decoded_streams);
-        block.data.clear();
-    } else {
-        // Single-stream (legacy) format
-        let lz_len = first_u32 as usize;
-        block.metadata.lz_len = Some(lz_len);
-        block.data = rangecoder::decode(&block.data[4..], lz_len)?;
-    }
-
-    Ok(block)
-}
-
 /// Dispatch to the appropriate compression stage function.
 fn run_compress_stage(
     pipeline: Pipeline,
@@ -957,9 +844,7 @@ fn run_compress_stage(
         (Pipeline::Bw, 0) => stage_bwt_encode(block, options),
         (Pipeline::Bw, 1) => stage_mtf_encode(block),
         (Pipeline::Bw, 2) => stage_rle_encode(block),
-        (Pipeline::Bw, 3) => stage_rangecoder_encode_bw(block),
-        (Pipeline::Lza, 0) => stage_lz77_compress(block, options),
-        (Pipeline::Lza, 1) => stage_rangecoder_encode_lza(block),
+        (Pipeline::Bw, 3) => stage_fse_encode_bw(block),
         (Pipeline::Lzr, 0) => stage_lz77_compress(block, options),
         (Pipeline::Lzr, 1) => stage_rans_encode(block),
         (Pipeline::Lzf, 0) => stage_lz77_compress(block, options),
@@ -978,14 +863,11 @@ fn run_decompress_stage(
         // Deflate: Huffman decode(0) → LZ77 decompress(1)
         (Pipeline::Deflate, 0) => stage_huffman_decode(block),
         (Pipeline::Deflate, 1) => stage_lz77_decompress(block),
-        // Bw: RC decode(0) → RLE decode(1) → MTF decode(2) → BWT decode(3)
-        (Pipeline::Bw, 0) => stage_rangecoder_decode_bw(block),
+        // Bw: FSE decode(0) → RLE decode(1) → MTF decode(2) → BWT decode(3)
+        (Pipeline::Bw, 0) => stage_fse_decode_bw(block),
         (Pipeline::Bw, 1) => stage_rle_decode(block),
         (Pipeline::Bw, 2) => stage_mtf_decode(block),
         (Pipeline::Bw, 3) => stage_bwt_decode(block),
-        // Lza: RC decode(0) → LZ77 decompress(1)
-        (Pipeline::Lza, 0) => stage_rangecoder_decode_lza(block),
-        (Pipeline::Lza, 1) => stage_lz77_decompress(block),
         // Lzr: rANS decode(0) → LZ77 decompress(1)
         (Pipeline::Lzr, 0) => stage_rans_decode(block),
         (Pipeline::Lzr, 1) => stage_lz77_decompress(block),
@@ -1362,7 +1244,7 @@ fn bwt_encode_with_backend(input: &[u8], options: &CompressOptions) -> PzResult<
     bwt::encode(input).ok_or(PzError::InvalidInput)
 }
 
-// --- BW pipeline: BWT + MTF + RLE + Range coder ---
+// --- BW pipeline: BWT + MTF + RLE + FSE ---
 
 /// Compress a single block using the BW pipeline (no container header).
 fn compress_block_bw(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
@@ -1376,7 +1258,7 @@ fn compress_block_bw(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8
     let block = stage_bwt_encode(block, options)?;
     let block = stage_mtf_encode(block)?;
     let block = stage_rle_encode(block)?;
-    let block = stage_rangecoder_encode_bw(block)?;
+    let block = stage_fse_encode_bw(block)?;
     Ok(block.data)
 }
 
@@ -1389,10 +1271,10 @@ fn decompress_block_bw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     let primary_index = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let rle_len = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
 
-    let rc_data = &payload[8..];
+    let entropy_data = &payload[8..];
 
-    // Stage 1: Range decoder
-    let rle_data = rangecoder::decode(rc_data, rle_len)?;
+    // Stage 1: FSE decoder
+    let rle_data = fse::decode(entropy_data, rle_len)?;
 
     // Stage 2: RLE decode
     let mtf_data = rle::decode(&rle_data)?;
@@ -1408,36 +1290,6 @@ fn decompress_block_bw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     }
 
     Ok(output)
-}
-
-// --- LZA pipeline: LZ77 + Range coder ---
-
-/// Compress a single block using the LZA pipeline (no container header).
-fn compress_block_lza(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    let block = StageBlock {
-        block_index: 0,
-        original_len: input.len(),
-        data: input.to_vec(),
-        streams: None,
-        metadata: StageMetadata::default(),
-    };
-    let block = stage_lz77_compress(block, options)?;
-    let block = stage_rangecoder_encode_lza(block)?;
-    Ok(block.data)
-}
-
-/// Decompress a single LZA block (no container header).
-fn decompress_block_lza(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    let block = StageBlock {
-        block_index: 0,
-        original_len: orig_len,
-        data: payload.to_vec(),
-        streams: None,
-        metadata: StageMetadata::default(),
-    };
-    let block = stage_rangecoder_decode_lza(block)?;
-    let block = stage_lz77_decompress(block)?;
-    Ok(block.data)
 }
 
 // --- LZR pipeline: LZ77 + rANS ---
@@ -1748,15 +1600,15 @@ pub fn select_pipeline(input: &[u8]) -> Pipeline {
     // Good match density: LZ-based pipelines
     if profile.match_density > 0.4 {
         if profile.byte_entropy > 6.0 {
-            // High entropy: range coder handles better than Huffman
-            return Pipeline::Lza;
+            // High entropy: FSE handles better than Huffman
+            return Pipeline::Lzf;
         }
         return Pipeline::Deflate;
     }
 
     // Moderate match density with high entropy
     if profile.match_density > 0.2 && profile.byte_entropy > 5.0 {
-        return Pipeline::Lza;
+        return Pipeline::Lzf;
     }
 
     // Default: Deflate (fast, decent compression)
@@ -1789,7 +1641,6 @@ pub fn select_pipeline_trial(
     let candidates = [
         Pipeline::Deflate,
         Pipeline::Bw,
-        Pipeline::Lza,
         Pipeline::Lzr,
         Pipeline::Lzf,
     ];
@@ -1906,48 +1757,6 @@ mod tests {
         assert_eq!(decompressed, input);
     }
 
-    // --- LZA pipeline tests ---
-
-    #[test]
-    fn test_lza_empty() {
-        let result = compress(&[], Pipeline::Lza).unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_lza_round_trip_hello() {
-        let input = b"hello, world! hello, world!";
-        let compressed = compress(input, Pipeline::Lza).unwrap();
-        let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input);
-    }
-
-    #[test]
-    fn test_lza_round_trip_repeating() {
-        let pattern = b"The quick brown fox jumps over the lazy dog. ";
-        let mut input = Vec::new();
-        for _ in 0..20 {
-            input.extend_from_slice(pattern);
-        }
-        let compressed = compress(&input, Pipeline::Lza).unwrap();
-        let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input);
-        assert!(
-            compressed.len() < input.len(),
-            "compressed {} >= input {}",
-            compressed.len(),
-            input.len()
-        );
-    }
-
-    #[test]
-    fn test_lza_round_trip_binary() {
-        let input: Vec<u8> = (0..=255).cycle().take(512).collect();
-        let compressed = compress(&input, Pipeline::Lza).unwrap();
-        let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input);
-    }
-
     // --- Header / format tests ---
 
     #[test]
@@ -1988,7 +1797,6 @@ mod tests {
         for &pipeline in &[
             Pipeline::Deflate,
             Pipeline::Bw,
-            Pipeline::Lza,
             Pipeline::Lzr,
             Pipeline::Lzf,
         ] {
@@ -2007,7 +1815,6 @@ mod tests {
         for &pipeline in &[
             Pipeline::Deflate,
             Pipeline::Bw,
-            Pipeline::Lza,
             Pipeline::Lzr,
             Pipeline::Lzf,
         ] {
@@ -2043,7 +1850,7 @@ mod tests {
             input.extend_from_slice(pattern);
         }
 
-        for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+        for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
             let compressed = compress_mt(&input, pipeline, 4, 512).unwrap();
             assert_eq!(compressed[2], VERSION, "expected V2 for {:?}", pipeline);
             let decompressed = decompress(&compressed).unwrap();
@@ -2084,7 +1891,7 @@ mod tests {
         }
 
         for block_size in [256, 512, 1024, 2048] {
-            for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 let compressed = compress_mt(&input, pipeline, 4, block_size).unwrap();
                 let decompressed = decompress(&compressed).unwrap();
                 assert_eq!(
@@ -2120,7 +1927,7 @@ mod tests {
         for _ in 0..100 {
             input.extend_from_slice(pattern);
         }
-        let compressed = compress_mt(&input, Pipeline::Lza, 2, 1024).unwrap();
+        let compressed = compress_mt(&input, Pipeline::Lzf, 2, 1024).unwrap();
         assert_eq!(compressed[2], VERSION);
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
@@ -2147,7 +1954,7 @@ mod tests {
         for _ in 0..2500 {
             input.extend_from_slice(pattern);
         }
-        for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+        for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
             let compressed = compress_mt(&input, pipeline, 4, 16384).unwrap();
             assert_eq!(compressed[2], VERSION);
             let decompressed = decompress(&compressed).unwrap();
@@ -2167,7 +1974,7 @@ mod tests {
             input.extend_from_slice(pattern);
         }
         // 5000 bytes / 512 byte blocks = ~10 blocks, enough for any pipeline
-        for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+        for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
             let stage_count = pipeline_stage_count(pipeline);
             let block_size = 512;
             let num_blocks = input.len().div_ceil(block_size);
@@ -2199,7 +2006,7 @@ mod tests {
             input.extend_from_slice(pattern);
         }
 
-        for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+        for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
             // Single-threaded compress
             let compressed_st = compress(input.as_slice(), pipeline).unwrap();
             let decompressed_st = decompress(&compressed_st).unwrap();
@@ -2238,7 +2045,7 @@ mod tests {
             input.extend_from_slice(pattern);
         }
 
-        for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+        for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
             let compressed = compress_mt(&input, pipeline, 4, 512).unwrap();
 
             // Decompress with various thread counts
@@ -2311,7 +2118,7 @@ mod tests {
             threads: 1,
             ..Default::default()
         };
-        let compressed = compress_with_options(&input, Pipeline::Lza, &opts).unwrap();
+        let compressed = compress_with_options(&input, Pipeline::Lzf, &opts).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
@@ -2351,7 +2158,7 @@ mod tests {
 
     #[test]
     fn test_select_pipeline_text() {
-        // Repetitive text → good match density, moderate entropy → Deflate or Lza
+        // Repetitive text → good match density, moderate entropy → Deflate or Lzf
         let pattern = b"The quick brown fox jumps over the lazy dog. ";
         let mut input = Vec::new();
         for _ in 0..200 {
@@ -2359,8 +2166,8 @@ mod tests {
         }
         let pipeline = select_pipeline(&input);
         assert!(
-            pipeline == Pipeline::Deflate || pipeline == Pipeline::Lza,
-            "expected Deflate or Lza, got {:?}",
+            pipeline == Pipeline::Deflate || pipeline == Pipeline::Lzf,
+            "expected Deflate or Lzf, got {:?}",
             pipeline
         );
     }
@@ -2510,24 +2317,24 @@ mod tests {
         );
     }
 
-    // --- Multi-stream LZA tests ---
+    // --- Multi-stream LZF tests ---
 
     #[test]
-    fn test_multistream_lza_round_trip_small() {
+    fn test_multistream_lzf_round_trip_small() {
         let input = b"hello, world! hello, world!";
-        let compressed = compress(input, Pipeline::Lza).unwrap();
+        let compressed = compress(input, Pipeline::Lzf).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
 
     #[test]
-    fn test_multistream_lza_round_trip_medium() {
+    fn test_multistream_lzf_round_trip_medium() {
         let pattern = b"abcdefghij abcdefghij ";
         let mut input = Vec::new();
         for _ in 0..500 {
             input.extend_from_slice(pattern);
         }
-        let compressed = compress(&input, Pipeline::Lza).unwrap();
+        let compressed = compress(&input, Pipeline::Lzf).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
         assert!(
@@ -2539,28 +2346,28 @@ mod tests {
     }
 
     #[test]
-    fn test_multistream_lza_round_trip_large() {
+    fn test_multistream_lzf_round_trip_large() {
         // 1MB input
         let mut input = Vec::with_capacity(1 << 20);
-        let pattern = b"LZA multi-stream test data with some repetition. ";
+        let pattern = b"LZF multi-stream test data with some repetition. ";
         while input.len() < (1 << 20) {
             input.extend_from_slice(pattern);
         }
         input.truncate(1 << 20);
 
-        let compressed = compress(&input, Pipeline::Lza).unwrap();
+        let compressed = compress(&input, Pipeline::Lzf).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
 
     #[test]
-    fn test_multistream_lza_multiblock() {
-        let pattern = b"LZA multi-stream multi-block test. ";
+    fn test_multistream_lzf_multiblock() {
+        let pattern = b"LZF multi-stream multi-block test. ";
         let mut input = Vec::new();
         for _ in 0..200 {
             input.extend_from_slice(pattern);
         }
-        let compressed = compress_mt(&input, Pipeline::Lza, 4, 1024).unwrap();
+        let compressed = compress_mt(&input, Pipeline::Lzf, 4, 1024).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
@@ -2573,12 +2380,7 @@ mod tests {
         for _ in 0..100 {
             input.extend_from_slice(pattern);
         }
-        for &pipeline in &[
-            Pipeline::Deflate,
-            Pipeline::Bw,
-            Pipeline::Lza,
-            Pipeline::Lzr,
-        ] {
+        for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzr] {
             let compressed = compress(&input, pipeline).unwrap();
             let decompressed = decompress(&compressed).unwrap();
             assert_eq!(decompressed, input, "round-trip failed for {:?}", pipeline);

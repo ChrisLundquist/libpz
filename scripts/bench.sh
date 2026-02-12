@@ -23,7 +23,7 @@ Usage:
 Options:
   -n, --iters N          Number of iterations per operation (default: 3)
   -p, --pipelines LIST   Comma-separated list of pipelines to benchmark
-                         (default: deflate,lza,lzr,lzf)
+                         (default: deflate,lzr,lzf)
   -h, --help             Show this help
 
 If no FILEs are given, benchmarks all files in samples/cantrbry and samples/large.
@@ -31,9 +31,9 @@ If no FILEs are given, benchmarks all files in samples/cantrbry and samples/larg
 Examples:
   ./scripts/bench.sh                              # all corpus, all pipelines
   ./scripts/bench.sh myfile.bin                   # specific file
-  ./scripts/bench.sh -p deflate,lza               # subset of pipelines
+  ./scripts/bench.sh -p deflate,lzf               # subset of pipelines
   ./scripts/bench.sh -n 10                        # more iterations
-  ./scripts/bench.sh -n 1 -p deflate,lza file.txt # combine options
+  ./scripts/bench.sh -n 1 -p deflate,lzf file.txt # combine options
 EOF
 }
 
@@ -74,7 +74,7 @@ done
 
 # Default pipelines if none specified
 if [[ ${#PIPELINES[@]} -eq 0 ]]; then
-    PIPELINES=(deflate lza lzr lzf)
+    PIPELINES=(deflate lzr lzf)
 fi
 
 # Collect input files from corpus if none given on command line

@@ -11,7 +11,6 @@ pub mod mtf;
 pub mod optimal;
 pub mod pipeline;
 pub mod pqueue;
-pub mod rangecoder;
 pub mod rans;
 pub mod rle;
 pub mod simd;

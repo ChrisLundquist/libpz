@@ -330,12 +330,12 @@ fn main() {
         // Single-threaded CPU variants
         (Pipeline::Deflate, ParseStrategy::Lazy, 1, Backend::Cpu),
         (Pipeline::Deflate, ParseStrategy::Optimal, 1, Backend::Cpu),
-        (Pipeline::Lza, ParseStrategy::Lazy, 1, Backend::Cpu),
-        (Pipeline::Lza, ParseStrategy::Optimal, 1, Backend::Cpu),
+        (Pipeline::Lzf, ParseStrategy::Lazy, 1, Backend::Cpu),
+        (Pipeline::Lzf, ParseStrategy::Optimal, 1, Backend::Cpu),
         (Pipeline::Bw, ParseStrategy::Auto, 1, Backend::Cpu),
         // Multi-threaded CPU
         (Pipeline::Deflate, ParseStrategy::Lazy, 0, Backend::Cpu),
-        (Pipeline::Lza, ParseStrategy::Lazy, 0, Backend::Cpu),
+        (Pipeline::Lzf, ParseStrategy::Lazy, 0, Backend::Cpu),
         (Pipeline::Bw, ParseStrategy::Auto, 0, Backend::Cpu),
     ];
 
@@ -344,7 +344,7 @@ fn main() {
     if has_opencl {
         pz_configs.extend([
             (Pipeline::Deflate, ParseStrategy::Auto, 1, Backend::OpenCl),
-            (Pipeline::Lza, ParseStrategy::Auto, 1, Backend::OpenCl),
+            (Pipeline::Lzf, ParseStrategy::Auto, 1, Backend::OpenCl),
             (Pipeline::Bw, ParseStrategy::Auto, 1, Backend::OpenCl),
         ]);
     }
@@ -354,7 +354,7 @@ fn main() {
     if has_webgpu {
         pz_configs.extend([
             (Pipeline::Deflate, ParseStrategy::Auto, 1, Backend::WebGpu),
-            (Pipeline::Lza, ParseStrategy::Auto, 1, Backend::WebGpu),
+            (Pipeline::Lzf, ParseStrategy::Auto, 1, Backend::WebGpu),
             (Pipeline::Bw, ParseStrategy::Auto, 1, Backend::WebGpu),
         ]);
     }

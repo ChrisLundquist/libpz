@@ -447,7 +447,7 @@ impl<'a> BitReader<'a> {
         let mask = (1u64 << nb_bits) - 1;
         let value = (self.container & mask) as u32;
         self.container >>= nb_bits;
-        self.bits_available -= nb_bits;
+        self.bits_available = self.bits_available.saturating_sub(nb_bits);
         value
     }
 
@@ -547,7 +547,7 @@ fn fse_decode_internal(
 ///
 /// Returns self-contained compressed data including the serialized
 /// frequency table. The original length must be known by the decoder
-/// (stored externally, consistent with `rangecoder::encode`).
+/// (stored externally).
 pub fn encode(input: &[u8]) -> Vec<u8> {
     encode_with_accuracy(input, DEFAULT_ACCURACY_LOG)
 }

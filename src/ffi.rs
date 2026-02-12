@@ -37,7 +37,6 @@ pub enum PzLevel {
 pub enum PzPipeline {
     Deflate = 0,
     Bw = 1,
-    Lza = 2,
 }
 
 /// Device information returned by pz_query_devices.
@@ -239,7 +238,6 @@ pub unsafe extern "C" fn pz_compress(
     let pipe = match pipeline {
         0 => pipeline::Pipeline::Deflate,
         1 => pipeline::Pipeline::Bw,
-        2 => pipeline::Pipeline::Lza,
         _ => return PZ_ERROR_UNSUPPORTED,
     };
 
@@ -297,7 +295,6 @@ pub unsafe extern "C" fn pz_compress_mt(
     let pipe = match pipeline {
         0 => pipeline::Pipeline::Deflate,
         1 => pipeline::Pipeline::Bw,
-        2 => pipeline::Pipeline::Lza,
         _ => return PZ_ERROR_UNSUPPORTED,
     };
 
@@ -625,7 +622,7 @@ mod tests {
                 input.extend_from_slice(pattern);
             }
 
-            for pipeline_id in 0..3i32 {
+            for pipeline_id in 0..2i32 {
                 let mut compressed = vec![0u8; input.len() * 2 + 2048];
                 let mut decompressed = vec![0u8; input.len() + 1024];
 

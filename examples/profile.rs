@@ -4,7 +4,7 @@
 ///
 /// Usage:
 ///   cargo build --profile profiling --example profile
-///   samply record ./target/profiling/examples/profile --pipeline lza
+///   samply record ./target/profiling/examples/profile --pipeline lzf
 ///   samply record ./target/profiling/examples/profile --pipeline deflate --decompress
 ///   samply record ./target/profiling/examples/profile --stage lz77
 ///   samply record ./target/profiling/examples/profile --stage fse --size 1048576
@@ -19,9 +19,9 @@ fn usage() {
     eprintln!("Usage: profile [OPTIONS]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --pipeline P    Pipeline: deflate, bw, lza, lzr, lzf (default: lza)");
+    eprintln!("  --pipeline P    Pipeline: deflate, bw, lzr, lzf (default: lzf)");
     eprintln!("  --stage S       Profile a single stage instead of full pipeline:");
-    eprintln!("                    lz77, huffman, bwt, mtf, rle, fse, rans, rangecoder");
+    eprintln!("                    lz77, huffman, bwt, mtf, rle, fse, rans");
     eprintln!("  --decompress    Profile decompression instead of compression");
     eprintln!("  --iterations N  Number of iterations (default: 200)");
     eprintln!("  --size N        Input data size in bytes (default: 262144)");
@@ -187,21 +187,9 @@ fn profile_stage(data: &[u8], stage: &str, decompress: bool, iterations: usize) 
                 let _ = std::hint::black_box(pz::rans::decode(&enc, len).unwrap());
             }
         }
-        ("rangecoder", false) => {
-            for _ in 0..iterations {
-                let _ = std::hint::black_box(pz::rangecoder::encode(data));
-            }
-        }
-        ("rangecoder", true) => {
-            let enc = pz::rangecoder::encode(data);
-            let len = data.len();
-            for _ in 0..iterations {
-                let _ = std::hint::black_box(pz::rangecoder::decode(&enc, len).unwrap());
-            }
-        }
         _ => {
             eprintln!("unknown stage: {}", stage);
-            eprintln!("valid stages: lz77, huffman, bwt, mtf, rle, fse, rans, rangecoder");
+            eprintln!("valid stages: lz77, huffman, bwt, mtf, rle, fse, rans");
             std::process::exit(1);
         }
     }
@@ -212,7 +200,7 @@ fn profile_stage(data: &[u8], stage: &str, decompress: bool, iterations: usize) 
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut pipeline_name = "lza".to_string();
+    let mut pipeline_name = "lzf".to_string();
     let mut stage: Option<String> = None;
     let mut decompress = false;
     let mut iterations = 200usize;
@@ -259,12 +247,11 @@ fn main() {
         let pipe = match pipeline_name.as_str() {
             "deflate" => Pipeline::Deflate,
             "bw" => Pipeline::Bw,
-            "lza" => Pipeline::Lza,
             "lzr" => Pipeline::Lzr,
             "lzf" => Pipeline::Lzf,
             other => {
                 eprintln!("unknown pipeline: {}", other);
-                eprintln!("valid pipelines: deflate, bw, lza, lzr, lzf");
+                eprintln!("valid pipelines: deflate, bw, lzr, lzf");
                 std::process::exit(1);
             }
         };

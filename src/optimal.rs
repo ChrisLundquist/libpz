@@ -82,7 +82,7 @@ impl MatchTable {
 ///
 /// In the PZ format, every token (literal or match) serializes to exactly
 /// 5 bytes: `offset:u16 + length:u16 + next:u8`. These 5 bytes are then
-/// entropy-coded by Huffman or Range Coder.
+/// entropy-coded by Huffman, FSE, or rANS.
 ///
 /// A **literal** token has offset=0, length=0, so 4 of its 5 bytes are
 /// always zero (very cheap after entropy coding). Only the `next` byte varies.

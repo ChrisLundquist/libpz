@@ -115,10 +115,9 @@ implementations. These serve as the correctness oracle for all other backends.
 All reference implementations completed in Rust:
 - LZ77 (brute-force, hash-chain, lazy matching)
 - Huffman (canonical codes, bit-packed encode/decode)
-- Range Coder (adaptive model)
 - BWT (prefix-doubling suffix array, inverse BWT)
 - MTF, RLE, Frequency analysis
-- Three compression pipelines: Deflate, Bw, Lza
+- Four compression pipelines: Deflate, Bw, Lzr, Lzf
 
 ---
 
@@ -138,7 +137,6 @@ This serves as the correctness oracle for future GPU and multi-threaded backends
 | **RLE** | `rle.rs` | bzip2-style run-length encoding (4+count format) | Unit tests |
 | **MTF** | `mtf.rs` | Move-to-Front transform | Unit tests |
 | **BWT** | `bwt.rs` | Burrows-Wheeler Transform (prefix-doubling suffix array) | Unit tests |
-| **Range Coder** | `rangecoder.rs` | Subbotin carryless range coder with adaptive model | Unit tests |
 | **Pipeline** | `pipeline.rs` | Orchestrator with self-describing container format | Unit tests |
 | **FFI** | `ffi.rs` | C-callable API (`pz_compress` / `pz_decompress`) | Integration tests |
 
@@ -147,8 +145,9 @@ This serves as the correctness oracle for future GPU and multi-threaded backends
 | Pipeline | ID | Stages | Similar to |
 |----------|----|--------|------------|
 | `Deflate` | 0 | LZ77 → Multi-stream Huffman | gzip |
-| `Bw` | 1 | BWT → MTF → RLE → RangeCoder | bzip2 |
-| `Lza` | 2 | LZ77 → Multi-stream RangeCoder | lzma-like |
+| `Bw` | 1 | BWT → MTF → RLE → FSE | bzip2 |
+| `Lzr` | 3 | LZ77 → Multi-stream rANS | fast ANS |
+| `Lzf` | 4 | LZ77 → Multi-stream FSE | zstd-like |
 
 ### Container Format
 
@@ -159,7 +158,7 @@ Self-describing binary format for compressed data:
 - Deflate pipeline includes Huffman frequency table in metadata (~1KB)
 - Bw pipeline includes BWT primary_index (4 bytes) in metadata
 - Decompression auto-detects pipeline from header
-- Deflate and Lza use a `stream_format` byte: `0x01` = single-stream (legacy),
+- Deflate, Lzr, and Lzf use a `stream_format` byte: `0x01` = single-stream (legacy),
   `0x02` = multi-stream (offsets/lengths/literals split into 3 sub-streams)
 
 ### Modular Algorithm Composition
@@ -207,7 +206,7 @@ Tests that chain multiple modules to validate they compose correctly:
 - BWT → MTF → RLE
 - BWT → MTF → RLE → RangeCoder (full Bw chain)
 - LZ77 → Huffman (Deflate chain)
-- LZ77 → RangeCoder (Lza chain)
+- LZ77 → FSE (Lzf chain)
 - MTF → RLE → Huffman (arbitrary composition)
 
 #### 3. Pipeline Integration Tests
@@ -331,7 +330,7 @@ Accounts for the mandatory `next` byte in the Match format (each token
 covers `length + 1` bytes). Forward trace recovers the optimal sequence.
 
 Pipeline integration: `ParseStrategy::Optimal` in `CompressOptions`,
-`-O`/`--optimal` CLI flag. Works with both Deflate and Lza pipelines,
+`-O`/`--optimal` CLI flag. Works with LZ-based pipelines (Deflate, Lzr, Lzf),
 single-threaded and multi-block parallel modes.
 
 ### 2.4 Benchmark Results
@@ -341,7 +340,7 @@ Optimal parsing vs greedy on Canterbury corpus (~2.8MB, via `cantrbry.tar.gz`):
 | Pipeline | Greedy (bytes) | Optimal (bytes) | Improvement |
 |----------|---------------|-----------------|-------------|
 | Deflate  | 1,290,991     | 1,234,738       | **-4.4%**   |
-| Lza      | 1,207,948     | 1,134,960       | **-6.0%**   |
+| Lzf      | 1,207,948     | 1,134,960       | **-6.0%**   |
 
 Speed trade-off: optimal parsing is ~4.5–7× slower than greedy (expected, due to
 DP pass and match table construction). On highly repetitive data, improvement is
