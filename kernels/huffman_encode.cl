@@ -96,7 +96,6 @@ __kernel void PrefixSumBlock(
     __local unsigned int *temp)        // local memory: 2 * local_size uints
 {
     unsigned int lid = get_local_id(0);
-    unsigned int gid = get_global_id(0);
     unsigned int group_id = get_group_id(0);
     unsigned int local_size = get_local_size(0);
     unsigned int block_size = local_size * 2;
