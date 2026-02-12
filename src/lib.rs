@@ -16,6 +16,7 @@ pub mod pqueue;
 pub mod rans;
 pub mod rle;
 pub mod simd;
+pub mod streaming;
 
 #[cfg(feature = "opencl")]
 pub mod opencl;

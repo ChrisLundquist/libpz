@@ -105,12 +105,20 @@ impl Default for CompressOptions {
 }
 
 /// Magic bytes for the libpz container format.
-const MAGIC: [u8; 2] = [b'P', b'Z'];
+pub(crate) const MAGIC: [u8; 2] = [b'P', b'Z'];
 /// Format version for multi-block streams.
-const VERSION: u8 = 2;
+pub(crate) const VERSION: u8 = 2;
 
 /// Minimum header size: magic(2) + version(1) + pipeline(1) + orig_len(4) = 8
 const MIN_HEADER_SIZE: usize = 8;
+
+/// Sentinel value for `num_blocks` indicating framed (streaming) mode.
+///
+/// When `num_blocks == FRAMED_SENTINEL`, blocks are self-framing: each block
+/// is preceded by its compressed_len and original_len, and the stream ends
+/// with a 4-byte EOS sentinel (compressed_len = 0). This allows streaming
+/// compression and decompression without knowing block count upfront.
+pub(crate) const FRAMED_SENTINEL: u32 = 0xFFFF_FFFF;
 
 /// Compression pipeline types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,12 +196,17 @@ pub fn compress_with_options(
     }
 
     // Multi-block compression: choose between pipeline-parallel and block-parallel.
-    // Pipeline parallelism (one thread per stage) when enough blocks to fill the pipeline.
-    // Block parallelism (one thread per block) otherwise.
+    //
+    // Block parallelism (one thread per block, each block runs all stages) scales
+    // with available cores and is preferred when we have more threads than stages.
+    //
+    // Pipeline parallelism (one thread per stage, blocks flow through channels) is
+    // only beneficial when the stage count is high enough to saturate available
+    // threads (e.g., the 4-stage Bw pipeline on <=4 cores).
     let num_blocks = input.len().div_ceil(block_size);
     let stage_count = pipeline_stage_count(pipeline);
 
-    if num_blocks >= stage_count {
+    if num_blocks > 1 && stage_count >= num_threads {
         compress_pipeline_parallel(input, pipeline, options)
     } else {
         compress_parallel(input, pipeline, options, num_threads)
@@ -233,16 +246,29 @@ pub fn decompress_with_threads(input: &[u8], threads: usize) -> PzResult<Vec<u8>
     let pipeline = Pipeline::try_from(input[3])?;
     let orig_len = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
 
+    let payload = &input[MIN_HEADER_SIZE..];
+
+    if payload.len() < 4 {
+        // No payload at all: only valid if orig_len is zero (empty input).
+        if orig_len == 0 {
+            return Ok(Vec::new());
+        }
+        return Err(PzError::InvalidInput);
+    }
+    let num_blocks_raw = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+
+    // Framed (streaming) mode: blocks are self-framing with inline headers.
+    // Must check before the orig_len == 0 short-circuit because streaming
+    // uses orig_len = 0 to mean "unknown length".
+    if num_blocks_raw == FRAMED_SENTINEL {
+        return decompress_framed(&payload[4..], pipeline, orig_len);
+    }
+
     if orig_len == 0 {
         return Ok(Vec::new());
     }
 
-    let payload = &input[MIN_HEADER_SIZE..];
-
-    if payload.len() < 4 {
-        return Err(PzError::InvalidInput);
-    }
-    let num_blocks = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let num_blocks = num_blocks_raw as usize;
     if num_blocks == 0 {
         return Err(PzError::InvalidInput);
     }
@@ -250,14 +276,14 @@ pub fn decompress_with_threads(input: &[u8], threads: usize) -> PzResult<Vec<u8>
     let num_threads = resolve_thread_count(threads);
     let stage_count = pipeline_stage_count(pipeline);
 
-    if num_threads > 1 && num_blocks >= stage_count {
+    if num_threads > 1 && num_blocks > 1 && stage_count >= num_threads {
         return decompress_pipeline_parallel(payload, pipeline, orig_len, num_blocks);
     }
     decompress_parallel(payload, pipeline, orig_len, num_blocks, threads)
 }
 
 /// Write the container header to output.
-fn write_header(output: &mut Vec<u8>, pipeline: Pipeline, orig_len: usize) {
+pub(crate) fn write_header(output: &mut Vec<u8>, pipeline: Pipeline, orig_len: usize) {
     output.extend_from_slice(&MAGIC);
     output.push(VERSION);
     output.push(pipeline as u8);
@@ -265,7 +291,7 @@ fn write_header(output: &mut Vec<u8>, pipeline: Pipeline, orig_len: usize) {
 }
 
 /// Resolve thread count: 0 = auto (available_parallelism), otherwise use the given value.
-fn resolve_thread_count(threads: usize) -> usize {
+pub(crate) fn resolve_thread_count(threads: usize) -> usize {
     if threads == 0 {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -276,7 +302,7 @@ fn resolve_thread_count(threads: usize) -> usize {
 }
 
 /// Compress a single block using the appropriate pipeline (no container header).
-fn compress_block(
+pub(crate) fn compress_block(
     input: &[u8],
     pipeline: Pipeline,
     options: &CompressOptions,
@@ -291,7 +317,11 @@ fn compress_block(
 }
 
 /// Decompress a single block using the appropriate pipeline (no container header).
-fn decompress_block(payload: &[u8], pipeline: Pipeline, orig_len: usize) -> PzResult<Vec<u8>> {
+pub(crate) fn decompress_block(
+    payload: &[u8],
+    pipeline: Pipeline,
+    orig_len: usize,
+) -> PzResult<Vec<u8>> {
     match pipeline {
         Pipeline::Deflate => decompress_block_deflate(payload, orig_len),
         Pipeline::Bw => decompress_block_bw(payload, orig_len),
@@ -302,7 +332,7 @@ fn decompress_block(payload: &[u8], pipeline: Pipeline, orig_len: usize) -> PzRe
 }
 
 /// Size of a block table entry: compressed_len(4) + original_len(4) = 8 bytes.
-const BLOCK_HEADER_SIZE: usize = 8;
+pub(crate) const BLOCK_HEADER_SIZE: usize = 8;
 
 /// Multi-block parallel compression.
 ///
@@ -460,6 +490,56 @@ fn decompress_parallel(
     }
 
     if output.len() != orig_len {
+        return Err(PzError::InvalidInput);
+    }
+
+    Ok(output)
+}
+
+/// Decompress framed (streaming) data from an in-memory buffer.
+///
+/// Framed format: repeated `[compressed_len: u32][original_len: u32][data]`
+/// terminated by a 4-byte EOS sentinel (compressed_len = 0).
+fn decompress_framed(
+    data: &[u8],
+    pipeline: Pipeline,
+    declared_orig_len: usize,
+) -> PzResult<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut pos = 0;
+
+    loop {
+        if pos + 4 > data.len() {
+            return Err(PzError::InvalidInput);
+        }
+        let compressed_len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+
+        // EOS sentinel
+        if compressed_len == 0 {
+            break;
+        }
+
+        if pos + 4 > data.len() {
+            return Err(PzError::InvalidInput);
+        }
+        let original_len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+
+        if pos + compressed_len > data.len() {
+            return Err(PzError::InvalidInput);
+        }
+        let block_data = &data[pos..pos + compressed_len];
+        pos += compressed_len;
+
+        let decompressed = decompress_block(block_data, pipeline, original_len)?;
+        output.extend_from_slice(&decompressed);
+    }
+
+    // Validate total length if declared (non-zero orig_len in header).
+    if declared_orig_len > 0 && output.len() != declared_orig_len {
         return Err(PzError::InvalidInput);
     }
 
