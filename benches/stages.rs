@@ -181,25 +181,6 @@ fn bench_rle(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_rangecoder(c: &mut Criterion) {
-    let mut group = c.benchmark_group("rangecoder");
-    cap(&mut group);
-    for &size in SIZES_ALL {
-        let data = get_test_data(size);
-        group.throughput(Throughput::Bytes(size as u64));
-
-        group.bench_with_input(BenchmarkId::new("encode", size), &data, |b, data| {
-            b.iter(|| pz::rangecoder::encode(data));
-        });
-
-        let encoded = pz::rangecoder::encode(&data);
-        group.bench_with_input(BenchmarkId::new("decode", size), &encoded, |b, enc| {
-            b.iter(|| pz::rangecoder::decode(enc, size).unwrap());
-        });
-    }
-    group.finish();
-}
-
 fn bench_fse(c: &mut Criterion) {
     let mut group = c.benchmark_group("fse");
     cap(&mut group);
@@ -701,7 +682,6 @@ criterion_group!(
     bench_huffman,
     bench_mtf,
     bench_rle,
-    bench_rangecoder,
     bench_fse,
     bench_rans,
     bench_simd,

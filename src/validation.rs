@@ -15,7 +15,6 @@ mod tests {
     use crate::lz77;
     use crate::mtf;
     use crate::pipeline::{self, Pipeline};
-    use crate::rangecoder;
     use crate::rle;
 
     // ---------------------------------------------------------------
@@ -98,14 +97,6 @@ mod tests {
                 }
 
                 #[test]
-                fn rangecoder() {
-                    let input = $data;
-                    let encoded = rangecoder::encode(&input);
-                    let decoded = rangecoder::decode(&encoded, input.len()).unwrap();
-                    assert_eq!(decoded, input, "rangecoder round-trip failed");
-                }
-
-                #[test]
                 fn bwt() {
                     let input = $data;
                     if input.is_empty() {
@@ -180,16 +171,17 @@ mod tests {
         }
 
         #[test]
-        fn bwt_mtf_rle_rangecoder() {
+        fn bwt_mtf_rle_fse() {
+            use crate::fse;
             let input = data_repeating_text();
             let bwt_result = bwt::encode(&input).unwrap();
             let mtf_data = mtf::encode(&bwt_result.data);
             let rle_data = rle::encode(&mtf_data);
-            let rc_data = rangecoder::encode(&rle_data);
+            let fse_data = fse::encode(&rle_data);
             // Inverse
-            let inv_rc = rangecoder::decode(&rc_data, rle_data.len()).unwrap();
-            assert_eq!(inv_rc, rle_data, "rangecoder decode mismatch");
-            let inv_rle = rle::decode(&inv_rc).unwrap();
+            let inv_fse = fse::decode(&fse_data, rle_data.len()).unwrap();
+            assert_eq!(inv_fse, rle_data, "fse decode mismatch");
+            let inv_rle = rle::decode(&inv_fse).unwrap();
             assert_eq!(inv_rle, mtf_data, "rle decode mismatch");
             let inv_mtf = mtf::decode(&inv_rle);
             assert_eq!(inv_mtf, bwt_result.data, "mtf decode mismatch");
@@ -211,14 +203,15 @@ mod tests {
         }
 
         #[test]
-        fn lz77_then_rangecoder() {
+        fn lz77_then_fse() {
+            use crate::fse;
             let input = data_repeating_text();
             let lz_data = lz77::compress_lazy(&input).unwrap();
-            let rc_data = rangecoder::encode(&lz_data);
+            let fse_data = fse::encode(&lz_data);
             // Inverse
-            let inv_rc = rangecoder::decode(&rc_data, lz_data.len()).unwrap();
-            assert_eq!(inv_rc, lz_data);
-            let inv_lz = lz77::decompress(&inv_rc).unwrap();
+            let inv_fse = fse::decode(&fse_data, lz_data.len()).unwrap();
+            assert_eq!(inv_fse, lz_data);
+            let inv_lz = lz77::decompress(&inv_fse).unwrap();
             assert_eq!(inv_lz, input);
         }
 
@@ -260,7 +253,7 @@ mod tests {
         #[test]
         fn all_pipelines_zeros() {
             let input = data_all_zeros(500);
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 assert_pipeline_round_trip(&input, p);
             }
         }
@@ -268,7 +261,7 @@ mod tests {
         #[test]
         fn all_pipelines_uniform() {
             let input = data_uniform();
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 assert_pipeline_round_trip(&input, p);
             }
         }
@@ -276,7 +269,7 @@ mod tests {
         #[test]
         fn all_pipelines_skewed() {
             let input = data_skewed(2000);
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 assert_pipeline_round_trip(&input, p);
             }
         }
@@ -284,7 +277,7 @@ mod tests {
         #[test]
         fn all_pipelines_text() {
             let input = data_repeating_text();
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 assert_pipeline_round_trip(&input, p);
             }
         }
@@ -292,7 +285,7 @@ mod tests {
         #[test]
         fn all_pipelines_sawtooth() {
             let input = data_sawtooth(2048);
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 assert_pipeline_round_trip(&input, p);
             }
         }
@@ -300,7 +293,7 @@ mod tests {
         #[test]
         fn all_pipelines_runs() {
             let input = data_runs();
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 assert_pipeline_round_trip(&input, p);
             }
         }
@@ -308,7 +301,7 @@ mod tests {
         #[test]
         fn all_pipelines_single_byte() {
             let input = vec![42u8];
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 assert_pipeline_round_trip(&input, p);
             }
         }
@@ -407,26 +400,6 @@ mod tests {
         }
 
         #[test]
-        fn rangecoder_better_than_huffman_on_skewed() {
-            // Range coder achieves fractional bits, so it should beat Huffman
-            // on highly skewed data (where Huffman wastes due to integer code lengths)
-            let input = data_all_zeros(1000);
-            let rc_encoded = rangecoder::encode(&input);
-
-            let tree = HuffmanTree::from_data(&input).unwrap();
-            let (huff_encoded, _) = tree.encode(&input).unwrap();
-
-            // Range coder should produce smaller output for single-symbol data
-            // (Huffman needs 1 bit/symbol minimum, range coder can go below)
-            assert!(
-                rc_encoded.len() <= huff_encoded.len(),
-                "rangecoder {} > huffman {} on uniform zeros",
-                rc_encoded.len(),
-                huff_encoded.len()
-            );
-        }
-
-        #[test]
         fn lz77_finds_matches_in_repetitive_data() {
             // LZ77 should produce fewer matches than input bytes for repetitive data
             let input = data_repeating_text();
@@ -472,7 +445,7 @@ mod tests {
                 return;
             }
 
-            for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 let compressed = pipeline::compress(&input, pipe).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(
@@ -505,11 +478,6 @@ mod tests {
             let (encoded, bits) = tree.encode(&input).unwrap();
             let decoded = tree.decode(&encoded, bits).unwrap();
             assert_eq!(decoded, input, "Huffman failed on {}", path);
-
-            // Range coder
-            let rc_encoded = rangecoder::encode(&input);
-            let rc_decoded = rangecoder::decode(&rc_encoded, input.len()).unwrap();
-            assert_eq!(rc_decoded, input, "Range coder failed on {}", path);
 
             // BWT + MTF + RLE chain
             let bwt_result = bwt::encode(&input).unwrap();
@@ -573,7 +541,7 @@ mod tests {
             }
             let full = fs::read(p).unwrap();
             let input = &full[..full.len().min(65536)];
-            for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 let compressed = pipeline::compress(input, pipe).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(
@@ -594,7 +562,7 @@ mod tests {
             }
             let full = fs::read(p).unwrap();
             let input = &full[..full.len().min(65536)];
-            for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 let compressed = pipeline::compress(input, pipe).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(
@@ -617,7 +585,7 @@ mod tests {
         fn pipeline_two_bytes() {
             // Smallest non-trivial input
             let input = vec![0u8, 1];
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -628,7 +596,7 @@ mod tests {
         fn alternating_bytes() {
             // Worst case for RLE (no runs), but structured for LZ77
             let input: Vec<u8> = (0..1000).map(|i| if i % 2 == 0 { 0 } else { 1 }).collect();
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -639,7 +607,7 @@ mod tests {
         fn all_256_byte_values() {
             // Every byte value appears exactly once
             let input: Vec<u8> = (0..=255).collect();
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -658,7 +626,7 @@ mod tests {
             assert_eq!(decoded, input);
 
             // Full pipeline test
-            for &p in &[Pipeline::Bw, Pipeline::Lza] {
+            for &p in &[Pipeline::Bw, Pipeline::Lzf] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -668,7 +636,7 @@ mod tests {
         #[test]
         fn descending_bytes() {
             let input: Vec<u8> = (0..=255).rev().collect();
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -679,7 +647,7 @@ mod tests {
         fn repeated_short_pattern() {
             // "ab" repeated 500 times - good for LZ77
             let input: Vec<u8> = b"ab".iter().copied().cycle().take(1000).collect();
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lza] {
+            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);

@@ -10,13 +10,13 @@
 ///
 /// Compared to the library's other entropy coders:
 ///
-/// | Property          | Huffman | Range Coder | FSE (tANS) | rANS       |
-/// |-------------------|---------|-------------|------------|------------|
-/// | Decode operation  | Bit-level tree walk | Division | Table lookup | Multiply + lookup |
-/// | I/O granularity   | Bits    | Bytes       | Bits       | 16-bit words |
-/// | Branch predict    | Poor    | Moderate    | Good       | Good       |
-/// | State independence| N/A     | Fully serial| Awkward    | Interleave N states |
-/// | GPU shared memory | Large trees | Poor fit | Large tables | Small freq tables |
+/// | Property          | Huffman | FSE (tANS) | rANS       |
+/// |-------------------|---------|------------|------------|
+/// | Decode operation  | Bit-level tree walk | Table lookup | Multiply + lookup |
+/// | I/O granularity   | Bits    | Bits       | 16-bit words |
+/// | Branch predict    | Poor    | Good       | Good       |
+/// | State independence| N/A     | Awkward    | Interleave N states |
+/// | GPU shared memory | Large trees | Large tables | Small freq tables |
 ///
 /// The key unlock is **interleaving**: maintain N independent rANS states
 /// (N=4 for SSE2, N=8 for AVX2, N=32+ for GPU). Symbols are assigned

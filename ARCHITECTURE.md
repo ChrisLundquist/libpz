@@ -4,8 +4,8 @@ Detailed implementation notes, benchmarks, and roadmap for libpz.
 For day-to-day development instructions, see `CLAUDE.md`.
 
 ## Completed milestones (11/12)
-- **Algorithms:** LZ77 (brute, hashchain, lazy, parallel), Huffman, BWT (SA-IS), MTF, RLE, RangeCoder, FSE, rANS
-- **Pipelines:** Deflate (LZ77+Huffman), Bw (BWT+MTF+RLE+RC), Lza (LZ77+RC), Lzr (LZ77+rANS) — Deflate, Lza, and Lzr use multi-stream entropy coding for ~16-18% better compression
+- **Algorithms:** LZ77 (brute, hashchain, lazy, parallel), Huffman, BWT (SA-IS), MTF, RLE, FSE, rANS
+- **Pipelines:** Deflate (LZ77+Huffman), Bw (BWT+MTF+RLE+FSE), Lzr (LZ77+rANS), Lzf (LZ77+FSE) — Deflate, Lzr, and Lzf use multi-stream entropy coding for ~16-18% better compression
 - **Auto-selection:** Heuristic (`select_pipeline`) and trial-based (`select_pipeline_trial`) pipeline selection using data analysis (entropy, match density, run ratio, autocorrelation)
 - **Data analysis:** `src/analysis.rs` — statistical profiling (Shannon entropy, autocorrelation, run ratio, match density, distribution shape) with sampling support
 - **Optimal parsing:** GPU top-K match table → CPU backward DP (4-6% better compression)
@@ -28,7 +28,7 @@ For day-to-day development instructions, see `CLAUDE.md`.
 
 ## Multi-stream Deflate
 
-The Deflate and Lza pipelines use **multi-stream entropy coding** to improve
+The Deflate, Lzr, and Lzf pipelines use **multi-stream entropy coding** to improve
 compression ratio by separating LZ77 output into independent byte streams with
 tighter symbol distributions. Instead of feeding one mixed stream to the entropy
 coder, the encoder deinterleaves tokens into three streams:
@@ -39,7 +39,7 @@ coder, the encoder deinterleaves tokens into three streams:
 | **Lengths** | Match lengths (capped to u8) | Length distribution is highly skewed (short matches dominate) |
 | **Literals** | Literal bytes + low offset bytes + next bytes | Natural-language / binary byte distribution |
 
-Each stream gets its own Huffman tree (Deflate) or range-coder context (Lza),
+Each stream gets its own Huffman tree (Deflate), FSE table (Lzf), or rANS context (Lzr),
 yielding lower per-stream entropy than a single combined stream.
 
 ### Encoding format
@@ -69,14 +69,14 @@ Comparison on Canterbury + Large corpus (14 files, 13.3 MB total), averaged over
 | Pipeline | Before (bytes) | After (bytes) | Size delta | Throughput delta |
 |----------|---------------|--------------|------------|-----------------|
 | Deflate  | 6,319,168     | 5,301,184    | **-16.1%** | +1.6% faster    |
-| Lza      | 6,199,044     | 5,107,601    | **-17.6%** | +2.8% faster    |
+| Lzf      | 6,199,044     | 5,107,601    | **-17.6%** | +2.8% faster    |
 
 **Decompression throughput:**
 
 | Pipeline | Throughput delta |
 |----------|-----------------|
 | Deflate  | **+8.4%** faster |
-| Lza      | **+2.4%** faster |
+| Lzf      | **+2.4%** faster |
 
 Multi-stream is a pure win: better compression **and** faster speed. The largest
 gains are on big files (E.coli: -21% size, +11% decode throughput; bible.txt:
@@ -93,13 +93,13 @@ coding but with a simpler, more parallelizable decode hot path.
 
 ### Comparison with other entropy coders
 
-| Property          | Huffman | Range Coder | FSE (tANS) | rANS       |
-|-------------------|---------|-------------|------------|------------|
-| Decode operation  | Bit-level tree walk | Division | Table lookup | Multiply + lookup |
-| I/O granularity   | Bits    | Bytes       | Bits       | 16-bit words |
-| Branch predict    | Poor    | Moderate    | Good       | Good       |
-| State independence| N/A     | Fully serial| Awkward    | Interleave N states |
-| GPU shared memory | Large trees | Poor fit | Large tables | Small freq tables |
+| Property          | Huffman | FSE (tANS) | rANS       |
+|-------------------|---------|------------|------------|
+| Decode operation  | Bit-level tree walk | Table lookup | Multiply + lookup |
+| I/O granularity   | Bits    | Bits       | 16-bit words |
+| Branch predict    | Poor    | Good       | Good       |
+| State independence| N/A     | Awkward    | Interleave N states |
+| GPU shared memory | Large trees | Large tables | Small freq tables |
 
 ### Variants
 
@@ -139,7 +139,7 @@ is shared conceptually with `src/fse.rs` (both operate on power-of-2 tables).
 
 `Pipeline::Lzr` (ID 3) reuses the existing multi-stream LZ77 architecture
 (offsets, lengths, literals) with rANS as the entropy coder instead of Huffman
-(Deflate) or Range Coder (Lza). It participates in auto-selection via
+(Deflate) or FSE (Lzf). It participates in auto-selection via
 `select_pipeline_trial()`.
 
 ### Forward TODOs
@@ -163,7 +163,7 @@ is shared conceptually with `src/fse.rs` (both operate on power-of-2 tables).
 
 4. **Benchmark integration**: Add rANS and Lzr pipeline to
    `benches/throughput.rs` and `benches/stages.rs` for head-to-head comparison
-   with Huffman, Range Coder, and FSE.
+   with Huffman and FSE.
 
 ## SIMD acceleration
 `src/simd.rs` provides runtime-dispatched SIMD for CPU hot paths:

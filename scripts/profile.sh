@@ -5,11 +5,11 @@
 #   cargo install samply
 #
 # Usage:
-#   ./scripts/profile.sh                              # default: lza compress, 256KB
+#   ./scripts/profile.sh                              # default: lzf compress, 256KB
 #   ./scripts/profile.sh --pipeline deflate            # profile deflate compress
 #   ./scripts/profile.sh --stage lz77                  # profile lz77 encode only
 #   ./scripts/profile.sh --stage fse --decompress      # profile fse decode
-#   ./scripts/profile.sh --pipeline lza --size 1048576 # 1MB input
+#   ./scripts/profile.sh --pipeline lzf --size 1048576 # 1MB input
 #
 # All arguments are forwarded to the profile example binary.
 
