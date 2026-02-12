@@ -114,6 +114,7 @@ fn bench_compress(c: &mut Criterion) {
     for &pipeline in &[
         Pipeline::Deflate,
         Pipeline::Bw,
+        Pipeline::Bbw,
         Pipeline::Lzr,
         Pipeline::Lzf,
     ] {
@@ -163,6 +164,7 @@ fn bench_decompress(c: &mut Criterion) {
     for &pipeline in &[
         Pipeline::Deflate,
         Pipeline::Bw,
+        Pipeline::Bbw,
         Pipeline::Lzr,
         Pipeline::Lzf,
     ] {
@@ -256,6 +258,7 @@ fn bench_compress_parallel(c: &mut Criterion) {
     for &pipe in &[
         Pipeline::Deflate,
         Pipeline::Bw,
+        Pipeline::Bbw,
         Pipeline::Lzr,
         Pipeline::Lzf,
     ] {

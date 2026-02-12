@@ -122,11 +122,12 @@ fn parse_args() -> Opts {
                 opts.pipeline = match args[i].as_str() {
                     "deflate" | "0" => Pipeline::Deflate,
                     "bw" | "1" => Pipeline::Bw,
+                    "bbw" | "2" => Pipeline::Bbw,
                     "lzr" | "3" => Pipeline::Lzr,
                     "lzf" | "4" => Pipeline::Lzf,
                     other => {
                         eprintln!("pz: unknown pipeline '{other}'");
-                        eprintln!("pz: valid pipelines: deflate, bw, lzr, lzf");
+                        eprintln!("pz: valid pipelines: deflate, bw, bbw, lzr, lzf");
                         process::exit(1);
                     }
                 };
@@ -331,6 +332,7 @@ fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
             let pipe = match data[3] {
                 0 => "deflate",
                 1 => "bw",
+                2 => "bbw",
                 3 => "lzr",
                 4 => "lzf",
                 _ => "unknown",
