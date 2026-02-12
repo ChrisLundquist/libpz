@@ -271,7 +271,12 @@ fn build_cli_options(opts: &Opts) -> CompressOptions {
     #[cfg(feature = "webgpu")]
     {
         if opts.webgpu {
-            match pz::webgpu::WebGpuEngine::new() {
+            let result = if opts.verbose {
+                pz::webgpu::WebGpuEngine::with_profiling(true)
+            } else {
+                pz::webgpu::WebGpuEngine::new()
+            };
+            match result {
                 Ok(engine) => {
                     if opts.verbose {
                         eprintln!("pz: using WebGPU device: {}", engine.device_name());

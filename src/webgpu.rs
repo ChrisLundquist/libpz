@@ -159,6 +159,14 @@ pub struct WebGpuEngine {
     is_cpu: bool,
     /// Scan workgroup size (power of 2, capped at 256).
     scan_workgroup_size: usize,
+    /// Whether profiling is enabled (timestamp queries).
+    profiling: bool,
+    /// Query set for timestamp profiling (begin + end).
+    query_set: Option<wgpu::QuerySet>,
+    /// Buffer to resolve timestamp queries into.
+    resolve_buf: Option<wgpu::Buffer>,
+    /// Staging buffer for reading back resolved timestamps.
+    staging_buf: Option<wgpu::Buffer>,
 }
 
 impl std::fmt::Debug for WebGpuEngine {
@@ -173,11 +181,23 @@ impl std::fmt::Debug for WebGpuEngine {
 impl WebGpuEngine {
     /// Create a new engine, selecting the best available GPU device.
     pub fn new() -> PzResult<Self> {
-        Self::with_device_preference(true)
+        Self::create(true, false)
     }
 
     /// Create a new engine with explicit GPU preference.
     pub fn with_device_preference(prefer_gpu: bool) -> PzResult<Self> {
+        Self::create(prefer_gpu, false)
+    }
+
+    /// Create a new engine with profiling enabled.
+    ///
+    /// When profiling is on, `TIMESTAMP_QUERY` is requested on the device
+    /// and major kernel dispatches print timing via `eprintln!`.
+    pub fn with_profiling(profiling: bool) -> PzResult<Self> {
+        Self::create(true, profiling)
+    }
+
+    fn create(prefer_gpu: bool, profiling: bool) -> PzResult<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
@@ -203,10 +223,19 @@ impl WebGpuEngine {
         let max_work_group_size = limits.max_compute_workgroup_size_x as usize;
         let max_workgroups_per_dim = limits.max_compute_workgroups_per_dimension;
 
+        // Request TIMESTAMP_QUERY when profiling is desired; fall back if unsupported.
+        let supports_timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let profiling = profiling && supports_timestamps;
+        let required_features = if profiling {
+            wgpu::Features::TIMESTAMP_QUERY
+        } else {
+            wgpu::Features::empty()
+        };
+
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("libpz-webgpu"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::downlevel_defaults(),
                 memory_hints: wgpu::MemoryHints::Performance,
             },
@@ -303,6 +332,30 @@ impl WebGpuEngine {
             make_pipeline("prefix_sum_apply", &huffman_module, "prefix_sum_apply");
         let pipeline_fse_decode = make_pipeline("fse_decode", &fse_decode_module, "fse_decode");
 
+        // Create profiling resources when enabled.
+        let (query_set, resolve_buf, staging_buf) = if profiling {
+            let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("timestamp_query_set"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            });
+            let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("timestamp_resolve"),
+                size: 2 * std::mem::size_of::<u64>() as u64,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("timestamp_staging"),
+                size: 2 * std::mem::size_of::<u64>() as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            (Some(qs), Some(resolve), Some(staging))
+        } else {
+            (None, None, None)
+        };
+
         Ok(WebGpuEngine {
             device,
             queue,
@@ -328,6 +381,10 @@ impl WebGpuEngine {
             max_workgroups_per_dim,
             is_cpu,
             scan_workgroup_size,
+            profiling,
+            query_set,
+            resolve_buf,
+            staging_buf,
         })
     }
 
@@ -344,6 +401,11 @@ impl WebGpuEngine {
     /// Check if the selected device is a CPU (not a GPU or accelerator).
     pub fn is_cpu_device(&self) -> bool {
         self.is_cpu
+    }
+
+    /// Whether profiling is enabled on this engine.
+    pub fn profiling(&self) -> bool {
+        self.profiling
     }
 
     /// Maximum input size (bytes) that fits in a single GPU dispatch.
@@ -481,15 +543,61 @@ impl WebGpuEngine {
     ) -> PzResult<()> {
         let (wx, wy) = self.tile_workgroups(workgroups_x)?;
         {
+            let timestamp_writes =
+                self.query_set
+                    .as_ref()
+                    .map(|qs| wgpu::ComputePassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some(label),
-                timestamp_writes: None,
+                timestamp_writes,
             });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bind_group, &[]);
             pass.dispatch_workgroups(wx, wy, 1);
         }
         Ok(())
+    }
+
+    /// Resolve timestamp queries, read back, and print elapsed time.
+    fn read_and_print_timestamps(&self, label: &str) {
+        let (Some(qs), Some(resolve), Some(staging)) =
+            (&self.query_set, &self.resolve_buf, &self.staging_buf)
+        else {
+            return;
+        };
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("timestamp_resolve"),
+            });
+        encoder.resolve_query_set(qs, 0..2, resolve, 0);
+        encoder.copy_buffer_to_buffer(resolve, 0, staging, 0, 16);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        if rx.recv().unwrap().is_ok() {
+            let data = slice.get_mapped_range();
+            let timestamps: &[u64] = bytemuck::cast_slice(&data);
+            let start_ns = timestamps[0];
+            let end_ns = timestamps[1];
+            drop(data);
+            staging.unmap();
+            let elapsed_ns = end_ns.saturating_sub(start_ns);
+            let ms = elapsed_ns as f64 / 1_000_000.0;
+            eprintln!("[pz-gpu] {label}: {ms:.3} ms");
+        } else {
+            staging.unmap();
+        }
     }
 
     /// Record and immediately submit a single compute dispatch.
@@ -505,6 +613,9 @@ impl WebGpuEngine {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
         self.record_dispatch(&mut encoder, pipeline, bind_group, workgroups_x, label)?;
         self.queue.submit(Some(encoder.finish()));
+        if self.profiling {
+            self.read_and_print_timestamps(label);
+        }
         Ok(())
     }
 
