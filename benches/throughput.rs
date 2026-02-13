@@ -83,6 +83,8 @@ fn bench_compress(c: &mut Criterion) {
         Pipeline::Bbw,
         Pipeline::Lzr,
         Pipeline::Lzf,
+        Pipeline::Lzfi,
+        Pipeline::Bwi,
     ] {
         group.bench_with_input(
             BenchmarkId::new("pz", format!("{:?}", pipeline)),
@@ -112,6 +114,8 @@ fn bench_decompress(c: &mut Criterion) {
         Pipeline::Bbw,
         Pipeline::Lzr,
         Pipeline::Lzf,
+        Pipeline::Lzfi,
+        Pipeline::Bwi,
     ] {
         group.bench_function(BenchmarkId::new("pz", format!("{:?}", pipeline)), |b| {
             let compressed = pipeline::compress(&data, pipeline).unwrap();
