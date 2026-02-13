@@ -638,3 +638,401 @@ fn test_fse_decode_various_stream_counts() {
         assert_eq!(decoded, input, "failed at num_streams={}", n);
     }
 }
+
+// --- Tests ported from OpenCL test suite ---
+
+#[test]
+fn test_dedupe_empty() {
+    let result = dedupe_gpu_matches(&[], &[]);
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_device_count_does_not_panic() {
+    let count = device_count();
+    let _ = count;
+}
+
+#[test]
+fn test_lz77_empty_input() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let compressed = engine.lz77_compress(b"").unwrap();
+    assert!(compressed.is_empty());
+}
+
+#[test]
+fn test_lz77_no_matches() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input = b"abcdefgh";
+    let compressed = engine.lz77_compress(input).unwrap();
+    let decompressed = crate::lz77::decompress(&compressed).unwrap();
+    assert_eq!(&decompressed, input);
+}
+
+#[test]
+fn test_lz77_hash_round_trip_longer() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input = b"the quick brown fox jumps over the lazy dog. the quick brown fox.";
+    let compressed = engine.lz77_compress(input).unwrap();
+    let decompressed = crate::lz77::decompress(&compressed).unwrap();
+    assert_eq!(&decompressed, &input[..]);
+}
+
+#[test]
+fn test_is_cpu_device() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+    let _is_cpu = engine.is_cpu_device();
+}
+
+// --- BWT edge case tests ---
+
+#[test]
+fn test_bwt_hello_world_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input = b"hello world hello world hello world";
+    let gpu_result = engine.bwt_encode(input).unwrap();
+    let decoded = crate::bwt::decode(&gpu_result.data, gpu_result.primary_index).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_bwt_binary_data() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..=255).collect();
+    let gpu_result = engine.bwt_encode(&input).unwrap();
+    let cpu_result = crate::bwt::encode(&input).unwrap();
+
+    assert_eq!(gpu_result.data, cpu_result.data);
+    assert_eq!(gpu_result.primary_index, cpu_result.primary_index);
+
+    let decoded = crate::bwt::decode(&gpu_result.data, gpu_result.primary_index).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_bwt_medium_sizes() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Test sizes that cross the multi-workgroup boundary.
+    for size in [257, 300, 400, 500, 512, 513, 768, 1024] {
+        let mut input = Vec::with_capacity(size);
+        for i in 0..size {
+            input.push((i % 256) as u8);
+        }
+        let gpu_result = engine.bwt_encode(&input).unwrap_or_else(|e| {
+            panic!("GPU BWT failed for size {}: {:?}", size, e);
+        });
+        let decoded = crate::bwt::decode(&gpu_result.data, gpu_result.primary_index).unwrap();
+        assert_eq!(decoded, input, "Round-trip failed for size {}", size);
+    }
+}
+
+#[test]
+fn test_bwt_single_byte() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input = b"x";
+    let gpu_result = engine.bwt_encode(input).unwrap();
+    assert_eq!(gpu_result.data, vec![b'x']);
+    assert_eq!(gpu_result.primary_index, 0);
+}
+
+#[test]
+fn test_bwt_all_same() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input = vec![b'a'; 64];
+    let gpu_result = engine.bwt_encode(&input).unwrap();
+    let decoded = crate::bwt::decode(&gpu_result.data, gpu_result.primary_index).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_bwt_large_structured() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // 4KB of structured data — enough to exercise multi-level prefix sum
+    let mut input = Vec::new();
+    for i in 0..256u16 {
+        input.extend_from_slice(&i.to_le_bytes());
+    }
+    for _ in 0..80 {
+        input.extend_from_slice(b"the quick brown fox jumps over the lazy dog ");
+    }
+    while input.len() < 4096 {
+        input.push(b'x');
+    }
+    input.truncate(4096);
+
+    let gpu_result = engine.bwt_encode(&input).unwrap();
+    let decoded = crate::bwt::decode(&gpu_result.data, gpu_result.primary_index).unwrap();
+    assert_eq!(decoded, input);
+}
+
+// --- Top-K match finding tests ---
+
+#[test]
+fn test_topk_empty_input() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let table = engine.find_topk_matches(b"").unwrap();
+    assert_eq!(table.input_len, 0);
+}
+
+#[test]
+fn test_topk_produces_valid_candidates() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input = b"hello world hello world hello world";
+    let table = engine.find_topk_matches(input).unwrap();
+
+    assert_eq!(table.input_len, input.len());
+    assert_eq!(table.k, TOPK_K);
+
+    // Verify candidates are valid: offsets point to matching data
+    for pos in 0..input.len() {
+        for cand in table.at(pos) {
+            if cand.length == 0 {
+                continue;
+            }
+            let offset = cand.offset as usize;
+            let length = cand.length as usize;
+            assert!(offset <= pos, "offset {} > pos {}", offset, pos);
+            let match_start = pos - offset;
+            for j in 0..length.min(input.len() - pos) {
+                assert_eq!(
+                    input[match_start + j],
+                    input[pos + j],
+                    "mismatch at pos {} offset {} len {} byte {}",
+                    pos,
+                    offset,
+                    length,
+                    j
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_topk_optimal_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input = b"the quick brown fox jumps over the lazy dog. the quick brown fox.";
+    let table = engine.find_topk_matches(input).unwrap();
+    let compressed = crate::optimal::compress_optimal_with_table(input, &table).unwrap();
+    let decompressed = crate::lz77::decompress(&compressed).unwrap();
+    assert_eq!(&decompressed, &input[..]);
+}
+
+#[test]
+fn test_topk_optimal_large_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let pattern = b"Hello, World! This is a test pattern. ";
+    let mut input = Vec::new();
+    for _ in 0..200 {
+        input.extend_from_slice(pattern);
+    }
+    let table = engine.find_topk_matches(&input).unwrap();
+    let compressed = crate::optimal::compress_optimal_with_table(&input, &table).unwrap();
+    let decompressed = crate::lz77::decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+// --- Huffman edge case tests ---
+
+#[test]
+fn test_byte_histogram_empty() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let hist = engine.byte_histogram(&[]).unwrap();
+    assert!(hist.iter().all(|&c| c == 0));
+}
+
+#[test]
+fn test_huffman_encode_cpu_vs_gpu() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input = b"hello world hello world hello world!";
+    let tree = crate::huffman::HuffmanTree::from_data(input).unwrap();
+
+    let mut code_lut = [0u32; 256];
+    for byte in 0..=255u8 {
+        let (codeword, bits) = tree.get_code(byte);
+        code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+    }
+
+    let (gpu_encoded, gpu_bits) = engine.huffman_encode(input, &code_lut).unwrap();
+    let (cpu_encoded, cpu_bits) = tree.encode(input).unwrap();
+
+    assert_eq!(gpu_bits, cpu_bits, "bit counts differ");
+    assert_eq!(
+        gpu_encoded,
+        cpu_encoded,
+        "encoded data differs: gpu {} bytes, cpu {} bytes",
+        gpu_encoded.len(),
+        cpu_encoded.len()
+    );
+
+    // Verify round-trip by decoding with CPU decoder
+    let decoded = tree.decode(&gpu_encoded, gpu_bits).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_huffman_encode_larger() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+
+    let tree = crate::huffman::HuffmanTree::from_data(&input).unwrap();
+    let mut code_lut = [0u32; 256];
+    for byte in 0..=255u8 {
+        let (codeword, bits) = tree.get_code(byte);
+        code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+    }
+
+    let (gpu_encoded, gpu_bits) = engine.huffman_encode(&input, &code_lut).unwrap();
+    let decoded = tree.decode(&gpu_encoded, gpu_bits).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_huffman_gpu_scan_cpu_comparison() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input = b"hello world hello world hello world!";
+    let tree = crate::huffman::HuffmanTree::from_data(input).unwrap();
+
+    let mut code_lut = [0u32; 256];
+    for byte in 0..=255u8 {
+        let (codeword, bits) = tree.get_code(byte);
+        code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+    }
+
+    let (gpu_encoded, gpu_bits) = engine.huffman_encode_gpu_scan(input, &code_lut).unwrap();
+    let (cpu_encoded, cpu_bits) = tree.encode(input).unwrap();
+
+    assert_eq!(gpu_bits, cpu_bits, "bit counts differ");
+    assert_eq!(gpu_encoded, cpu_encoded, "encoded data differs");
+
+    let decoded = tree.decode(&gpu_encoded, gpu_bits).unwrap();
+    assert_eq!(decoded, input);
+}
+
+// --- Deflate chained edge case tests ---
+
+#[test]
+fn test_deflate_chained_binary() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Binary data with repeating patterns — exercises all byte values
+    let mut input = Vec::new();
+    for i in 0u8..=255 {
+        for _ in 0..40 {
+            input.push(i);
+        }
+    }
+
+    let block_data = engine.deflate_chained(&input).unwrap();
+
+    let decompressed = crate::pipeline::decompress(&{
+        let mut container = Vec::new();
+        container.extend_from_slice(&[b'P', b'Z', 2, 0]);
+        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
+        container.extend_from_slice(&1u32.to_le_bytes());
+        container.extend_from_slice(&(block_data.len() as u32).to_le_bytes());
+        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
+        container.extend_from_slice(&block_data);
+        container
+    })
+    .unwrap();
+
+    assert_eq!(decompressed, input);
+}
