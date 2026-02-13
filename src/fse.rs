@@ -344,6 +344,41 @@ fn build_encode_tables(
     tables
 }
 
+/// Build a flat GPU-friendly encode table packed as `u32` values.
+///
+/// Returns a `Vec<u32>` of length `256 * table_size`, indexed by
+/// `symbol * table_size + state`. Each entry is packed as:
+///
+/// ```text
+/// bits  0..11  = compressed_state (12 bits, max 4096 for accuracy_log=12)
+/// bits 12..15  = bits_to_output   (4 bits, max 12)
+/// bits 16..31  = base             (16 bits)
+/// ```
+///
+/// Absent symbols (frequency == 0) have all-zero entries (never accessed
+/// during encoding because no input byte maps to them).
+#[allow(dead_code)] // Used by GPU FSE encode (opencl + webgpu features)
+pub(crate) fn build_gpu_encode_table(norm: &NormalizedFreqs) -> Vec<u32> {
+    let table_size = 1usize << norm.accuracy_log;
+    let spread = spread_symbols(norm);
+    let decode_table = build_decode_table(norm, &spread);
+    let encode_tables = build_encode_tables(norm, &decode_table);
+
+    let mut packed = vec![0u32; NUM_SYMBOLS * table_size];
+    for (sym, sym_table) in encode_tables.iter().enumerate() {
+        if sym_table.lookup.is_empty() {
+            continue;
+        }
+        let base_idx = sym * table_size;
+        for (state, m) in sym_table.lookup.iter().enumerate() {
+            packed[base_idx + state] = (m.compressed_state as u32 & 0xFFF)
+                | ((m.bits as u32 & 0xF) << 12)
+                | ((m.base as u32) << 16);
+        }
+    }
+    packed
+}
+
 // ---------------------------------------------------------------------------
 // Combined FSE table
 // ---------------------------------------------------------------------------
@@ -1432,5 +1467,51 @@ mod tests {
         let encoded = encode_interleaved(&input);
         let decoded = decode_interleaved(&encoded, input.len()).unwrap();
         assert_eq!(decoded, input);
+    }
+
+    // --- GPU encode table ---
+
+    #[test]
+    fn test_build_gpu_encode_table_matches_cpu() {
+        // Verify that the packed GPU encode table produces the same
+        // encode results as the CPU SymbolEncodeTable for all valid
+        // (symbol, state) pairs.
+        let mut freq = FrequencyTable::new();
+        freq.count(b"abracadabra alakazam");
+        let norm = normalize_frequencies(&freq, 7).unwrap();
+        let table_size = 1usize << norm.accuracy_log;
+
+        let fse_table = FseTable::from_normalized(&norm);
+        let packed = build_gpu_encode_table(&norm);
+
+        assert_eq!(packed.len(), 256 * table_size);
+
+        // Check every present symbol at every state.
+        for sym in 0..256usize {
+            if norm.freq[sym] == 0 {
+                continue;
+            }
+            for state in 0..table_size {
+                let cpu_mapping = fse_table.encode_tables[sym].find(state);
+                let gpu_entry = packed[sym * table_size + state];
+
+                let gpu_compressed = (gpu_entry & 0xFFF) as u16;
+                let gpu_bits = ((gpu_entry >> 12) & 0xF) as u8;
+                let gpu_base = (gpu_entry >> 16) as u16;
+
+                assert_eq!(
+                    gpu_compressed, cpu_mapping.compressed_state,
+                    "compressed_state mismatch: sym={sym}, state={state}"
+                );
+                assert_eq!(
+                    gpu_bits, cpu_mapping.bits,
+                    "bits mismatch: sym={sym}, state={state}"
+                );
+                assert_eq!(
+                    gpu_base, cpu_mapping.base,
+                    "base mismatch: sym={sym}, state={state}"
+                );
+            }
+        }
     }
 }
