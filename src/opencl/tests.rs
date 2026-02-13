@@ -1019,3 +1019,79 @@ fn test_gpu_deflate_chained_binary() {
 
     assert_eq!(decompressed, input);
 }
+
+// --- Modular GPU pipeline composition tests ---
+
+/// Helper: compress/decompress via the pipeline API with OpenCL backend.
+fn gpu_pipeline_round_trip(input: &[u8], pipeline: crate::pipeline::Pipeline) {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let options = crate::pipeline::CompressOptions {
+        backend: crate::pipeline::Backend::OpenCl,
+        opencl_engine: Some(engine),
+        ..Default::default()
+    };
+
+    let compressed = crate::pipeline::compress_with_options(input, pipeline, &options)
+        .unwrap_or_else(|e| {
+            panic!("compress failed for {:?}: {:?}", pipeline, e);
+        });
+
+    let decompressed = crate::pipeline::decompress(&compressed).unwrap_or_else(|e| {
+        panic!("decompress failed for {:?}: {:?}", pipeline, e);
+    });
+
+    assert_eq!(
+        decompressed, input,
+        "round-trip mismatch for {:?}",
+        pipeline
+    );
+}
+
+#[test]
+fn test_modular_gpu_deflate_round_trip() {
+    // GPU LZ77 → GPU Huffman (modular stage path, not monolithic deflate_chained)
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+    gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Deflate);
+}
+
+#[test]
+fn test_gpu_lz77_cpu_rans_round_trip() {
+    // GPU LZ77 → CPU rANS (previously impossible without modular stages)
+    let pattern = b"Hello, World! This is a test pattern for GPU+CPU composition. ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+    gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Lzr);
+}
+
+#[test]
+fn test_gpu_lz77_cpu_fse_round_trip() {
+    // GPU LZ77 → CPU FSE (previously impossible without modular stages)
+    let pattern = b"Hello, World! This is a test pattern for GPU+CPU composition. ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+    gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Lzf);
+}
+
+#[test]
+fn test_gpu_bwt_cpu_pipeline_round_trip() {
+    // GPU BWT → CPU MTF → CPU RLE → CPU FSE
+    let pattern = b"the quick brown fox jumps over the lazy dog ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+    gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Bw);
+}
