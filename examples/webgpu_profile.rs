@@ -144,7 +144,7 @@ fn run() {
         cpu_huff.as_secs_f64() * 1000.0
     );
 
-    // Phase 5: Full pipeline end-to-end
+    // Phase 5: Full pipeline end-to-end (deflate)
     eprintln!("\n--- Full pipeline compress (4MB, deflate) ---");
     let opts_gpu = CompressOptions {
         backend: Backend::WebGpu,
@@ -187,6 +187,122 @@ fn run() {
     eprintln!(
         "GPU/CPU:     {:.2}x",
         cpu_full.as_secs_f64() / gpu_full.as_secs_f64()
+    );
+
+    // Phase 5b: Lzfi pipeline (LZ77 + interleaved FSE) — full WebGPU acceleration
+    eprintln!("\n--- Full pipeline compress (4MB, lzfi) ---");
+    // Warmup
+    let _ = pipeline::compress_with_options(&large_data, Pipeline::Lzfi, &opts_gpu).unwrap();
+
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let _ = std::hint::black_box(
+            pipeline::compress_with_options(&large_data, Pipeline::Lzfi, &opts_gpu).unwrap(),
+        );
+    }
+    let gpu_lzfi = t0.elapsed() / iters;
+    let gpu_lzfi_mbps = large_data.len() as f64 / gpu_lzfi.as_secs_f64() / (1024.0 * 1024.0);
+    eprintln!(
+        "GPU lzfi:    {:.0} ms ({:.1} MB/s)",
+        gpu_lzfi.as_secs_f64() * 1000.0,
+        gpu_lzfi_mbps
+    );
+
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let _ = std::hint::black_box(
+            pipeline::compress_with_options(&large_data, Pipeline::Lzfi, &opts_cpu).unwrap(),
+        );
+    }
+    let cpu_lzfi = t0.elapsed() / iters;
+    let cpu_lzfi_mbps = large_data.len() as f64 / cpu_lzfi.as_secs_f64() / (1024.0 * 1024.0);
+    eprintln!(
+        "CPU lzfi:    {:.0} ms ({:.1} MB/s)",
+        cpu_lzfi.as_secs_f64() * 1000.0,
+        cpu_lzfi_mbps
+    );
+    eprintln!(
+        "GPU/CPU:     {:.2}x",
+        cpu_lzfi.as_secs_f64() / gpu_lzfi.as_secs_f64()
+    );
+
+    // Phase 5c: Lzfi decompress
+    eprintln!("\n--- Full pipeline decompress (4MB, lzfi) ---");
+    let compressed_lzfi_gpu =
+        pipeline::compress_with_options(&large_data, Pipeline::Lzfi, &opts_gpu).unwrap();
+    let compressed_lzfi_cpu =
+        pipeline::compress_with_options(&large_data, Pipeline::Lzfi, &opts_cpu).unwrap();
+
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let _ = std::hint::black_box(pipeline::decompress(&compressed_lzfi_gpu).unwrap());
+    }
+    let dec_lzfi = t0.elapsed() / iters;
+    let dec_lzfi_mbps = large_data.len() as f64 / dec_lzfi.as_secs_f64() / (1024.0 * 1024.0);
+    eprintln!(
+        "CPU decompress (gpu-compressed): {:.0} ms ({:.1} MB/s)",
+        dec_lzfi.as_secs_f64() * 1000.0,
+        dec_lzfi_mbps
+    );
+
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let _ = std::hint::black_box(pipeline::decompress(&compressed_lzfi_cpu).unwrap());
+    }
+    let dec_lzfi_cpu = t0.elapsed() / iters;
+    let dec_lzfi_cpu_mbps =
+        large_data.len() as f64 / dec_lzfi_cpu.as_secs_f64() / (1024.0 * 1024.0);
+    eprintln!(
+        "CPU decompress (cpu-compressed): {:.0} ms ({:.1} MB/s)",
+        dec_lzfi_cpu.as_secs_f64() * 1000.0,
+        dec_lzfi_cpu_mbps
+    );
+
+    // Phase 5d: LzssR pipeline (CPU-only, for comparison)
+    eprintln!("\n--- Full pipeline compress (4MB, lzssr) ---");
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let _ = std::hint::black_box(
+            pipeline::compress_with_options(&large_data, Pipeline::LzssR, &opts_cpu).unwrap(),
+        );
+    }
+    let cpu_lzssr = t0.elapsed() / iters;
+    let cpu_lzssr_mbps = large_data.len() as f64 / cpu_lzssr.as_secs_f64() / (1024.0 * 1024.0);
+    eprintln!(
+        "CPU lzssr:   {:.0} ms ({:.1} MB/s)",
+        cpu_lzssr.as_secs_f64() * 1000.0,
+        cpu_lzssr_mbps
+    );
+
+    let compressed_lzssr =
+        pipeline::compress_with_options(&large_data, Pipeline::LzssR, &opts_cpu).unwrap();
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let _ = std::hint::black_box(pipeline::decompress(&compressed_lzssr).unwrap());
+    }
+    let dec_lzssr = t0.elapsed() / iters;
+    let dec_lzssr_mbps = large_data.len() as f64 / dec_lzssr.as_secs_f64() / (1024.0 * 1024.0);
+    eprintln!(
+        "CPU decompress lzssr: {:.0} ms ({:.1} MB/s)",
+        dec_lzssr.as_secs_f64() * 1000.0,
+        dec_lzssr_mbps
+    );
+
+    // Compression ratio comparison
+    eprintln!("\n--- Compression ratios (4MB) ---");
+    let compressed_deflate =
+        pipeline::compress_with_options(&large_data, Pipeline::Deflate, &opts_cpu).unwrap();
+    eprintln!(
+        "deflate: {:.2}%",
+        compressed_deflate.len() as f64 / large_data.len() as f64 * 100.0
+    );
+    eprintln!(
+        "lzfi:    {:.2}%",
+        compressed_lzfi_cpu.len() as f64 / large_data.len() as f64 * 100.0
+    );
+    eprintln!(
+        "lzssr:   {:.2}%",
+        compressed_lzssr.len() as f64 / large_data.len() as f64 * 100.0
     );
 
     // Phase 6: Buffer allocation overhead
@@ -316,6 +432,7 @@ fn run() {
     );
 
     eprintln!("\n=== Summary ===");
+    eprintln!("-- LZ77 stage --");
     eprintln!(
         "GPU LZ77 single block (256KB): {:.2} ms ({:.1} MB/s)",
         lz77_single.as_secs_f64() * 1000.0,
@@ -341,20 +458,36 @@ fn run() {
         batch_time.as_secs_f64() * 1000.0,
         batch_mbps
     );
+    eprintln!("\n-- Full pipelines (4MB) --");
     eprintln!(
-        "GPU full pipeline (4MB):       {:.0} ms ({:.1} MB/s)",
+        "GPU deflate:  {:.0} ms ({:.1} MB/s)",
         gpu_full.as_secs_f64() * 1000.0,
         gpu_full_mbps
     );
     eprintln!(
-        "CPU full pipeline (4MB, MT):   {:.0} ms ({:.1} MB/s)",
+        "CPU deflate:  {:.0} ms ({:.1} MB/s)",
         cpu_full.as_secs_f64() * 1000.0,
         cpu_full_mbps
     );
     eprintln!(
-        "CPU full pipeline (4MB, 1T):   {:.0} ms ({:.1} MB/s)",
+        "CPU 1T defl:  {:.0} ms ({:.1} MB/s)",
         cpu_1t.as_secs_f64() * 1000.0,
         cpu_1t_mbps
+    );
+    eprintln!(
+        "GPU lzfi:     {:.0} ms ({:.1} MB/s)",
+        gpu_lzfi.as_secs_f64() * 1000.0,
+        gpu_lzfi_mbps
+    );
+    eprintln!(
+        "CPU lzfi:     {:.0} ms ({:.1} MB/s)",
+        cpu_lzfi.as_secs_f64() * 1000.0,
+        cpu_lzfi_mbps
+    );
+    eprintln!(
+        "CPU lzssr:    {:.0} ms ({:.1} MB/s)",
+        cpu_lzssr.as_secs_f64() * 1000.0,
+        cpu_lzssr_mbps
     );
 }
 

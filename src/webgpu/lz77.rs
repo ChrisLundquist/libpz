@@ -986,21 +986,21 @@ impl WebGpuEngine {
             });
         self.record_dispatch(
             &mut encoder,
-            &self.pipeline_lz77_lazy_build(),
+            self.pipeline_lz77_lazy_build(),
             &build_bg,
             workgroups,
             "slot_build",
         )?;
         self.record_dispatch(
             &mut encoder,
-            &self.pipeline_lz77_lazy_find(),
+            self.pipeline_lz77_lazy_find(),
             &find_bg,
             workgroups,
             "slot_find",
         )?;
         self.record_dispatch(
             &mut encoder,
-            &self.pipeline_lz77_lazy_resolve(),
+            self.pipeline_lz77_lazy_resolve(),
             &resolve_bg,
             workgroups,
             "slot_resolve",

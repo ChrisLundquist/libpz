@@ -355,8 +355,8 @@ fn compress_streaming_gpu(
             }
 
             // Drain remaining in-flight slots
-            for slot_idx in 0..ring_depth {
-                if let Some(prev_idx) = slot_inflight[slot_idx].take() {
+            for (slot_idx, inflight) in slot_inflight.iter_mut().enumerate() {
+                if let Some(prev_idx) = inflight.take() {
                     engine.poll_wait();
                     let prev_block = blocks[prev_idx];
                     let result = engine.complete_lz77_from_slot(&ring.slots[slot_idx], prev_block);

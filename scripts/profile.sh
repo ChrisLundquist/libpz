@@ -7,6 +7,8 @@
 # Usage:
 #   ./scripts/profile.sh                              # default: lzf compress, 256KB
 #   ./scripts/profile.sh --pipeline deflate            # profile deflate compress
+#   ./scripts/profile.sh --pipeline lzfi               # profile lzfi (LZ77 + interleaved FSE)
+#   ./scripts/profile.sh --pipeline lzssr              # profile lzssr (LZSS + rANS)
 #   ./scripts/profile.sh --stage lz77                  # profile lz77 encode only
 #   ./scripts/profile.sh --stage fse --decompress      # profile fse decode
 #   ./scripts/profile.sh --pipeline lzf --size 1048576 # 1MB input
