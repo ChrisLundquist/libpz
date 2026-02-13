@@ -544,8 +544,15 @@ impl WebGpuEngine {
         let max_dispatch = self.max_dispatch_input_size();
         let mut all_results: Vec<Vec<Match>> = Vec::with_capacity(blocks.len());
 
+        // Compute batch size from the kernel cost model and device memory budget.
+        // Cap at GPU_PREFETCH_DEPTH to limit latency while hiding dispatch overhead.
+        const GPU_PREFETCH_DEPTH: usize = 3;
+        let block_size = blocks.first().map(|b| b.len()).unwrap_or(256 * 1024);
+        let mem_limit = self.max_in_flight(&self.cost_lz77_lazy, block_size);
+        let batch_size = mem_limit.min(GPU_PREFETCH_DEPTH);
+
         // Process in batches to cap GPU memory usage
-        for chunk in blocks.chunks(MAX_GPU_BATCH_SIZE) {
+        for chunk in blocks.chunks(batch_size) {
             // Phase 1: Submit all blocks in this batch
             let mut pending: Vec<Option<PendingLz77>> = Vec::with_capacity(chunk.len());
 

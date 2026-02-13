@@ -6,6 +6,13 @@
 //   Pass 2 (find_matches): Each invocation looks up its hash bucket and only
 //     compares against positions in that bucket (bounded by MAX_CHAIN).
 
+// @pz_cost {
+//   threads_per_element: 1
+//   passes: 2
+//   buffers: input=N, hash_counts=131072, hash_table=8388608, output=N*12
+//   local_mem: 0
+// }
+
 struct Lz77Match {
     offset: u32,
     length: u32,

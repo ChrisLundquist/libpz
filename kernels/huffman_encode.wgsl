@@ -6,6 +6,13 @@
 //   Pass 2 (write_codes): After prefix sum produces bit offsets, each invocation
 //     writes its codeword at the computed offset.
 
+// @pz_cost {
+//   threads_per_element: 1
+//   passes: 2
+//   buffers: input=N, lut=1024, bit_lengths=N*4, offsets=N*4, output=N
+//   local_mem: 0
+// }
+
 @group(0) @binding(0) var<storage, read> symbols: array<u32>; // packed bytes
 @group(0) @binding(1) var<storage, read> code_lut: array<u32>; // 256 entries
 @group(0) @binding(2) var<storage, read_write> bit_lengths: array<u32>;

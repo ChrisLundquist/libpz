@@ -7,6 +7,13 @@
 // Output: K candidates per position (flat array, position-major order).
 // Candidates are sorted by length descending. Unused slots have length=0.
 
+// @pz_cost {
+//   threads_per_element: 1
+//   passes: 1
+//   buffers: input=N, output=N*16
+//   local_mem: 0
+// }
+
 struct Lz77Candidate {
     offset: u32, // packed: u16 offset in low 16, u16 length in high 16
 }

@@ -15,6 +15,13 @@
 // The lazy resolution produces better compression than pure greedy per-position
 // matching, approaching CPU lazy matching quality while retaining GPU parallelism.
 
+// @pz_cost {
+//   threads_per_element: 1
+//   passes: 3
+//   buffers: input=N, hash_counts=131072, hash_table=8388608, raw_matches=N*12, resolved=N*12, staging=N*12
+//   local_mem: 0
+// }
+
 struct Lz77Match {
     offset: u32,
     length: u32,

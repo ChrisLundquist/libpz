@@ -11,6 +11,13 @@
 //
 // Bit packing uses MSB-first order matching the CPU Huffman encoder.
 
+// @pz_cost {
+//   threads_per_element: 1
+//   passes: 2
+//   buffers: input=N, lut=1024, bit_lengths=N*4, offsets=N*4, output=N
+//   local_mem: 0
+// }
+
 // Code lookup table entry: codeword in low 24 bits, bit count in high 8 bits.
 // Packed as: (bits << 24) | codeword
 // This lets us store the full table in 256 uints.

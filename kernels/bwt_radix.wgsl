@@ -3,6 +3,14 @@
 // LSB-first 8-bit radix sort. Each pass sorts by one byte of the
 // 64-bit composite key: key = (rank[sa[i]] << 32) | rank[(sa[i]+k) % n]
 
+// @pz_cost {
+//   threads_per_element: 1
+//   passes: 3
+//   buffers: keys=N*4, histogram=N*4, sa_in=N*4, sa_out=N*4
+//   local_mem: 1024
+//   note: 4 radix passes per doubling step
+// }
+
 const RADIX: u32 = 256u;
 
 @group(0) @binding(0) var<storage, read> rk_sa: array<u32>;

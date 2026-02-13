@@ -4,6 +4,13 @@
 // searching backward through a sliding window of MAX_WINDOW bytes.
 // The host deduplicates overlapping matches after readback.
 
+// @pz_cost {
+//   threads_per_element: 1
+//   passes: 1
+//   buffers: input=N, output=N*12
+//   local_mem: 0
+// }
+
 typedef struct {
     unsigned int offset;
     unsigned int length;

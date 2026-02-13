@@ -5,6 +5,14 @@
 //   2. Prefix sum: inclusive scan of diff[], giving each suffix its rank
 //   3. Scatter: new_rank[sa[i]] = prefix[i]
 
+// @pz_cost {
+//   threads_per_element: 1
+//   passes: 4
+//   buffers: sa=N*4, rank=N*4, diff=N*4, prefix=N*4
+//   local_mem: 2048
+//   note: called per doubling step (log2(N) steps)
+// }
+
 // WORKGROUP_SIZE is set via pipeline constant override
 override WORKGROUP_SIZE: u32 = 256u;
 const BLOCK_ELEMS_MULT: u32 = 2u; // BLOCK_ELEMS = WORKGROUP_SIZE * 2
