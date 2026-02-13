@@ -39,6 +39,7 @@
 //! ```
 
 use crate::bwt::BwtResult;
+use crate::gpu_cost::KernelCost;
 use crate::lz77::Match;
 use crate::{PzError, PzResult};
 
@@ -252,6 +253,10 @@ pub struct OpenClEngine {
     is_cpu: bool,
     /// Whether profiling is enabled (CL_QUEUE_PROFILING_ENABLE).
     profiling: bool,
+    /// Device global memory size in bytes.
+    global_mem_size: u64,
+    /// Parsed cost model for the LZ77 hash kernel (used for batch scheduling).
+    cost_lz77_hash: KernelCost,
 }
 
 // SAFETY: OpenCL 1.2+ guarantees thread safety for context, command queue, kernel,
@@ -376,6 +381,7 @@ impl OpenClEngine {
         let max_work_group_size = device.max_work_group_size().unwrap_or(1);
         let dev_type: cl_device_type = device.dev_type().unwrap_or(0);
         let is_cpu = (dev_type & CL_DEVICE_TYPE_GPU) == 0;
+        let global_mem_size = device.global_mem_size().unwrap_or(0);
 
         // Compile both kernel variants
         let program_per_pos =
@@ -475,6 +481,10 @@ impl OpenClEngine {
         let kernel_fse_decode =
             Kernel::create(&program_fse_decode, "FseDecode").map_err(|_| PzError::Unsupported)?;
 
+        // Parse kernel cost annotations for batch scheduling.
+        let cost_lz77_hash = KernelCost::parse(LZ77_HASH_KERNEL_SOURCE)
+            .expect("lz77_hash.cl missing @pz_cost annotation");
+
         Ok(OpenClEngine {
             _device: device,
             context,
@@ -503,6 +513,8 @@ impl OpenClEngine {
             max_work_group_size,
             is_cpu,
             profiling,
+            global_mem_size,
+            cost_lz77_hash,
         })
     }
 
@@ -527,6 +539,21 @@ impl OpenClEngine {
     /// Whether profiling is enabled on this engine.
     pub fn profiling(&self) -> bool {
         self.profiling
+    }
+
+    /// Max blocks of `block_size` bytes in flight for a kernel without
+    /// exceeding the GPU memory budget.
+    pub(crate) fn max_in_flight(&self, kernel: &KernelCost, block_size: usize) -> usize {
+        let per_block = kernel.memory_bytes(block_size);
+        if per_block == 0 {
+            return 8;
+        }
+        (self.gpu_memory_budget() / per_block).max(1)
+    }
+
+    /// Conservative GPU memory budget: 50% of global_mem_size.
+    fn gpu_memory_budget(&self) -> usize {
+        (self.global_mem_size as usize) / 2
     }
 
     /// Extract elapsed time in milliseconds from a completed OpenCL event.
@@ -622,7 +649,10 @@ impl DeviceBuf {
         })
     }
 
-    /// Allocate a zero-initialized device buffer of the given size.
+    /// Allocate a device buffer of the given size.
+    ///
+    /// **Note:** The buffer contents are *not* guaranteed to be zero-initialized.
+    /// Callers that need zeroed memory should write zeros explicitly.
     pub fn alloc(engine: &OpenClEngine, len: usize) -> PzResult<Self> {
         let actual_len = len.max(1); // avoid zero-size allocation
         let buf = unsafe {
@@ -717,8 +747,23 @@ fn dedupe_gpu_matches(gpu_matches: &[GpuMatch], input: &[u8]) -> Vec<Match> {
             gm.next
         };
 
+        // Clamp offset to u16 range. The PerPosition kernel uses a 128KB
+        // window which can produce offsets > u16::MAX; matches with such
+        // offsets are unrepresentable, so emit a literal instead.
+        let offset = gm.offset;
+        if offset > u16::MAX as u32 && match_length > 0 {
+            // Unrepresentable match — emit as literal (offset=0, length=0).
+            result.push(Match {
+                offset: 0,
+                length: 0,
+                next: input[index],
+            });
+            index += 1;
+            continue;
+        }
+
         result.push(Match {
-            offset: gm.offset as u16,
+            offset: offset as u16,
             length: match_length as u16,
             next,
         });

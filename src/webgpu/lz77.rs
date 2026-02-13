@@ -234,6 +234,7 @@ impl WebGpuEngine {
     fn find_matches_hash(&self, input: &[u8]) -> PzResult<Vec<Match>> {
         let input_len = input.len();
         let padded = Self::pad_input_bytes(input);
+        let match_buf_size = (input_len * std::mem::size_of::<GpuMatch>()) as u64;
 
         let input_buf =
             self.create_buffer_init("lz77_hash_input", &padded, wgpu::BufferUsages::STORAGE);
@@ -261,8 +262,15 @@ impl WebGpuEngine {
 
         let output_buf = self.create_buffer(
             "lz77_hash_output",
-            (input_len * std::mem::size_of::<GpuMatch>()) as u64,
+            match_buf_size,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        // Staging buffer for readback (baked into same command buffer)
+        let staging_buf = self.create_buffer(
+            "lz77_hash_staging",
+            match_buf_size,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         );
 
         // Build + Find passes batched into a single command encoder submission
@@ -342,17 +350,28 @@ impl WebGpuEngine {
             workgroups,
             "lz77_hash_find",
         )?;
+        // Bake staging copy into the same command buffer
+        encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, match_buf_size);
         self.queue.submit(Some(encoder.finish()));
+
+        // Wait for all work including the copy
+        self.device.poll(wgpu::Maintain::Wait);
         if let Some(t0) = t0 {
-            self.device.poll(wgpu::Maintain::Wait);
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             eprintln!("[pz-gpu] lz77_hash (build+find): {ms:.3} ms");
         }
 
-        let raw = self.read_buffer(
-            &output_buf,
-            (input_len * std::mem::size_of::<GpuMatch>()) as u64,
-        );
+        // Map the staging buffer directly (no extra submission needed)
+        let slice = staging_buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().map_err(|_| PzError::Unsupported)?;
+
+        let raw = slice.get_mapped_range().to_vec();
+        staging_buf.unmap();
         let gpu_matches: Vec<GpuMatch> = bytemuck::cast_slice(&raw).to_vec();
 
         Ok(dedupe_gpu_matches(&gpu_matches, input))
@@ -363,171 +382,17 @@ impl WebGpuEngine {
     /// Pass 1: Build hash table (parallel hash insertion with atomics).
     /// Pass 2: Find best match per position (greedy, parallel).
     /// Pass 3: Lazy resolve -- demote positions where pos+1 has a longer match.
+    ///
+    /// Uses the submit/complete pattern to bake the staging copy into the same
+    /// command buffer as the compute passes, eliminating one extra submission
+    /// and synchronization round-trip.
     fn find_matches_lazy(&self, input: &[u8]) -> PzResult<Vec<Match>> {
-        let input_len = input.len();
-        let padded = Self::pad_input_bytes(input);
-        let match_buf_size = (input_len * std::mem::size_of::<GpuMatch>()) as u64;
-
-        let input_buf =
-            self.create_buffer_init("lz77_lazy_input", &padded, wgpu::BufferUsages::STORAGE);
-
-        let workgroups = (input_len as u32).div_ceil(64);
-        let params = [input_len as u32, 0, 0, self.dispatch_width(workgroups, 64)];
-        let params_buf = self.create_buffer_init(
-            "lz77_lazy_params",
-            bytemuck::cast_slice(&params),
-            wgpu::BufferUsages::UNIFORM,
-        );
-
-        // Hash counts and table buffers (pass 1)
-        let hash_counts_buf = self.create_buffer_init(
-            "lazy_hash_counts",
-            &vec![0u8; HASH_TABLE_SIZE * 4],
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        );
-
-        let hash_table_buf = self.create_buffer(
-            "lazy_hash_table",
-            (HASH_TABLE_SIZE * HASH_BUCKET_CAP * 4) as u64,
-            wgpu::BufferUsages::STORAGE,
-        );
-
-        // Raw match output (pass 2 writes, pass 3 reads)
-        let raw_match_buf = self.create_buffer(
-            "lazy_raw_matches",
-            match_buf_size,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        );
-
-        // Resolved match output (pass 3 writes)
-        let resolved_buf = self.create_buffer(
-            "lazy_resolved",
-            match_buf_size,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        );
-
-        // --- Pass 1 bind group: build_hash_table ---
-        let build_bg_layout = self.pipeline_lz77_lazy_build.get_bind_group_layout(0);
-        let build_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lz77_lazy_build_bg"),
-            layout: &build_bg_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: hash_counts_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: hash_table_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        // --- Pass 2 bind group: find_matches ---
-        let find_bg_layout = self.pipeline_lz77_lazy_find.get_bind_group_layout(0);
-        let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lz77_lazy_find_bg"),
-            layout: &find_bg_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: raw_match_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: hash_counts_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: hash_table_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        // --- Pass 3 bind group: resolve_lazy ---
-        let resolve_bg_layout = self.pipeline_lz77_lazy_resolve.get_bind_group_layout(0);
-        let resolve_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lz77_lazy_resolve_bg"),
-            layout: &resolve_bg_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: resolved_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: raw_match_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Submit all 3 passes in a single command encoder
-        let t0 = if self.profiling {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("lz77_lazy"),
-            });
-        self.record_dispatch(
-            &mut encoder,
-            &self.pipeline_lz77_lazy_build,
-            &build_bg,
-            workgroups,
-            "lz77_lazy_build",
-        )?;
-        self.record_dispatch(
-            &mut encoder,
-            &self.pipeline_lz77_lazy_find,
-            &find_bg,
-            workgroups,
-            "lz77_lazy_find",
-        )?;
-        self.record_dispatch(
-            &mut encoder,
-            &self.pipeline_lz77_lazy_resolve,
-            &resolve_bg,
-            workgroups,
-            "lz77_lazy_resolve",
-        )?;
-        self.queue.submit(Some(encoder.finish()));
-        if let Some(t0) = t0 {
-            self.device.poll(wgpu::Maintain::Wait);
-            let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            eprintln!("[pz-gpu] lz77_lazy (build+find+resolve): {ms:.3} ms");
+        let pending = self.submit_find_matches_lazy(input)?;
+        self.device.poll(wgpu::Maintain::Wait);
+        if self.profiling {
+            eprintln!("[pz-gpu] lz77_lazy (build+find+resolve): submitted");
         }
-
-        let raw = self.read_buffer(&resolved_buf, match_buf_size);
-        let gpu_matches: Vec<GpuMatch> = bytemuck::cast_slice(&raw).to_vec();
-
-        Ok(dedupe_gpu_matches(&gpu_matches, input))
+        self.complete_find_matches_lazy(pending, input)
     }
 
     /// Submit GPU LZ77 lazy matching work without blocking for results.
@@ -747,8 +612,18 @@ impl WebGpuEngine {
         let max_dispatch = self.max_dispatch_input_size();
         let mut all_results: Vec<Vec<Match>> = Vec::with_capacity(blocks.len());
 
+        // Compute batch size from the kernel cost model and device memory budget.
+        // Allow large batches to maximize GPU utilization — submitting all blocks
+        // in one batch lets the GPU pipeline work across blocks while hiding
+        // per-dispatch overhead. On discrete GPUs (e.g. 16GB VRAM) the memory
+        // budget easily accommodates 32+ concurrent 256KB blocks (~18MB each).
+        const GPU_MAX_BATCH: usize = 64;
+        let block_size = blocks.first().map(|b| b.len()).unwrap_or(256 * 1024);
+        let mem_limit = self.max_in_flight(&self.cost_lz77_lazy, block_size);
+        let batch_size = mem_limit.min(GPU_MAX_BATCH);
+
         // Process in batches to cap GPU memory usage
-        for chunk in blocks.chunks(MAX_GPU_BATCH_SIZE) {
+        for chunk in blocks.chunks(batch_size) {
             // Phase 1: Submit all blocks in this batch
             let mut pending: Vec<Option<PendingLz77>> = Vec::with_capacity(chunk.len());
 

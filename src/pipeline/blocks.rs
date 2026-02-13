@@ -1,6 +1,6 @@
 //! Per-pipeline single-block compress and decompress implementations.
 //!
-//! LZ-based pipelines (Deflate, Lzr, Lzf, LzssR, Lz78R) use a unified path:
+//! LZ-based pipelines (Deflate, Lzr, Lzf, Lzfi, LzssR, Lz78R) use a unified path:
 //!   compress:   demux → entropy_encode
 //!   decompress: entropy_decode → demux
 //!
@@ -14,7 +14,7 @@ use crate::{PzError, PzResult};
 
 use super::demux::{demuxer_for_pipeline, LzDemuxer};
 use super::stages::*;
-#[cfg(any(feature = "opencl", feature = "webgpu"))]
+#[cfg(feature = "opencl")]
 use super::Backend;
 use super::{resolve_max_match_len, CompressOptions, Pipeline};
 
@@ -140,19 +140,13 @@ fn entropy_encode(
                 }
             }
 
+            // Note: WebGPU Huffman is intentionally NOT used here.
+            // Profiling shows CPU Huffman (~0.5ms/256KB) is faster than the
+            // WebGPU path (~2ms) due to CPU↔GPU round-trips for bit-length
+            // computation and prefix-sum. The GPU LZ77 path provides the
+            // parallelism win; entropy encoding is faster on the CPU.
             #[cfg(feature = "webgpu")]
-            {
-                if let Backend::WebGpu = options.backend {
-                    if let Some(ref engine) = options.webgpu_engine {
-                        if !engine.is_cpu_device()
-                            && input_len >= crate::webgpu::MIN_GPU_INPUT_SIZE
-                            && input_len <= engine.max_dispatch_input_size()
-                        {
-                            return stage_huffman_encode_webgpu(block, engine);
-                        }
-                    }
-                }
-            }
+            let _ = &options;
 
             // Suppress unused variable warning when no GPU features are enabled
             let _ = (input_len, options);
@@ -166,6 +160,10 @@ fn entropy_encode(
             let _ = (input_len, options);
             stage_fse_encode(block)
         }
+        Pipeline::Lzfi => {
+            let _ = (input_len, options);
+            stage_fse_interleaved_encode(block)
+        }
         _ => Err(PzError::Unsupported),
     }
 }
@@ -176,6 +174,7 @@ fn entropy_decode(block: StageBlock, pipeline: Pipeline) -> PzResult<StageBlock>
         Pipeline::Deflate => stage_huffman_decode(block),
         Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R => stage_rans_decode(block),
         Pipeline::Lzf => stage_fse_decode(block),
+        Pipeline::Lzfi => stage_fse_interleaved_decode(block),
         _ => Err(PzError::Unsupported),
     }
 }

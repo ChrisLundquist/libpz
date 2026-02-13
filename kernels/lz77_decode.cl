@@ -14,6 +14,14 @@
 //   [1] num_matches        — number of 5-byte match records in this block
 //   [2] output_offset      — byte offset into the output buffer
 
+// @pz_cost {
+//   threads_per_element: 0.004
+//   passes: 1
+//   buffers: match_data=N*5, block_meta=N*0.001, output=N
+//   local_mem: 12
+//   note: one workgroup (typ. 32-64 threads) per block. match_data is compressed input (~5 bytes/match). Sequential match parsing with cooperative back-ref copy.
+// }
+
 // Number of threads per workgroup (set via -D at compile time).
 #ifndef WG_SIZE
 #define WG_SIZE 64u

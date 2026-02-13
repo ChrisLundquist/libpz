@@ -14,6 +14,14 @@
 // The decode table is cached in __local (shared) memory per workgroup.
 // All blocks share the same decode table (encoded with a shared freq table).
 
+// @pz_cost {
+//   threads_per_element: 0.015625
+//   passes: 1
+//   buffers: decode_table=4096, bitstream_data=N, block_meta=N*0.001, stream_meta=N*0.05, output=N
+//   local_mem: 16384
+//   note: one workgroup per block, N streams per block (typ. 4). Batched: single launch for all blocks.
+// }
+
 #ifndef MAX_LOCAL_TABLE_ENTRIES
 #define MAX_LOCAL_TABLE_ENTRIES 4096u
 #endif

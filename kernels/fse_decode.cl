@@ -15,6 +15,14 @@
 // (up to 4096 entries = 16KB). This avoids repeated global memory reads
 // in the hot decode loop.
 
+// @pz_cost {
+//   threads_per_element: 0.015625
+//   passes: 1
+//   buffers: decode_table=4096, bitstream_data=N, stream_meta=64, output=N
+//   local_mem: 16384
+//   note: threads = num_streams (typ. 4-8), each decodes N/K symbols. Output is u32-packed (atomic_or).
+// }
+
 // Maximum decode table entries that fit in __local memory.
 // 4096 entries × 4 bytes = 16KB. Most GPUs have 32-64KB local memory,
 // so this leaves room for ≥2 warps/SM to be active concurrently.

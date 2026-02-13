@@ -171,7 +171,10 @@ fn decode_multistream(
 ///   [stream_data_len: u32] [total_bits: u32] [freq_table: 256×u32] [huffman_data]
 pub(crate) fn stage_huffman_encode(mut block: StageBlock) -> PzResult<StageBlock> {
     let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
-    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+    let pre_entropy_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
 
     block.data = encode_multistream(
         &streams,
@@ -211,7 +214,10 @@ pub(crate) fn stage_huffman_encode_gpu(
     use crate::opencl::DeviceBuf;
 
     let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
-    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+    let pre_entropy_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
 
     block.data = encode_multistream(
         &streams,
@@ -267,6 +273,7 @@ pub(crate) fn stage_huffman_encode_gpu(
 ///
 /// Falls back to CPU for empty streams where GPU overhead dominates.
 #[cfg(feature = "webgpu")]
+#[allow(dead_code)] // Available but not currently called; CPU Huffman is faster (see blocks.rs)
 pub(crate) fn stage_huffman_encode_webgpu(
     mut block: StageBlock,
     engine: &crate::webgpu::WebGpuEngine,
@@ -274,7 +281,10 @@ pub(crate) fn stage_huffman_encode_webgpu(
     use crate::webgpu::DeviceBuf;
 
     let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
-    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+    let pre_entropy_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
 
     block.data = encode_multistream(
         &streams,
@@ -369,7 +379,10 @@ pub(crate) fn stage_huffman_decode(mut block: StageBlock) -> PzResult<StageBlock
 /// Per-stream framing: [orig_len: u32] [compressed_len: u32] [rans_data]
 pub(crate) fn stage_rans_encode(mut block: StageBlock) -> PzResult<StageBlock> {
     let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
-    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+    let pre_entropy_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
 
     block.data = encode_multistream(
         &streams,
@@ -448,7 +461,10 @@ fn adaptive_accuracy_log(data: &[u8]) -> u8 {
 /// Per-stream framing: [orig_len: u32] [compressed_len: u32] [fse_data]
 pub(crate) fn stage_fse_encode(mut block: StageBlock) -> PzResult<StageBlock> {
     let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
-    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+    let pre_entropy_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
 
     block.data = encode_multistream(
         &streams,
@@ -492,6 +508,60 @@ pub(crate) fn stage_fse_decode(mut block: StageBlock) -> PzResult<StageBlock> {
 }
 
 // ---------------------------------------------------------------------------
+// Entropy stage functions — Interleaved FSE (GPU-decodable, LZ-based pipelines)
+// ---------------------------------------------------------------------------
+
+/// Interleaved FSE encoding stage: encode each stream with N-way interleaved FSE.
+///
+/// Per-stream framing: [orig_len: u32] [compressed_len: u32] [interleaved_fse_data]
+///
+/// The interleaved format splits each stream into N independent FSE lanes,
+/// enabling parallel decode on GPU (one workgroup per lane).
+pub(crate) fn stage_fse_interleaved_encode(mut block: StageBlock) -> PzResult<StageBlock> {
+    let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
+    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+
+    block.data = encode_multistream(
+        &streams,
+        pre_entropy_len,
+        &block.metadata.demux_meta,
+        |stream, output| {
+            let fse_data = fse::encode_interleaved(stream);
+            output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+            output.extend_from_slice(&(fse_data.len() as u32).to_le_bytes());
+            output.extend_from_slice(&fse_data);
+            Ok(())
+        },
+    )?;
+
+    Ok(block)
+}
+
+/// Interleaved FSE decoding stage (CPU): parse multi-stream container + decode each stream.
+///
+/// Per-stream framing: [orig_len: u32] [compressed_len: u32] [interleaved_fse_data]
+pub(crate) fn stage_fse_interleaved_decode(mut block: StageBlock) -> PzResult<StageBlock> {
+    let (streams, pre_entropy_len, meta) = decode_multistream(&block.data, |data| {
+        if data.len() < 8 {
+            return Err(PzError::InvalidInput);
+        }
+        let orig_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let comp_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        if 8 + comp_len > data.len() {
+            return Err(PzError::InvalidInput);
+        }
+        let decoded = fse::decode_interleaved(&data[8..8 + comp_len], orig_len)?;
+        Ok((decoded, 8 + comp_len))
+    })?;
+
+    block.metadata.pre_entropy_len = Some(pre_entropy_len);
+    block.metadata.demux_meta = meta;
+    block.streams = Some(streams);
+    block.data.clear();
+    Ok(block)
+}
+
+// ---------------------------------------------------------------------------
 // BWT pipeline stages (Bw)
 // ---------------------------------------------------------------------------
 
@@ -521,8 +591,14 @@ pub(crate) fn stage_rle_encode(mut block: StageBlock) -> PzResult<StageBlock> {
 
 /// Bw stage 3: FSE encoding + serialization.
 pub(crate) fn stage_fse_encode_bw(mut block: StageBlock) -> PzResult<StageBlock> {
-    let primary_index = block.metadata.bwt_primary_index.unwrap();
-    let rle_len = block.metadata.pre_entropy_len.unwrap();
+    let primary_index = block
+        .metadata
+        .bwt_primary_index
+        .ok_or(PzError::InvalidInput)?;
+    let rle_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
     let fse_data = fse::encode(&block.data);
 
     let mut output = Vec::new();
@@ -563,7 +639,10 @@ pub(crate) fn stage_mtf_decode(mut block: StageBlock) -> PzResult<StageBlock> {
 
 /// Bw decompress stage 3: BWT decode.
 pub(crate) fn stage_bwt_decode(mut block: StageBlock) -> PzResult<StageBlock> {
-    let primary_index = block.metadata.bwt_primary_index.unwrap();
+    let primary_index = block
+        .metadata
+        .bwt_primary_index
+        .ok_or(PzError::InvalidInput)?;
     block.data = bwt::decode(&block.data, primary_index)?;
     Ok(block)
 }
@@ -587,8 +666,15 @@ pub(crate) fn stage_bbwt_encode(
 ///
 /// Format: [num_factors: u16] [factor_lengths: u32 × num_factors] [rle_len: u32] [fse_data...]
 pub(crate) fn stage_fse_encode_bbw(mut block: StageBlock) -> PzResult<StageBlock> {
-    let factor_lengths = block.metadata.bbwt_factor_lengths.take().unwrap();
-    let rle_len = block.metadata.pre_entropy_len.unwrap();
+    let factor_lengths = block
+        .metadata
+        .bbwt_factor_lengths
+        .take()
+        .ok_or(PzError::InvalidInput)?;
+    let rle_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
     let fse_data = fse::encode(&block.data);
 
     let mut output = Vec::new();
@@ -661,7 +747,7 @@ pub(crate) fn pipeline_stage_count(pipeline: Pipeline) -> usize {
         Pipeline::Bw => 4,
         Pipeline::Bbw => 4,
         Pipeline::Lzr => 2,
-        Pipeline::Lzf => 2,
+        Pipeline::Lzf | Pipeline::Lzfi => 2,
         Pipeline::LzssR | Pipeline::Lz78R => 2,
     }
 }
@@ -698,6 +784,8 @@ pub(crate) fn run_compress_stage(
         (Pipeline::Lzr, 1) => stage_rans_encode(block),
         (Pipeline::Lzf, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
         (Pipeline::Lzf, 1) => stage_fse_encode(block),
+        (Pipeline::Lzfi, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
+        (Pipeline::Lzfi, 1) => stage_fse_interleaved_encode(block),
         (Pipeline::LzssR, 0) => stage_demux_compress(block, &LzDemuxer::Lzss, options),
         (Pipeline::LzssR, 1) => stage_rans_encode(block),
         (Pipeline::Lz78R, 0) => stage_demux_compress(block, &LzDemuxer::Lz78, options),
@@ -732,6 +820,9 @@ pub(crate) fn run_decompress_stage(
         // Lzf: FSE decode(0) → LZ77 decompress(1)
         (Pipeline::Lzf, 0) => stage_fse_decode(block),
         (Pipeline::Lzf, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
+        // Lzfi: interleaved FSE decode(0) → LZ77 decompress(1)
+        (Pipeline::Lzfi, 0) => stage_fse_interleaved_decode(block),
+        (Pipeline::Lzfi, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
         // LzssR: rANS decode(0) → LZSS decompress(1)
         (Pipeline::LzssR, 0) => stage_rans_decode(block),
         (Pipeline::LzssR, 1) => stage_demux_decompress(block, &LzDemuxer::Lzss),

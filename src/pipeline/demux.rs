@@ -51,9 +51,10 @@ pub(crate) enum LzDemuxer {
 /// Returns `None` for BWT-based pipelines (Bw, Bbw).
 pub(crate) fn demuxer_for_pipeline(pipeline: super::Pipeline) -> Option<LzDemuxer> {
     match pipeline {
-        super::Pipeline::Deflate | super::Pipeline::Lzr | super::Pipeline::Lzf => {
-            Some(LzDemuxer::Lz77)
-        }
+        super::Pipeline::Deflate
+        | super::Pipeline::Lzr
+        | super::Pipeline::Lzf
+        | super::Pipeline::Lzfi => Some(LzDemuxer::Lz77),
         super::Pipeline::LzssR => Some(LzDemuxer::Lzss),
         super::Pipeline::Lz78R => Some(LzDemuxer::Lz78),
         super::Pipeline::Bw | super::Pipeline::Bbw => None,
@@ -114,12 +115,23 @@ impl StreamDemuxer for LzDemuxer {
                 let mut lengths = Vec::new();
                 let mut td_pos = 0;
 
+                let required_flag_bytes = (num_tokens as usize).div_ceil(8);
+                if required_flag_bytes > flag_bytes_len {
+                    return Err(PzError::InvalidInput);
+                }
+
                 for i in 0..num_tokens as usize {
                     let is_literal = flags_data[i / 8] & (1 << (7 - (i % 8))) != 0;
                     if is_literal {
+                        if td_pos >= token_data.len() {
+                            return Err(PzError::InvalidInput);
+                        }
                         literals.push(token_data[td_pos]);
                         td_pos += 1;
                     } else {
+                        if td_pos + 4 > token_data.len() {
+                            return Err(PzError::InvalidInput);
+                        }
                         offsets.extend_from_slice(&token_data[td_pos..td_pos + 2]);
                         lengths.extend_from_slice(&token_data[td_pos + 2..td_pos + 4]);
                         td_pos += 4;
@@ -195,6 +207,11 @@ impl StreamDemuxer for LzDemuxer {
                 let offsets = &streams[2];
                 let lengths = &streams[3];
                 let flag_bytes_len = flags_stream.len();
+
+                let required_flag_bytes = (num_tokens as usize).div_ceil(8);
+                if required_flag_bytes > flag_bytes_len {
+                    return Err(PzError::InvalidInput);
+                }
 
                 let mut token_data = Vec::new();
                 let mut lit_pos = 0;

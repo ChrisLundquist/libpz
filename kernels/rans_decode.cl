@@ -18,6 +18,14 @@
 // Per-lane metadata layout: [initial_state, num_words, word_offset]
 // Lane i starts at lane_meta[i * 3].
 
+// @pz_cost {
+//   threads_per_element: 0.0625
+//   passes: 1
+//   buffers: cum2sym=16384, freq_table=512, cum_table=512, word_data=N, lane_meta=192, output=N
+//   local_mem: 16384
+//   note: threads = num_lanes (typ. K=16), each decodes N/K symbols. word_data ≈ N compressed.
+// }
+
 #define RANS_L 65536u
 #define IO_BITS 16u
 

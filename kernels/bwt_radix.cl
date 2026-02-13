@@ -10,6 +10,14 @@
 ///
 /// Compiled with -DWORKGROUP_SIZE=N (power of 2, typically 256).
 
+// @pz_cost {
+//   threads_per_element: 1
+//   passes: 3
+//   buffers: keys=N*4, histogram=N*4, sa_in=N*4, sa_out=N*4
+//   local_mem: 1024
+//   note: 4 radix passes per doubling step
+// }
+
 /// Number of radix buckets (8-bit digit → 256 values).
 #define RADIX 256
 

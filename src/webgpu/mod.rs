@@ -28,6 +28,7 @@
 //! ```
 
 use crate::bwt::BwtResult;
+use crate::gpu_cost::KernelCost;
 use crate::lz77::Match;
 use crate::{PzError, PzResult};
 
@@ -101,10 +102,6 @@ struct PendingLz77 {
     input_len: usize,
 }
 
-/// Maximum number of blocks to submit in a single GPU batch.
-/// Limits GPU memory pressure: 8 x 256KB x ~36 bytes/pos ~ 72MB.
-const MAX_GPU_BATCH_SIZE: usize = 8;
-
 /// Information about a discovered WebGPU device.
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -174,8 +171,6 @@ pub struct WebGpuEngine {
     pipeline_byte_histogram: wgpu::ComputePipeline,
     pipeline_compute_bit_lengths: wgpu::ComputePipeline,
     pipeline_write_codes: wgpu::ComputePipeline,
-    pipeline_prefix_sum_block: wgpu::ComputePipeline,
-    pipeline_prefix_sum_apply: wgpu::ComputePipeline,
     pipeline_fse_decode: wgpu::ComputePipeline,
     /// Device name for diagnostics.
     device_name: String,
@@ -189,14 +184,14 @@ pub struct WebGpuEngine {
     scan_workgroup_size: usize,
     /// Maximum storage buffer binding size in bytes (device limit).
     max_buffer_size: u32,
+    /// Parsed cost model for the LZ77 lazy kernel (used for batch scheduling).
+    cost_lz77_lazy: KernelCost,
     /// Whether profiling is enabled (timestamp queries).
     profiling: bool,
     /// Query set for timestamp profiling (begin + end).
     query_set: Option<wgpu::QuerySet>,
     /// Buffer to resolve timestamp queries into.
     resolve_buf: Option<wgpu::Buffer>,
-    /// Staging buffer for reading back resolved timestamps.
-    staging_buf: Option<wgpu::Buffer>,
 }
 
 impl std::fmt::Debug for WebGpuEngine {
@@ -369,14 +364,14 @@ impl WebGpuEngine {
             "compute_bit_lengths",
         );
         let pipeline_write_codes = make_pipeline("write_codes", &huffman_module, "write_codes");
-        let pipeline_prefix_sum_block =
-            make_pipeline("prefix_sum_block", &huffman_module, "prefix_sum_block");
-        let pipeline_prefix_sum_apply =
-            make_pipeline("prefix_sum_apply", &huffman_module, "prefix_sum_apply");
         let pipeline_fse_decode = make_pipeline("fse_decode", &fse_decode_module, "fse_decode");
 
+        // Parse kernel cost annotations for batch scheduling.
+        let cost_lz77_lazy = KernelCost::parse(LZ77_LAZY_KERNEL_SOURCE)
+            .expect("lz77_lazy.wgsl missing @pz_cost annotation");
+
         // Create profiling resources when GPU timestamps are available.
-        let (query_set, resolve_buf, staging_buf) = if use_timestamps {
+        let (query_set, resolve_buf) = if use_timestamps {
             let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("timestamp_query_set"),
                 ty: wgpu::QueryType::Timestamp,
@@ -388,15 +383,9 @@ impl WebGpuEngine {
                 usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
-            let staging = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("timestamp_staging"),
-                size: 2 * std::mem::size_of::<u64>() as u64,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            (Some(qs), Some(resolve), Some(staging))
+            (Some(qs), Some(resolve))
         } else {
-            (None, None, None)
+            (None, None)
         };
 
         Ok(WebGpuEngine {
@@ -419,8 +408,6 @@ impl WebGpuEngine {
             pipeline_byte_histogram,
             pipeline_compute_bit_lengths,
             pipeline_write_codes,
-            pipeline_prefix_sum_block,
-            pipeline_prefix_sum_apply,
             pipeline_fse_decode,
             device_name,
             max_work_group_size,
@@ -428,10 +415,10 @@ impl WebGpuEngine {
             is_cpu,
             scan_workgroup_size,
             max_buffer_size,
+            cost_lz77_lazy,
             profiling,
             query_set,
             resolve_buf,
-            staging_buf,
         })
     }
 
@@ -453,6 +440,41 @@ impl WebGpuEngine {
     /// Whether profiling is enabled on this engine.
     pub fn profiling(&self) -> bool {
         self.profiling
+    }
+
+    /// Max blocks of `block_size` bytes in flight for a kernel without
+    /// exceeding the GPU memory budget.
+    pub(crate) fn max_in_flight(&self, kernel: &KernelCost, block_size: usize) -> usize {
+        let per_block = kernel.memory_bytes(block_size);
+        if per_block == 0 {
+            return 8;
+        }
+        (self.gpu_memory_budget() / per_block).max(1)
+    }
+
+    /// GPU memory budget for concurrent in-flight work.
+    ///
+    /// Discrete GPUs have far more VRAM than `max_buffer_size` (which is a
+    /// per-buffer WebGPU limit, typically 256MB-1GB). Use 4× max_buffer_size
+    /// as a proxy for total available memory, which is still conservative for
+    /// cards with 8-16GB VRAM but allows enough headroom to submit many
+    /// blocks in parallel.
+    fn gpu_memory_budget(&self) -> usize {
+        if self.is_cpu {
+            // Integrated/CPU devices: be conservative
+            (self.max_buffer_size as usize) / 2
+        } else {
+            // Discrete GPU: allow 4× max_buffer_size (~1-4GB on modern cards)
+            (self.max_buffer_size as usize) * 4
+        }
+    }
+
+    /// Compute the batch size for LZ77 GPU dispatches, based on the cost model
+    /// and memory budget. Exposed for the pipelined batched path in `parallel.rs`.
+    pub(crate) fn lz77_batch_size(&self, block_size: usize) -> usize {
+        const GPU_MAX_BATCH: usize = 64;
+        let mem_limit = self.max_in_flight(&self.cost_lz77_lazy, block_size);
+        mem_limit.min(GPU_MAX_BATCH)
     }
 
     /// Maximum input size (bytes) that fits in a single GPU dispatch.
@@ -617,12 +639,21 @@ impl WebGpuEngine {
     }
 
     /// Resolve timestamp queries, read back, and print elapsed time.
+    ///
+    /// Uses a per-call staging buffer instead of the shared `self.staging_buf`
+    /// to avoid "buffer is still mapped" panics when called from multiple
+    /// threads or re-entrantly within the same dispatch sequence.
     fn read_and_print_timestamps(&self, label: &str) {
-        let (Some(qs), Some(resolve), Some(staging)) =
-            (&self.query_set, &self.resolve_buf, &self.staging_buf)
-        else {
+        let (Some(qs), Some(resolve)) = (&self.query_set, &self.resolve_buf) else {
             return;
         };
+
+        // Allocate a per-call staging buffer to avoid races with the shared one.
+        let staging = self.create_buffer(
+            "timestamp_staging_local",
+            2 * std::mem::size_of::<u64>() as u64,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
 
         let mut encoder = self
             .device
@@ -630,7 +661,7 @@ impl WebGpuEngine {
                 label: Some("timestamp_resolve"),
             });
         encoder.resolve_query_set(qs, 0..2, resolve, 0);
-        encoder.copy_buffer_to_buffer(resolve, 0, staging, 0, 16);
+        encoder.copy_buffer_to_buffer(resolve, 0, &staging, 0, 16);
         self.queue.submit(Some(encoder.finish()));
 
         let slice = staging.slice(..);
@@ -742,7 +773,10 @@ impl DeviceBuf {
         })
     }
 
-    /// Allocate a zero-initialized device buffer of the given size.
+    /// Allocate a device buffer of the given size.
+    ///
+    /// **Note:** The buffer contents are *not* guaranteed to be zero-initialized.
+    /// Callers that need zeroed memory should write zeros explicitly.
     pub fn alloc(engine: &WebGpuEngine, len: usize) -> PzResult<Self> {
         let actual_len = len.max(4); // avoid zero-size allocation
         let buf = engine.create_buffer(

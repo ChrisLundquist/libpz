@@ -7,6 +7,14 @@
 ///
 /// Compiled with -DWORKGROUP_SIZE=N (power of 2, typically 256).
 
+// @pz_cost {
+//   threads_per_element: 1
+//   passes: 4
+//   buffers: sa=N*4, rank=N*4, diff=N*4, prefix=N*4
+//   local_mem: 2048
+//   note: called per doubling step (log2(N) steps)
+// }
+
 /// Phase 1: Parallel comparison of consecutive composite keys.
 ///
 /// For each sorted position i, compare the composite key of sa[i] against

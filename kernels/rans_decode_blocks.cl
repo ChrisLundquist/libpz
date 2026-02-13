@@ -16,6 +16,14 @@
 // Per-lane metadata layout (3 entries per lane):
 //   [initial_state, num_words, word_offset]
 
+// @pz_cost {
+//   threads_per_element: 0.0625
+//   passes: 1
+//   buffers: cum2sym=16384, freq_table=512, cum_table=512, word_data=N, block_meta=N*0.001, lane_meta=N*0.05, output=N
+//   local_mem: 16384
+//   note: one workgroup per block. K lanes per block (typ. 16). Batched: single launch for all blocks.
+// }
+
 #define RANS_L 65536u
 #define IO_BITS 16u
 
