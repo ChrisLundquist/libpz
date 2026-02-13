@@ -1,10 +1,10 @@
 //! Per-pipeline single-block compress and decompress implementations.
 //!
-//! LZ-based pipelines (Deflate, Lzr, Lzf, LzssR, Lz78R) use a unified path:
+//! LZ-based pipelines (Deflate, Lzr, Lzf, Lzfi, LzssR, Lz78R) use a unified path:
 //!   compress:   demux → entropy_encode
 //!   decompress: entropy_decode → demux
 //!
-//! BWT-based pipelines (Bw, Bbw) have their own structure and are handled separately.
+//! BWT-based pipelines (Bw, Bbw, Bwi) have their own structure and are handled separately.
 
 use crate::bwt;
 use crate::fse;
@@ -46,6 +46,7 @@ pub(crate) fn compress_block(
         None => match pipeline {
             Pipeline::Bw => compress_block_bw(input, opts),
             Pipeline::Bbw => compress_block_bbw(input, opts),
+            Pipeline::Bwi => compress_block_bwi(input, opts),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -62,6 +63,7 @@ pub(crate) fn decompress_block(
         None => match pipeline {
             Pipeline::Bw => decompress_block_bw(payload, orig_len),
             Pipeline::Bbw => decompress_block_bbw(payload, orig_len),
+            Pipeline::Bwi => decompress_block_bwi(payload, orig_len),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -166,6 +168,10 @@ fn entropy_encode(
             let _ = (input_len, options);
             stage_fse_encode(block)
         }
+        Pipeline::Lzfi => {
+            let _ = (input_len, options);
+            stage_fse_interleaved_encode(block)
+        }
         _ => Err(PzError::Unsupported),
     }
 }
@@ -176,6 +182,7 @@ fn entropy_decode(block: StageBlock, pipeline: Pipeline) -> PzResult<StageBlock>
         Pipeline::Deflate => stage_huffman_decode(block),
         Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R => stage_rans_decode(block),
         Pipeline::Lzf => stage_fse_decode(block),
+        Pipeline::Lzfi => stage_fse_interleaved_decode(block),
         _ => Err(PzError::Unsupported),
     }
 }
@@ -296,6 +303,56 @@ fn decompress_block_bbw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 
     // Stage 4: Inverse bijective BWT
     let output = bwt::decode_bijective(&bwt_data, &factor_lengths)?;
+
+    if output.len() != orig_len {
+        return Err(PzError::InvalidInput);
+    }
+
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
+// BWI pipeline: BWT + MTF + RLE + interleaved FSE (GPU-decodable)
+// ---------------------------------------------------------------------------
+
+/// Compress a single block using the Bwi pipeline (no container header).
+fn compress_block_bwi(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
+    let block = StageBlock {
+        block_index: 0,
+        original_len: input.len(),
+        data: input.to_vec(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+    let block = stage_bwt_encode(block, options)?;
+    let block = stage_mtf_encode(block)?;
+    let block = stage_rle_encode(block)?;
+    let block = stage_fse_interleaved_encode_bwi(block)?;
+    Ok(block.data)
+}
+
+/// Decompress a single Bwi block (no container header).
+fn decompress_block_bwi(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    if payload.len() < 8 {
+        return Err(PzError::InvalidInput);
+    }
+
+    let primary_index = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let rle_len = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
+
+    let entropy_data = &payload[8..];
+
+    // Stage 1: Interleaved FSE decode
+    let rle_data = fse::decode_interleaved(entropy_data, rle_len)?;
+
+    // Stage 2: RLE decode
+    let mtf_data = rle::decode(&rle_data)?;
+
+    // Stage 3: Inverse MTF
+    let bwt_data = mtf::decode(&mtf_data);
+
+    // Stage 4: Inverse BWT
+    let output = bwt::decode(&bwt_data, primary_index)?;
 
     if output.len() != orig_len {
         return Err(PzError::InvalidInput);

@@ -13,14 +13,16 @@
 //! | `Bw`          | BWT → MTF → RLE → FSE            | bzip2           |
 //! | `Lzr`         | LZ77 → rANS                      | fast ANS        |
 //! | `Lzf`         | LZ77 → FSE                       | zstd-like       |
+//! | `Lzfi`        | LZ77 → interleaved FSE           | GPU FSE decode  |
 //! | `LzssR`       | LZSS → rANS                      | experimental    |
+//! | `Bwi`         | BWT → MTF → RLE → interleaved FSE| GPU FSE decode  |
 //! | `Lz78R`       | LZ78 → rANS                      | experimental    |
 //!
 //! **Container format (V2, multi-block):**
 //! Each compressed stream starts with a header:
 //! - Magic bytes: `PZ` (2 bytes)
 //! - Version: 2 (1 byte)
-//! - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 6=LzssR, 8=Lz78R (1 byte)
+//! - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 5=Lzfi, 6=LzssR, 7=Bwi, 8=Lz78R (1 byte)
 //! - Original length: u32 little-endian (4 bytes)
 //! - num_blocks: u32 little-endian (4 bytes)
 //! - Block table: \[compressed_len: u32, original_len: u32\] \* num_blocks
@@ -166,8 +168,12 @@ pub enum Pipeline {
     Lzr = 3,
     /// LZ77 + FSE (finite state entropy, zstd-style)
     Lzf = 4,
+    /// LZ77 + interleaved FSE (N-way parallel FSE, GPU-decodable)
+    Lzfi = 5,
     /// LZSS + rANS (flag-bit LZ + arithmetic ANS, experimental)
     LzssR = 6,
+    /// BWT + MTF + RLE + interleaved FSE (GPU-decodable entropy)
+    Bwi = 7,
     /// LZ78 + rANS (incremental trie + rANS, experimental)
     Lz78R = 8,
 }
@@ -182,7 +188,9 @@ impl TryFrom<u8> for Pipeline {
             2 => Ok(Self::Bbw),
             3 => Ok(Self::Lzr),
             4 => Ok(Self::Lzf),
+            5 => Ok(Self::Lzfi),
             6 => Ok(Self::LzssR),
+            7 => Ok(Self::Bwi),
             8 => Ok(Self::Lz78R),
             _ => Err(PzError::Unsupported),
         }
@@ -409,7 +417,9 @@ pub fn select_pipeline_trial(
         Pipeline::Bw,
         Pipeline::Lzr,
         Pipeline::Lzf,
+        Pipeline::Lzfi,
         Pipeline::LzssR,
+        Pipeline::Bwi,
         Pipeline::Lz78R,
     ];
     let mut best_pipeline = Pipeline::Deflate;

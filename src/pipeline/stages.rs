@@ -492,6 +492,93 @@ pub(crate) fn stage_fse_decode(mut block: StageBlock) -> PzResult<StageBlock> {
 }
 
 // ---------------------------------------------------------------------------
+// Entropy stage functions — Interleaved FSE (GPU-decodable, LZ-based pipelines)
+// ---------------------------------------------------------------------------
+
+/// Interleaved FSE encoding stage: encode each stream with N-way interleaved FSE.
+///
+/// Per-stream framing: [orig_len: u32] [compressed_len: u32] [interleaved_fse_data]
+///
+/// The interleaved format splits each stream into N independent FSE lanes,
+/// enabling parallel decode on GPU (one workgroup per lane).
+pub(crate) fn stage_fse_interleaved_encode(mut block: StageBlock) -> PzResult<StageBlock> {
+    let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
+    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+
+    block.data = encode_multistream(
+        &streams,
+        pre_entropy_len,
+        &block.metadata.demux_meta,
+        |stream, output| {
+            let fse_data = fse::encode_interleaved(stream);
+            output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+            output.extend_from_slice(&(fse_data.len() as u32).to_le_bytes());
+            output.extend_from_slice(&fse_data);
+            Ok(())
+        },
+    )?;
+
+    Ok(block)
+}
+
+/// Interleaved FSE decoding stage (CPU): parse multi-stream container + decode each stream.
+///
+/// Per-stream framing: [orig_len: u32] [compressed_len: u32] [interleaved_fse_data]
+pub(crate) fn stage_fse_interleaved_decode(mut block: StageBlock) -> PzResult<StageBlock> {
+    let (streams, pre_entropy_len, meta) = decode_multistream(&block.data, |data| {
+        if data.len() < 8 {
+            return Err(PzError::InvalidInput);
+        }
+        let orig_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let comp_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        if 8 + comp_len > data.len() {
+            return Err(PzError::InvalidInput);
+        }
+        let decoded = fse::decode_interleaved(&data[8..8 + comp_len], orig_len)?;
+        Ok((decoded, 8 + comp_len))
+    })?;
+
+    block.metadata.pre_entropy_len = Some(pre_entropy_len);
+    block.metadata.demux_meta = meta;
+    block.streams = Some(streams);
+    block.data.clear();
+    Ok(block)
+}
+
+/// Interleaved FSE decoding stage (WebGPU GPU): decode each stream on GPU.
+///
+/// Falls back to CPU decode for empty streams.
+#[cfg(feature = "webgpu")]
+pub(crate) fn stage_fse_interleaved_decode_webgpu(
+    mut block: StageBlock,
+    engine: &crate::webgpu::WebGpuEngine,
+) -> PzResult<StageBlock> {
+    let (streams, pre_entropy_len, meta) = decode_multistream(&block.data, |data| {
+        if data.len() < 8 {
+            return Err(PzError::InvalidInput);
+        }
+        let orig_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let comp_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        if 8 + comp_len > data.len() {
+            return Err(PzError::InvalidInput);
+        }
+        let fse_data = &data[8..8 + comp_len];
+        let decoded = if orig_len == 0 || fse_data.is_empty() {
+            fse::decode_interleaved(fse_data, orig_len)?
+        } else {
+            engine.fse_decode(fse_data, orig_len)?
+        };
+        Ok((decoded, 8 + comp_len))
+    })?;
+
+    block.metadata.pre_entropy_len = Some(pre_entropy_len);
+    block.metadata.demux_meta = meta;
+    block.streams = Some(streams);
+    block.data.clear();
+    Ok(block)
+}
+
+// ---------------------------------------------------------------------------
 // BWT pipeline stages (Bw)
 // ---------------------------------------------------------------------------
 
@@ -651,6 +738,66 @@ pub(crate) fn stage_bbwt_decode(mut block: StageBlock) -> PzResult<StageBlock> {
 }
 
 // ---------------------------------------------------------------------------
+// BWI pipeline stages (BWT + MTF + RLE + interleaved FSE)
+// ---------------------------------------------------------------------------
+
+/// Bwi stage 3: interleaved FSE encoding + serialization.
+///
+/// Format: [primary_index: u32] [rle_len: u32] [interleaved_fse_data...]
+pub(crate) fn stage_fse_interleaved_encode_bwi(mut block: StageBlock) -> PzResult<StageBlock> {
+    let primary_index = block.metadata.bwt_primary_index.unwrap();
+    let rle_len = block.metadata.pre_entropy_len.unwrap();
+    let fse_data = fse::encode_interleaved(&block.data);
+
+    let mut output = Vec::new();
+    output.extend_from_slice(&primary_index.to_le_bytes());
+    output.extend_from_slice(&(rle_len as u32).to_le_bytes());
+    output.extend_from_slice(&fse_data);
+
+    block.data = output;
+    Ok(block)
+}
+
+/// Bwi decompress stage 0 (CPU): parse metadata + interleaved FSE decode.
+pub(crate) fn stage_fse_interleaved_decode_bwi(mut block: StageBlock) -> PzResult<StageBlock> {
+    if block.data.len() < 8 {
+        return Err(PzError::InvalidInput);
+    }
+    let primary_index =
+        u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]);
+    let rle_len =
+        u32::from_le_bytes([block.data[4], block.data[5], block.data[6], block.data[7]]) as usize;
+
+    block.metadata.bwt_primary_index = Some(primary_index);
+    block.data = fse::decode_interleaved(&block.data[8..], rle_len)?;
+    Ok(block)
+}
+
+/// Bwi decompress stage 0 (WebGPU GPU): parse metadata + GPU FSE decode.
+#[cfg(feature = "webgpu")]
+pub(crate) fn stage_fse_interleaved_decode_bwi_webgpu(
+    mut block: StageBlock,
+    engine: &crate::webgpu::WebGpuEngine,
+) -> PzResult<StageBlock> {
+    if block.data.len() < 8 {
+        return Err(PzError::InvalidInput);
+    }
+    let primary_index =
+        u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]);
+    let rle_len =
+        u32::from_le_bytes([block.data[4], block.data[5], block.data[6], block.data[7]]) as usize;
+
+    block.metadata.bwt_primary_index = Some(primary_index);
+    let fse_data = &block.data[8..];
+    block.data = if rle_len == 0 || fse_data.is_empty() {
+        fse::decode_interleaved(fse_data, rle_len)?
+    } else {
+        engine.fse_decode(fse_data, rle_len)?
+    };
+    Ok(block)
+}
+
+// ---------------------------------------------------------------------------
 // Stage dispatch — maps (pipeline, stage_idx) to the appropriate function
 // ---------------------------------------------------------------------------
 
@@ -660,8 +807,9 @@ pub(crate) fn pipeline_stage_count(pipeline: Pipeline) -> usize {
         Pipeline::Deflate => 2,
         Pipeline::Bw => 4,
         Pipeline::Bbw => 4,
+        Pipeline::Bwi => 4,
         Pipeline::Lzr => 2,
-        Pipeline::Lzf => 2,
+        Pipeline::Lzf | Pipeline::Lzfi => 2,
         Pipeline::LzssR | Pipeline::Lz78R => 2,
     }
 }
@@ -698,6 +846,12 @@ pub(crate) fn run_compress_stage(
         (Pipeline::Lzr, 1) => stage_rans_encode(block),
         (Pipeline::Lzf, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
         (Pipeline::Lzf, 1) => stage_fse_encode(block),
+        (Pipeline::Lzfi, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
+        (Pipeline::Lzfi, 1) => stage_fse_interleaved_encode(block),
+        (Pipeline::Bwi, 0) => stage_bwt_encode(block, options),
+        (Pipeline::Bwi, 1) => stage_mtf_encode(block),
+        (Pipeline::Bwi, 2) => stage_rle_encode(block),
+        (Pipeline::Bwi, 3) => stage_fse_interleaved_encode_bwi(block),
         (Pipeline::LzssR, 0) => stage_demux_compress(block, &LzDemuxer::Lzss, options),
         (Pipeline::LzssR, 1) => stage_rans_encode(block),
         (Pipeline::Lz78R, 0) => stage_demux_compress(block, &LzDemuxer::Lz78, options),
@@ -732,6 +886,14 @@ pub(crate) fn run_decompress_stage(
         // Lzf: FSE decode(0) → LZ77 decompress(1)
         (Pipeline::Lzf, 0) => stage_fse_decode(block),
         (Pipeline::Lzf, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
+        // Lzfi: interleaved FSE decode(0) → LZ77 decompress(1)
+        (Pipeline::Lzfi, 0) => stage_fse_interleaved_decode(block),
+        (Pipeline::Lzfi, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
+        // Bwi: interleaved FSE decode(0) → RLE decode(1) → MTF decode(2) → BWT decode(3)
+        (Pipeline::Bwi, 0) => stage_fse_interleaved_decode_bwi(block),
+        (Pipeline::Bwi, 1) => stage_rle_decode(block),
+        (Pipeline::Bwi, 2) => stage_mtf_decode(block),
+        (Pipeline::Bwi, 3) => stage_bwt_decode(block),
         // LzssR: rANS decode(0) → LZSS decompress(1)
         (Pipeline::LzssR, 0) => stage_rans_decode(block),
         (Pipeline::LzssR, 1) => stage_demux_decompress(block, &LzDemuxer::Lzss),
