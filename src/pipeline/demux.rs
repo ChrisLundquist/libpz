@@ -51,9 +51,6 @@ pub(crate) enum LzDemuxer {
 
 /// Map a pipeline to its demuxer, if it uses one.
 /// Returns `None` for BWT-based pipelines (Bw, Bbw).
-// TODO: Use in compress_block/decompress_block to replace per-pipeline match arms with
-// a generic demux→entropy path, reducing code duplication across LZ-based pipelines.
-#[allow(dead_code)]
 pub(crate) fn demuxer_for_pipeline(pipeline: super::Pipeline) -> Option<LzDemuxer> {
     match pipeline {
         super::Pipeline::Deflate | super::Pipeline::Lzr | super::Pipeline::Lzf => {

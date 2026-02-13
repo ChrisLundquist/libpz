@@ -1,4 +1,10 @@
 //! Per-pipeline single-block compress and decompress implementations.
+//!
+//! LZ-based pipelines (Deflate, Lzr, Lzf, LzssR, Lz78R) use a unified path:
+//!   compress:   demux → entropy_encode
+//!   decompress: entropy_decode → demux
+//!
+//! BWT-based pipelines (Bw, Bbw) have their own structure and are handled separately.
 
 use crate::bwt;
 use crate::fse;
@@ -11,6 +17,10 @@ use super::stages::*;
 #[cfg(any(feature = "opencl", feature = "webgpu"))]
 use super::Backend;
 use super::{resolve_max_match_len, CompressOptions, Pipeline};
+
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
 
 /// Compress a single block using the appropriate pipeline (no container header).
 pub(crate) fn compress_block(
@@ -31,14 +41,13 @@ pub(crate) fn compress_block(
         options
     };
 
-    match pipeline {
-        Pipeline::Deflate => compress_block_deflate(input, opts),
-        Pipeline::Bw => compress_block_bw(input, opts),
-        Pipeline::Bbw => compress_block_bbw(input, opts),
-        Pipeline::Lzr => compress_block_lzr(input, opts),
-        Pipeline::Lzf => compress_block_lzf(input, opts),
-        Pipeline::LzssR => compress_block_lzssr(input),
-        Pipeline::Lz78R => compress_block_lz78r(input),
+    match demuxer_for_pipeline(pipeline) {
+        Some(demuxer) => compress_block_lz(input, pipeline, &demuxer, opts),
+        None => match pipeline {
+            Pipeline::Bw => compress_block_bw(input, opts),
+            Pipeline::Bbw => compress_block_bbw(input, opts),
+            _ => Err(PzError::Unsupported),
+        },
     }
 }
 
@@ -48,26 +57,30 @@ pub(crate) fn decompress_block(
     pipeline: Pipeline,
     orig_len: usize,
 ) -> PzResult<Vec<u8>> {
-    match pipeline {
-        Pipeline::Deflate => decompress_block_deflate(payload, orig_len),
-        Pipeline::Bw => decompress_block_bw(payload, orig_len),
-        Pipeline::Bbw => decompress_block_bbw(payload, orig_len),
-        Pipeline::Lzr => decompress_block_lzr(payload, orig_len),
-        Pipeline::Lzf => decompress_block_lzf(payload, orig_len),
-        Pipeline::LzssR => decompress_block_lzssr(payload, orig_len),
-        Pipeline::Lz78R => decompress_block_lz78r(payload, orig_len),
+    match demuxer_for_pipeline(pipeline) {
+        Some(demuxer) => decompress_block_lz(payload, pipeline, &demuxer, orig_len),
+        None => match pipeline {
+            Pipeline::Bw => decompress_block_bw(payload, orig_len),
+            Pipeline::Bbw => decompress_block_bbw(payload, orig_len),
+            _ => Err(PzError::Unsupported),
+        },
     }
 }
 
-// --- DEFLATE pipeline: LZ77 + Huffman ---
+// ---------------------------------------------------------------------------
+// Unified LZ-based pipeline path
+// ---------------------------------------------------------------------------
 
-/// Compress a single block using the Deflate pipeline (no container header).
-/// Returns pipeline-specific metadata + compressed data.
-fn compress_block_deflate(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    // Modular path: GPU or CPU LZ77 (stage 0) → GPU or CPU Huffman (stage 1).
-    // stage_demux_compress dispatches to GPU LZ77 via lz77_compress_with_backend()
-    // when a GPU backend is active. The GPU path only diverges at the entropy
-    // encode step, guaranteeing format compatibility between GPU and CPU.
+/// Compress a single block for any LZ-based pipeline.
+///
+/// All LZ pipelines share the same structure:
+///   input → stage_demux_compress(demuxer) → entropy_encode(pipeline) → output
+fn compress_block_lz(
+    input: &[u8],
+    pipeline: Pipeline,
+    demuxer: &LzDemuxer,
+    options: &CompressOptions,
+) -> PzResult<Vec<u8>> {
     let block = StageBlock {
         block_index: 0,
         original_len: input.len(),
@@ -75,39 +88,21 @@ fn compress_block_deflate(input: &[u8], options: &CompressOptions) -> PzResult<V
         streams: None,
         metadata: StageMetadata::default(),
     };
-    let block = stage_demux_compress(block, &LzDemuxer::Lz77, options)?;
-
-    #[cfg(feature = "opencl")]
-    {
-        if let Backend::OpenCl = options.backend {
-            if let Some(ref engine) = options.opencl_engine {
-                let block = stage_huffman_encode_gpu(block, engine)?;
-                return Ok(block.data);
-            }
-        }
-    }
-
-    #[cfg(feature = "webgpu")]
-    {
-        if let Backend::WebGpu = options.backend {
-            if let Some(ref engine) = options.webgpu_engine {
-                if !engine.is_cpu_device()
-                    && input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
-                    && input.len() <= engine.max_dispatch_input_size()
-                {
-                    let block = stage_huffman_encode_webgpu(block, engine)?;
-                    return Ok(block.data);
-                }
-            }
-        }
-    }
-
-    let block = stage_huffman_encode(block)?;
+    let block = stage_demux_compress(block, demuxer, options)?;
+    let block = entropy_encode(block, pipeline, input.len(), options)?;
     Ok(block.data)
 }
 
-/// Decompress a single Deflate block (no container header).
-fn decompress_block_deflate(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+/// Decompress a single block for any LZ-based pipeline.
+///
+/// All LZ pipelines share the same structure:
+///   payload → entropy_decode(pipeline) → stage_demux_decompress(demuxer) → output
+fn decompress_block_lz(
+    payload: &[u8],
+    pipeline: Pipeline,
+    demuxer: &LzDemuxer,
+    orig_len: usize,
+) -> PzResult<Vec<u8>> {
     let block = StageBlock {
         block_index: 0,
         original_len: orig_len,
@@ -115,12 +110,79 @@ fn decompress_block_deflate(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>
         streams: None,
         metadata: StageMetadata::default(),
     };
-    let block = stage_huffman_decode(block)?;
-    let block = stage_demux_decompress(block, &LzDemuxer::Lz77)?;
+    let block = entropy_decode(block, pipeline)?;
+    let block = stage_demux_decompress(block, demuxer)?;
     Ok(block.data)
 }
 
-// --- BW pipeline: BWT + MTF + RLE + FSE ---
+// ---------------------------------------------------------------------------
+// Entropy encode/decode dispatch
+// ---------------------------------------------------------------------------
+
+/// Dispatch to the correct entropy encoder for a pipeline.
+///
+/// For Huffman (Deflate), GPU variants are used when a GPU backend is active.
+fn entropy_encode(
+    block: StageBlock,
+    pipeline: Pipeline,
+    input_len: usize,
+    options: &CompressOptions,
+) -> PzResult<StageBlock> {
+    match pipeline {
+        Pipeline::Deflate => {
+            // GPU Huffman when available, otherwise CPU Huffman.
+            #[cfg(feature = "opencl")]
+            {
+                if let Backend::OpenCl = options.backend {
+                    if let Some(ref engine) = options.opencl_engine {
+                        return stage_huffman_encode_gpu(block, engine);
+                    }
+                }
+            }
+
+            #[cfg(feature = "webgpu")]
+            {
+                if let Backend::WebGpu = options.backend {
+                    if let Some(ref engine) = options.webgpu_engine {
+                        if !engine.is_cpu_device()
+                            && input_len >= crate::webgpu::MIN_GPU_INPUT_SIZE
+                            && input_len <= engine.max_dispatch_input_size()
+                        {
+                            return stage_huffman_encode_webgpu(block, engine);
+                        }
+                    }
+                }
+            }
+
+            // Suppress unused variable warning when no GPU features are enabled
+            let _ = (input_len, options);
+            stage_huffman_encode(block)
+        }
+        Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R => {
+            let _ = (input_len, options);
+            stage_rans_encode(block)
+        }
+        Pipeline::Lzf => {
+            let _ = (input_len, options);
+            stage_fse_encode(block)
+        }
+        _ => Err(PzError::Unsupported),
+    }
+}
+
+/// Dispatch to the correct entropy decoder for a pipeline.
+fn entropy_decode(block: StageBlock, pipeline: Pipeline) -> PzResult<StageBlock> {
+    match pipeline {
+        Pipeline::Deflate => stage_huffman_decode(block),
+        Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R => stage_rans_decode(block),
+        Pipeline::Lzf => stage_fse_decode(block),
+        _ => Err(PzError::Unsupported),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BW pipeline: BWT + MTF + RLE + FSE
+// ---------------------------------------------------------------------------
 
 /// Compress a single block using the BW pipeline (no container header).
 fn compress_block_bw(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
@@ -168,7 +230,9 @@ fn decompress_block_bw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     Ok(output)
 }
 
-// --- BBW pipeline: Bijective BWT + MTF + RLE + FSE ---
+// ---------------------------------------------------------------------------
+// BBW pipeline: Bijective BWT + MTF + RLE + FSE
+// ---------------------------------------------------------------------------
 
 /// Compress a single block using the Bbw pipeline (no container header).
 fn compress_block_bbw(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
@@ -238,124 +302,4 @@ fn decompress_block_bbw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     }
 
     Ok(output)
-}
-
-// --- LZR pipeline: LZ77 + rANS ---
-
-/// Compress a single block using the Lzr pipeline (no container header).
-fn compress_block_lzr(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    let block = StageBlock {
-        block_index: 0,
-        original_len: input.len(),
-        data: input.to_vec(),
-        streams: None,
-        metadata: StageMetadata::default(),
-    };
-    let block = stage_demux_compress(block, &LzDemuxer::Lz77, options)?;
-    let block = stage_rans_encode(block)?;
-    Ok(block.data)
-}
-
-/// Decompress a single Lzr block (no container header).
-fn decompress_block_lzr(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    let block = StageBlock {
-        block_index: 0,
-        original_len: orig_len,
-        data: payload.to_vec(),
-        streams: None,
-        metadata: StageMetadata::default(),
-    };
-    let block = stage_rans_decode(block)?;
-    let block = stage_demux_decompress(block, &LzDemuxer::Lz77)?;
-    Ok(block.data)
-}
-
-// --- LZF pipeline: LZ77 + FSE ---
-
-/// Compress a single block using the Lzf pipeline (no container header).
-fn compress_block_lzf(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    let block = StageBlock {
-        block_index: 0,
-        original_len: input.len(),
-        data: input.to_vec(),
-        streams: None,
-        metadata: StageMetadata::default(),
-    };
-    let block = stage_demux_compress(block, &LzDemuxer::Lz77, options)?;
-    let block = stage_fse_encode(block)?;
-    Ok(block.data)
-}
-
-/// Decompress a single Lzf block (no container header).
-fn decompress_block_lzf(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    let block = StageBlock {
-        block_index: 0,
-        original_len: orig_len,
-        data: payload.to_vec(),
-        streams: None,
-        metadata: StageMetadata::default(),
-    };
-    let block = stage_fse_decode(block)?;
-    let block = stage_demux_decompress(block, &LzDemuxer::Lz77)?;
-    Ok(block.data)
-}
-
-// --- LZSS+rANS pipeline: LZSS + rANS ---
-
-/// Compress a single block using the LzssR pipeline (no container header).
-fn compress_block_lzssr(input: &[u8]) -> PzResult<Vec<u8>> {
-    let block = StageBlock {
-        block_index: 0,
-        original_len: input.len(),
-        data: input.to_vec(),
-        streams: None,
-        metadata: StageMetadata::default(),
-    };
-    let block = stage_demux_compress(block, &LzDemuxer::Lzss, &CompressOptions::default())?;
-    let block = stage_rans_encode(block)?;
-    Ok(block.data)
-}
-
-/// Decompress a single LzssR block (no container header).
-fn decompress_block_lzssr(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    let block = StageBlock {
-        block_index: 0,
-        original_len: orig_len,
-        data: payload.to_vec(),
-        streams: None,
-        metadata: StageMetadata::default(),
-    };
-    let block = stage_rans_decode(block)?;
-    let block = stage_demux_decompress(block, &LzDemuxer::Lzss)?;
-    Ok(block.data)
-}
-
-// --- LZ78+rANS pipeline: LZ78 + rANS ---
-
-/// Compress a single block using the Lz78R pipeline (no container header).
-fn compress_block_lz78r(input: &[u8]) -> PzResult<Vec<u8>> {
-    let block = StageBlock {
-        block_index: 0,
-        original_len: input.len(),
-        data: input.to_vec(),
-        streams: None,
-        metadata: StageMetadata::default(),
-    };
-    let block = stage_demux_compress(block, &LzDemuxer::Lz78, &CompressOptions::default())?;
-    let block = stage_rans_encode(block)?;
-    Ok(block.data)
-}
-
-/// Decompress a single Lz78R block (no container header).
-fn decompress_block_lz78r(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    let block = StageBlock {
-        block_index: 0,
-        original_len: orig_len,
-        data: payload.to_vec(),
-        streams: None,
-        metadata: StageMetadata::default(),
-    };
-    let block = stage_rans_decode(block)?;
-    let block = stage_demux_decompress(block, &LzDemuxer::Lz78)?;
-    Ok(block.data)
 }
