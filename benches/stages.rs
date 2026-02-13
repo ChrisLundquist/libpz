@@ -1304,13 +1304,14 @@ fn bench_combined_gpu_decode(c: &mut Criterion) {
 
             // Also compress with FSE for entropy decode benchmarking
             let mut fse_encoded_blocks: Vec<Vec<u8>> = Vec::new();
+            let mut fse_interleaved_blocks: Vec<Vec<u8>> = Vec::new();
             let mut fse_original_lens: Vec<usize> = Vec::new();
             for &(offset, num_matches, _decompressed_size) in &block_meta {
                 let end = offset + num_matches * 5;
                 let block_compressed = &block_data[offset..end];
-                let fse_encoded = pz::fse::encode(block_compressed);
+                fse_encoded_blocks.push(pz::fse::encode(block_compressed));
+                fse_interleaved_blocks.push(pz::fse::encode_interleaved(block_compressed));
                 fse_original_lens.push(block_compressed.len());
-                fse_encoded_blocks.push(fse_encoded);
             }
 
             // CPU baseline: FSE decode + LZ77 decompress per block
@@ -1337,6 +1338,30 @@ fn bench_combined_gpu_decode(c: &mut Criterion) {
                     b.iter(|| {
                         engine
                             .lz77_decompress_blocks(&block_data, &block_meta, 32)
+                            .unwrap()
+                    });
+                },
+            );
+
+            // GPU: FSE decode (per-block) + LZ77 decompress (batched)
+            group.bench_function(
+                BenchmarkId::new("gpu_fse_lz77", format!("{label_size}_{label_bs}")),
+                |b| {
+                    b.iter(|| {
+                        // Stage 1: GPU FSE decode each block
+                        let mut all_lz77 = Vec::with_capacity(block_data.len());
+                        let mut decoded_meta = Vec::new();
+                        for (i, fse_block) in fse_interleaved_blocks.iter().enumerate() {
+                            let lz77_data =
+                                engine.fse_decode(fse_block, fse_original_lens[i]).unwrap();
+                            let num_matches = lz77_data.len() / 5;
+                            decoded_meta.push((all_lz77.len(), num_matches, block_meta[i].2));
+                            all_lz77.extend_from_slice(&lz77_data);
+                        }
+
+                        // Stage 2: GPU LZ77 block-parallel decompress
+                        engine
+                            .lz77_decompress_blocks(&all_lz77, &decoded_meta, 32)
                             .unwrap()
                     });
                 },
