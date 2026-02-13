@@ -102,6 +102,172 @@ fn butterfly(data: &mut [i32]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Haar wavelet transform (reversed butterfly ordering)
+// ---------------------------------------------------------------------------
+
+/// Apply the forward Haar wavelet transform in-place.
+///
+/// Uses the standard "in-place lifting" Haar wavelet:
+/// - At each scale, pairs of values are replaced by (sum, difference)
+/// - The sums are packed into the left half, differences into the right
+/// - Next scale operates only on the left half (sums from previous scale)
+///
+/// After all stages, `data[0]` contains the global sum (DC), and the
+/// remaining entries hold detail coefficients at successively finer scales:
+/// `data[1]` = coarsest detail, `data[2..4]` = next level, etc.
+///
+/// This is fundamentally different from WHT: Haar operates on a shrinking
+/// subarray at each stage, while WHT always operates on the full array.
+/// The result is a multi-resolution decomposition where most energy
+/// concentrates in the low-index (coarse) coefficients for smooth signals.
+pub fn haar_forward(data: &mut [i32]) {
+    assert_eq!(
+        data.len(),
+        BLOCK_SIZE,
+        "Haar block must be exactly {BLOCK_SIZE} elements"
+    );
+
+    // Process at each scale: n = 256, 128, 64, ..., 2
+    let mut n = BLOCK_SIZE;
+    while n >= 2 {
+        let half = n / 2;
+        // Compute sums and differences for pairs in data[0..n]
+        // Use a temporary buffer to avoid aliasing
+        let mut temp = vec![0i32; n];
+        for i in 0..half {
+            let a = data[2 * i];
+            let b = data[2 * i + 1];
+            temp[i] = a + b; // sum (goes to left half)
+            temp[half + i] = a - b; // difference (goes to right half)
+        }
+        data[..n].copy_from_slice(&temp);
+        n /= 2;
+    }
+}
+
+/// Apply the inverse Haar wavelet transform in-place.
+///
+/// Reverses the forward Haar lifting. At each stage, reconstruct pairs
+/// from (sum, difference): a = (s + d) / 2, b = (s - d) / 2.
+/// Since forward used (a+b, a-b) without scaling, inverse needs the /2.
+/// After all LOG2_N stages, divide by remaining scale factor.
+///
+/// The total scale factor from the forward transform is 2^LOG2_N = N,
+/// but each inverse stage already divides by 2, so after LOG2_N stages
+/// of /2, we've divided by 2^LOG2_N = N total. No final division needed.
+pub fn haar_inverse(data: &mut [i32]) {
+    assert_eq!(
+        data.len(),
+        BLOCK_SIZE,
+        "Haar block must be exactly {BLOCK_SIZE} elements"
+    );
+
+    // Process at each scale: n = 2, 4, 8, ..., 256
+    let mut n = 2;
+    while n <= BLOCK_SIZE {
+        let half = n / 2;
+        let mut temp = vec![0i32; n];
+        for i in 0..half {
+            let s = data[i]; // sum
+            let d = data[half + i]; // difference
+                                    // a + b = s, a - b = d  =>  a = (s+d)/2, b = (s-d)/2
+            temp[2 * i] = (s + d) / 2;
+            temp[2 * i + 1] = (s - d) / 2;
+        }
+        data[..n].copy_from_slice(&temp);
+        n *= 2;
+    }
+    // No final division: the /2 in each of the LOG2_N stages
+    // accounts for the factor of 2^LOG2_N = N from the forward transform.
+}
+
+/// Apply sparse thresholding using the Haar transform instead of WHT.
+///
+/// Unlike [`sparse_threshold_block`], the threshold here is an absolute
+/// value (not scaled by BLOCK_SIZE) because Haar coefficients at different
+/// decomposition levels have different magnitudes. The finest-level
+/// detail coefficients (indices 128..256) are single byte-pair differences,
+/// while the DC coefficient (index 0) is the global sum.
+///
+/// Coefficients are stored as i32 LE (4 bytes) since Haar's DC can be
+/// as large as 256 * 127 = 32,512 which fits i16, but intermediate
+/// sums at coarser levels can exceed i16 range. For safety and
+/// round-trip correctness, we use i32 throughout.
+pub fn haar_sparse_threshold_block(input: &[u8], threshold: i32) -> SparseBlock {
+    assert!(input.len() <= BLOCK_SIZE);
+
+    let mut block = [0i32; BLOCK_SIZE];
+    lift_bytes(input, &mut block[..input.len()]);
+    for x in &mut block[input.len()..] {
+        *x = -128;
+    }
+
+    haar_forward(&mut block);
+
+    // Absolute threshold — not scaled by BLOCK_SIZE
+    let mut sparse_data = Vec::new();
+    let mut approx_coeffs = [0i32; BLOCK_SIZE];
+
+    for (i, &coeff) in block.iter().enumerate() {
+        if coeff.abs() >= threshold {
+            sparse_data.push(i as u8);
+            // Store as i32 LE (4 bytes) for lossless round-trip
+            let bytes = coeff.to_le_bytes();
+            sparse_data.push(bytes[0]);
+            sparse_data.push(bytes[1]);
+            sparse_data.push(bytes[2]);
+            sparse_data.push(bytes[3]);
+            approx_coeffs[i] = coeff;
+        }
+    }
+
+    let num_significant = sparse_data.len() / 5; // 1 byte index + 4 bytes value
+
+    haar_inverse(&mut approx_coeffs);
+
+    let mut approx_bytes = [0u8; BLOCK_SIZE];
+    unlift_bytes(&approx_coeffs, &mut approx_bytes);
+
+    let mut residual = vec![0u8; input.len()];
+    for (i, r) in residual.iter_mut().enumerate() {
+        *r = input[i].wrapping_sub(approx_bytes[i]);
+    }
+
+    SparseBlock {
+        num_significant,
+        sparse_data,
+        residual,
+    }
+}
+
+/// Reconstruct a block from a Haar-based SparseBlock.
+pub fn haar_reconstruct_sparse_block(sb: &SparseBlock, output: &mut [u8]) {
+    let mut coeffs = [0i32; BLOCK_SIZE];
+
+    // Unpack: 5 bytes per coefficient (1 byte index + 4 bytes i32 LE)
+    for i in 0..sb.num_significant {
+        let base = i * 5;
+        let idx = sb.sparse_data[base] as usize;
+        let val = i32::from_le_bytes([
+            sb.sparse_data[base + 1],
+            sb.sparse_data[base + 2],
+            sb.sparse_data[base + 3],
+            sb.sparse_data[base + 4],
+        ]);
+        coeffs[idx] = val;
+    }
+
+    haar_inverse(&mut coeffs);
+
+    let mut approx_bytes = [0u8; BLOCK_SIZE];
+    unlift_bytes(&coeffs, &mut approx_bytes);
+
+    for (i, &r) in sb.residual.iter().enumerate() {
+        output[i] = approx_bytes[i].wrapping_add(r);
+    }
+}
+
 /// Lift a byte slice into centered i32 values for WHT processing.
 ///
 /// Each byte b is mapped to (b as i32) - 128, centering the range
@@ -1070,6 +1236,395 @@ mod tests {
                 "", best_thresh, best_ratio, winner
             );
             println!();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Haar transform tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_haar_forward_inverse_roundtrip() {
+        let original: Vec<i32> = (0..BLOCK_SIZE as i32).map(|i| i - 128).collect();
+        let mut data = original.clone();
+        haar_forward(&mut data);
+        assert_ne!(data, original);
+        haar_inverse(&mut data);
+        assert_eq!(data, original);
+    }
+
+    #[test]
+    fn test_haar_roundtrip_constant() {
+        let mut data = [42i32; BLOCK_SIZE];
+        let original = data;
+        haar_forward(&mut data);
+        // DC component should be 42 * 256 = 10752, all others 0
+        assert_eq!(data[0], 42 * BLOCK_SIZE as i32);
+        for &c in &data[1..] {
+            assert_eq!(c, 0);
+        }
+        haar_inverse(&mut data);
+        assert_eq!(data, original);
+    }
+
+    #[test]
+    fn test_haar_roundtrip_random() {
+        let mut state: u32 = 98765;
+        let mut data = [0i32; BLOCK_SIZE];
+        for x in &mut data {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            *x = ((state >> 16) as i32 % 256) - 128;
+        }
+        let original = data;
+        haar_forward(&mut data);
+        haar_inverse(&mut data);
+        assert_eq!(data, original);
+    }
+
+    #[test]
+    fn test_haar_energy_scaling() {
+        // Haar's lifting scheme packs sums and differences at different
+        // scales, so the energy relationship differs from WHT.
+        // Verify that the transform is still exactly invertible (the key property).
+        let original: Vec<i32> = (0..BLOCK_SIZE as i32).map(|i| i - 128).collect();
+        let mut data = original.clone();
+        let input_energy: i64 = data.iter().map(|&x| (x as i64) * (x as i64)).sum();
+
+        haar_forward(&mut data);
+        let spectral_energy: i64 = data.iter().map(|&x| (x as i64) * (x as i64)).sum();
+
+        // Energy is NOT preserved 1:1 with Haar (unlike WHT).
+        // The ratio depends on the data. Just verify it's nonzero and
+        // the transform round-trips correctly.
+        assert!(spectral_energy > 0);
+        assert!(input_energy > 0);
+
+        haar_inverse(&mut data);
+        assert_eq!(data, original, "Haar round-trip must be exact");
+    }
+
+    #[test]
+    fn test_haar_sparse_roundtrip() {
+        let input: Vec<u8> = (0..=255).collect();
+        // Absolute thresholds for Haar (not scaled by N)
+        for threshold in [1, 4, 16, 64, 256, 1024] {
+            let sb = haar_sparse_threshold_block(&input, threshold);
+            let mut output = [0u8; BLOCK_SIZE];
+            haar_reconstruct_sparse_block(&sb, &mut output);
+            assert_eq!(
+                &output[..],
+                &input[..],
+                "Haar sparse round-trip failed at threshold={threshold}"
+            );
+        }
+    }
+
+    /// Diagnostic: examine whether Haar and WHT produce different coefficient
+    /// distributions when applied to the same data.
+    #[test]
+    fn test_haar_vs_wht_coefficient_analysis() {
+        // Use non-periodic data: first 256 bytes of a gradient
+        let input: Vec<u8> = (0..256)
+            .map(|i| {
+                let smooth = (i as f64 * 0.05).sin() * 80.0 + 128.0;
+                let noise = ((i as u32).wrapping_mul(2654435761) >> 28) as f64;
+                (smooth + noise).clamp(0.0, 255.0) as u8
+            })
+            .collect();
+
+        let mut wht_block = [0i32; BLOCK_SIZE];
+        let mut haar_block = [0i32; BLOCK_SIZE];
+        lift_bytes(&input, &mut wht_block);
+        lift_bytes(&input, &mut haar_block);
+
+        forward(&mut wht_block);
+        haar_forward(&mut haar_block);
+
+        // Energy differs between WHT and Haar (different normalization per level)
+        let wht_energy: i64 = wht_block.iter().map(|&x| (x as i64) * (x as i64)).sum();
+        let haar_energy: i64 = haar_block.iter().map(|&x| (x as i64) * (x as i64)).sum();
+        println!("WHT total energy: {wht_energy}, Haar total energy: {haar_energy}");
+
+        // Check if coefficient arrays differ, or are just permutations
+        let coeffs_differ = wht_block != haar_block;
+
+        let mut wht_sorted: Vec<i32> = wht_block.iter().map(|x| x.abs()).collect();
+        let mut haar_sorted: Vec<i32> = haar_block.iter().map(|x| x.abs()).collect();
+        wht_sorted.sort_unstable();
+        haar_sorted.sort_unstable();
+        let sorted_mags_match = wht_sorted == haar_sorted;
+
+        println!("\n=== Haar vs WHT Coefficient Analysis ===\n");
+        println!("Coefficients differ:          {coeffs_differ}");
+        println!("Sorted magnitudes match:      {sorted_mags_match}");
+
+        // Count near-zero at various thresholds
+        println!(
+            "\n{:<12} {:>12} {:>12}",
+            "Threshold", "WHT near-0", "Haar near-0"
+        );
+        for thresh in [1, 2, 4, 8, 16, 32, 64] {
+            let t = thresh * BLOCK_SIZE as i32;
+            let wht_near = wht_block.iter().filter(|&&c| c.abs() < t).count();
+            let haar_near = haar_block.iter().filter(|&&c| c.abs() < t).count();
+            println!("{:<12} {:>12} {:>12}", thresh, wht_near, haar_near);
+        }
+
+        // The critical insight: if sorted magnitudes always match, then
+        // Haar and WHT are just permutations of each other for any input,
+        // and magnitude-based thresholding cannot distinguish them.
+        // In that case, the difference would only matter for:
+        // 1. Position-dependent coding (run-length on coefficient indices)
+        // 2. Coefficient prediction / DPCM
+        // 3. Subband-specific quantization (Haar has meaningful subbands)
+        if sorted_mags_match {
+            println!("\nHaar and WHT produce the same multiset of coefficient magnitudes.");
+            println!("Magnitude-based thresholding cannot distinguish them.");
+            println!("To exploit Haar's locality, need subband-aware coding.");
+        }
+    }
+
+    /// Head-to-head: Haar vs WHT vs raw rANS on Canterbury corpus.
+    ///
+    /// Tests whether Haar's multi-scale decomposition gives better
+    /// energy compaction than WHT's global Walsh-function basis for
+    /// real-world byte data.
+    #[test]
+    fn test_haar_vs_wht_vs_raw_corpus() {
+        use crate::rans;
+
+        let corpus_dir = std::path::Path::new("samples/cantrbry");
+        if !corpus_dir.exists() {
+            eprintln!("Skipping: samples/cantrbry not found");
+            return;
+        }
+
+        println!("\n=== Haar vs WHT vs Raw rANS (Canterbury Corpus) ===\n");
+        println!(
+            "{:<16} {:>7} {:>10} {:>10} {:>6} {:>10} {:>6} {:>8}",
+            "File", "Size", "Raw rANS", "WHT best", "ratio", "Haar best", "ratio", "Winner"
+        );
+        println!("{}", "-".repeat(95));
+
+        // WHT thresholds are scaled by BLOCK_SIZE in sparse_threshold_block
+        let wht_thresholds = [1, 2, 4, 8, 16, 32, 64];
+        // Haar thresholds are absolute values (not scaled)
+        // Fine details are byte diffs (~0-50), coarse are larger
+        let haar_thresholds = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+
+        let mut files: Vec<_> = std::fs::read_dir(corpus_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        files.sort_by_key(|e| e.file_name());
+
+        for entry in &files {
+            let path = entry.path();
+            let data = std::fs::read(&path).unwrap();
+            if data.is_empty() {
+                continue;
+            }
+            let file_name = path.file_name().unwrap().to_str().unwrap();
+
+            let raw_rans_size = rans::encode(&data).len();
+
+            // WHT sweep
+            let mut wht_best = usize::MAX;
+            for &threshold in &wht_thresholds {
+                let num_blocks = data.len().div_ceil(BLOCK_SIZE);
+                let mut sparse_bytes: usize = 4 + num_blocks;
+                let mut all_residuals = Vec::with_capacity(data.len());
+
+                for b in 0..num_blocks {
+                    let start = b * BLOCK_SIZE;
+                    let end = (start + BLOCK_SIZE).min(data.len());
+                    let sb = sparse_threshold_block(&data[start..end], threshold);
+                    sparse_bytes += sb.sparse_data.len();
+                    all_residuals.extend_from_slice(&sb.residual);
+                }
+                let total = sparse_bytes + rans::encode(&all_residuals).len();
+                wht_best = wht_best.min(total);
+            }
+
+            // Haar sweep (absolute thresholds, 5 bytes per kept coeff)
+            let mut haar_best = usize::MAX;
+            for &threshold in &haar_thresholds {
+                let num_blocks = data.len().div_ceil(BLOCK_SIZE);
+                let mut sparse_bytes: usize = 4 + num_blocks;
+                let mut all_residuals = Vec::with_capacity(data.len());
+
+                for b in 0..num_blocks {
+                    let start = b * BLOCK_SIZE;
+                    let end = (start + BLOCK_SIZE).min(data.len());
+                    let sb = haar_sparse_threshold_block(&data[start..end], threshold);
+                    sparse_bytes += sb.sparse_data.len();
+                    all_residuals.extend_from_slice(&sb.residual);
+                }
+                let total = sparse_bytes + rans::encode(&all_residuals).len();
+                haar_best = haar_best.min(total);
+            }
+
+            let wht_ratio = wht_best as f64 / raw_rans_size as f64;
+            let haar_ratio = haar_best as f64 / raw_rans_size as f64;
+            let winner = if haar_best < wht_best && haar_best < raw_rans_size {
+                "Haar"
+            } else if wht_best < haar_best && wht_best < raw_rans_size {
+                "WHT"
+            } else {
+                "Raw"
+            };
+
+            println!(
+                "{:<16} {:>7} {:>10} {:>10} {:>6.3} {:>10} {:>6.3} {:>8}",
+                file_name,
+                data.len(),
+                raw_rans_size,
+                wht_best,
+                wht_ratio,
+                haar_best,
+                haar_ratio,
+                winner
+            );
+        }
+    }
+
+    /// Head-to-head on synthetic data.
+    #[test]
+    fn test_haar_vs_wht_vs_raw_synthetic() {
+        use crate::rans;
+
+        println!("\n=== Haar vs WHT vs Raw rANS (Synthetic Data) ===\n");
+        println!(
+            "{:<20} {:>8} {:>10} {:>10} {:>6} {:>10} {:>6} {:>8}",
+            "Data type", "Size", "Raw rANS", "WHT best", "ratio", "Haar best", "ratio", "Winner"
+        );
+        println!("{}", "-".repeat(100));
+
+        let test_cases: Vec<(&str, Vec<u8>)> = vec![
+            ("smooth_ramp_1k", (0..=255u8).cycle().take(1024).collect()),
+            (
+                "sawtooth_1k",
+                (0..1024).map(|i| ((i % 16) * 16) as u8).collect(),
+            ),
+            ("step_1k", {
+                let mut v = vec![50u8; 512];
+                v.extend(vec![200u8; 512]);
+                v
+            }),
+            (
+                "sine_1k",
+                (0..1024)
+                    .map(|i| {
+                        let t = i as f64 * std::f64::consts::TAU / 256.0;
+                        ((t.sin() * 100.0) + 128.0).clamp(0.0, 255.0) as u8
+                    })
+                    .collect(),
+            ),
+            ("text_1k", {
+                let text = b"The quick brown fox jumps over the lazy dog. ";
+                text.iter().cycle().take(1024).copied().collect()
+            }),
+            ("random_1k", {
+                let mut state: u32 = 12345;
+                (0..1024)
+                    .map(|_| {
+                        state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                        (state >> 16) as u8
+                    })
+                    .collect()
+            }),
+            ("sparse_signal_1k", {
+                let mut v = vec![128u8; 1024];
+                for i in (0..1024).step_by(64) {
+                    v[i] = 255;
+                }
+                v
+            }),
+            (
+                "gradient_4k",
+                (0..4096).map(|i| (i * 256 / 4096) as u8).collect(),
+            ),
+            // New: piecewise-constant (staircase) — Haar's sweet spot
+            (
+                "staircase_1k",
+                (0..1024).map(|i| ((i / 32) * 8 + 16) as u8).collect(),
+            ),
+            // New: smooth + noise
+            (
+                "smooth_noisy_1k",
+                (0..1024)
+                    .map(|i| {
+                        let smooth = (i as f64 * 0.025).sin() * 80.0 + 128.0;
+                        let noise = ((i as u32).wrapping_mul(2654435761) >> 27) as f64;
+                        (smooth + noise).clamp(0.0, 255.0) as u8
+                    })
+                    .collect(),
+            ),
+        ];
+
+        let wht_thresholds = [1, 2, 4, 8, 16, 32, 64];
+        let haar_thresholds = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+
+        for (name, data) in &test_cases {
+            let raw_rans_size = rans::encode(data).len();
+
+            let mut wht_best = usize::MAX;
+            for &threshold in &wht_thresholds {
+                let num_blocks = data.len().div_ceil(BLOCK_SIZE);
+                let mut sparse_bytes: usize = 4 + num_blocks;
+                let mut all_residuals = Vec::with_capacity(data.len());
+                for b in 0..num_blocks {
+                    let start = b * BLOCK_SIZE;
+                    let end = (start + BLOCK_SIZE).min(data.len());
+                    let sb = sparse_threshold_block(&data[start..end], threshold);
+                    sparse_bytes += sb.sparse_data.len();
+                    all_residuals.extend_from_slice(&sb.residual);
+                }
+                wht_best = wht_best.min(sparse_bytes + rans::encode(&all_residuals).len());
+            }
+
+            let mut haar_best = usize::MAX;
+            for &threshold in &haar_thresholds {
+                let num_blocks = data.len().div_ceil(BLOCK_SIZE);
+                let mut sparse_bytes: usize = 4 + num_blocks;
+                let mut all_residuals = Vec::with_capacity(data.len());
+                for b in 0..num_blocks {
+                    let start = b * BLOCK_SIZE;
+                    let end = (start + BLOCK_SIZE).min(data.len());
+                    let sb = haar_sparse_threshold_block(&data[start..end], threshold);
+                    sparse_bytes += sb.sparse_data.len();
+                    all_residuals.extend_from_slice(&sb.residual);
+                }
+                haar_best = haar_best.min(sparse_bytes + rans::encode(&all_residuals).len());
+            }
+
+            let wht_ratio = wht_best as f64 / raw_rans_size as f64;
+            let haar_ratio = haar_best as f64 / raw_rans_size as f64;
+            let winner = if haar_best < wht_best && haar_best < raw_rans_size {
+                "Haar"
+            } else if wht_best < haar_best && wht_best < raw_rans_size {
+                "WHT"
+            } else if haar_best <= raw_rans_size || wht_best <= raw_rans_size {
+                if haar_ratio <= wht_ratio {
+                    "Haar"
+                } else {
+                    "WHT"
+                }
+            } else {
+                "Raw"
+            };
+
+            println!(
+                "{:<20} {:>8} {:>10} {:>10} {:>6.3} {:>10} {:>6.3} {:>8}",
+                name,
+                data.len(),
+                raw_rans_size,
+                wht_best,
+                wht_ratio,
+                haar_best,
+                haar_ratio,
+                winner
+            );
         }
     }
 }
