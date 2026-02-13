@@ -489,6 +489,39 @@ fn run() {
         cpu_lzssr.as_secs_f64() * 1000.0,
         cpu_lzssr_mbps
     );
+
+    // --- GPU Profiling Trace ---
+    // Create a separate profiling engine to collect one clean trace without
+    // benchmark overhead. Each GPU dispatch is timed via wgpu-profiler.
+    eprintln!("\n--- GPU Profiling Trace ---");
+    let profile_engine = WebGpuEngine::with_profiling(true).expect("No WebGPU device");
+    eprintln!(
+        "Profiler active: {}",
+        if profile_engine.profiling() {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+
+    // Run key GPU operations once for the trace
+    let _ = profile_engine.find_matches(&data).unwrap();
+    let _ = profile_engine.byte_histogram(&data).unwrap();
+    let _ = profile_engine
+        .huffman_encode_gpu_scan(&data, &code_lut)
+        .unwrap();
+
+    // Collect and write profiler results
+    if let Some(results) = profile_engine.profiler_end_frame() {
+        let trace_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("profiling");
+        std::fs::create_dir_all(&trace_dir).ok();
+        let trace_path = trace_dir.join("webgpu_trace.json");
+        WebGpuEngine::profiler_write_trace(&trace_path, &results).unwrap();
+        eprintln!("Chrome trace written to {}", trace_path.display());
+        eprintln!("View at chrome://tracing or https://ui.perfetto.dev/");
+    } else {
+        eprintln!("GPU timestamps not available (profiler returned no results)");
+    }
 }
 
 #[cfg(feature = "webgpu")]

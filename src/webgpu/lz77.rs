@@ -221,6 +221,7 @@ impl WebGpuEngine {
             workgroups,
             "lz77_tod_resolve",
         )?;
+        self.profiler_resolve(&mut encoder);
         self.queue.submit(Some(encoder.finish()));
         if let Some(t0) = t0 {
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
@@ -374,6 +375,7 @@ impl WebGpuEngine {
         )?;
         // Bake staging copy into the same command buffer
         encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, match_buf_size);
+        self.profiler_resolve(&mut encoder);
         self.queue.submit(Some(encoder.finish()));
 
         // Wait for all work including the copy
@@ -578,6 +580,7 @@ impl WebGpuEngine {
         // Copy resolved matches to staging buffer (in same command buffer)
         encoder.copy_buffer_to_buffer(&resolved_buf, 0, &staging_buf, 0, match_buf_size);
 
+        self.profiler_resolve(&mut encoder);
         self.queue.submit(Some(encoder.finish()));
 
         Ok(PendingLz77 {
@@ -1007,6 +1010,7 @@ impl WebGpuEngine {
         )?;
         encoder.copy_buffer_to_buffer(&slot.resolved_buf, 0, &slot.staging_buf, 0, match_buf_size);
 
+        self.profiler_resolve(&mut encoder);
         self.queue.submit(Some(encoder.finish()));
         Ok(())
     }

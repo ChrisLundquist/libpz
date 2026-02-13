@@ -12,6 +12,7 @@ opencl3 = { version = "0.9", optional = true }
 wgpu = { version = "27", optional = true }
 pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
+wgpu-profiler = { version = "0.25", optional = true }
 
 [[bin]]
 name = "pz"
@@ -35,4 +36,4 @@ debug = true
 [features]
 default = ["webgpu"]
 opencl = ["dep:opencl3"]
-webgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+webgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:wgpu-profiler"]

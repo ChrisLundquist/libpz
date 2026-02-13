@@ -549,6 +549,7 @@ impl WebGpuEngine {
                 num_groups as u32,
                 "radix_histogram",
             )?;
+            self.profiler_resolve(&mut encoder);
             self.queue.submit(Some(encoder.finish()));
             if let Some(t0) = t0 {
                 let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
