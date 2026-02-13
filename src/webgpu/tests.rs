@@ -506,36 +506,31 @@ fn test_bijective_bwt_round_trip() {
 }
 
 #[test]
-fn test_deflate_chained_round_trip() {
+fn test_webgpu_deflate_pipeline_round_trip() {
     let engine = match WebGpuEngine::new() {
-        Ok(e) => e,
+        Ok(e) => std::sync::Arc::new(e),
         Err(PzError::Unsupported) => return,
         Err(e) => panic!("unexpected error: {:?}", e),
     };
 
     let input = b"the quick brown fox jumps over the lazy dog. the quick brown fox.";
-    let block_data = engine.deflate_chained(input).unwrap();
+    let options = crate::pipeline::CompressOptions {
+        backend: crate::pipeline::Backend::WebGpu,
+        webgpu_engine: Some(engine),
+        ..Default::default()
+    };
 
-    // Decompress using the standard CPU Deflate decoder
-    let decompressed = crate::pipeline::decompress(&{
-        let mut container = Vec::new();
-        container.extend_from_slice(&[b'P', b'Z', 2, 0]); // magic + version=2 + pipeline=Deflate
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
-        container.extend_from_slice(&1u32.to_le_bytes()); // num_blocks = 1
-        container.extend_from_slice(&(block_data.len() as u32).to_le_bytes());
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
-        container.extend_from_slice(&block_data);
-        container
-    })
-    .unwrap();
-
+    let compressed =
+        crate::pipeline::compress_with_options(input, crate::pipeline::Pipeline::Deflate, &options)
+            .unwrap();
+    let decompressed = crate::pipeline::decompress(&compressed).unwrap();
     assert_eq!(decompressed, input);
 }
 
 #[test]
-fn test_deflate_chained_larger() {
+fn test_webgpu_deflate_pipeline_larger() {
     let engine = match WebGpuEngine::new() {
-        Ok(e) => e,
+        Ok(e) => std::sync::Arc::new(e),
         Err(PzError::Unsupported) => return,
         Err(e) => panic!("unexpected error: {:?}", e),
     };
@@ -546,20 +541,19 @@ fn test_deflate_chained_larger() {
         input.extend_from_slice(pattern);
     }
 
-    let block_data = engine.deflate_chained(&input).unwrap();
+    let options = crate::pipeline::CompressOptions {
+        backend: crate::pipeline::Backend::WebGpu,
+        webgpu_engine: Some(engine),
+        ..Default::default()
+    };
 
-    let decompressed = crate::pipeline::decompress(&{
-        let mut container = Vec::new();
-        container.extend_from_slice(&[b'P', b'Z', 2, 0]);
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
-        container.extend_from_slice(&1u32.to_le_bytes());
-        container.extend_from_slice(&(block_data.len() as u32).to_le_bytes());
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
-        container.extend_from_slice(&block_data);
-        container
-    })
+    let compressed = crate::pipeline::compress_with_options(
+        &input,
+        crate::pipeline::Pipeline::Deflate,
+        &options,
+    )
     .unwrap();
-
+    let decompressed = crate::pipeline::decompress(&compressed).unwrap();
     assert_eq!(decompressed, input);
 }
 

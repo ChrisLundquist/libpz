@@ -1,4 +1,4 @@
-//! Huffman encoding and deflate chained GPU pipeline.
+//! GPU Huffman encoding: byte histogram and Huffman coding via GPU prefix sum.
 
 use super::*;
 
@@ -445,80 +445,5 @@ impl WebGpuEngine {
         }
 
         Ok((output_bytes, total_bits))
-    }
-
-    /// GPU-chained Deflate compression: LZ77 + Huffman on GPU.
-    pub fn deflate_chained(&self, input: &[u8]) -> PzResult<Vec<u8>> {
-        if input.is_empty() {
-            return Err(PzError::InvalidInput);
-        }
-
-        // Stage 1: GPU LZ77 compression
-        let lz_data = self.lz77_compress(input)?;
-        let lz_len = lz_data.len();
-
-        if lz_data.is_empty() {
-            return Err(PzError::InvalidInput);
-        }
-
-        // Stage 2: Demux LZ77 matches into 3 streams (offsets, lengths, literals)
-        // to match the CPU pipeline's multistream format.
-        let match_size = crate::lz77::Match::SERIALIZED_SIZE; // 5
-        let num_matches = lz_len / match_size;
-
-        let mut offsets = Vec::with_capacity(num_matches * 2);
-        let mut lengths = Vec::with_capacity(num_matches * 2);
-        let mut literals = Vec::with_capacity(num_matches);
-
-        for i in 0..num_matches {
-            let base = i * match_size;
-            offsets.push(lz_data[base]);
-            offsets.push(lz_data[base + 1]);
-            lengths.push(lz_data[base + 2]);
-            lengths.push(lz_data[base + 3]);
-            literals.push(lz_data[base + 4]);
-        }
-
-        let streams = [offsets.as_slice(), lengths.as_slice(), literals.as_slice()];
-
-        // Stage 3: GPU Huffman encode each stream and serialize in multistream format.
-        // Multistream header: [num_streams: u8][pre_entropy_len: u32][meta_len: u16][meta]
-        let mut output = Vec::new();
-        output.push(streams.len() as u8);
-        output.extend_from_slice(&(lz_len as u32).to_le_bytes());
-        output.extend_from_slice(&0u16.to_le_bytes()); // meta_len = 0 for LZ77
-
-        for stream in &streams {
-            let histogram = self.byte_histogram(stream)?;
-
-            let mut freq = crate::frequency::FrequencyTable::new();
-            for (i, &count) in histogram.iter().enumerate() {
-                freq.byte[i] = count;
-            }
-            freq.total = freq.byte.iter().map(|&c| c as u64).sum();
-            freq.used = freq.byte.iter().filter(|&&c| c > 0).count() as u32;
-
-            let tree = crate::huffman::HuffmanTree::from_frequency_table(&freq)
-                .ok_or(PzError::InvalidInput)?;
-            let freq_table = tree.serialize_frequencies();
-
-            let mut code_lut = [0u32; 256];
-            for byte in 0..=255u8 {
-                let (codeword, bits) = tree.get_code(byte);
-                code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
-            }
-
-            let (huffman_data, total_bits) = self.huffman_encode_gpu_scan(stream, &code_lut)?;
-
-            // Per-stream framing: [huffman_data_len: u32][total_bits: u32][freq_table: 256×u32][huffman_data]
-            output.extend_from_slice(&(huffman_data.len() as u32).to_le_bytes());
-            output.extend_from_slice(&(total_bits as u32).to_le_bytes());
-            for &freq_val in &freq_table {
-                output.extend_from_slice(&freq_val.to_le_bytes());
-            }
-            output.extend_from_slice(&huffman_data);
-        }
-
-        Ok(output)
     }
 }

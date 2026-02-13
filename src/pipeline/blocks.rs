@@ -64,25 +64,10 @@ pub(crate) fn decompress_block(
 /// Compress a single block using the Deflate pipeline (no container header).
 /// Returns pipeline-specific metadata + compressed data.
 fn compress_block_deflate(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    // WebGPU still uses the monolithic chained path (has its own DeviceBuf equivalent)
-    #[cfg(feature = "webgpu")]
-    {
-        if let Backend::WebGpu = options.backend {
-            if let Some(ref engine) = options.webgpu_engine {
-                if !engine.is_cpu_device()
-                    && input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
-                    && input.len() <= engine.max_dispatch_input_size()
-                {
-                    return engine.deflate_chained(input);
-                }
-            }
-        }
-    }
-
     // Modular path: GPU or CPU LZ77 (stage 0) → GPU or CPU Huffman (stage 1).
-    // When OpenCL is active, stage_demux_compress dispatches to GPU LZ77 via
-    // lz77_compress_with_backend(), and stage_huffman_encode_gpu uses DeviceBuf
-    // to avoid re-uploading streams for histogram + encode.
+    // stage_demux_compress dispatches to GPU LZ77 via lz77_compress_with_backend()
+    // when a GPU backend is active. The GPU path only diverges at the entropy
+    // encode step, guaranteeing format compatibility between GPU and CPU.
     let block = StageBlock {
         block_index: 0,
         original_len: input.len(),
@@ -98,6 +83,21 @@ fn compress_block_deflate(input: &[u8], options: &CompressOptions) -> PzResult<V
             if let Some(ref engine) = options.opencl_engine {
                 let block = stage_huffman_encode_gpu(block, engine)?;
                 return Ok(block.data);
+            }
+        }
+    }
+
+    #[cfg(feature = "webgpu")]
+    {
+        if let Backend::WebGpu = options.backend {
+            if let Some(ref engine) = options.webgpu_engine {
+                if !engine.is_cpu_device()
+                    && input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
+                    && input.len() <= engine.max_dispatch_input_size()
+                {
+                    let block = stage_huffman_encode_webgpu(block, engine)?;
+                    return Ok(block.data);
+                }
             }
         }
     }

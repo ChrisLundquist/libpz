@@ -926,75 +926,26 @@ fn test_gpu_huffman_encode_gpu_scan_round_trip() {
     assert_eq!(decoded, input);
 }
 
-// --- GPU chained Deflate tests ---
+// --- GPU Deflate pipeline round-trip tests (modular stage path) ---
 
 #[test]
-fn test_gpu_deflate_chained_round_trip() {
-    let engine = match OpenClEngine::new() {
-        Ok(e) => e,
-        Err(PzError::Unsupported) => return,
-        Err(e) => panic!("Unexpected error: {:?}", e),
-    };
-
+fn test_gpu_deflate_pipeline_round_trip() {
     let input = b"the quick brown fox jumps over the lazy dog. the quick brown fox.";
-    let block_data = engine.deflate_chained(input).unwrap();
-
-    // Decompress using the standard CPU Deflate decoder
-    let decompressed = crate::pipeline::decompress(&{
-        // Build a proper V2 PZ container around the block data
-        let mut container = Vec::new();
-        container.extend_from_slice(&[b'P', b'Z', 2, 0]); // magic + version=2 + pipeline=Deflate
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes()); // original length
-        container.extend_from_slice(&1u32.to_le_bytes()); // num_blocks = 1
-        container.extend_from_slice(&(block_data.len() as u32).to_le_bytes()); // compressed_len
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes()); // original_len
-        container.extend_from_slice(&block_data);
-        container
-    })
-    .unwrap();
-
-    assert_eq!(decompressed, input);
+    gpu_pipeline_round_trip(input, crate::pipeline::Pipeline::Deflate);
 }
 
 #[test]
-fn test_gpu_deflate_chained_larger() {
-    let engine = match OpenClEngine::new() {
-        Ok(e) => e,
-        Err(PzError::Unsupported) => return,
-        Err(e) => panic!("Unexpected error: {:?}", e),
-    };
-
+fn test_gpu_deflate_pipeline_larger() {
     let pattern = b"The quick brown fox jumps over the lazy dog. ";
     let mut input = Vec::new();
     for _ in 0..200 {
         input.extend_from_slice(pattern);
     }
-
-    let block_data = engine.deflate_chained(&input).unwrap();
-
-    let decompressed = crate::pipeline::decompress(&{
-        let mut container = Vec::new();
-        container.extend_from_slice(&[b'P', b'Z', 2, 0]); // magic + version=2 + pipeline=Deflate
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes()); // original length
-        container.extend_from_slice(&1u32.to_le_bytes()); // num_blocks = 1
-        container.extend_from_slice(&(block_data.len() as u32).to_le_bytes()); // compressed_len
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes()); // original_len
-        container.extend_from_slice(&block_data);
-        container
-    })
-    .unwrap();
-
-    assert_eq!(decompressed, input);
+    gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Deflate);
 }
 
 #[test]
-fn test_gpu_deflate_chained_binary() {
-    let engine = match OpenClEngine::new() {
-        Ok(e) => e,
-        Err(PzError::Unsupported) => return,
-        Err(e) => panic!("Unexpected error: {:?}", e),
-    };
-
+fn test_gpu_deflate_pipeline_binary() {
     // Binary data with repeating patterns — exercises all byte values
     let mut input = Vec::new();
     for i in 0u8..=255 {
@@ -1002,22 +953,7 @@ fn test_gpu_deflate_chained_binary() {
             input.push(i);
         }
     }
-
-    let block_data = engine.deflate_chained(&input).unwrap();
-
-    let decompressed = crate::pipeline::decompress(&{
-        let mut container = Vec::new();
-        container.extend_from_slice(&[b'P', b'Z', 2, 0]);
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
-        container.extend_from_slice(&1u32.to_le_bytes());
-        container.extend_from_slice(&(block_data.len() as u32).to_le_bytes());
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
-        container.extend_from_slice(&block_data);
-        container
-    })
-    .unwrap();
-
-    assert_eq!(decompressed, input);
+    gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Deflate);
 }
 
 // --- Modular GPU pipeline composition tests ---

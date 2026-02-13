@@ -251,6 +251,61 @@ pub(crate) fn stage_huffman_encode_gpu(
     Ok(block)
 }
 
+/// GPU Huffman encoding stage (WebGPU): same output format as [`stage_huffman_encode()`]
+/// but uses the WebGPU backend for histogram computation and Huffman encoding.
+///
+/// Each stream is uploaded to the GPU for both histogram and encoding. The output
+/// is byte-identical to the CPU path, so the same decoder works for both.
+///
+/// Falls back to CPU for empty streams where GPU overhead dominates.
+#[cfg(feature = "webgpu")]
+pub(crate) fn stage_huffman_encode_webgpu(
+    mut block: StageBlock,
+    engine: &crate::webgpu::WebGpuEngine,
+) -> PzResult<StageBlock> {
+    let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
+    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+
+    block.data = encode_multistream(
+        &streams,
+        pre_entropy_len,
+        &block.metadata.demux_meta,
+        |stream, output| {
+            // GPU histogram
+            let histogram = engine.byte_histogram(stream)?;
+
+            let mut freq = crate::frequency::FrequencyTable::new();
+            for (i, &count) in histogram.iter().enumerate() {
+                freq.byte[i] = count;
+            }
+            freq.total = freq.byte.iter().map(|&c| c as u64).sum();
+            freq.used = freq.byte.iter().filter(|&&c| c > 0).count() as u32;
+
+            let tree = HuffmanTree::from_frequency_table(&freq).ok_or(PzError::InvalidInput)?;
+            let freq_table = tree.serialize_frequencies();
+
+            let mut code_lut = [0u32; 256];
+            for byte in 0..=255u8 {
+                let (codeword, bits) = tree.get_code(byte);
+                code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+            }
+
+            // GPU Huffman encode
+            let (huffman_data, total_bits) = engine.huffman_encode_gpu_scan(stream, &code_lut)?;
+
+            output.extend_from_slice(&(huffman_data.len() as u32).to_le_bytes());
+            output.extend_from_slice(&(total_bits as u32).to_le_bytes());
+            for &freq_val in &freq_table {
+                output.extend_from_slice(&freq_val.to_le_bytes());
+            }
+            output.extend_from_slice(&huffman_data);
+            Ok(())
+        },
+    )?;
+
+    Ok(block)
+}
+
 /// Huffman decoding stage: parse multi-stream container + Huffman decode each stream.
 ///
 /// Per-stream framing:
