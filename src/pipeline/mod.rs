@@ -21,7 +21,7 @@
 //! Each compressed stream starts with a header:
 //! - Magic bytes: `PZ` (2 bytes)
 //! - Version: 2 (1 byte)
-//! - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 5=Lzfi, 6=LzssR, 8=Lz78R (1 byte)
+//! - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 5=Lzfi, 6=LzssR, 7=Lz78R (1 byte)
 //! - Original length: u32 little-endian (4 bytes)
 //! - num_blocks: u32 little-endian (4 bytes)
 //! - Block table: \[compressed_len: u32, original_len: u32\] \* num_blocks
@@ -172,7 +172,7 @@ pub enum Pipeline {
     /// LZSS + rANS (flag-bit LZ + arithmetic ANS, experimental)
     LzssR = 6,
     /// LZ78 + rANS (incremental trie + rANS, experimental)
-    Lz78R = 8,
+    Lz78R = 7,
 }
 
 impl TryFrom<u8> for Pipeline {
@@ -187,7 +187,7 @@ impl TryFrom<u8> for Pipeline {
             4 => Ok(Self::Lzf),
             5 => Ok(Self::Lzfi),
             6 => Ok(Self::LzssR),
-            8 => Ok(Self::Lz78R),
+            7 => Ok(Self::Lz78R),
             _ => Err(PzError::Unsupported),
         }
     }
@@ -371,14 +371,14 @@ pub fn select_pipeline(input: &[u8]) -> Pipeline {
     if profile.match_density > 0.4 {
         if profile.byte_entropy > 6.0 {
             // High entropy: FSE handles better than Huffman
-            return Pipeline::Lzf;
+            return Pipeline::Lzfi;
         }
         return Pipeline::Deflate;
     }
 
     // Moderate match density with high entropy
     if profile.match_density > 0.2 && profile.byte_entropy > 5.0 {
-        return Pipeline::Lzf;
+        return Pipeline::Lzfi;
     }
 
     // Default: Deflate (fast, decent compression)
@@ -412,7 +412,6 @@ pub fn select_pipeline_trial(
         Pipeline::Deflate,
         Pipeline::Bw,
         Pipeline::Lzr,
-        Pipeline::Lzf,
         Pipeline::Lzfi,
         Pipeline::LzssR,
         Pipeline::Lz78R,
