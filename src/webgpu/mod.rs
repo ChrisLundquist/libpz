@@ -306,6 +306,13 @@ impl WebGpuEngine {
         let info = adapter.get_info();
         let device_name = info.name.clone();
         let is_cpu = matches!(info.device_type, wgpu::DeviceType::Cpu);
+
+        // Reject software/CPU adapters (e.g. WARP on Windows) when a real GPU
+        // was requested — they're too slow for compute workloads and can hang.
+        if prefer_gpu && is_cpu {
+            return Err(PzError::Unsupported);
+        }
+
         let limits = adapter.limits();
         let max_work_group_size = limits.max_compute_workgroup_size_x as usize;
         let max_workgroups_per_dim = limits.max_compute_workgroups_per_dimension;
