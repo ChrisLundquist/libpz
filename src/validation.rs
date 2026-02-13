@@ -297,7 +297,12 @@ mod tests {
         #[test]
         fn all_pipelines_zeros() {
             let input = data_all_zeros(500);
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+            for &p in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Lzf,
+                Pipeline::Lzfi,
+            ] {
                 assert_pipeline_round_trip(&input, p);
             }
         }
@@ -305,7 +310,12 @@ mod tests {
         #[test]
         fn all_pipelines_uniform() {
             let input = data_uniform();
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+            for &p in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Lzf,
+                Pipeline::Lzfi,
+            ] {
                 assert_pipeline_round_trip(&input, p);
             }
         }
@@ -313,7 +323,12 @@ mod tests {
         #[test]
         fn all_pipelines_skewed() {
             let input = data_skewed(2000);
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+            for &p in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Lzf,
+                Pipeline::Lzfi,
+            ] {
                 assert_pipeline_round_trip(&input, p);
             }
         }
@@ -321,7 +336,12 @@ mod tests {
         #[test]
         fn all_pipelines_text() {
             let input = data_repeating_text();
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+            for &p in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Lzf,
+                Pipeline::Lzfi,
+            ] {
                 assert_pipeline_round_trip(&input, p);
             }
         }
@@ -329,7 +349,12 @@ mod tests {
         #[test]
         fn all_pipelines_sawtooth() {
             let input = data_sawtooth(2048);
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+            for &p in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Lzf,
+                Pipeline::Lzfi,
+            ] {
                 assert_pipeline_round_trip(&input, p);
             }
         }
@@ -337,7 +362,12 @@ mod tests {
         #[test]
         fn all_pipelines_runs() {
             let input = data_runs();
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+            for &p in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Lzf,
+                Pipeline::Lzfi,
+            ] {
                 assert_pipeline_round_trip(&input, p);
             }
         }
@@ -345,7 +375,12 @@ mod tests {
         #[test]
         fn all_pipelines_single_byte() {
             let input = vec![42u8];
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+            for &p in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Lzf,
+                Pipeline::Lzfi,
+            ] {
                 assert_pipeline_round_trip(&input, p);
             }
         }

@@ -70,7 +70,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --all)
-            PIPELINES=(deflate bw bbw lzr lzf)
+            PIPELINES=(deflate bw bbw lzr lzf lzfi)
             shift
             ;;
         --opencl)

@@ -51,9 +51,10 @@ pub(crate) enum LzDemuxer {
 /// Returns `None` for BWT-based pipelines (Bw, Bbw).
 pub(crate) fn demuxer_for_pipeline(pipeline: super::Pipeline) -> Option<LzDemuxer> {
     match pipeline {
-        super::Pipeline::Deflate | super::Pipeline::Lzr | super::Pipeline::Lzf => {
-            Some(LzDemuxer::Lz77)
-        }
+        super::Pipeline::Deflate
+        | super::Pipeline::Lzr
+        | super::Pipeline::Lzf
+        | super::Pipeline::Lzfi => Some(LzDemuxer::Lz77),
         super::Pipeline::LzssR => Some(LzDemuxer::Lzss),
         super::Pipeline::Lz78R => Some(LzDemuxer::Lz78),
         super::Pipeline::Bw | super::Pipeline::Bbw => None,

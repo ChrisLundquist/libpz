@@ -29,8 +29,10 @@ pub(crate) fn compress_parallel(
     {
         if let super::Backend::WebGpu = options.backend {
             if let Some(ref engine) = options.webgpu_engine {
-                let is_lz77_pipeline =
-                    matches!(pipeline, Pipeline::Deflate | Pipeline::Lzr | Pipeline::Lzf);
+                let is_lz77_pipeline = matches!(
+                    pipeline,
+                    Pipeline::Deflate | Pipeline::Lzr | Pipeline::Lzf | Pipeline::Lzfi
+                );
                 let is_batchable =
                     is_lz77_pipeline && options.parse_strategy != super::ParseStrategy::Optimal;
                 if is_batchable {
@@ -186,7 +188,9 @@ fn entropy_encode_lz77_block(
     original_len: usize,
     pipeline: Pipeline,
 ) -> PzResult<Vec<u8>> {
-    use super::stages::{stage_fse_encode, stage_huffman_encode, stage_rans_encode};
+    use super::stages::{
+        stage_fse_encode, stage_fse_interleaved_encode, stage_huffman_encode, stage_rans_encode,
+    };
     use crate::lz77;
 
     // Serialize matches
@@ -225,6 +229,7 @@ fn entropy_encode_lz77_block(
         Pipeline::Deflate => stage_huffman_encode(block)?,
         Pipeline::Lzr => stage_rans_encode(block)?,
         Pipeline::Lzf => stage_fse_encode(block)?,
+        Pipeline::Lzfi => stage_fse_interleaved_encode(block)?,
         _ => return Err(PzError::Unsupported),
     };
 

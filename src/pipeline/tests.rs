@@ -1,7 +1,7 @@
 use super::*;
 use demux::LzDemuxer;
 use stages::{
-    pipeline_stage_count, stage_demux_compress, stage_demux_decompress, stage_fse_decode,
+    self, pipeline_stage_count, stage_demux_compress, stage_demux_decompress, stage_fse_decode,
     stage_fse_encode, stage_huffman_decode, stage_huffman_encode, stage_rans_decode,
     stage_rans_encode, StageBlock, StageMetadata,
 };
@@ -186,6 +186,7 @@ fn test_all_pipelines_banana() {
         Pipeline::Bw,
         Pipeline::Lzr,
         Pipeline::Lzf,
+        Pipeline::Lzfi,
     ] {
         let compressed = compress(input, pipeline).unwrap();
         let decompressed = decompress(&compressed).unwrap();
@@ -204,6 +205,7 @@ fn test_all_pipelines_medium_text() {
         Pipeline::Bw,
         Pipeline::Lzr,
         Pipeline::Lzf,
+        Pipeline::Lzfi,
     ] {
         let compressed = compress(&input, pipeline).unwrap();
         let decompressed = decompress(&compressed).unwrap();
@@ -237,7 +239,12 @@ fn test_multiblock_round_trip_all_pipelines() {
         input.extend_from_slice(pattern);
     }
 
-    for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+    for &pipeline in &[
+        Pipeline::Deflate,
+        Pipeline::Bw,
+        Pipeline::Lzf,
+        Pipeline::Lzfi,
+    ] {
         let compressed = compress_mt(&input, pipeline, 4, 512).unwrap();
         assert_eq!(compressed[2], VERSION, "expected V2 for {:?}", pipeline);
         let decompressed = decompress(&compressed).unwrap();
@@ -1180,6 +1187,101 @@ fn test_lz78r_round_trip_all_same() {
     assert_eq!(decompressed, input);
 }
 
+// --- Lzfi pipeline tests (LZ77 + interleaved FSE) ---
+
+#[test]
+fn test_lzfi_empty() {
+    let result = compress(&[], Pipeline::Lzfi).unwrap();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_lzfi_round_trip_hello() {
+    let input = b"hello, world! hello, world!";
+    let compressed = compress(input, Pipeline::Lzfi).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_lzfi_round_trip_repeating() {
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+    let compressed = compress(&input, Pipeline::Lzfi).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+    assert!(
+        compressed.len() < input.len(),
+        "compressed {} >= input {}",
+        compressed.len(),
+        input.len()
+    );
+}
+
+#[test]
+fn test_lzfi_round_trip_binary() {
+    let input: Vec<u8> = (0..=255).cycle().take(512).collect();
+    let compressed = compress(&input, Pipeline::Lzfi).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_lzfi_round_trip_all_same() {
+    let input = vec![0xAA_u8; 500];
+    let compressed = compress(&input, Pipeline::Lzfi).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_lzfi_multiblock_round_trip() {
+    let pattern = b"Lzfi multi-block test data with repetition. ";
+    let mut input = Vec::new();
+    for _ in 0..200 {
+        input.extend_from_slice(pattern);
+    }
+    let compressed = compress_mt(&input, Pipeline::Lzfi, 4, 1024).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_lzfi_multistream_deinterleave_reinterleave() {
+    // Verify LZ77 deinterleave → interleaved FSE encode → decode → reinterleave
+    let input = b"The quick brown fox jumps over the lazy dog. The quick brown fox.";
+    let opts = CompressOptions::default();
+    let block = StageBlock {
+        block_index: 0,
+        original_len: input.len(),
+        data: input.to_vec(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+
+    let block = stage_demux_compress(block, &LzDemuxer::Lz77, &opts).unwrap();
+    assert!(block.streams.is_some());
+    let streams = block.streams.as_ref().unwrap();
+    assert_eq!(streams.len(), 3);
+
+    let block = stages::stage_fse_interleaved_encode(block).unwrap();
+    assert!(block.streams.is_none());
+    assert!(!block.data.is_empty());
+    assert_eq!(block.data[0], 3, "expected 3 streams");
+
+    let block = stages::stage_fse_interleaved_decode(block).unwrap();
+    assert!(block.streams.is_some());
+    let streams = block.streams.as_ref().unwrap();
+    assert_eq!(streams.len(), 3);
+
+    let block = stage_demux_decompress(block, &LzDemuxer::Lz77).unwrap();
+    assert!(block.streams.is_none());
+    assert_eq!(block.data, input);
+}
+
 // --- Trial selection with new pipelines ---
 
 #[test]
@@ -1372,6 +1474,20 @@ mod gpu_batched_tests {
             .map(|i| ((i * 7 + 13) % 251) as u8)
             .collect();
         let compressed = compress_with_options(&input, Pipeline::Lzf, &opts).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_gpu_batched_lzfi_round_trip() {
+        let opts = match make_webgpu_options() {
+            Some(o) => o,
+            None => return,
+        };
+
+        let pattern = b"the quick brown fox jumps over the lazy dog. ";
+        let input: Vec<u8> = pattern.iter().cycle().take(256 * 1024).copied().collect();
+        let compressed = compress_with_options(&input, Pipeline::Lzfi, &opts).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
