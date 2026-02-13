@@ -444,6 +444,56 @@ fn bench_lz77_gpu(c: &mut Criterion) {
 // bench_lz77_parallel removed: parallel LZ77 match-finding was slower than
 // single-threaded lazy. Multi-threading now happens at the pipeline block level.
 
+#[cfg(feature = "opencl")]
+fn bench_fse_gpu(c: &mut Criterion) {
+    use pz::opencl::OpenClEngine;
+
+    let engine = match OpenClEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => return,
+    };
+
+    let mut group = c.benchmark_group("fse_gpu");
+    cap(&mut group);
+
+    for &size in SIZES_LARGE {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // Encode with interleaved FSE at various K values
+        for &num_states in &[4usize, 8, 16, 32] {
+            let encoded = pz::fse::encode_interleaved_n(&data, num_states, 7);
+
+            // CPU decode baseline
+            let label_cpu = format!("decode_cpu_k{num_states}");
+            group.bench_with_input(
+                BenchmarkId::new(&label_cpu, size),
+                &encoded,
+                |b, encoded| {
+                    b.iter(|| pz::fse::decode_interleaved(encoded, data.len()).unwrap());
+                },
+            );
+
+            // GPU decode
+            let label_gpu = format!("decode_gpu_k{num_states}");
+            let eng = engine.clone();
+            let orig_len = data.len();
+            group.bench_with_input(
+                BenchmarkId::new(&label_gpu, size),
+                &encoded,
+                move |b, encoded| {
+                    b.iter(|| eng.fse_decode(encoded, orig_len).unwrap());
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_fse_gpu(_c: &mut Criterion) {}
+
 fn bench_analysis(c: &mut Criterion) {
     let mut group = c.benchmark_group("analysis");
     for &size in &[8192, 65536] {
@@ -962,6 +1012,197 @@ fn bench_lz77_webgpu(_c: &mut Criterion) {}
 #[cfg(not(feature = "webgpu"))]
 fn bench_deflate_webgpu_chained(_c: &mut Criterion) {}
 
+/// Experiment 4: LZ77 block-parallel GPU decompression.
+///
+/// Sweeps block_size (4KB-256KB) and cooperative_threads (1, 8, 32, 64).
+/// Compares GPU block-parallel decode vs CPU sequential decode.
+#[cfg(feature = "opencl")]
+fn bench_lz77_decompress_blocks(c: &mut Criterion) {
+    let engine = match pz::opencl::OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut group = c.benchmark_group("lz77_decompress_blocks");
+    cap(&mut group);
+
+    let block_sizes: &[usize] = &[4096, 16384, 32768, 65536, 262144];
+    let thread_counts: &[usize] = &[1, 8, 32, 64];
+
+    // Use 1MB test data
+    let data = get_test_data(1_048_576);
+
+    for &block_size in block_sizes {
+        // Compress into independent blocks
+        let (block_data, block_meta) =
+            pz::opencl::lz77::lz77_compress_blocks(&data, block_size).unwrap();
+
+        let label_bs = if block_size >= 1024 {
+            format!("{}KB", block_size / 1024)
+        } else {
+            format!("{}B", block_size)
+        };
+
+        // CPU baseline: decompress each block independently
+        group.throughput(Throughput::Bytes(data.len() as u64));
+        group.bench_function(BenchmarkId::new("cpu", &label_bs), |b| {
+            b.iter(|| {
+                let mut result = Vec::with_capacity(data.len());
+                for &(offset, num_matches, _decompressed_size) in &block_meta {
+                    let end = offset + num_matches * 5;
+                    let block_compressed = &block_data[offset..end];
+                    let decoded = pz::lz77::decompress(block_compressed).unwrap();
+                    result.extend_from_slice(&decoded);
+                }
+                result
+            });
+        });
+
+        // GPU: sweep cooperative thread counts
+        for &threads in thread_counts {
+            group.bench_function(
+                BenchmarkId::new(format!("gpu_t{threads}"), &label_bs),
+                |b| {
+                    b.iter(|| {
+                        engine
+                            .lz77_decompress_blocks(&block_data, &block_meta, threads)
+                            .unwrap()
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_lz77_decompress_blocks(_c: &mut Criterion) {}
+
+/// Experiment 1: rANS interleaved GPU decode.
+///
+/// Sweeps K (interleaved lanes: 4, 8, 16, 32, 64) and scale_bits (10, 11, 12).
+/// Compares GPU decode vs CPU decode throughput.
+#[cfg(feature = "opencl")]
+fn bench_rans_gpu(c: &mut Criterion) {
+    let engine = match pz::opencl::OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut group = c.benchmark_group("rans_gpu_decode");
+    cap(&mut group);
+
+    let interleave_counts: &[usize] = &[4, 8, 16, 32, 64];
+    let scale_values: &[u8] = &[10, 11, 12];
+
+    for &size in SIZES_LARGE {
+        let data = get_test_data(size);
+        let label_size = if size >= 1_048_576 {
+            format!("{}MB", size / 1_048_576)
+        } else {
+            format!("{}KB", size / 1024)
+        };
+
+        group.throughput(Throughput::Bytes(size as u64));
+
+        for &scale_bits in scale_values {
+            for &k in interleave_counts {
+                let encoded = pz::rans::encode_interleaved_n(&data, k, scale_bits);
+                let label = format!("K{k}_s{scale_bits}_{label_size}");
+
+                // CPU baseline
+                group.bench_function(BenchmarkId::new("cpu", &label), |b| {
+                    b.iter(|| pz::rans::decode_interleaved(&encoded, data.len()).unwrap());
+                });
+
+                // GPU
+                group.bench_function(BenchmarkId::new("gpu", &label), |b| {
+                    b.iter(|| {
+                        engine
+                            .rans_decode_interleaved(&encoded, data.len())
+                            .unwrap()
+                    });
+                });
+            }
+        }
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_rans_gpu(_c: &mut Criterion) {}
+
+/// Experiment 1 (gap fix): Multi-block rANS GPU decode.
+///
+/// Splits input into independent blocks (e.g., 16KB each), encodes each
+/// with K-way interleaved rANS, then decodes all blocks in a single GPU
+/// kernel launch. Total work-items = num_blocks × K.
+#[cfg(feature = "opencl")]
+fn bench_rans_gpu_blocks(c: &mut Criterion) {
+    let engine = match pz::opencl::OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut group = c.benchmark_group("rans_gpu_blocks");
+    cap(&mut group);
+
+    let block_sizes: &[usize] = &[4096, 16384, 65536];
+    let interleave_counts: &[usize] = &[8, 16, 32];
+
+    for &size in SIZES_LARGE {
+        let data = get_test_data(size);
+        let label_size = if size >= 1_048_576 {
+            format!("{}MB", size / 1_048_576)
+        } else {
+            format!("{}KB", size / 1024)
+        };
+        group.throughput(Throughput::Bytes(size as u64));
+
+        for &block_size in block_sizes {
+            for &k in interleave_counts {
+                let label_bs = format!("{}KB", block_size / 1024);
+                let scale_bits = 11u8;
+
+                // Encode all blocks with shared frequency table
+                let encoded_blocks =
+                    pz::opencl::rans::rans_encode_blocks(&data, block_size, k, scale_bits).unwrap();
+                let num_blocks = encoded_blocks.len();
+
+                let label = format!("K{k}_bs{label_bs}_{label_size}_n{num_blocks}");
+
+                // CPU baseline: decode each block sequentially
+                group.bench_function(BenchmarkId::new("cpu", &label), |b| {
+                    b.iter(|| {
+                        let mut result = Vec::with_capacity(data.len());
+                        for (enc, orig_len) in &encoded_blocks {
+                            let decoded = pz::rans::decode_interleaved(enc, *orig_len).unwrap();
+                            result.extend_from_slice(&decoded);
+                        }
+                        result
+                    });
+                });
+
+                // GPU: batched multi-block decode
+                let block_refs: Vec<(&[u8], usize)> = encoded_blocks
+                    .iter()
+                    .map(|(enc, len)| (enc.as_slice(), *len))
+                    .collect();
+                group.bench_function(BenchmarkId::new("gpu_blocks", &label), |b| {
+                    b.iter(|| engine.rans_decode_interleaved_blocks(&block_refs).unwrap());
+                });
+            }
+        }
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_rans_gpu_blocks(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_bwt,
@@ -989,6 +1230,10 @@ criterion_group!(
     bench_lz77_webgpu,
     bench_lz77_webgpu_batched,
     bench_huffman_webgpu,
-    bench_deflate_webgpu_chained
+    bench_deflate_webgpu_chained,
+    bench_fse_gpu,
+    bench_lz77_decompress_blocks,
+    bench_rans_gpu,
+    bench_rans_gpu_blocks
 );
 criterion_main!(benches);

@@ -343,6 +343,17 @@ mod tests {
                 "huffman_encode.cl",
                 include_str!("../kernels/huffman_encode.cl"),
             ),
+            ("rans_decode.cl", include_str!("../kernels/rans_decode.cl")),
+            (
+                "rans_decode_blocks.cl",
+                include_str!("../kernels/rans_decode_blocks.cl"),
+            ),
+            ("fse_decode.cl", include_str!("../kernels/fse_decode.cl")),
+            (
+                "fse_decode_blocks.cl",
+                include_str!("../kernels/fse_decode_blocks.cl"),
+            ),
+            ("lz77_decode.cl", include_str!("../kernels/lz77_decode.cl")),
         ];
         for (name, src) in &sources {
             assert!(
@@ -371,6 +382,17 @@ mod tests {
                 "fse_decode.wgsl",
                 include_str!("../kernels/fse_decode.wgsl"),
             ),
+            ("rans_decode.cl", include_str!("../kernels/rans_decode.cl")),
+            (
+                "rans_decode_blocks.cl",
+                include_str!("../kernels/rans_decode_blocks.cl"),
+            ),
+            ("fse_decode.cl", include_str!("../kernels/fse_decode.cl")),
+            (
+                "fse_decode_blocks.cl",
+                include_str!("../kernels/fse_decode_blocks.cl"),
+            ),
+            ("lz77_decode.cl", include_str!("../kernels/lz77_decode.cl")),
         ];
         let sizes: &[usize] = &[64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024];
 
@@ -447,6 +469,17 @@ mod tests {
                 "fse_decode.wgsl",
                 include_str!("../kernels/fse_decode.wgsl"),
             ),
+            ("rans_decode.cl", include_str!("../kernels/rans_decode.cl")),
+            (
+                "rans_decode_blocks.cl",
+                include_str!("../kernels/rans_decode_blocks.cl"),
+            ),
+            ("fse_decode.cl", include_str!("../kernels/fse_decode.cl")),
+            (
+                "fse_decode_blocks.cl",
+                include_str!("../kernels/fse_decode_blocks.cl"),
+            ),
+            ("lz77_decode.cl", include_str!("../kernels/lz77_decode.cl")),
         ];
         for (name, src) in sources {
             assert!(

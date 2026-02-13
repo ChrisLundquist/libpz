@@ -374,4 +374,171 @@ impl OpenClEngine {
 
         Ok(table)
     }
+
+    /// GPU-accelerated block-parallel LZ77 decompression.
+    ///
+    /// Decompresses multiple independently-compressed LZ77 blocks in parallel
+    /// on the GPU. Each block is assigned to one workgroup; thread 0 parses
+    /// matches sequentially while all threads cooperate on back-reference copies.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_data` - Concatenated serialized LZ77 match data for all blocks.
+    /// * `block_meta` - Per-block metadata: `(match_data_offset, num_matches, decompressed_size)`.
+    /// * `cooperative_threads` - Workgroup size (threads per block). Must be
+    ///   a power of 2, clamped to device max.
+    ///
+    /// Returns the concatenated decompressed data from all blocks.
+    pub fn lz77_decompress_blocks(
+        &self,
+        block_data: &[u8],
+        block_meta: &[(usize, usize, usize)],
+        cooperative_threads: usize,
+    ) -> PzResult<Vec<u8>> {
+        if block_data.is_empty() || block_meta.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let num_blocks = block_meta.len();
+
+        // Compute output offsets via prefix sum of decompressed sizes
+        let mut gpu_meta = Vec::with_capacity(num_blocks * 3);
+        let mut output_offset = 0usize;
+        for &(data_offset, num_matches, decompressed_size) in block_meta {
+            gpu_meta.push(data_offset as u32);
+            gpu_meta.push(num_matches as u32);
+            gpu_meta.push(output_offset as u32);
+            output_offset += decompressed_size;
+        }
+        let total_output_len = output_offset;
+
+        if total_output_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Compile kernel with the requested workgroup size
+        let wg_size = cooperative_threads
+            .next_power_of_two()
+            .min(self.max_work_group_size)
+            .max(1);
+        let defines = format!("-Werror -DWG_SIZE={wg_size}u");
+        let source = include_str!("../../kernels/lz77_decode.cl");
+        let program = Program::create_and_build_from_source(&self.context, source, &defines)
+            .map_err(|_| PzError::Unsupported)?;
+        let kernel =
+            Kernel::create(&program, "Lz77DecodeBlock").map_err(|_| PzError::Unsupported)?;
+
+        // Upload match data
+        let mut match_buf = unsafe {
+            Buffer::<u8>::create(
+                &self.context,
+                CL_MEM_READ_ONLY,
+                block_data.len(),
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+        let ev = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut match_buf, CL_BLOCKING, 0, block_data, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        ev.wait().map_err(|_| PzError::Unsupported)?;
+        self.profile_event("lz77_decompress_blocks: upload matches", &ev);
+
+        // Upload block metadata
+        let mut meta_buf = unsafe {
+            Buffer::<u32>::create(
+                &self.context,
+                CL_MEM_READ_ONLY,
+                gpu_meta.len(),
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+        let ev = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut meta_buf, CL_BLOCKING, 0, &gpu_meta, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        ev.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Allocate output buffer (zeroed)
+        let mut output_buf = unsafe {
+            Buffer::<u8>::create(
+                &self.context,
+                CL_MEM_READ_WRITE,
+                total_output_len,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+        let zeros = vec![0u8; total_output_len];
+        let ev = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut output_buf, CL_BLOCKING, 0, &zeros, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        ev.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Dispatch: one workgroup per block
+        let num_blocks_arg = num_blocks as cl_uint;
+        let total_out_arg = total_output_len as cl_uint;
+        let global_size = num_blocks * wg_size;
+
+        let kernel_event = unsafe {
+            ExecuteKernel::new(&kernel)
+                .set_arg(&match_buf)
+                .set_arg(&meta_buf)
+                .set_arg(&output_buf)
+                .set_arg(&num_blocks_arg)
+                .set_arg(&total_out_arg)
+                .set_global_work_size(global_size)
+                .set_local_work_size(wg_size)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        kernel_event.wait().map_err(|_| PzError::Unsupported)?;
+        self.profile_event("lz77_decompress_blocks: decode kernel", &kernel_event);
+
+        // Download result
+        let mut result = vec![0u8; total_output_len];
+        let ev = unsafe {
+            self.queue
+                .enqueue_read_buffer(&output_buf, CL_BLOCKING, 0, &mut result, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        ev.wait().map_err(|_| PzError::Unsupported)?;
+        self.profile_event("lz77_decompress_blocks: download output", &ev);
+
+        Ok(result)
+    }
+}
+
+/// Per-block metadata: `(data_offset, num_matches, decompressed_size)`.
+pub type BlockMeta = Vec<(usize, usize, usize)>;
+
+/// Compress input into independently-decompressible LZ77 blocks.
+///
+/// Each block of `block_size` bytes is compressed with a fresh LZ77 window,
+/// so blocks can be decompressed in any order without cross-block dependencies.
+///
+/// Returns:
+/// - `block_data`: concatenated serialized match data for all blocks
+/// - `block_meta`: per-block `(data_offset, num_matches, decompressed_size)`
+pub fn lz77_compress_blocks(input: &[u8], block_size: usize) -> PzResult<(Vec<u8>, BlockMeta)> {
+    use crate::lz77;
+
+    let mut block_data = Vec::new();
+    let mut block_meta = Vec::new();
+
+    for chunk in input.chunks(block_size) {
+        let compressed = lz77::compress_lazy(chunk)?;
+        let data_offset = block_data.len();
+        let num_matches = compressed.len() / Match::SERIALIZED_SIZE;
+        block_meta.push((data_offset, num_matches, chunk.len()));
+        block_data.extend_from_slice(&compressed);
+    }
+
+    Ok((block_data, block_meta))
 }
