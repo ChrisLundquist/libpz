@@ -66,7 +66,7 @@ fn list_pipelines() {
         ),
         ("lzr", "3", "LZ77 + rANS (fastest compression)"),
         ("lzf", "4", "LZ77 + FSE (zstd-style entropy coding)"),
-        ("lzfi", "5", "LZ77 + interleaved FSE (fast CPU decode)"),
+        ("lzfi", "5", "LZSS + interleaved FSE (fast CPU decode)"),
         ("lzssr", "6", "LZSS + rANS (experimental)"),
         ("lz78r", "7", "LZ78 + rANS (experimental)"),
     ];

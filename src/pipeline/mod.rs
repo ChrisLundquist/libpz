@@ -13,7 +13,7 @@
 //! | `Bw`          | BWT → MTF → RLE → FSE            | bzip2           |
 //! | `Lzr`         | LZ77 → rANS                      | fast ANS        |
 //! | `Lzf`         | LZ77 → FSE                       | zstd-like       |
-//! | `Lzfi`        | LZ77 → interleaved FSE           | fast CPU decode |
+//! | `Lzfi`        | LZSS → interleaved FSE           | fast CPU decode |
 //! | `LzssR`       | LZSS → rANS                      | experimental    |
 //! | `Lz78R`       | LZ78 → rANS                      | experimental    |
 //!
@@ -198,7 +198,7 @@ pub enum Pipeline {
     Lzr = 3,
     /// LZ77 + FSE (finite state entropy, zstd-style)
     Lzf = 4,
-    /// LZ77 + interleaved FSE (N-way parallel FSE, fast CPU decode)
+    /// LZSS + interleaved FSE (N-way parallel FSE, fast CPU decode)
     Lzfi = 5,
     /// LZSS + rANS (flag-bit LZ + arithmetic ANS, experimental)
     LzssR = 6,

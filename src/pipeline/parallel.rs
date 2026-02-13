@@ -153,7 +153,7 @@ pub(crate) fn compress_parallel(
 /// entropy-encode the current batch, the GPU is already processing the next
 /// batch. This overlaps GPU and CPU work, improving throughput on large inputs.
 ///
-/// This is used for LZ77-based pipelines (Deflate, Lzr, Lzf, Lzfi) when the
+/// This is used for LZ-based pipelines (Deflate, Lzr, Lzf, Lzfi) when the
 /// WebGPU backend is active and there are multiple blocks.
 #[cfg(feature = "webgpu")]
 fn compress_parallel_gpu_batched(

@@ -971,7 +971,7 @@ pub(crate) fn run_decompress_stage(
         // Lzf: FSE decode(0) → LZ77 decompress(1)
         (Pipeline::Lzf, 0) => stage_fse_decode(block),
         (Pipeline::Lzf, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
-        // Lzfi: interleaved FSE decode(0) → LZ77 decompress(1)
+        // Lzfi: interleaved FSE decode(0) → LZSS decompress(1)
         (Pipeline::Lzfi, 0) => {
             #[cfg(feature = "opencl")]
             {
