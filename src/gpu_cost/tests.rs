@@ -179,31 +179,31 @@ fn no_annotation_returns_none() {
 
 #[test]
 fn memory_bytes_at_known_sizes() {
-    // lz77_lazy: input=N, hash_counts=131072, hash_table=8388608,
+    // lz77_lazy: input=N, hash_counts=524288, hash_table=134217728,
     //            raw_matches=N*12, resolved=N*12, staging=N*12
     let src = r#"
 // @pz_cost {
 //   threads_per_element: 1
 //   passes: 3
-//   buffers: input=N, hash_counts=131072, hash_table=8388608, raw_matches=N*12, resolved=N*12, staging=N*12
+//   buffers: input=N, hash_counts=524288, hash_table=134217728, raw_matches=N*12, resolved=N*12, staging=N*12
 //   local_mem: 0
 // }
 "#;
     let cost = KernelCost::parse(src).unwrap();
     // At N=256KB (262144):
-    // input=262144, hash_counts=131072, hash_table=8388608,
+    // input=262144, hash_counts=524288, hash_table=134217728,
     // raw_matches=3145728, resolved=3145728, staging=3145728
-    // Total = 262144 + 131072 + 8388608 + 3*3145728 = 18219008
+    // Total = 262144 + 524288 + 134217728 + 3*3145728 = 144401344
     let n = 256 * 1024;
-    let expected = n + 131072 + 8388608 + 3 * (n * 12);
+    let expected = n + 524288 + 134217728 + 3 * (n * 12);
     assert_eq!(cost.memory_bytes(n), expected);
 
     // At N=4MB (4194304):
-    // input=4194304, hash_counts=131072, hash_table=8388608,
+    // input=4194304, hash_counts=524288, hash_table=134217728,
     // raw_matches=50331648, resolved=50331648, staging=50331648
-    // Total = 4194304 + 131072 + 8388608 + 3*50331648 = 163689728 (~156MB)
+    // Total = 4194304 + 524288 + 134217728 + 3*50331648 = 289736960 (~276MB)
     let n = 4 * 1024 * 1024;
-    let expected = n + 131072 + 8388608 + 3 * (n * 12);
+    let expected = n + 524288 + 134217728 + 3 * (n * 12);
     assert_eq!(cost.memory_bytes(n), expected);
 }
 
@@ -952,11 +952,8 @@ fn cross_validate_fse_decode_wgsl() {
 #[test]
 fn cross_validate_cl_wgsl_parity() {
     let pairs: &[(&str, &str, &str)] = &[
-        (
-            "lz77_hash",
-            include_str!("../../kernels/lz77_hash.cl"),
-            include_str!("../../kernels/lz77_hash.wgsl"),
-        ),
+        // lz77_hash: WGSL uses a larger hash table (1<<17) than OpenCL (1<<15)
+        // for better match quality on large inputs. Parity intentionally broken.
         (
             "lz77_topk",
             include_str!("../../kernels/lz77_topk.cl"),

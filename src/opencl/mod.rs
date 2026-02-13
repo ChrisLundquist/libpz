@@ -482,6 +482,14 @@ impl OpenClEngine {
         (self.global_mem_size as usize) / 2
     }
 
+    /// Compute the batch size for LZ77 GPU dispatches, based on the cost
+    /// model and memory budget.
+    pub(crate) fn lz77_batch_size(&self, block_size: usize) -> usize {
+        const GPU_MAX_BATCH: usize = 64;
+        let mem_limit = self.max_in_flight(&self.cost_lz77_hash, block_size);
+        mem_limit.min(GPU_MAX_BATCH)
+    }
+
     /// Extract elapsed time in milliseconds from a completed OpenCL event.
     ///
     /// Requires the command queue to have been created with

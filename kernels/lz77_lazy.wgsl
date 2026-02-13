@@ -18,7 +18,7 @@
 // @pz_cost {
 //   threads_per_element: 1
 //   passes: 3
-//   buffers: input=N, hash_counts=131072, hash_table=8388608, raw_matches=N*12, resolved=N*12, staging=N*12
+//   buffers: input=N, hash_counts=524288, hash_table=134217728, raw_matches=N*12, resolved=N*12, staging=N*12
 //   local_mem: 0
 // }
 
@@ -29,10 +29,10 @@ struct Lz77Match {
 }
 
 const MAX_WINDOW: u32 = 32768u;
-const HASH_SIZE: u32 = 32768u; // 1 << 15
-const HASH_MASK: u32 = 32767u; // HASH_SIZE - 1
-const MAX_CHAIN: u32 = 64u;
-const BUCKET_CAP: u32 = 64u;
+const HASH_SIZE: u32 = 131072u; // 1 << 17
+const HASH_MASK: u32 = 131071u; // HASH_SIZE - 1
+const MAX_CHAIN: u32 = 128u;
+const BUCKET_CAP: u32 = 256u;
 const MIN_MATCH: u32 = 3u;
 // Matches this long skip lazy evaluation (unlikely to be beaten).
 const LAZY_SKIP_THRESHOLD: u32 = 32u;
@@ -55,7 +55,7 @@ fn hash3_p1(pos: u32, len: u32) -> u32 {
     if (pos + 2u >= len) {
         return 0u;
     }
-    let h = (read_byte_p1(pos) << 10u) ^ (read_byte_p1(pos + 1u) << 5u) ^ read_byte_p1(pos + 2u);
+    let h = (read_byte_p1(pos) << 12u) ^ (read_byte_p1(pos + 1u) << 6u) ^ read_byte_p1(pos + 2u);
     return h & HASH_MASK;
 }
 
@@ -104,7 +104,7 @@ fn hash3_p2(pos: u32, len: u32) -> u32 {
     if (pos + 2u >= len) {
         return 0u;
     }
-    let h = (read_byte_p2(pos) << 10u) ^ (read_byte_p2(pos + 1u) << 5u) ^ read_byte_p2(pos + 2u);
+    let h = (read_byte_p2(pos) << 12u) ^ (read_byte_p2(pos + 1u) << 6u) ^ read_byte_p2(pos + 2u);
     return h & HASH_MASK;
 }
 
