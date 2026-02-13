@@ -5,6 +5,13 @@
 // per-position search. The host deduplicates overlapping matches
 // after readback.
 
+// @pz_cost {
+//   threads_per_element: 0.03125
+//   passes: 1
+//   buffers: input=N, output=N*12
+//   local_mem: 0
+// }
+
 typedef struct {
     unsigned int offset;
     unsigned int length;

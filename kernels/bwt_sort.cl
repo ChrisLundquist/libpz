@@ -10,6 +10,14 @@
 /// The sa[] and rank[] arrays are padded to a power-of-2 size. Padding
 /// entries have rank = UINT_MAX so they sort to the end.
 
+// @pz_cost {
+//   threads_per_element: 0.5
+//   passes: 1
+//   buffers: sa=N*4, rank=N*4
+//   local_mem: 0
+//   note: O(log^2 N) dispatches for full bitonic sort
+// }
+
 /// One compare-and-swap step of bitonic sort.
 ///
 /// Each work-item handles one pair (i, i^j) and swaps if the

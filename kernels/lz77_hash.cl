@@ -9,6 +9,13 @@
 // This replaces the brute-force O(n*w) search with O(n*MAX_CHAIN) search,
 // matching the CPU hash-chain strategy.
 
+// @pz_cost {
+//   threads_per_element: 1
+//   passes: 2
+//   buffers: input=N, hash_counts=131072, hash_table=8388608, output=N*12
+//   local_mem: 0
+// }
+
 typedef struct {
     unsigned int offset;
     unsigned int length;

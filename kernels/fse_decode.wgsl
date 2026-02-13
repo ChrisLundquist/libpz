@@ -15,6 +15,13 @@
 //
 // Bitstream is LSB-first (matching the CPU FSE BitWriter).
 
+// @pz_cost {
+//   threads_per_element: 1
+//   passes: 1
+//   buffers: input=N, output=N, table=4096
+//   local_mem: 0
+// }
+
 // Decode table: indexed by state, each entry is a packed u32.
 @group(0) @binding(0) var<storage, read> decode_table: array<u32>;
 

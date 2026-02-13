@@ -28,6 +28,7 @@
 //! ```
 
 use crate::bwt::BwtResult;
+use crate::gpu_cost::KernelCost;
 use crate::lz77::Match;
 use crate::{PzError, PzResult};
 
@@ -100,10 +101,6 @@ struct PendingLz77 {
     staging_buf: wgpu::Buffer,
     input_len: usize,
 }
-
-/// Maximum number of blocks to submit in a single GPU batch.
-/// Limits GPU memory pressure: 8 x 256KB x ~36 bytes/pos ~ 72MB.
-const MAX_GPU_BATCH_SIZE: usize = 8;
 
 /// Information about a discovered WebGPU device.
 #[derive(Debug, Clone)]
@@ -189,6 +186,8 @@ pub struct WebGpuEngine {
     scan_workgroup_size: usize,
     /// Maximum storage buffer binding size in bytes (device limit).
     max_buffer_size: u32,
+    /// Parsed cost model for the LZ77 lazy kernel (used for batch scheduling).
+    cost_lz77_lazy: KernelCost,
     /// Whether profiling is enabled (timestamp queries).
     profiling: bool,
     /// Query set for timestamp profiling (begin + end).
@@ -375,6 +374,10 @@ impl WebGpuEngine {
             make_pipeline("prefix_sum_apply", &huffman_module, "prefix_sum_apply");
         let pipeline_fse_decode = make_pipeline("fse_decode", &fse_decode_module, "fse_decode");
 
+        // Parse kernel cost annotations for batch scheduling.
+        let cost_lz77_lazy = KernelCost::parse(LZ77_LAZY_KERNEL_SOURCE)
+            .expect("lz77_lazy.wgsl missing @pz_cost annotation");
+
         // Create profiling resources when GPU timestamps are available.
         let (query_set, resolve_buf, staging_buf) = if use_timestamps {
             let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -428,6 +431,7 @@ impl WebGpuEngine {
             is_cpu,
             scan_workgroup_size,
             max_buffer_size,
+            cost_lz77_lazy,
             profiling,
             query_set,
             resolve_buf,
@@ -453,6 +457,21 @@ impl WebGpuEngine {
     /// Whether profiling is enabled on this engine.
     pub fn profiling(&self) -> bool {
         self.profiling
+    }
+
+    /// Max blocks of `block_size` bytes in flight for a kernel without
+    /// exceeding the GPU memory budget.
+    pub(crate) fn max_in_flight(&self, kernel: &KernelCost, block_size: usize) -> usize {
+        let per_block = kernel.memory_bytes(block_size);
+        if per_block == 0 {
+            return 8;
+        }
+        (self.gpu_memory_budget() / per_block).max(1)
+    }
+
+    /// Conservative GPU memory budget: 50% of max_buffer_size.
+    fn gpu_memory_budget(&self) -> usize {
+        (self.max_buffer_size as usize) / 2
     }
 
     /// Maximum input size (bytes) that fits in a single GPU dispatch.

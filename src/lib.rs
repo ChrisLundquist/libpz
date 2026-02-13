@@ -18,6 +18,9 @@ pub mod rle;
 pub mod simd;
 pub mod streaming;
 
+#[allow(dead_code)]
+mod gpu_cost;
+
 #[cfg(feature = "opencl")]
 pub mod opencl;
 
