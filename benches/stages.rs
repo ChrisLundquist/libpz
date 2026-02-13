@@ -379,13 +379,26 @@ fn bench_deflate_gpu_chained(c: &mut Criterion) {
             });
         });
 
-        // GPU chained Deflate
+        // GPU modular Deflate (GPU LZ77 → GPU Huffman via composable stages)
         let eng = engine.clone();
         group.bench_with_input(
-            BenchmarkId::new("gpu_chained", size),
+            BenchmarkId::new("gpu_modular", size),
             &data,
             move |b, data| {
-                b.iter(|| eng.deflate_chained(data).unwrap());
+                let opts = CompressOptions {
+                    backend: pz::pipeline::Backend::OpenCl,
+                    threads: 1,
+                    opencl_engine: Some(eng.clone()),
+                    ..Default::default()
+                };
+                b.iter(|| {
+                    pz::pipeline::compress_with_options(
+                        data,
+                        pz::pipeline::Pipeline::Deflate,
+                        &opts,
+                    )
+                    .unwrap()
+                });
             },
         );
     }
@@ -759,13 +772,26 @@ fn bench_deflate_webgpu_chained(c: &mut Criterion) {
             });
         });
 
-        // WebGPU chained Deflate
+        // WebGPU modular Deflate (WebGPU LZ77 → WebGPU Huffman via composable stages)
         let eng = engine.clone();
         group.bench_with_input(
-            BenchmarkId::new("webgpu_chained", size),
+            BenchmarkId::new("webgpu_modular", size),
             &data,
             move |b, data| {
-                b.iter(|| eng.deflate_chained(data).unwrap());
+                let opts = CompressOptions {
+                    backend: pz::pipeline::Backend::WebGpu,
+                    threads: 1,
+                    webgpu_engine: Some(eng.clone()),
+                    ..Default::default()
+                };
+                b.iter(|| {
+                    pz::pipeline::compress_with_options(
+                        data,
+                        pz::pipeline::Pipeline::Deflate,
+                        &opts,
+                    )
+                    .unwrap()
+                });
             },
         );
     }

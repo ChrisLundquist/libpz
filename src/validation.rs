@@ -793,4 +793,147 @@ mod tests {
             assert_eq!(decompressed, input);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // GPU → CPU cross-decompression tests
+    //
+    // These verify the critical invariant: compressed bytes from a GPU backend
+    // are decompressible by the standard CPU path. This is the exact scenario
+    // that breaks when GPU and CPU demux/mux formats diverge.
+    // -----------------------------------------------------------------------
+
+    /// Generate test input large enough to trigger GPU dispatch (≥64KB).
+    #[cfg(any(feature = "opencl", feature = "webgpu"))]
+    fn gpu_test_input() -> Vec<u8> {
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let target_size = 80 * 1024; // 80KB, above MIN_GPU_INPUT_SIZE (64KB)
+        let mut input = Vec::with_capacity(target_size);
+        while input.len() < target_size {
+            input.extend_from_slice(pattern);
+        }
+        input.truncate(target_size);
+        input
+    }
+
+    #[test]
+    #[cfg(feature = "opencl")]
+    fn opencl_compress_cpu_decompress_deflate() {
+        use crate::pipeline::{Backend, CompressOptions};
+        let engine = match crate::opencl::OpenClEngine::new() {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(crate::PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+        let input = gpu_test_input();
+        let options = CompressOptions {
+            backend: Backend::OpenCl,
+            opencl_engine: Some(engine),
+            ..Default::default()
+        };
+        let compressed =
+            pipeline::compress_with_options(&input, Pipeline::Deflate, &options).unwrap();
+        let decompressed = pipeline::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "OpenCL Deflate GPU→CPU round-trip");
+    }
+
+    #[test]
+    #[cfg(feature = "opencl")]
+    fn opencl_compress_cpu_decompress_lzr() {
+        use crate::pipeline::{Backend, CompressOptions};
+        let engine = match crate::opencl::OpenClEngine::new() {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(crate::PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+        let input = gpu_test_input();
+        let options = CompressOptions {
+            backend: Backend::OpenCl,
+            opencl_engine: Some(engine),
+            ..Default::default()
+        };
+        let compressed = pipeline::compress_with_options(&input, Pipeline::Lzr, &options).unwrap();
+        let decompressed = pipeline::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "OpenCL Lzr GPU→CPU round-trip");
+    }
+
+    #[test]
+    #[cfg(feature = "opencl")]
+    fn opencl_compress_cpu_decompress_lzf() {
+        use crate::pipeline::{Backend, CompressOptions};
+        let engine = match crate::opencl::OpenClEngine::new() {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(crate::PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+        let input = gpu_test_input();
+        let options = CompressOptions {
+            backend: Backend::OpenCl,
+            opencl_engine: Some(engine),
+            ..Default::default()
+        };
+        let compressed = pipeline::compress_with_options(&input, Pipeline::Lzf, &options).unwrap();
+        let decompressed = pipeline::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "OpenCL Lzf GPU→CPU round-trip");
+    }
+
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn webgpu_compress_cpu_decompress_deflate() {
+        use crate::pipeline::{Backend, CompressOptions};
+        let engine = match crate::webgpu::WebGpuEngine::new() {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(crate::PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+        let input = gpu_test_input();
+        let options = CompressOptions {
+            backend: Backend::WebGpu,
+            webgpu_engine: Some(engine),
+            ..Default::default()
+        };
+        let compressed =
+            pipeline::compress_with_options(&input, Pipeline::Deflate, &options).unwrap();
+        let decompressed = pipeline::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "WebGPU Deflate GPU→CPU round-trip");
+    }
+
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn webgpu_compress_cpu_decompress_lzr() {
+        use crate::pipeline::{Backend, CompressOptions};
+        let engine = match crate::webgpu::WebGpuEngine::new() {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(crate::PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+        let input = gpu_test_input();
+        let options = CompressOptions {
+            backend: Backend::WebGpu,
+            webgpu_engine: Some(engine),
+            ..Default::default()
+        };
+        let compressed = pipeline::compress_with_options(&input, Pipeline::Lzr, &options).unwrap();
+        let decompressed = pipeline::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "WebGPU Lzr GPU→CPU round-trip");
+    }
+
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn webgpu_compress_cpu_decompress_lzf() {
+        use crate::pipeline::{Backend, CompressOptions};
+        let engine = match crate::webgpu::WebGpuEngine::new() {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(crate::PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+        let input = gpu_test_input();
+        let options = CompressOptions {
+            backend: Backend::WebGpu,
+            webgpu_engine: Some(engine),
+            ..Default::default()
+        };
+        let compressed = pipeline::compress_with_options(&input, Pipeline::Lzf, &options).unwrap();
+        let decompressed = pipeline::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "WebGPU Lzf GPU→CPU round-trip");
+    }
 }

@@ -23,8 +23,6 @@ pub(crate) struct DemuxOutput {
 /// them back on decompression.
 pub(crate) trait StreamDemuxer {
     /// Number of independent streams this format produces.
-    // TODO: Use in decode validation to verify stream count matches before decoding.
-    #[allow(dead_code)]
     fn stream_count(&self) -> usize;
 
     /// Compress input bytes and split into independent streams + metadata.
@@ -51,9 +49,6 @@ pub(crate) enum LzDemuxer {
 
 /// Map a pipeline to its demuxer, if it uses one.
 /// Returns `None` for BWT-based pipelines (Bw, Bbw).
-// TODO: Use in compress_block/decompress_block to replace per-pipeline match arms with
-// a generic demux→entropy path, reducing code duplication across LZ-based pipelines.
-#[allow(dead_code)]
 pub(crate) fn demuxer_for_pipeline(pipeline: super::Pipeline) -> Option<LzDemuxer> {
     match pipeline {
         super::Pipeline::Deflate | super::Pipeline::Lzr | super::Pipeline::Lzf => {

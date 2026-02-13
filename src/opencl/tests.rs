@@ -170,6 +170,79 @@ fn test_gpu_lz77_empty_input() {
     assert!(result.is_empty());
 }
 
+// --- find_matches_to_device tests ---
+
+#[test]
+fn test_find_matches_to_device_matches_find_matches() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let input = b"hello world hello world hello world";
+
+    // Direct path: find_matches downloads and dedupes in one call
+    let direct = engine
+        .find_matches(input, KernelVariant::HashTable)
+        .unwrap();
+
+    // Device path: keep on GPU, then download
+    let match_buf = engine
+        .find_matches_to_device(input, KernelVariant::HashTable)
+        .unwrap();
+    assert_eq!(match_buf.input_len(), input.len());
+    let device = engine.download_and_dedupe(&match_buf, input).unwrap();
+
+    // Both paths should produce identical match sequences
+    assert_eq!(direct.len(), device.len(), "match count differs");
+    for (i, (d, v)) in direct.iter().zip(device.iter()).enumerate() {
+        assert_eq!(d.offset, v.offset, "offset mismatch at match {}", i);
+        assert_eq!(d.length, v.length, "length mismatch at match {}", i);
+        assert_eq!(d.next, v.next, "next mismatch at match {}", i);
+    }
+}
+
+#[test]
+fn test_find_matches_to_device_empty() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let match_buf = engine
+        .find_matches_to_device(b"", KernelVariant::HashTable)
+        .unwrap();
+    assert_eq!(match_buf.input_len(), 0);
+
+    let matches = engine.download_and_dedupe(&match_buf, b"").unwrap();
+    assert!(matches.is_empty());
+}
+
+#[test]
+fn test_find_matches_to_device_round_trip() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let input = b"the quick brown fox jumps over the lazy dog. the quick brown fox.";
+    let match_buf = engine
+        .find_matches_to_device(input, KernelVariant::Batch)
+        .unwrap();
+    let matches = engine.download_and_dedupe(&match_buf, input).unwrap();
+
+    // Serialize matches and verify LZ77 round-trip
+    let mut compressed = Vec::with_capacity(matches.len() * Match::SERIALIZED_SIZE);
+    for m in &matches {
+        compressed.extend_from_slice(&m.to_bytes());
+    }
+    let decompressed = crate::lz77::decompress(&compressed).unwrap();
+    assert_eq!(&decompressed, &input[..]);
+}
+
 // --- Hash-table LZ77 GPU tests ---
 
 #[test]
@@ -494,6 +567,77 @@ fn test_gpu_topk_optimal_large_round_trip() {
     assert_eq!(decompressed, input);
 }
 
+// --- DeviceBuf tests ---
+
+#[test]
+fn test_device_buf_round_trip() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let data = b"hello world this is a test of device buffers";
+    let device_buf = DeviceBuf::from_host(&engine, data).unwrap();
+    assert_eq!(device_buf.len(), data.len());
+    assert!(!device_buf.is_empty());
+
+    let host_data = device_buf.read_to_host(&engine).unwrap();
+    assert_eq!(&host_data, data);
+}
+
+#[test]
+fn test_device_buf_empty() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let device_buf = DeviceBuf::from_host(&engine, &[]).unwrap();
+    assert_eq!(device_buf.len(), 0);
+    assert!(device_buf.is_empty());
+
+    let host_data = device_buf.read_to_host(&engine).unwrap();
+    assert!(host_data.is_empty());
+}
+
+#[test]
+fn test_byte_histogram_on_device_matches_host() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let input = b"aabbccdd hello world aabbccdd";
+
+    // Host-upload path
+    let hist_host = engine.byte_histogram(input).unwrap();
+
+    // Device-buffer path
+    let device_buf = DeviceBuf::from_host(&engine, input).unwrap();
+    let hist_device = engine.byte_histogram_on_device(&device_buf).unwrap();
+
+    assert_eq!(
+        hist_host, hist_device,
+        "histogram mismatch between host and device paths"
+    );
+}
+
+#[test]
+fn test_byte_histogram_on_device_empty() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let device_buf = DeviceBuf::from_host(&engine, &[]).unwrap();
+    let hist = engine.byte_histogram_on_device(&device_buf).unwrap();
+    assert!(hist.iter().all(|&c| c == 0));
+}
+
 // --- GPU Huffman encoding tests ---
 
 #[test]
@@ -687,6 +831,72 @@ fn test_gpu_prefix_sum_large() {
     assert_eq!(result, expected);
 }
 
+// --- GPU Huffman on-device tests ---
+
+#[test]
+fn test_gpu_huffman_encode_on_device_matches_gpu_scan() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let input = b"hello world hello world hello world!";
+    let tree = crate::huffman::HuffmanTree::from_data(input).unwrap();
+
+    let mut code_lut = [0u32; 256];
+    for byte in 0..=255u8 {
+        let (codeword, bits) = tree.get_code(byte);
+        code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+    }
+
+    // Host-upload path
+    let (scan_encoded, scan_bits) = engine.huffman_encode_gpu_scan(input, &code_lut).unwrap();
+
+    // Device-buffer path
+    let device_buf = DeviceBuf::from_host(&engine, input).unwrap();
+    let (device_encoded, device_bits) = engine
+        .huffman_encode_on_device(&device_buf, &code_lut)
+        .unwrap();
+
+    assert_eq!(scan_bits, device_bits, "bit counts differ");
+    assert_eq!(scan_encoded, device_encoded, "encoded data differs");
+
+    // Verify round-trip
+    let decoded = tree.decode(&device_encoded, device_bits).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_gpu_huffman_encode_on_device_larger() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
+
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+
+    let tree = crate::huffman::HuffmanTree::from_data(&input).unwrap();
+    let mut code_lut = [0u32; 256];
+    for byte in 0..=255u8 {
+        let (codeword, bits) = tree.get_code(byte);
+        code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+    }
+
+    let device_buf = DeviceBuf::from_host(&engine, &input).unwrap();
+    let (device_encoded, device_bits) = engine
+        .huffman_encode_on_device(&device_buf, &code_lut)
+        .unwrap();
+
+    let decoded = tree.decode(&device_encoded, device_bits).unwrap();
+    assert_eq!(decoded, input);
+}
+
 // --- GPU Huffman with GPU scan tests ---
 
 #[test]
@@ -716,75 +926,26 @@ fn test_gpu_huffman_encode_gpu_scan_round_trip() {
     assert_eq!(decoded, input);
 }
 
-// --- GPU chained Deflate tests ---
+// --- GPU Deflate pipeline round-trip tests (modular stage path) ---
 
 #[test]
-fn test_gpu_deflate_chained_round_trip() {
-    let engine = match OpenClEngine::new() {
-        Ok(e) => e,
-        Err(PzError::Unsupported) => return,
-        Err(e) => panic!("Unexpected error: {:?}", e),
-    };
-
+fn test_gpu_deflate_pipeline_round_trip() {
     let input = b"the quick brown fox jumps over the lazy dog. the quick brown fox.";
-    let block_data = engine.deflate_chained(input).unwrap();
-
-    // Decompress using the standard CPU Deflate decoder
-    let decompressed = crate::pipeline::decompress(&{
-        // Build a proper V2 PZ container around the block data
-        let mut container = Vec::new();
-        container.extend_from_slice(&[b'P', b'Z', 2, 0]); // magic + version=2 + pipeline=Deflate
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes()); // original length
-        container.extend_from_slice(&1u32.to_le_bytes()); // num_blocks = 1
-        container.extend_from_slice(&(block_data.len() as u32).to_le_bytes()); // compressed_len
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes()); // original_len
-        container.extend_from_slice(&block_data);
-        container
-    })
-    .unwrap();
-
-    assert_eq!(decompressed, input);
+    gpu_pipeline_round_trip(input, crate::pipeline::Pipeline::Deflate);
 }
 
 #[test]
-fn test_gpu_deflate_chained_larger() {
-    let engine = match OpenClEngine::new() {
-        Ok(e) => e,
-        Err(PzError::Unsupported) => return,
-        Err(e) => panic!("Unexpected error: {:?}", e),
-    };
-
+fn test_gpu_deflate_pipeline_larger() {
     let pattern = b"The quick brown fox jumps over the lazy dog. ";
     let mut input = Vec::new();
     for _ in 0..200 {
         input.extend_from_slice(pattern);
     }
-
-    let block_data = engine.deflate_chained(&input).unwrap();
-
-    let decompressed = crate::pipeline::decompress(&{
-        let mut container = Vec::new();
-        container.extend_from_slice(&[b'P', b'Z', 2, 0]); // magic + version=2 + pipeline=Deflate
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes()); // original length
-        container.extend_from_slice(&1u32.to_le_bytes()); // num_blocks = 1
-        container.extend_from_slice(&(block_data.len() as u32).to_le_bytes()); // compressed_len
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes()); // original_len
-        container.extend_from_slice(&block_data);
-        container
-    })
-    .unwrap();
-
-    assert_eq!(decompressed, input);
+    gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Deflate);
 }
 
 #[test]
-fn test_gpu_deflate_chained_binary() {
-    let engine = match OpenClEngine::new() {
-        Ok(e) => e,
-        Err(PzError::Unsupported) => return,
-        Err(e) => panic!("Unexpected error: {:?}", e),
-    };
-
+fn test_gpu_deflate_pipeline_binary() {
     // Binary data with repeating patterns — exercises all byte values
     let mut input = Vec::new();
     for i in 0u8..=255 {
@@ -792,20 +953,81 @@ fn test_gpu_deflate_chained_binary() {
             input.push(i);
         }
     }
+    gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Deflate);
+}
 
-    let block_data = engine.deflate_chained(&input).unwrap();
+// --- Modular GPU pipeline composition tests ---
 
-    let decompressed = crate::pipeline::decompress(&{
-        let mut container = Vec::new();
-        container.extend_from_slice(&[b'P', b'Z', 2, 0]);
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
-        container.extend_from_slice(&1u32.to_le_bytes());
-        container.extend_from_slice(&(block_data.len() as u32).to_le_bytes());
-        container.extend_from_slice(&(input.len() as u32).to_le_bytes());
-        container.extend_from_slice(&block_data);
-        container
-    })
-    .unwrap();
+/// Helper: compress/decompress via the pipeline API with OpenCL backend.
+fn gpu_pipeline_round_trip(input: &[u8], pipeline: crate::pipeline::Pipeline) {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    };
 
-    assert_eq!(decompressed, input);
+    let options = crate::pipeline::CompressOptions {
+        backend: crate::pipeline::Backend::OpenCl,
+        opencl_engine: Some(engine),
+        ..Default::default()
+    };
+
+    let compressed = crate::pipeline::compress_with_options(input, pipeline, &options)
+        .unwrap_or_else(|e| {
+            panic!("compress failed for {:?}: {:?}", pipeline, e);
+        });
+
+    let decompressed = crate::pipeline::decompress(&compressed).unwrap_or_else(|e| {
+        panic!("decompress failed for {:?}: {:?}", pipeline, e);
+    });
+
+    assert_eq!(
+        decompressed, input,
+        "round-trip mismatch for {:?}",
+        pipeline
+    );
+}
+
+#[test]
+fn test_modular_gpu_deflate_round_trip() {
+    // GPU LZ77 → GPU Huffman (modular stage path, not monolithic deflate_chained)
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+    gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Deflate);
+}
+
+#[test]
+fn test_gpu_lz77_cpu_rans_round_trip() {
+    // GPU LZ77 → CPU rANS (previously impossible without modular stages)
+    let pattern = b"Hello, World! This is a test pattern for GPU+CPU composition. ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+    gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Lzr);
+}
+
+#[test]
+fn test_gpu_lz77_cpu_fse_round_trip() {
+    // GPU LZ77 → CPU FSE (previously impossible without modular stages)
+    let pattern = b"Hello, World! This is a test pattern for GPU+CPU composition. ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+    gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Lzf);
+}
+
+#[test]
+fn test_gpu_bwt_cpu_pipeline_round_trip() {
+    // GPU BWT → CPU MTF → CPU RLE → CPU FSE
+    let pattern = b"the quick brown fox jumps over the lazy dog ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+    gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Bw);
 }

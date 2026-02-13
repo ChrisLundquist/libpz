@@ -71,11 +71,17 @@ pub(crate) fn stage_demux_compress(
 }
 
 /// Generic decompress stage: reinterleave streams with a demuxer.
+///
+/// Validates that the number of decoded streams matches the demuxer's
+/// expected `stream_count()` before passing them to `remux_and_decompress`.
 pub(crate) fn stage_demux_decompress(
     mut block: StageBlock,
     demuxer: &LzDemuxer,
 ) -> PzResult<StageBlock> {
     let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
+    if streams.len() != demuxer.stream_count() {
+        return Err(PzError::InvalidInput);
+    }
     let decoded =
         demuxer.remux_and_decompress(streams, &block.metadata.demux_meta, block.original_len)?;
     block.data = decoded;
@@ -180,6 +186,123 @@ pub(crate) fn stage_huffman_encode(mut block: StageBlock) -> PzResult<StageBlock
             output.extend_from_slice(&(total_bits as u32).to_le_bytes());
             for &freq in &freq_table {
                 output.extend_from_slice(&freq.to_le_bytes());
+            }
+            output.extend_from_slice(&huffman_data);
+            Ok(())
+        },
+    )?;
+
+    Ok(block)
+}
+
+/// GPU Huffman encoding stage: same output format as [`stage_huffman_encode()`] but
+/// uses the GPU for histogram computation and Huffman encoding via [`DeviceBuf`].
+///
+/// Each stream is uploaded to the GPU once, then both the histogram and encoding
+/// run on-device — no extra PCI transfers. The output is byte-identical to the
+/// CPU path, so the same decoder works for both.
+///
+/// Falls back to CPU for empty or very small streams where GPU overhead dominates.
+#[cfg(feature = "opencl")]
+pub(crate) fn stage_huffman_encode_gpu(
+    mut block: StageBlock,
+    engine: &crate::opencl::OpenClEngine,
+) -> PzResult<StageBlock> {
+    use crate::opencl::DeviceBuf;
+
+    let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
+    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+
+    block.data = encode_multistream(
+        &streams,
+        pre_entropy_len,
+        &block.metadata.demux_meta,
+        |stream, output| {
+            // Upload stream to GPU once
+            let device_buf = DeviceBuf::from_host(engine, stream)?;
+
+            // GPU histogram (no re-upload)
+            let histogram = engine.byte_histogram_on_device(&device_buf)?;
+
+            let mut freq = crate::frequency::FrequencyTable::new();
+            for (i, &count) in histogram.iter().enumerate() {
+                freq.byte[i] = count;
+            }
+            freq.total = freq.byte.iter().map(|&c| c as u64).sum();
+            freq.used = freq.byte.iter().filter(|&&c| c > 0).count() as u32;
+
+            let tree = HuffmanTree::from_frequency_table(&freq).ok_or(PzError::InvalidInput)?;
+            let freq_table = tree.serialize_frequencies();
+
+            let mut code_lut = [0u32; 256];
+            for byte in 0..=255u8 {
+                let (codeword, bits) = tree.get_code(byte);
+                code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+            }
+
+            // GPU Huffman encode on same device buffer (no re-upload)
+            let (huffman_data, total_bits) =
+                engine.huffman_encode_on_device(&device_buf, &code_lut)?;
+
+            output.extend_from_slice(&(huffman_data.len() as u32).to_le_bytes());
+            output.extend_from_slice(&(total_bits as u32).to_le_bytes());
+            for &freq_val in &freq_table {
+                output.extend_from_slice(&freq_val.to_le_bytes());
+            }
+            output.extend_from_slice(&huffman_data);
+            Ok(())
+        },
+    )?;
+
+    Ok(block)
+}
+
+/// GPU Huffman encoding stage (WebGPU): same output format as [`stage_huffman_encode()`]
+/// but uses the WebGPU backend for histogram computation and Huffman encoding.
+///
+/// Each stream is uploaded to the GPU for both histogram and encoding. The output
+/// is byte-identical to the CPU path, so the same decoder works for both.
+///
+/// Falls back to CPU for empty streams where GPU overhead dominates.
+#[cfg(feature = "webgpu")]
+pub(crate) fn stage_huffman_encode_webgpu(
+    mut block: StageBlock,
+    engine: &crate::webgpu::WebGpuEngine,
+) -> PzResult<StageBlock> {
+    let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
+    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+
+    block.data = encode_multistream(
+        &streams,
+        pre_entropy_len,
+        &block.metadata.demux_meta,
+        |stream, output| {
+            // GPU histogram
+            let histogram = engine.byte_histogram(stream)?;
+
+            let mut freq = crate::frequency::FrequencyTable::new();
+            for (i, &count) in histogram.iter().enumerate() {
+                freq.byte[i] = count;
+            }
+            freq.total = freq.byte.iter().map(|&c| c as u64).sum();
+            freq.used = freq.byte.iter().filter(|&&c| c > 0).count() as u32;
+
+            let tree = HuffmanTree::from_frequency_table(&freq).ok_or(PzError::InvalidInput)?;
+            let freq_table = tree.serialize_frequencies();
+
+            let mut code_lut = [0u32; 256];
+            for byte in 0..=255u8 {
+                let (codeword, bits) = tree.get_code(byte);
+                code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+            }
+
+            // GPU Huffman encode
+            let (huffman_data, total_bits) = engine.huffman_encode_gpu_scan(stream, &code_lut)?;
+
+            output.extend_from_slice(&(huffman_data.len() as u32).to_le_bytes());
+            output.extend_from_slice(&(total_bits as u32).to_le_bytes());
+            for &freq_val in &freq_table {
+                output.extend_from_slice(&freq_val.to_le_bytes());
             }
             output.extend_from_slice(&huffman_data);
             Ok(())
@@ -544,7 +667,17 @@ pub(crate) fn run_compress_stage(
 ) -> PzResult<StageBlock> {
     match (pipeline, stage_idx) {
         (Pipeline::Deflate, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
-        (Pipeline::Deflate, 1) => stage_huffman_encode(block),
+        (Pipeline::Deflate, 1) => {
+            #[cfg(feature = "opencl")]
+            {
+                if let super::Backend::OpenCl = options.backend {
+                    if let Some(ref engine) = options.opencl_engine {
+                        return stage_huffman_encode_gpu(block, engine);
+                    }
+                }
+            }
+            stage_huffman_encode(block)
+        }
         (Pipeline::Bw, 0) => stage_bwt_encode(block, options),
         (Pipeline::Bw, 1) => stage_mtf_encode(block),
         (Pipeline::Bw, 2) => stage_rle_encode(block),
@@ -598,5 +731,39 @@ pub(crate) fn run_decompress_stage(
         (Pipeline::Lz78R, 0) => stage_rans_decode(block),
         (Pipeline::Lz78R, 1) => stage_demux_decompress(block, &LzDemuxer::Lz78),
         _ => Err(PzError::Unsupported),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PzError;
+
+    #[test]
+    fn test_demux_decompress_wrong_stream_count() {
+        // LZ77 expects 3 streams; provide 2 → should fail with InvalidInput
+        let block = StageBlock {
+            block_index: 0,
+            original_len: 100,
+            data: Vec::new(),
+            streams: Some(vec![vec![0u8; 10], vec![0u8; 10]]), // 2 streams, need 3
+            metadata: StageMetadata::default(),
+        };
+        let result = stage_demux_decompress(block, &LzDemuxer::Lz77);
+        assert!(matches!(result, Err(PzError::InvalidInput)));
+    }
+
+    #[test]
+    fn test_demux_decompress_no_streams() {
+        // No streams at all → should fail with InvalidInput
+        let block = StageBlock {
+            block_index: 0,
+            original_len: 100,
+            data: Vec::new(),
+            streams: None,
+            metadata: StageMetadata::default(),
+        };
+        let result = stage_demux_decompress(block, &LzDemuxer::Lz77);
+        assert!(matches!(result, Err(PzError::InvalidInput)));
     }
 }

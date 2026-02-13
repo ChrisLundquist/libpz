@@ -1,18 +1,18 @@
-//! End-to-end pipeline throughput benchmarks and external tool comparison.
+//! End-to-end pipeline throughput benchmarks.
 //!
 //! Measures compression and decompression throughput in MB/s for each
-//! pipeline, and compares against external tools (gzip, pigz, zstd)
-//! when available on the system PATH.
+//! pipeline (CPU, GPU, multi-threaded).
 //!
 //! Size tiers: default corpus (~135KB), 4MB, 16MB.
 //!
 //! All groups enforce warm_up_time(2s) + measurement_time(5s) + sample_size(10)
 //! to keep total runtime bounded.
+//!
+//! Note: External tool comparison (gzip, pigz, zstd) is done via `scripts/bench.sh`
+//! instead, since subprocess-based benchmarks are unreliable in Criterion.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use pz::pipeline::{self, Pipeline};
@@ -70,40 +70,6 @@ fn get_test_data_sized(size: usize) -> Vec<u8> {
     data
 }
 
-/// Check if a command exists on PATH.
-fn command_exists(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
-}
-
-/// Compress data by piping through an external tool.
-fn shell_compress(data: &[u8], cmd: &str, args: &[&str]) -> Option<Vec<u8>> {
-    let mut child = Command::new(cmd)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    child.stdin.take()?.write_all(data).ok()?;
-    let output = child.wait_with_output().ok()?;
-    if output.status.success() {
-        Some(output.stdout)
-    } else {
-        None
-    }
-}
-
-/// Decompress data by piping through an external tool.
-fn shell_decompress(data: &[u8], cmd: &str, args: &[&str]) -> Option<Vec<u8>> {
-    shell_compress(data, cmd, args) // same mechanism
-}
-
 fn bench_compress(c: &mut Criterion) {
     let data = get_test_data();
     let mut group = c.benchmark_group("compress");
@@ -125,27 +91,6 @@ fn bench_compress(c: &mut Criterion) {
                 b.iter(|| pipeline::compress(data, pipeline).unwrap());
             },
         );
-    }
-
-    // External: gzip
-    if command_exists("gzip") {
-        group.bench_with_input(BenchmarkId::new("external", "gzip"), &data, |b, data| {
-            b.iter(|| shell_compress(data, "gzip", &["-c"]).unwrap());
-        });
-    }
-
-    // External: pigz
-    if command_exists("pigz") {
-        group.bench_with_input(BenchmarkId::new("external", "pigz"), &data, |b, data| {
-            b.iter(|| shell_compress(data, "pigz", &["-c"]).unwrap());
-        });
-    }
-
-    // External: zstd
-    if command_exists("zstd") {
-        group.bench_with_input(BenchmarkId::new("external", "zstd"), &data, |b, data| {
-            b.iter(|| shell_compress(data, "zstd", &["-c", "-"]).unwrap());
-        });
     }
 
     group.finish();
@@ -171,30 +116,6 @@ fn bench_decompress(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("pz", format!("{:?}", pipeline)), |b| {
             let compressed = pipeline::compress(&data, pipeline).unwrap();
             b.iter(|| pipeline::decompress(&compressed).unwrap());
-        });
-    }
-
-    // External: gzip decompress
-    if command_exists("gzip") {
-        group.bench_function(BenchmarkId::new("external", "gzip"), |b| {
-            let gz_data = shell_compress(&data, "gzip", &["-c"]).unwrap();
-            b.iter(|| shell_decompress(&gz_data, "gzip", &["-dc"]).unwrap());
-        });
-    }
-
-    // External: pigz decompress
-    if command_exists("pigz") {
-        group.bench_function(BenchmarkId::new("external", "pigz"), |b| {
-            let gz_data = shell_compress(&data, "pigz", &["-c"]).unwrap();
-            b.iter(|| shell_decompress(&gz_data, "pigz", &["-dc"]).unwrap());
-        });
-    }
-
-    // External: zstd decompress
-    if command_exists("zstd") {
-        group.bench_function(BenchmarkId::new("external", "zstd"), |b| {
-            let zst_data = shell_compress(&data, "zstd", &["-c", "-"]).unwrap();
-            b.iter(|| shell_decompress(&zst_data, "zstd", &["-dc"]).unwrap());
         });
     }
 
