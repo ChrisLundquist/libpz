@@ -10,7 +10,7 @@ use super::blocks::compress_block;
 use super::stages::{
     pipeline_stage_count, run_compress_stage, run_decompress_stage, StageBlock, StageMetadata,
 };
-use super::{write_header, CompressOptions, Pipeline, BLOCK_HEADER_SIZE};
+use super::{write_header, CompressOptions, DecompressOptions, Pipeline, BLOCK_HEADER_SIZE};
 
 /// Multi-block parallel compression.
 ///
@@ -274,9 +274,9 @@ pub(crate) fn decompress_parallel(
     pipeline: Pipeline,
     orig_len: usize,
     num_blocks: usize,
-    threads: usize,
+    options: &DecompressOptions,
 ) -> PzResult<Vec<u8>> {
-    let num_threads = super::resolve_thread_count(threads);
+    let num_threads = super::resolve_thread_count(options.threads);
 
     // Parse block table (starts after num_blocks field)
     let table_start = 4; // skip num_blocks u32
@@ -333,8 +333,9 @@ pub(crate) fn decompress_parallel(
                 let handle = handles.remove(0);
                 results.push(handle.join().unwrap_or(Err(PzError::InvalidInput)));
             }
+            let opts = options.clone();
             handles.push(scope.spawn(move || {
-                super::blocks::decompress_block(comp_data, pipeline, orig_block_len)
+                super::blocks::decompress_block(comp_data, pipeline, orig_block_len, &opts)
             }));
         }
 
@@ -471,6 +472,7 @@ pub(crate) fn decompress_pipeline_parallel(
     pipeline: Pipeline,
     orig_len: usize,
     num_blocks: usize,
+    options: &DecompressOptions,
 ) -> PzResult<Vec<u8>> {
     let stage_count = pipeline_stage_count(pipeline);
 
@@ -525,11 +527,12 @@ pub(crate) fn decompress_pipeline_parallel(
         for stage_idx in 0..stage_count {
             let (tx_out, rx_next) = mpsc::sync_channel::<PzResult<StageBlock>>(2);
             let rx = prev_rx;
+            let opts = options.clone();
 
             scope.spawn(move || {
                 while let Ok(result) = rx.recv() {
                     let output = match result {
-                        Ok(block) => run_decompress_stage(pipeline, stage_idx, block),
+                        Ok(block) => run_decompress_stage(pipeline, stage_idx, block, &opts),
                         Err(e) => Err(e),
                     };
                     if tx_out.send(output).is_err() {

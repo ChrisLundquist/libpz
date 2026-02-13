@@ -123,6 +123,37 @@ impl Default for CompressOptions {
     }
 }
 
+/// Options controlling pipeline decompression behavior.
+///
+/// Carries the GPU backend and engine handles so that decompression stages
+/// can dispatch to GPU decode kernels when available.
+#[derive(Debug, Clone)]
+pub struct DecompressOptions {
+    /// Which backend to use for GPU-amenable decode stages.
+    pub backend: Backend,
+    /// Number of threads to use. 0 = auto, 1 = single-threaded.
+    pub threads: usize,
+    /// OpenCL engine handle, required when `backend` is `Backend::OpenCl`.
+    #[cfg(feature = "opencl")]
+    pub opencl_engine: Option<std::sync::Arc<crate::opencl::OpenClEngine>>,
+    /// WebGPU engine handle, required when `backend` is `Backend::WebGpu`.
+    #[cfg(feature = "webgpu")]
+    pub webgpu_engine: Option<std::sync::Arc<crate::webgpu::WebGpuEngine>>,
+}
+
+impl Default for DecompressOptions {
+    fn default() -> Self {
+        DecompressOptions {
+            backend: Backend::Cpu,
+            threads: 0,
+            #[cfg(feature = "opencl")]
+            opencl_engine: None,
+            #[cfg(feature = "webgpu")]
+            webgpu_engine: None,
+        }
+    }
+}
+
 /// Resolve the effective max match length from options and pipeline type.
 ///
 /// Deflate is hard-capped at 258 (RFC 1951). Other LZ77-based pipelines
@@ -264,13 +295,28 @@ pub fn compress_with_options(
 /// Reads the header to determine the pipeline, then applies the
 /// inverse stages. Decompresses blocks in parallel when applicable.
 pub fn decompress(input: &[u8]) -> PzResult<Vec<u8>> {
-    decompress_with_threads(input, 0)
+    decompress_with_options(input, &DecompressOptions::default())
 }
 
 /// Decompress data with an explicit thread count.
 ///
 /// `threads`: 0 = auto, 1 = single-threaded, N = use up to N threads.
 pub fn decompress_with_threads(input: &[u8], threads: usize) -> PzResult<Vec<u8>> {
+    decompress_with_options(
+        input,
+        &DecompressOptions {
+            threads,
+            ..DecompressOptions::default()
+        },
+    )
+}
+
+/// Decompress data with full options including GPU backend selection.
+///
+/// When `options.backend` is `Backend::OpenCl` or `Backend::WebGpu` with
+/// an engine, GPU-amenable decode stages (e.g., interleaved FSE for Lzfi)
+/// run on the GPU. Other stages and pipelines use the CPU.
+pub fn decompress_with_options(input: &[u8], options: &DecompressOptions) -> PzResult<Vec<u8>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
@@ -307,7 +353,7 @@ pub fn decompress_with_threads(input: &[u8], threads: usize) -> PzResult<Vec<u8>
     // Must check before the orig_len == 0 short-circuit because streaming
     // uses orig_len = 0 to mean "unknown length".
     if num_blocks_raw == FRAMED_SENTINEL {
-        return decompress_framed(&payload[4..], pipeline, orig_len);
+        return decompress_framed(&payload[4..], pipeline, orig_len, options);
     }
 
     if orig_len == 0 {
@@ -319,13 +365,13 @@ pub fn decompress_with_threads(input: &[u8], threads: usize) -> PzResult<Vec<u8>
         return Err(PzError::InvalidInput);
     }
 
-    let num_threads = resolve_thread_count(threads);
+    let num_threads = resolve_thread_count(options.threads);
     let stage_count = pipeline_stage_count(pipeline);
 
     if num_threads > 1 && num_blocks > 1 && stage_count >= num_threads {
-        return decompress_pipeline_parallel(payload, pipeline, orig_len, num_blocks);
+        return decompress_pipeline_parallel(payload, pipeline, orig_len, num_blocks, options);
     }
-    decompress_parallel(payload, pipeline, orig_len, num_blocks, threads)
+    decompress_parallel(payload, pipeline, orig_len, num_blocks, options)
 }
 
 // ---------------------------------------------------------------------------
@@ -462,6 +508,7 @@ fn decompress_framed(
     data: &[u8],
     pipeline: Pipeline,
     declared_orig_len: usize,
+    options: &DecompressOptions,
 ) -> PzResult<Vec<u8>> {
     let mut output = Vec::new();
     let mut pos = 0;
@@ -492,7 +539,7 @@ fn decompress_framed(
         let block_data = &data[pos..pos + compressed_len];
         pos += compressed_len;
 
-        let decompressed = blocks::decompress_block(block_data, pipeline, original_len)?;
+        let decompressed = blocks::decompress_block(block_data, pipeline, original_len, options)?;
         output.extend_from_slice(&decompressed);
     }
 

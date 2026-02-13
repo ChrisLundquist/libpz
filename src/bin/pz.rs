@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 
 use pz::gzip;
-use pz::pipeline::{self, CompressOptions, ParseStrategy, Pipeline};
+use pz::pipeline::{self, CompressOptions, DecompressOptions, ParseStrategy, Pipeline};
 use pz::streaming;
 
 fn usage() {
@@ -36,9 +36,9 @@ fn usage() {
     eprintln!("  --trial            Auto-select by trial compression (slower, more accurate)");
     eprintln!("  -t, --threads N    Number of threads (0=auto, 1=single-threaded)");
     #[cfg(feature = "opencl")]
-    eprintln!("  -g, --gpu          Use GPU (OpenCL) for compression");
+    eprintln!("  -g, --gpu          Use GPU (OpenCL) for compression and decompression");
     #[cfg(feature = "webgpu")]
-    eprintln!("  --webgpu           Use GPU (WebGPU/wgpu) for compression");
+    eprintln!("  --webgpu           Use GPU (WebGPU/wgpu) for compression and decompression");
     eprintln!("  -O, --optimal      Use optimal parsing (best compression, slowest)");
     eprintln!("  --lazy             Use lazy matching (good compression, default)");
     eprintln!("  --greedy           Use greedy matching (fastest, least compression)");
@@ -248,10 +248,17 @@ fn decompress_output_path(input: &str) -> Option<PathBuf> {
     }
 }
 
-/// Build compression options from CLI flags.
-fn build_cli_options(opts: &Opts) -> CompressOptions {
-    let parse_strategy = opts.parse_strategy;
+/// Resolved GPU backend state shared between compress and decompress options.
+struct GpuState {
+    backend: pipeline::Backend,
+    #[cfg(feature = "opencl")]
+    opencl_engine: Option<std::sync::Arc<pz::opencl::OpenClEngine>>,
+    #[cfg(feature = "webgpu")]
+    webgpu_engine: Option<std::sync::Arc<pz::webgpu::WebGpuEngine>>,
+}
 
+/// Initialize GPU engine based on CLI flags.
+fn init_gpu(opts: &Opts) -> GpuState {
     #[cfg(feature = "opencl")]
     {
         if opts.gpu {
@@ -265,12 +272,11 @@ fn build_cli_options(opts: &Opts) -> CompressOptions {
                     if opts.verbose {
                         eprintln!("pz: using GPU device: {}", engine.device_name());
                     }
-                    return CompressOptions {
+                    return GpuState {
                         backend: pipeline::Backend::OpenCl,
-                        threads: opts.threads,
-                        parse_strategy,
                         opencl_engine: Some(std::sync::Arc::new(engine)),
-                        ..Default::default()
+                        #[cfg(feature = "webgpu")]
+                        webgpu_engine: None,
                     };
                 }
                 Err(_) => {
@@ -308,14 +314,11 @@ fn build_cli_options(opts: &Opts) -> CompressOptions {
                     if opts.verbose {
                         eprintln!("pz: using WebGPU device: {}", engine.device_name());
                     }
-                    return CompressOptions {
+                    return GpuState {
                         backend: pipeline::Backend::WebGpu,
-                        threads: opts.threads,
-                        parse_strategy,
                         #[cfg(feature = "opencl")]
                         opencl_engine: None,
                         webgpu_engine: Some(std::sync::Arc::new(engine)),
-                        ..Default::default()
                     };
                 }
                 Err(_) => {
@@ -340,11 +343,40 @@ fn build_cli_options(opts: &Opts) -> CompressOptions {
         }
     }
 
-    CompressOptions {
-        threads: opts.threads,
-        parse_strategy,
-        ..Default::default()
+    GpuState {
+        backend: pipeline::Backend::Cpu,
+        #[cfg(feature = "opencl")]
+        opencl_engine: None,
+        #[cfg(feature = "webgpu")]
+        webgpu_engine: None,
     }
+}
+
+/// Build compression and decompression options from CLI flags.
+fn build_cli_options(opts: &Opts) -> (CompressOptions, DecompressOptions) {
+    let gpu = init_gpu(opts);
+
+    let compress_options = CompressOptions {
+        backend: gpu.backend,
+        threads: opts.threads,
+        parse_strategy: opts.parse_strategy,
+        #[cfg(feature = "opencl")]
+        opencl_engine: gpu.opencl_engine.clone(),
+        #[cfg(feature = "webgpu")]
+        webgpu_engine: gpu.webgpu_engine.clone(),
+        ..Default::default()
+    };
+
+    let decompress_options = DecompressOptions {
+        backend: gpu.backend,
+        threads: opts.threads,
+        #[cfg(feature = "opencl")]
+        opencl_engine: gpu.opencl_engine,
+        #[cfg(feature = "webgpu")]
+        webgpu_engine: gpu.webgpu_engine,
+    };
+
+    (compress_options, decompress_options)
 }
 
 fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
@@ -510,7 +542,11 @@ fn process_compress(opts: &Opts, path: &str, options: &CompressOptions) -> Resul
     Ok(())
 }
 
-fn process_decompress(opts: &Opts, path: &str) -> Result<(), String> {
+fn process_decompress(
+    opts: &Opts,
+    path: &str,
+    decompress_options: &DecompressOptions,
+) -> Result<(), String> {
     // Peek first 2 bytes to detect format
     let mut file = fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
     let mut magic = [0u8; 2];
@@ -531,7 +567,7 @@ fn process_decompress(opts: &Opts, path: &str) -> Result<(), String> {
         let input = BufReader::new(file);
         if opts.to_stdout {
             let output = BufWriter::new(io::stdout().lock());
-            streaming::decompress_stream(input, output, opts.threads)
+            streaming::decompress_stream(input, output, decompress_options)
                 .map_err(|e| format!("{path}: {e}"))?;
         } else {
             let out_path = decompress_output_path(path)
@@ -544,7 +580,7 @@ fn process_decompress(opts: &Opts, path: &str) -> Result<(), String> {
 
             let out_file = fs::File::create(&out_path).map_err(|e| format!("{out_str}: {e}"))?;
             let output = BufWriter::new(out_file);
-            streaming::decompress_stream(input, output, opts.threads)
+            streaming::decompress_stream(input, output, decompress_options)
                 .map_err(|e| format!("{path}: {e}"))?;
 
             if opts.verbose {
@@ -591,7 +627,11 @@ fn write_decompressed_output(opts: &Opts, path: &str, data: &[u8]) -> Result<(),
     Ok(())
 }
 
-fn process_stdin_stdout(opts: &Opts, options: &CompressOptions) -> Result<(), String> {
+fn process_stdin_stdout(
+    opts: &Opts,
+    options: &CompressOptions,
+    decompress_options: &DecompressOptions,
+) -> Result<(), String> {
     // Use io::stdin() (not .lock()) so the BufReader is Send for the worker threads.
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -599,7 +639,7 @@ fn process_stdin_stdout(opts: &Opts, options: &CompressOptions) -> Result<(), St
     if opts.decompress {
         let input = BufReader::new(stdin);
         let output = BufWriter::new(stdout.lock());
-        streaming::decompress_stream(input, output, opts.threads)
+        streaming::decompress_stream(input, output, decompress_options)
             .map_err(|e| format!("stdin: {e}"))?;
     } else {
         // For auto-select from stdin, we require explicit --pipeline since
@@ -621,7 +661,7 @@ fn process_stdin_stdout(opts: &Opts, options: &CompressOptions) -> Result<(), St
 
 fn run() -> Result<(), ()> {
     let opts = parse_args();
-    let compress_options = build_cli_options(&opts);
+    let (compress_options, decompress_options) = build_cli_options(&opts);
     let mut had_error = false;
 
     if opts.files.is_empty() {
@@ -630,7 +670,7 @@ fn run() -> Result<(), ()> {
             eprintln!("pz: -l requires a file argument");
             return Err(());
         }
-        if let Err(e) = process_stdin_stdout(&opts, &compress_options) {
+        if let Err(e) = process_stdin_stdout(&opts, &compress_options, &decompress_options) {
             eprintln!("pz: {e}");
             return Err(());
         }
@@ -662,9 +702,9 @@ fn run() -> Result<(), ()> {
 
     for path in &opts.files {
         let result = if path == "-" {
-            process_stdin_stdout(&opts, &compress_options)
+            process_stdin_stdout(&opts, &compress_options, &decompress_options)
         } else if opts.decompress {
-            process_decompress(&opts, path)
+            process_decompress(&opts, path, &decompress_options)
         } else {
             process_compress(&opts, path, &compress_options)
         };
