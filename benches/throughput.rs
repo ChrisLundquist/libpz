@@ -84,7 +84,6 @@ fn bench_compress(c: &mut Criterion) {
         Pipeline::Lzr,
         Pipeline::Lzf,
         Pipeline::Lzfi,
-        Pipeline::Bwi,
     ] {
         group.bench_with_input(
             BenchmarkId::new("pz", format!("{:?}", pipeline)),
@@ -115,7 +114,6 @@ fn bench_decompress(c: &mut Criterion) {
         Pipeline::Lzr,
         Pipeline::Lzf,
         Pipeline::Lzfi,
-        Pipeline::Bwi,
     ] {
         group.bench_function(BenchmarkId::new("pz", format!("{:?}", pipeline)), |b| {
             let compressed = pipeline::compress(&data, pipeline).unwrap();
@@ -340,109 +338,6 @@ fn bench_compress_webgpu(c: &mut Criterion) {
 #[cfg(not(feature = "webgpu"))]
 fn bench_compress_webgpu(_c: &mut Criterion) {}
 
-/// Decompression throughput with WebGPU FSE decode for Lzfi/Bwi pipelines.
-#[cfg(feature = "webgpu")]
-fn bench_decompress_webgpu(c: &mut Criterion) {
-    use pz::pipeline::{Backend, DecompressOptions};
-    use pz::webgpu::WebGpuEngine;
-
-    let engine = match WebGpuEngine::new() {
-        Ok(e) => std::sync::Arc::new(e),
-        Err(_) => {
-            eprintln!("throughput: no WebGPU device, skipping WebGPU decompress benchmarks");
-            return;
-        }
-    };
-
-    eprintln!(
-        "throughput: WebGPU decompress device: {}",
-        engine.device_name()
-    );
-
-    let data = get_test_data();
-    let mut group = c.benchmark_group("decompress_webgpu");
-    cap(&mut group);
-    group.throughput(Throughput::Bytes(data.len() as u64));
-
-    let decomp_opts = DecompressOptions {
-        backend: Backend::WebGpu,
-        webgpu_engine: Some(engine),
-        threads: 1,
-    };
-
-    // CPU decompress baselines for comparison
-    for &pipe in &[Pipeline::Lzf, Pipeline::Lzfi, Pipeline::Bw, Pipeline::Bwi] {
-        group.bench_function(BenchmarkId::new("cpu", format!("{:?}", pipe)), |b| {
-            let compressed = pipeline::compress(&data, pipe).unwrap();
-            b.iter(|| pipeline::decompress(&compressed).unwrap());
-        });
-    }
-
-    // GPU decompress for interleaved-FSE pipelines
-    for &pipe in &[Pipeline::Lzfi, Pipeline::Bwi] {
-        let opts = decomp_opts.clone();
-        group.bench_function(BenchmarkId::new("webgpu", format!("{:?}", pipe)), |b| {
-            let compressed = pipeline::compress(&data, pipe).unwrap();
-            b.iter(|| pipeline::decompress_with_options(&compressed, &opts).unwrap());
-        });
-    }
-
-    group.finish();
-}
-
-/// Decompression throughput with WebGPU FSE decode at large sizes.
-#[cfg(feature = "webgpu")]
-fn bench_decompress_webgpu_large(c: &mut Criterion) {
-    use pz::pipeline::{Backend, DecompressOptions};
-    use pz::webgpu::WebGpuEngine;
-
-    let engine = match WebGpuEngine::new() {
-        Ok(e) => std::sync::Arc::new(e),
-        Err(_) => {
-            eprintln!("throughput: no WebGPU device, skipping large WebGPU decompress benchmarks");
-            return;
-        }
-    };
-
-    let mut group = c.benchmark_group("decompress_webgpu_large");
-    cap(&mut group);
-
-    let decomp_opts = DecompressOptions {
-        backend: Backend::WebGpu,
-        webgpu_engine: Some(engine),
-        threads: 1,
-    };
-
-    for &size in &[4_194_304usize, 16_777_216] {
-        let data = get_test_data_sized(size);
-        group.throughput(Throughput::Bytes(size as u64));
-
-        // CPU baselines
-        for &pipe in &[Pipeline::Lzf, Pipeline::Lzfi, Pipeline::Bw, Pipeline::Bwi] {
-            group.bench_function(BenchmarkId::new(format!("{:?}_cpu", pipe), size), |b| {
-                let compressed = pipeline::compress(&data, pipe).unwrap();
-                b.iter(|| pipeline::decompress(&compressed).unwrap());
-            });
-        }
-
-        // GPU decompress
-        for &pipe in &[Pipeline::Lzfi, Pipeline::Bwi] {
-            let opts = decomp_opts.clone();
-            group.bench_function(BenchmarkId::new(format!("{:?}_webgpu", pipe), size), |b| {
-                let compressed = pipeline::compress(&data, pipe).unwrap();
-                b.iter(|| pipeline::decompress_with_options(&compressed, &opts).unwrap());
-            });
-        }
-    }
-    group.finish();
-}
-
-#[cfg(not(feature = "webgpu"))]
-fn bench_decompress_webgpu(_c: &mut Criterion) {}
-
-#[cfg(not(feature = "webgpu"))]
-fn bench_decompress_webgpu_large(_c: &mut Criterion) {}
-
 /// End-to-end WebGPU pipeline throughput at 4MB and 16MB.
 #[cfg(feature = "webgpu")]
 fn bench_compress_webgpu_large(c: &mut Criterion) {
@@ -497,8 +392,6 @@ criterion_group!(
     bench_compress_gpu,
     bench_compress_gpu_large,
     bench_compress_webgpu,
-    bench_compress_webgpu_large,
-    bench_decompress_webgpu,
-    bench_decompress_webgpu_large
+    bench_compress_webgpu_large
 );
 criterion_main!(benches);

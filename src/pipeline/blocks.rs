@@ -4,7 +4,7 @@
 //!   compress:   demux → entropy_encode
 //!   decompress: entropy_decode → demux
 //!
-//! BWT-based pipelines (Bw, Bbw, Bwi) have their own structure and are handled separately.
+//! BWT-based pipelines (Bw, Bbw) have their own structure and are handled separately.
 
 use crate::bwt;
 use crate::fse;
@@ -16,7 +16,7 @@ use super::demux::{demuxer_for_pipeline, LzDemuxer};
 use super::stages::*;
 #[cfg(any(feature = "opencl", feature = "webgpu"))]
 use super::Backend;
-use super::{resolve_max_match_len, CompressOptions, DecompressOptions, Pipeline};
+use super::{resolve_max_match_len, CompressOptions, Pipeline};
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -46,7 +46,6 @@ pub(crate) fn compress_block(
         None => match pipeline {
             Pipeline::Bw => compress_block_bw(input, opts),
             Pipeline::Bbw => compress_block_bbw(input, opts),
-            Pipeline::Bwi => compress_block_bwi(input, opts),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -57,14 +56,12 @@ pub(crate) fn decompress_block(
     payload: &[u8],
     pipeline: Pipeline,
     orig_len: usize,
-    options: &DecompressOptions,
 ) -> PzResult<Vec<u8>> {
     match demuxer_for_pipeline(pipeline) {
-        Some(demuxer) => decompress_block_lz(payload, pipeline, &demuxer, orig_len, options),
+        Some(demuxer) => decompress_block_lz(payload, pipeline, &demuxer, orig_len),
         None => match pipeline {
             Pipeline::Bw => decompress_block_bw(payload, orig_len),
             Pipeline::Bbw => decompress_block_bbw(payload, orig_len),
-            Pipeline::Bwi => decompress_block_bwi(payload, orig_len, options),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -105,7 +102,6 @@ fn decompress_block_lz(
     pipeline: Pipeline,
     demuxer: &LzDemuxer,
     orig_len: usize,
-    options: &DecompressOptions,
 ) -> PzResult<Vec<u8>> {
     let block = StageBlock {
         block_index: 0,
@@ -114,7 +110,7 @@ fn decompress_block_lz(
         streams: None,
         metadata: StageMetadata::default(),
     };
-    let block = entropy_decode(block, pipeline, options)?;
+    let block = entropy_decode(block, pipeline)?;
     let block = stage_demux_decompress(block, demuxer)?;
     Ok(block.data)
 }
@@ -179,30 +175,12 @@ fn entropy_encode(
 }
 
 /// Dispatch to the correct entropy decoder for a pipeline.
-///
-/// For interleaved-FSE pipelines (Lzfi), GPU variants are used when a WebGPU
-/// backend is active.
-fn entropy_decode(
-    block: StageBlock,
-    pipeline: Pipeline,
-    options: &DecompressOptions,
-) -> PzResult<StageBlock> {
+fn entropy_decode(block: StageBlock, pipeline: Pipeline) -> PzResult<StageBlock> {
     match pipeline {
         Pipeline::Deflate => stage_huffman_decode(block),
         Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R => stage_rans_decode(block),
         Pipeline::Lzf => stage_fse_decode(block),
-        Pipeline::Lzfi => {
-            #[cfg(feature = "webgpu")]
-            {
-                if let Backend::WebGpu = options.backend {
-                    if let Some(ref engine) = options.webgpu_engine {
-                        return stage_fse_interleaved_decode_webgpu(block, engine);
-                    }
-                }
-            }
-            let _ = options;
-            stage_fse_interleaved_decode(block)
-        }
+        Pipeline::Lzfi => stage_fse_interleaved_decode(block),
         _ => Err(PzError::Unsupported),
     }
 }
@@ -323,78 +301,6 @@ fn decompress_block_bbw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 
     // Stage 4: Inverse bijective BWT
     let output = bwt::decode_bijective(&bwt_data, &factor_lengths)?;
-
-    if output.len() != orig_len {
-        return Err(PzError::InvalidInput);
-    }
-
-    Ok(output)
-}
-
-// ---------------------------------------------------------------------------
-// BWI pipeline: BWT + MTF + RLE + interleaved FSE (GPU-decodable)
-// ---------------------------------------------------------------------------
-
-/// Compress a single block using the Bwi pipeline (no container header).
-fn compress_block_bwi(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    let block = StageBlock {
-        block_index: 0,
-        original_len: input.len(),
-        data: input.to_vec(),
-        streams: None,
-        metadata: StageMetadata::default(),
-    };
-    let block = stage_bwt_encode(block, options)?;
-    let block = stage_mtf_encode(block)?;
-    let block = stage_rle_encode(block)?;
-    let block = stage_fse_interleaved_encode_bwi(block)?;
-    Ok(block.data)
-}
-
-/// Decompress a single Bwi block (no container header).
-fn decompress_block_bwi(
-    payload: &[u8],
-    orig_len: usize,
-    options: &DecompressOptions,
-) -> PzResult<Vec<u8>> {
-    if payload.len() < 8 {
-        return Err(PzError::InvalidInput);
-    }
-
-    let primary_index = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let rle_len = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
-
-    let entropy_data = &payload[8..];
-
-    // Stage 1: Interleaved FSE decode (GPU or CPU)
-    let rle_data;
-    #[cfg(feature = "webgpu")]
-    {
-        if let Backend::WebGpu = options.backend {
-            if let Some(ref engine) = options.webgpu_engine {
-                rle_data = engine.fse_decode(entropy_data, rle_len)?;
-                // Skip to stage 2
-                let mtf_data = rle::decode(&rle_data)?;
-                let bwt_data = mtf::decode(&mtf_data);
-                let output = bwt::decode(&bwt_data, primary_index)?;
-                if output.len() != orig_len {
-                    return Err(PzError::InvalidInput);
-                }
-                return Ok(output);
-            }
-        }
-    }
-    let _ = options;
-    rle_data = fse::decode_interleaved(entropy_data, rle_len)?;
-
-    // Stage 2: RLE decode
-    let mtf_data = rle::decode(&rle_data)?;
-
-    // Stage 3: Inverse MTF
-    let bwt_data = mtf::decode(&mtf_data);
-
-    // Stage 4: Inverse BWT
-    let output = bwt::decode(&bwt_data, primary_index)?;
 
     if output.len() != orig_len {
         return Err(PzError::InvalidInput);

@@ -66,13 +66,8 @@ fn list_pipelines() {
         ),
         ("lzr", "3", "LZ77 + rANS (fastest compression)"),
         ("lzf", "4", "LZ77 + FSE (zstd-style entropy coding)"),
-        ("lzfi", "5", "LZ77 + interleaved FSE (GPU-decodable)"),
+        ("lzfi", "5", "LZ77 + interleaved FSE (fast CPU decode)"),
         ("lzssr", "6", "LZSS + rANS (experimental)"),
-        (
-            "bwi",
-            "7",
-            "BWT + MTF + RLE + interleaved FSE (GPU-decodable)",
-        ),
         ("lz78r", "8", "LZ78 + rANS (experimental)"),
     ];
     for (name, id, desc) in pipelines {
@@ -164,7 +159,6 @@ fn parse_args() -> Opts {
                     "lzf" | "4" => Pipeline::Lzf,
                     "lzfi" | "5" => Pipeline::Lzfi,
                     "lzssr" | "6" => Pipeline::LzssR,
-                    "bwi" | "7" => Pipeline::Bwi,
                     "lz78r" | "8" => Pipeline::Lz78R,
                     other => {
                         eprintln!("pz: unknown pipeline '{other}'");
@@ -368,7 +362,6 @@ fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
                 4 => "lzf",
                 5 => "lzfi",
                 6 => "lzssr",
-                7 => "bwi",
                 8 => "lz78r",
                 _ => "unknown",
             };

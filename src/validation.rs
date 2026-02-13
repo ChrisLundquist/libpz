@@ -302,7 +302,6 @@ mod tests {
                 Pipeline::Bw,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
-                Pipeline::Bwi,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -316,7 +315,6 @@ mod tests {
                 Pipeline::Bw,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
-                Pipeline::Bwi,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -330,7 +328,6 @@ mod tests {
                 Pipeline::Bw,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
-                Pipeline::Bwi,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -344,7 +341,6 @@ mod tests {
                 Pipeline::Bw,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
-                Pipeline::Bwi,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -358,7 +354,6 @@ mod tests {
                 Pipeline::Bw,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
-                Pipeline::Bwi,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -372,7 +367,6 @@ mod tests {
                 Pipeline::Bw,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
-                Pipeline::Bwi,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -386,7 +380,6 @@ mod tests {
                 Pipeline::Bw,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
-                Pipeline::Bwi,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
