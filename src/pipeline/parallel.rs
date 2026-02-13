@@ -484,9 +484,11 @@ fn compress_streaming_gpu_opencl(
 
         scope.spawn(move || {
             let worker_txs = worker_txs;
-            // Track (block_index, PendingSlotWork) per slot
+            // Track (block_index, PendingSlotWork) per slot.
+            // Use iterator init instead of vec![None; N] because PendingSlotWork
+            // contains an OpenCL Event which is not Clone.
             let mut slot_inflight: Vec<Option<(usize, crate::opencl::lz77::PendingSlotWork)>> =
-                vec![None; ring_depth];
+                (0..ring_depth).map(|_| None).collect();
             let mut next_worker = 0usize;
 
             for (block_idx, block) in blocks.iter().enumerate() {
@@ -549,8 +551,8 @@ fn compress_streaming_gpu_opencl(
             }
 
             // Drain remaining in-flight slots
-            for slot_idx in 0..ring_depth {
-                if let Some((prev_idx, pending)) = slot_inflight[slot_idx].take() {
+            for (slot_idx, inflight) in slot_inflight.iter_mut().enumerate() {
+                if let Some((prev_idx, pending)) = inflight.take() {
                     let prev_block = blocks[prev_idx];
                     let result =
                         engine.complete_lz77_from_slot(&ring.slots[slot_idx], &pending, prev_block);
@@ -594,7 +596,7 @@ fn compress_streaming_gpu_opencl(
 
 /// Demux LZ77 matches into 3 streams (offsets, lengths, literals) and apply
 /// the appropriate entropy encoder for the given pipeline.
-#[cfg(feature = "webgpu")]
+#[cfg(any(feature = "webgpu", feature = "opencl"))]
 fn entropy_encode_lz77_block(
     matches: &[crate::lz77::Match],
     original_len: usize,

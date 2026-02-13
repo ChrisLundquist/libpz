@@ -1090,7 +1090,7 @@ mod tests {
 
     /// Generate multi-block test input: ~512KB of structured text, guaranteeing
     /// at least 2 blocks at default block size (256KB).
-    #[cfg(any(feature = "opencl", feature = "webgpu"))]
+    #[cfg(feature = "webgpu")]
     fn gpu_streaming_test_input() -> Vec<u8> {
         let pattern = b"The quick brown fox jumps over the lazy dog. ";
         let target_size = 512 * 1024; // 512KB = 2 blocks at 256KB default
