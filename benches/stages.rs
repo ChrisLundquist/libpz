@@ -501,6 +501,56 @@ fn bench_lz77_gpu_params(c: &mut Criterion) {
 #[cfg(not(feature = "opencl"))]
 fn bench_lz77_gpu_params(_c: &mut Criterion) {}
 
+#[cfg(feature = "opencl")]
+fn bench_fse_gpu(c: &mut Criterion) {
+    use pz::opencl::OpenClEngine;
+
+    let engine = match OpenClEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => return,
+    };
+
+    let mut group = c.benchmark_group("fse_gpu");
+    cap(&mut group);
+
+    for &size in SIZES_LARGE {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // Encode with interleaved FSE at various K values
+        for &num_states in &[4usize, 8, 16, 32] {
+            let encoded = pz::fse::encode_interleaved_n(&data, num_states, 7);
+
+            // CPU decode baseline
+            let label_cpu = format!("decode_cpu_k{num_states}");
+            group.bench_with_input(
+                BenchmarkId::new(&label_cpu, size),
+                &encoded,
+                |b, encoded| {
+                    b.iter(|| pz::fse::decode_interleaved(encoded, data.len()).unwrap());
+                },
+            );
+
+            // GPU decode
+            let label_gpu = format!("decode_gpu_k{num_states}");
+            let eng = engine.clone();
+            let orig_len = data.len();
+            group.bench_with_input(
+                BenchmarkId::new(&label_gpu, size),
+                &encoded,
+                move |b, encoded| {
+                    b.iter(|| eng.fse_decode(encoded, orig_len).unwrap());
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_fse_gpu(_c: &mut Criterion) {}
+
 fn bench_analysis(c: &mut Criterion) {
     let mut group = c.benchmark_group("analysis");
     for &size in &[8192, 65536] {
@@ -1126,6 +1176,7 @@ criterion_group!(
     bench_deflate_webgpu_chained,
     bench_lz78_static,
     bench_lz78_static_gpu,
-    bench_lz77_gpu_params
+    bench_lz77_gpu_params,
+    bench_fse_gpu
 );
 criterion_main!(benches);
