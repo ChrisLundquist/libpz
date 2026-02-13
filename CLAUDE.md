@@ -53,11 +53,15 @@ cargo bench --features opencl      # include GPU benchmarks
 
 ### Profiling with samply
 ```bash
-cargo install samply                                # one-time setup
-./scripts/profile.sh                                # lza compress, 256KB (default)
+cargo install samply                                        # one-time setup
+./scripts/profile.sh                                        # → profiling/a1b2c3d/lzf_encode_256KB.json.gz
 ./scripts/profile.sh --pipeline deflate --decompress
-./scripts/profile.sh --stage lz77                   # single algorithm
-./scripts/profile.sh --stage fse --size 1048576     # 1MB input
+./scripts/profile.sh --stage lz77                           # single algorithm
+./scripts/profile.sh --stage fse --size 1048576             # 1MB input
+./scripts/profile.sh --web --pipeline lzf                   # open browser UI
+./scripts/profile.sh --no-default-features --pipeline lzf   # pure CPU (no GPU)
+./scripts/profile.sh --features opencl --pipeline lzf       # OpenCL GPU backend
+samply load profiling/a1b2c3d/lz77_encode_256KB.json.gz     # view saved profile later
 ```
 
 ### Optimization workflow
@@ -94,7 +98,8 @@ cargo install samply                                # one-time setup
 - `benches/stages.rs` — per-algorithm scaling benchmarks
 - `scripts/setup.sh` — extract sample archives (idempotent, called automatically by other scripts)
 - `scripts/bench.sh` — pz vs gzip comparison (ratio, throughput, all pipelines)
-- `scripts/profile.sh` — samply profiling wrapper
+- `scripts/profile.sh` — samply profiling wrapper (headless by default, `--web` for browser)
+- `profiling/` — saved profiles, organized as `<7-char-sha>/<description>.json.gz` (e.g. `a1b2c3d-dirty/`)
 - `examples/profile.rs` — profiling harness (pipeline or individual stage loops)
 - `examples/gpu_compare.rs` — GPU backend comparison benchmark
 

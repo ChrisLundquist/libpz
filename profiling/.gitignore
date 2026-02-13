@@ -1,0 +1,4 @@
+# Ignore saved profiles — they're large and machine-specific
+*
+!.gitignore
+!.gitkeep
