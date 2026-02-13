@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::pipeline::{
     compress_block, decompress_block, resolve_thread_count, write_header, CompressOptions,
-    Pipeline, BLOCK_HEADER_SIZE, FRAMED_SENTINEL, MAGIC, VERSION,
+    DecompressOptions, Pipeline, BLOCK_HEADER_SIZE, FRAMED_SENTINEL, MAGIC, VERSION,
 };
 use crate::{PzError, PzResult};
 
@@ -105,18 +105,21 @@ pub fn compress_stream<R: Read + Send, W: Write>(
 /// since the block table precedes block data). For framed-mode input, blocks
 /// are decompressed and written progressively.
 ///
+/// When `options.backend` is a GPU backend with an engine, GPU-amenable decode
+/// stages (e.g., interleaved FSE for Lzfi) run on the GPU.
+///
 /// Returns the total number of decompressed bytes written to `output`.
 pub fn decompress_stream<R: Read + Send, W: Write>(
     input: R,
     output: W,
-    threads: usize,
+    options: &DecompressOptions,
 ) -> StreamResult<u64> {
-    let num_threads = resolve_thread_count(threads);
+    let num_threads = resolve_thread_count(options.threads);
 
     if num_threads <= 1 {
-        decompress_stream_single(input, output)
+        decompress_stream_single(input, output, options)
     } else {
-        decompress_stream_parallel(input, output, num_threads)
+        decompress_stream_parallel(input, output, num_threads, options)
     }
 }
 
@@ -276,7 +279,11 @@ fn compress_stream_parallel<R: Read + Send, W: Write>(
 // Internal: single-threaded streaming decompression
 // ---------------------------------------------------------------------------
 
-fn decompress_stream_single<R: Read, W: Write>(mut input: R, mut output: W) -> StreamResult<u64> {
+fn decompress_stream_single<R: Read, W: Write>(
+    mut input: R,
+    mut output: W,
+    options: &DecompressOptions,
+) -> StreamResult<u64> {
     // Read 8-byte header
     let mut header = [0u8; 8];
     read_exact(&mut input, &mut header)?;
@@ -298,7 +305,13 @@ fn decompress_stream_single<R: Read, W: Write>(mut input: R, mut output: W) -> S
 
     if num_blocks_raw == FRAMED_SENTINEL {
         // Framed mode: read self-framing blocks
-        decompress_framed_stream(&mut input, &mut output, pipeline, declared_orig_len)
+        decompress_framed_stream(
+            &mut input,
+            &mut output,
+            pipeline,
+            declared_orig_len,
+            options,
+        )
     } else {
         // Table mode: must read entire remaining input, then use in-memory path
         decompress_table_mode_from_stream(
@@ -307,6 +320,7 @@ fn decompress_stream_single<R: Read, W: Write>(mut input: R, mut output: W) -> S
             pipeline,
             declared_orig_len,
             num_blocks_raw,
+            options,
         )
     }
 }
@@ -317,6 +331,7 @@ fn decompress_framed_stream<R: Read, W: Write>(
     output: &mut W,
     pipeline: Pipeline,
     declared_orig_len: usize,
+    options: &DecompressOptions,
 ) -> StreamResult<u64> {
     let mut total_decompressed = 0u64;
 
@@ -340,7 +355,7 @@ fn decompress_framed_stream<R: Read, W: Write>(
         read_exact(input, &mut block_data)?;
 
         // Decompress and write
-        let decompressed = decompress_block(&block_data, pipeline, original_len)?;
+        let decompressed = decompress_block(&block_data, pipeline, original_len, options)?;
         output.write_all(&decompressed)?;
         total_decompressed += decompressed.len() as u64;
     }
@@ -361,6 +376,7 @@ fn decompress_table_mode_from_stream<R: Read, W: Write>(
     pipeline: Pipeline,
     declared_orig_len: usize,
     num_blocks_raw: u32,
+    options: &DecompressOptions,
 ) -> StreamResult<u64> {
     let num_blocks = num_blocks_raw as usize;
     if num_blocks == 0 {
@@ -403,7 +419,7 @@ fn decompress_table_mode_from_stream<R: Read, W: Write>(
         let block_data = &remaining[pos..pos + comp_len];
         pos += comp_len;
 
-        let decompressed = decompress_block(block_data, pipeline, *orig_block_len)?;
+        let decompressed = decompress_block(block_data, pipeline, *orig_block_len, options)?;
         output.write_all(&decompressed)?;
         total_decompressed += decompressed.len() as u64;
     }
@@ -420,6 +436,7 @@ fn decompress_stream_parallel<R: Read + Send, W: Write>(
     mut input: R,
     mut output: W,
     num_threads: usize,
+    options: &DecompressOptions,
 ) -> StreamResult<u64> {
     // Read 8-byte header
     let mut header = [0u8; 8];
@@ -448,6 +465,7 @@ fn decompress_stream_parallel<R: Read + Send, W: Write>(
             pipeline,
             declared_orig_len,
             num_blocks_raw,
+            options,
         );
     }
 
@@ -465,12 +483,13 @@ fn decompress_stream_parallel<R: Read + Send, W: Write>(
         for _ in 0..num_threads {
             let rx = Arc::clone(&input_rx);
             let tx = output_tx.clone();
+            let opts = options.clone();
             scope.spawn(move || loop {
                 let (idx, block_data, orig_len) = match rx.lock().unwrap().recv() {
                     Ok(msg) => msg,
                     Err(_) => break,
                 };
-                let result = decompress_block(&block_data, pipeline, orig_len);
+                let result = decompress_block(&block_data, pipeline, orig_len, &opts);
                 if tx.send((idx, result)).is_err() {
                     break;
                 }
@@ -612,9 +631,13 @@ mod tests {
 
     /// Helper: decompress via streaming, return the decompressed bytes.
     fn stream_decompress(data: &[u8], threads: usize) -> Vec<u8> {
+        let options = DecompressOptions {
+            threads,
+            ..DecompressOptions::default()
+        };
         let input = Cursor::new(data);
         let mut output = Vec::new();
-        decompress_stream(input, &mut output, threads).unwrap();
+        decompress_stream(input, &mut output, &options).unwrap();
         output
     }
 
@@ -749,7 +772,7 @@ mod tests {
         let truncated = &compressed[..12];
         let input = Cursor::new(truncated);
         let mut output = Vec::new();
-        let result = decompress_stream(input, &mut output, 1);
+        let result = decompress_stream(input, &mut output, &DecompressOptions::default());
         assert!(result.is_err());
     }
 
