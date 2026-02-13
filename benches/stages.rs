@@ -1367,9 +1367,7 @@ fn bench_combined_gpu_decode(c: &mut Criterion) {
                 },
             );
 
-            // GPU: rANS decode + LZ77 decompress (combined)
-            // Collect each block's LZ77 match data as separate slices, then encode
-            // with a shared frequency table for batched GPU decode.
+            // Collect each block's LZ77 match data as separate slices for encoding
             let match_slices: Vec<&[u8]> = block_meta
                 .iter()
                 .map(|&(offset, num_matches, _)| {
@@ -1377,6 +1375,38 @@ fn bench_combined_gpu_decode(c: &mut Criterion) {
                     &block_data[offset..end]
                 })
                 .collect();
+            // GPU: batched FSE decode (single kernel launch) + LZ77 decompress
+            let fse_batched_result =
+                pz::opencl::fse::fse_encode_block_slices(&match_slices, 4, 8).unwrap();
+            let fse_batched_refs: Vec<(&[u8], usize)> = fse_batched_result
+                .iter()
+                .map(|(enc, len)| (enc.as_slice(), *len))
+                .collect();
+
+            group.bench_function(
+                BenchmarkId::new("gpu_fse_batched_lz77", format!("{label_size}_{label_bs}")),
+                |b| {
+                    b.iter(|| {
+                        // Stage 1: GPU batched FSE decode (all blocks in one launch)
+                        let all_lz77 = engine.fse_decode_blocks(&fse_batched_refs).unwrap();
+
+                        // Build metadata for LZ77 decompress
+                        let mut decoded_meta = Vec::new();
+                        let mut lz77_offset = 0usize;
+                        for (i, &orig_len) in fse_original_lens.iter().enumerate() {
+                            let num_matches = orig_len / 5;
+                            decoded_meta.push((lz77_offset, num_matches, block_meta[i].2));
+                            lz77_offset += orig_len;
+                        }
+
+                        // Stage 2: GPU LZ77 block-parallel decompress
+                        engine
+                            .lz77_decompress_blocks(&all_lz77, &decoded_meta, 32)
+                            .unwrap()
+                    });
+                },
+            );
+
             let rans_encoded_result =
                 pz::opencl::rans::rans_encode_block_slices(&match_slices, 4, 12).unwrap();
 

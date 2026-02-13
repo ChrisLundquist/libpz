@@ -751,7 +751,7 @@ fn dedupe_gpu_matches(gpu_matches: &[GpuMatch], input: &[u8]) -> Vec<Match> {
 }
 
 mod bwt;
-mod fse;
+pub mod fse;
 mod huffman;
 pub mod lz77;
 mod lz78;

@@ -1331,3 +1331,49 @@ fn test_gpu_combined_rans_lz77_pipeline() {
         "GPU combined rANS+LZ77 pipeline should reproduce original data"
     );
 }
+
+#[test]
+fn test_gpu_fse_decode_blocks() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    // Create test data
+    let pattern = b"abracadabra alakazam open sesame ";
+    let mut input = Vec::new();
+    for _ in 0..500 {
+        input.extend_from_slice(pattern);
+    }
+
+    let block_size = 2048;
+    let num_streams = 4;
+    let accuracy_log = 10u8;
+
+    // Encode all blocks with shared frequency table
+    let slices: Vec<&[u8]> = input.chunks(block_size).collect();
+    let encoded_blocks =
+        crate::opencl::fse::fse_encode_block_slices(&slices, num_streams, accuracy_log).unwrap();
+
+    // Verify CPU decode of each block
+    let mut cpu_result = Vec::new();
+    for (enc, orig_len) in &encoded_blocks {
+        let decoded = crate::fse::decode_interleaved(enc, *orig_len).unwrap();
+        cpu_result.extend_from_slice(&decoded);
+    }
+    assert_eq!(
+        cpu_result, input,
+        "CPU FSE round-trip with shared freq table failed"
+    );
+
+    // GPU batched decode
+    let block_refs: Vec<(&[u8], usize)> = encoded_blocks
+        .iter()
+        .map(|(enc, len)| (enc.as_slice(), *len))
+        .collect();
+    let gpu_result = engine.fse_decode_blocks(&block_refs).unwrap();
+    assert_eq!(
+        gpu_result, input,
+        "GPU multi-block FSE decode should match original"
+    );
+}
