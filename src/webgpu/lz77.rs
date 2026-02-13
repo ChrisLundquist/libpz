@@ -2,6 +2,46 @@
 
 use super::*;
 
+// ---------------------------------------------------------------------------
+// Buffer ring for double/triple-buffered GPU streaming
+// ---------------------------------------------------------------------------
+
+/// Pre-allocated GPU buffer set for one block's LZ77 lazy computation.
+///
+/// Reusing pre-allocated slots across blocks avoids per-block buffer
+/// creation overhead and enables overlapped GPU/CPU execution: while
+/// the GPU computes on slot N, the CPU reads back results from slot N-1.
+pub(crate) struct Lz77BufferSlot {
+    pub(crate) input_buf: wgpu::Buffer,
+    pub(crate) params_buf: wgpu::Buffer,
+    pub(crate) hash_counts_buf: wgpu::Buffer,
+    pub(crate) hash_table_buf: wgpu::Buffer,
+    pub(crate) raw_match_buf: wgpu::Buffer,
+    pub(crate) resolved_buf: wgpu::Buffer,
+    pub(crate) staging_buf: wgpu::Buffer,
+    pub(crate) capacity: usize,
+}
+
+/// Round-robin ring of pre-allocated buffer slots for streaming GPU work.
+pub(crate) struct BufferRing<S> {
+    pub(crate) slots: Vec<S>,
+    next: usize,
+}
+
+impl<S> BufferRing<S> {
+    /// Acquire the next slot index, advancing the ring pointer.
+    pub(crate) fn acquire(&mut self) -> usize {
+        let idx = self.next;
+        self.next = (self.next + 1) % self.slots.len();
+        idx
+    }
+
+    /// Number of slots in the ring.
+    pub(crate) fn depth(&self) -> usize {
+        self.slots.len()
+    }
+}
+
 impl WebGpuEngine {
     // --- LZ77 Match Finding ---
 
@@ -764,5 +804,256 @@ impl WebGpuEngine {
         }
 
         Ok(table)
+    }
+
+    // --- Streaming buffer slot management ---
+
+    /// Allocate a single pre-allocated buffer slot for LZ77 lazy matching.
+    ///
+    /// The slot contains all 7 GPU buffers needed for one block: input,
+    /// params, hash counts, hash table, raw matches, resolved matches,
+    /// and a staging buffer for CPU readback.
+    pub(crate) fn alloc_lz77_slot(&self, max_block_size: usize) -> Lz77BufferSlot {
+        let padded_size = ((max_block_size + 3) & !3) + 4;
+        let match_buf_size = (max_block_size * std::mem::size_of::<GpuMatch>()) as u64;
+
+        let input_buf = self.create_buffer(
+            "slot_input",
+            padded_size as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let params_buf = self.create_buffer(
+            "slot_params",
+            16, // 4 x u32
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        );
+        let hash_counts_buf = self.create_buffer(
+            "slot_hash_counts",
+            (HASH_TABLE_SIZE * 4) as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let hash_table_buf = self.create_buffer(
+            "slot_hash_table",
+            (HASH_TABLE_SIZE * HASH_BUCKET_CAP * 4) as u64,
+            wgpu::BufferUsages::STORAGE,
+        );
+        let raw_match_buf = self.create_buffer(
+            "slot_raw_matches",
+            match_buf_size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let resolved_buf = self.create_buffer(
+            "slot_resolved",
+            match_buf_size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let staging_buf = self.create_buffer(
+            "slot_staging",
+            match_buf_size,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
+
+        Lz77BufferSlot {
+            input_buf,
+            params_buf,
+            hash_counts_buf,
+            hash_table_buf,
+            raw_match_buf,
+            resolved_buf,
+            staging_buf,
+            capacity: max_block_size,
+        }
+    }
+
+    /// Create a buffer ring for streaming LZ77 with depth based on GPU memory.
+    ///
+    /// Uses the `@pz_cost` model to estimate per-slot memory and allocates
+    /// 2 slots (double buffer) or 3 slots (triple buffer) depending on
+    /// available GPU memory. Returns `None` if even 2 slots don't fit.
+    pub(crate) fn create_lz77_ring(&self, block_size: usize) -> Option<BufferRing<Lz77BufferSlot>> {
+        let per_slot = self.cost_lz77_lazy.memory_bytes(block_size);
+        if per_slot == 0 {
+            return None;
+        }
+        // Reserve 25% headroom for non-ring allocations
+        let budget = (self.gpu_memory_budget() * 3) / 4;
+        let max_slots = budget / per_slot;
+        if max_slots < 2 {
+            return None;
+        }
+        let depth = max_slots.clamp(2, 3);
+
+        let slots = (0..depth)
+            .map(|_| self.alloc_lz77_slot(block_size))
+            .collect();
+        Some(BufferRing { slots, next: 0 })
+    }
+
+    /// Submit LZ77 lazy matching work to a pre-allocated buffer slot.
+    ///
+    /// Writes input data, encodes 3 compute passes and a staging copy
+    /// into one command buffer, and submits without blocking.
+    /// Call `complete_lz77_from_slot()` after `device.poll(Wait)` to
+    /// read back results.
+    pub(crate) fn submit_lz77_to_slot(&self, input: &[u8], slot: &Lz77BufferSlot) -> PzResult<()> {
+        assert!(
+            input.len() <= slot.capacity,
+            "input {} exceeds slot capacity {}",
+            input.len(),
+            slot.capacity
+        );
+
+        let input_len = input.len();
+        let padded = Self::pad_input_bytes(input);
+        let match_buf_size = (input_len * std::mem::size_of::<GpuMatch>()) as u64;
+
+        // Write input data to the slot's buffers (non-blocking GPU-side enqueue)
+        self.queue.write_buffer(&slot.input_buf, 0, &padded);
+
+        let workgroups = (input_len as u32).div_ceil(64);
+        let params = [input_len as u32, 0, 0, self.dispatch_width(workgroups, 64)];
+        self.queue
+            .write_buffer(&slot.params_buf, 0, bytemuck::cast_slice(&params));
+
+        // Zero hash counts
+        self.queue
+            .write_buffer(&slot.hash_counts_buf, 0, &vec![0u8; HASH_TABLE_SIZE * 4]);
+
+        // Build bind groups referencing the slot's buffers
+        let build_bg_layout = self.pipeline_lz77_lazy_build.get_bind_group_layout(0);
+        let build_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("slot_build_bg"),
+            layout: &build_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: slot.input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: slot.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: slot.hash_counts_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: slot.hash_table_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let find_bg_layout = self.pipeline_lz77_lazy_find.get_bind_group_layout(0);
+        let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("slot_find_bg"),
+            layout: &find_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: slot.input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: slot.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: slot.raw_match_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: slot.hash_counts_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: slot.hash_table_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let resolve_bg_layout = self.pipeline_lz77_lazy_resolve.get_bind_group_layout(0);
+        let resolve_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("slot_resolve_bg"),
+            layout: &resolve_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: slot.input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: slot.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: slot.resolved_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: slot.raw_match_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Encode 3 compute passes + staging copy in one command buffer
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("slot_lz77_lazy"),
+            });
+        self.record_dispatch(
+            &mut encoder,
+            &self.pipeline_lz77_lazy_build,
+            &build_bg,
+            workgroups,
+            "slot_build",
+        )?;
+        self.record_dispatch(
+            &mut encoder,
+            &self.pipeline_lz77_lazy_find,
+            &find_bg,
+            workgroups,
+            "slot_find",
+        )?;
+        self.record_dispatch(
+            &mut encoder,
+            &self.pipeline_lz77_lazy_resolve,
+            &resolve_bg,
+            workgroups,
+            "slot_resolve",
+        )?;
+        encoder.copy_buffer_to_buffer(&slot.resolved_buf, 0, &slot.staging_buf, 0, match_buf_size);
+
+        self.queue.submit(Some(encoder.finish()));
+        Ok(())
+    }
+
+    /// Complete a previously submitted slot-based LZ77 computation.
+    ///
+    /// Maps the staging buffer, reads back matches, unmaps, and deduplicates.
+    /// The caller must ensure `device.poll(Wait)` has been called after
+    /// submitting to guarantee GPU work is complete.
+    pub(crate) fn complete_lz77_from_slot(
+        &self,
+        slot: &Lz77BufferSlot,
+        input: &[u8],
+    ) -> PzResult<Vec<Match>> {
+        let input_len = input.len();
+        let match_buf_size = input_len * std::mem::size_of::<GpuMatch>();
+
+        let slice = slot.staging_buf.slice(..match_buf_size as u64);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().map_err(|_| PzError::Unsupported)?;
+
+        let raw = slice.get_mapped_range().to_vec();
+        slot.staging_buf.unmap();
+
+        let gpu_matches: Vec<GpuMatch> = bytemuck::cast_slice(&raw).to_vec();
+        Ok(dedupe_gpu_matches(&gpu_matches, input))
     }
 }

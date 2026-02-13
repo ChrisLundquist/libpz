@@ -37,7 +37,7 @@ use wgpu::util::DeviceExt;
 mod bwt;
 mod fse;
 mod huffman;
-mod lz77;
+pub(crate) mod lz77;
 
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -436,6 +436,11 @@ impl WebGpuEngine {
     /// Return the name of the selected compute device.
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    /// Block the host until all submitted GPU work completes.
+    pub(crate) fn poll_wait(&self) {
+        self.device.poll(wgpu::Maintain::Wait);
     }
 
     /// Return the maximum work-group size for the device.

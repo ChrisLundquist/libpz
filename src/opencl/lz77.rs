@@ -515,6 +515,224 @@ impl OpenClEngine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Streaming buffer slots for double/triple-buffered GPU pipeline
+// ---------------------------------------------------------------------------
+
+/// Round-robin ring of pre-allocated buffer slots for streaming GPU work.
+pub(crate) struct BufferRing<S> {
+    pub(crate) slots: Vec<S>,
+    pub(crate) next: usize,
+}
+
+impl<S> BufferRing<S> {
+    /// Acquire the next slot index, advancing the ring pointer.
+    pub(crate) fn acquire(&mut self) -> usize {
+        let idx = self.next;
+        self.next = (self.next + 1) % self.slots.len();
+        idx
+    }
+
+    /// Number of slots in the ring.
+    pub(crate) fn depth(&self) -> usize {
+        self.slots.len()
+    }
+}
+
+/// Pre-allocated GPU buffer set for one block's LZ77 hash-table computation.
+///
+/// Reusing pre-allocated slots avoids per-block buffer creation overhead
+/// and enables overlapped GPU/CPU execution via event-based synchronization.
+pub(crate) struct Lz77BufferSlot {
+    pub(crate) input_buf: Buffer<u8>,
+    pub(crate) output_buf: Buffer<GpuMatch>,
+    pub(crate) hash_counts_buf: Buffer<cl_uint>,
+    pub(crate) hash_table_buf: Buffer<cl_uint>,
+    pub(crate) capacity: usize,
+}
+
+/// Handle to in-flight GPU work on an OpenCL buffer slot.
+/// Holds the final event whose completion signals readback is safe.
+pub(crate) struct PendingSlotWork {
+    pub(crate) find_event: Event,
+}
+
+impl OpenClEngine {
+    /// Allocate a single pre-allocated buffer slot for LZ77 hash-table matching.
+    pub(crate) fn alloc_lz77_slot(&self, max_block_size: usize) -> PzResult<Lz77BufferSlot> {
+        let table_entries = HASH_TABLE_SIZE * HASH_BUCKET_CAP;
+
+        let input_buf = unsafe {
+            Buffer::<u8>::create(
+                &self.context,
+                CL_MEM_READ_ONLY,
+                max_block_size,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+        let output_buf = unsafe {
+            Buffer::<GpuMatch>::create(
+                &self.context,
+                CL_MEM_WRITE_ONLY,
+                max_block_size,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+        let hash_counts_buf = unsafe {
+            Buffer::<cl_uint>::create(
+                &self.context,
+                CL_MEM_READ_WRITE,
+                HASH_TABLE_SIZE,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+        let hash_table_buf = unsafe {
+            Buffer::<cl_uint>::create(
+                &self.context,
+                CL_MEM_READ_WRITE,
+                table_entries,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        Ok(Lz77BufferSlot {
+            input_buf,
+            output_buf,
+            hash_counts_buf,
+            hash_table_buf,
+            capacity: max_block_size,
+        })
+    }
+
+    /// Create a buffer ring for streaming LZ77 with depth based on GPU memory.
+    ///
+    /// Returns `None` if even 2 slots don't fit in the memory budget.
+    pub(crate) fn create_lz77_ring(&self, block_size: usize) -> Option<BufferRing<Lz77BufferSlot>> {
+        let per_slot = self.cost_lz77_hash.memory_bytes(block_size);
+        if per_slot == 0 {
+            return None;
+        }
+        let budget = (self.gpu_memory_budget() * 3) / 4;
+        let max_slots = budget / per_slot;
+        if max_slots < 2 {
+            return None;
+        }
+        let depth = max_slots.clamp(2, 3);
+
+        let mut slots = Vec::with_capacity(depth);
+        for _ in 0..depth {
+            match self.alloc_lz77_slot(block_size) {
+                Ok(slot) => slots.push(slot),
+                Err(_) => return None,
+            }
+        }
+        Some(BufferRing { slots, next: 0 })
+    }
+
+    /// Submit LZ77 hash-table matching to a pre-allocated slot using
+    /// non-blocking transfers and event-chained kernel dispatches.
+    ///
+    /// Returns a `PendingSlotWork` whose `find_event` can be waited on
+    /// before reading back results.
+    pub(crate) fn submit_lz77_to_slot(
+        &self,
+        input: &[u8],
+        slot: &mut Lz77BufferSlot,
+    ) -> PzResult<PendingSlotWork> {
+        use opencl3::types::CL_NON_BLOCKING;
+
+        assert!(
+            input.len() <= slot.capacity,
+            "input {} exceeds slot capacity {}",
+            input.len(),
+            slot.capacity
+        );
+
+        let input_len = input.len();
+        let count = input_len as cl_uint;
+
+        // Non-blocking upload of input data
+        let upload_event = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut slot.input_buf, CL_NON_BLOCKING, 0, input, &[])
+                .map_err(|_| PzError::InvalidInput)?
+        };
+
+        // Non-blocking zero of hash counts
+        let zeros = vec![0u32; HASH_TABLE_SIZE];
+        let zero_event = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut slot.hash_counts_buf, CL_NON_BLOCKING, 0, &zeros, &[])
+                .map_err(|_| PzError::InvalidInput)?
+        };
+
+        // Pass 1: Build hash table (depends on upload + zero completion)
+        let build_event = unsafe {
+            let mut exec = ExecuteKernel::new(&self.kernel_hash_build);
+            exec.set_arg(&slot.input_buf)
+                .set_arg(&count)
+                .set_arg(&slot.hash_counts_buf)
+                .set_arg(&slot.hash_table_buf)
+                .set_global_work_size(input_len)
+                .set_wait_event(&upload_event)
+                .set_wait_event(&zero_event);
+            exec.enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+
+        // Pass 2: Find matches (depends on build completion)
+        let find_event = unsafe {
+            let mut exec = ExecuteKernel::new(&self.kernel_hash_find);
+            exec.set_arg(&slot.input_buf)
+                .set_arg(&count)
+                .set_arg(&slot.hash_counts_buf)
+                .set_arg(&slot.hash_table_buf)
+                .set_arg(&slot.output_buf)
+                .set_global_work_size(input_len)
+                .set_wait_event(&build_event);
+            exec.enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+
+        Ok(PendingSlotWork { find_event })
+    }
+
+    /// Complete a previously submitted slot-based LZ77 computation.
+    ///
+    /// Blocks until the `find_event` completes, then reads back matches
+    /// and deduplicates them.
+    pub(crate) fn complete_lz77_from_slot(
+        &self,
+        slot: &Lz77BufferSlot,
+        pending: &PendingSlotWork,
+        input: &[u8],
+    ) -> PzResult<Vec<Match>> {
+        let input_len = input.len();
+
+        // Blocking read that waits on the find event
+        let mut gpu_matches = vec![GpuMatch::default(); input_len];
+        let read_event = unsafe {
+            self.queue
+                .enqueue_read_buffer(
+                    &slot.output_buf,
+                    CL_BLOCKING,
+                    0,
+                    &mut gpu_matches,
+                    &[pending.find_event.get()],
+                )
+                .map_err(|_| PzError::InvalidInput)?
+        };
+        read_event.wait().map_err(|_| PzError::InvalidInput)?;
+        self.profile_event("streaming slot: download matches", &read_event);
+
+        Ok(dedupe_gpu_matches(&gpu_matches, input))
+    }
+}
+
 /// Per-block metadata: `(data_offset, num_matches, decompressed_size)`.
 pub type BlockMeta = Vec<(usize, usize, usize)>;
 
