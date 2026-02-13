@@ -49,7 +49,7 @@ pub const MAX_ACCURACY_LOG: u8 = 12;
 const NUM_SYMBOLS: usize = 256;
 
 /// Size of the serialized frequency table in the header (256 x u16 LE).
-pub(crate) const FREQ_TABLE_BYTES: usize = NUM_SYMBOLS * 2;
+const FREQ_TABLE_BYTES: usize = NUM_SYMBOLS * 2;
 
 /// Fixed header size: accuracy_log(1) + freq_table(512) + initial_state(2) + total_bits(4).
 const HEADER_SIZE: usize = 1 + FREQ_TABLE_BYTES + 2 + 4;
@@ -72,10 +72,7 @@ pub(crate) struct NormalizedFreqs {
 /// Every symbol with a nonzero raw count is guaranteed at least 1 in the
 /// normalized table. Rounding remainder is distributed to the symbols
 /// with the largest raw counts.
-pub(crate) fn normalize_frequencies(
-    raw: &FrequencyTable,
-    accuracy_log: u8,
-) -> PzResult<NormalizedFreqs> {
+fn normalize_frequencies(raw: &FrequencyTable, accuracy_log: u8) -> PzResult<NormalizedFreqs> {
     let table_size = 1u32 << accuracy_log;
     let total = raw.total;
 
@@ -349,14 +346,14 @@ fn build_encode_tables(
 // ---------------------------------------------------------------------------
 
 /// Complete FSE table for encoding and decoding.
-pub(crate) struct FseTable {
-    pub(crate) decode_table: Vec<DecodeEntry>,
+struct FseTable {
+    decode_table: Vec<DecodeEntry>,
     encode_tables: Vec<SymbolEncodeTable>,
-    pub(crate) table_size: usize,
+    table_size: usize,
 }
 
 impl FseTable {
-    pub(crate) fn from_normalized(norm: &NormalizedFreqs) -> Self {
+    fn from_normalized(norm: &NormalizedFreqs) -> Self {
         let table_size = 1usize << norm.accuracy_log;
         let spread = spread_symbols(norm);
         let decode_table = build_decode_table(norm, &spread);
@@ -700,7 +697,7 @@ const DEFAULT_INTERLEAVE: usize = 4;
 /// with zero data dependencies.
 ///
 /// Returns per-stream (bitstream, initial_state, total_bits).
-pub(crate) fn fse_encode_interleaved(
+fn fse_encode_interleaved(
     input: &[u8],
     table: &FseTable,
     num_states: usize,
