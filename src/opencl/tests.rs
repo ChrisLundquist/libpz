@@ -1310,3 +1310,103 @@ fn test_gpu_fse_decode_blocks() {
         "GPU multi-block FSE decode should match original"
     );
 }
+
+// ---------------------------------------------------------------------------
+// GPU FSE encode tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_gpu_fse_encode_round_trip() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return, // Skip if no GPU
+    };
+
+    let pattern = b"abracadabra alakazam abracadabra ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+
+    // GPU encode → CPU decode
+    let encoded = engine.fse_encode_interleaved_gpu(&input, 4, 7).unwrap();
+    let decoded = crate::fse::decode_interleaved(&encoded, input.len()).unwrap();
+    assert_eq!(decoded, input, "GPU FSE encode → CPU decode mismatch");
+}
+
+#[test]
+fn test_gpu_fse_encode_decode_gpu_round_trip() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let pattern = b"the quick brown fox jumps over the lazy dog ";
+    let mut input = Vec::new();
+    for _ in 0..200 {
+        input.extend_from_slice(pattern);
+    }
+
+    // GPU encode → GPU decode
+    let encoded = engine.fse_encode_interleaved_gpu(&input, 8, 7).unwrap();
+    let decoded = engine.fse_decode(&encoded, input.len()).unwrap();
+    assert_eq!(decoded, input, "GPU FSE encode → GPU decode mismatch");
+}
+
+#[test]
+fn test_gpu_fse_encode_various_params() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let pattern = b"FSE GPU encode test data with various parameters and symbols ";
+    let mut input = Vec::new();
+    for _ in 0..200 {
+        input.extend_from_slice(pattern);
+    }
+
+    for (num_states, accuracy_log) in [(4, 7), (8, 8), (16, 9), (32, 7), (4, 10)] {
+        let encoded = engine
+            .fse_encode_interleaved_gpu(&input, num_states, accuracy_log)
+            .unwrap();
+        let decoded = crate::fse::decode_interleaved(&encoded, input.len()).unwrap();
+        assert_eq!(
+            decoded, input,
+            "mismatch with num_states={num_states}, accuracy_log={accuracy_log}"
+        );
+    }
+}
+
+#[test]
+fn test_gpu_fse_encode_single_byte() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    // Single repeated byte (edge case: only 1 symbol in frequency table)
+    let input = vec![42u8; 4096];
+    let encoded = engine.fse_encode_interleaved_gpu(&input, 4, 7).unwrap();
+    let decoded = crate::fse::decode_interleaved(&encoded, input.len()).unwrap();
+    assert_eq!(decoded, input, "single-byte GPU FSE encode mismatch");
+}
+
+#[test]
+fn test_gpu_fse_encode_all_bytes() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    // All 256 byte values present
+    let mut input = Vec::new();
+    for _ in 0..20 {
+        for b in 0..=255u8 {
+            input.push(b);
+        }
+    }
+    let encoded = engine.fse_encode_interleaved_gpu(&input, 8, 9).unwrap();
+    let decoded = crate::fse::decode_interleaved(&encoded, input.len()).unwrap();
+    assert_eq!(decoded, input, "all-bytes GPU FSE encode mismatch");
+}

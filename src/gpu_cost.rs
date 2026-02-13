@@ -319,6 +319,10 @@ mod tests {
                 "fse_decode.wgsl",
                 include_str!("../kernels/fse_decode.wgsl"),
             ),
+            (
+                "fse_encode.wgsl",
+                include_str!("../kernels/fse_encode.wgsl"),
+            ),
         ];
         for (name, src) in &sources {
             assert!(
@@ -354,6 +358,7 @@ mod tests {
                 include_str!("../kernels/fse_decode_blocks.cl"),
             ),
             ("lz77_decode.cl", include_str!("../kernels/lz77_decode.cl")),
+            ("fse_encode.cl", include_str!("../kernels/fse_encode.cl")),
         ];
         for (name, src) in &sources {
             assert!(
@@ -393,6 +398,7 @@ mod tests {
                 include_str!("../kernels/fse_decode_blocks.cl"),
             ),
             ("lz77_decode.cl", include_str!("../kernels/lz77_decode.cl")),
+            ("fse_encode.cl", include_str!("../kernels/fse_encode.cl")),
         ];
         let sizes: &[usize] = &[64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024];
 
@@ -480,6 +486,11 @@ mod tests {
                 include_str!("../kernels/fse_decode_blocks.cl"),
             ),
             ("lz77_decode.cl", include_str!("../kernels/lz77_decode.cl")),
+            ("fse_encode.cl", include_str!("../kernels/fse_encode.cl")),
+            (
+                "fse_encode.wgsl",
+                include_str!("../kernels/fse_encode.wgsl"),
+            ),
         ];
         for (name, src) in sources {
             assert!(
