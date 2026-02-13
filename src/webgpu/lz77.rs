@@ -744,47 +744,88 @@ impl WebGpuEngine {
             return Ok(vec![self.find_matches(blocks[0])?]);
         }
 
+        // Use pipelined implementation for better GPU utilization
+        self.find_matches_batched_pipelined(blocks)
+    }
+
+    /// Pipelined batch processing with overlapping GPU work.
+    ///
+    /// Improved batching strategy:
+    /// 1. Submit ALL blocks to GPU (fills command queue)
+    /// 2. Initiate ALL buffer map operations
+    /// 3. Single poll(Wait) for all GPU work + all maps
+    /// 4. Read back all results from mapped buffers
+    ///
+    /// This maximizes GPU utilization by keeping the command queue full
+    /// and overlaps DMA transfers with compute.
+    fn find_matches_batched_pipelined(&self, blocks: &[&[u8]]) -> PzResult<Vec<Vec<Match>>> {
         let max_dispatch = self.max_dispatch_input_size();
+
+        // Phase 1: Submit ALL blocks to GPU (non-blocking, just enqueues commands)
+        let mut all_pending: Vec<(Option<PendingLz77>, &[u8])> = Vec::with_capacity(blocks.len());
+        let mut gpu_count = 0;
+        let mut cpu_count = 0;
+
+        for block in blocks {
+            if block.is_empty() || block.len() < MIN_GPU_INPUT_SIZE || block.len() > max_dispatch {
+                all_pending.push((None, block)); // CPU fallback
+                cpu_count += 1;
+            } else {
+                all_pending.push((Some(self.submit_find_matches_lazy(block)?), block));
+                gpu_count += 1;
+            }
+        }
+
+        if self.profiling {
+            eprintln!(
+                "[pz-gpu] Batching: {} GPU blocks, {} CPU fallback blocks",
+                gpu_count, cpu_count
+            );
+        }
+
+        // Phase 2: Initiate ALL map_async operations (non-blocking)
+        // This queues the DMA transfers but doesn't wait for them
+        let mut map_receivers = Vec::new();
+        for (pending_opt, _) in &all_pending {
+            if let Some(pending) = pending_opt {
+                let slice = pending.staging_buf.slice(..);
+                let (tx, rx) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |result| {
+                    tx.send(result).unwrap();
+                });
+                map_receivers.push(Some(rx));
+            } else {
+                map_receivers.push(None);
+            }
+        }
+
+        // Phase 3: Single synchronization point - wait for ALL GPU work + ALL maps
+        // The GPU processes all blocks in parallel, DMA engines transfer results in parallel
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Phase 4: Read back all results from mapped buffers
         let mut all_results: Vec<Vec<Match>> = Vec::with_capacity(blocks.len());
 
-        // Compute batch size from the kernel cost model and device memory budget.
-        // Cap at GPU_PREFETCH_DEPTH to limit latency while hiding dispatch overhead.
-        const GPU_PREFETCH_DEPTH: usize = 3;
-        let block_size = blocks.first().map(|b| b.len()).unwrap_or(256 * 1024);
-        let mem_limit = self.max_in_flight(&self.cost_lz77_lazy, block_size);
-        let batch_size = mem_limit.min(GPU_PREFETCH_DEPTH);
-
-        // Process in batches to cap GPU memory usage
-        for chunk in blocks.chunks(batch_size) {
-            // Phase 1: Submit all blocks in this batch
-            let mut pending: Vec<Option<PendingLz77>> = Vec::with_capacity(chunk.len());
-
-            for block in chunk {
-                if block.is_empty()
-                    || block.len() < MIN_GPU_INPUT_SIZE
-                    || block.len() > max_dispatch
-                {
-                    pending.push(None); // CPU fallback
-                } else {
-                    pending.push(Some(self.submit_find_matches_lazy(block)?));
-                }
-            }
-
-            // Phase 2: Wait for ALL GPU work in this batch to complete
-            self.device.poll(wgpu::Maintain::Wait);
-
-            // Phase 3: Read back + dedup
-            for (i, p) in pending.into_iter().enumerate() {
-                match p {
-                    Some(pending_lz77) => {
-                        all_results.push(self.complete_find_matches_lazy(pending_lz77, chunk[i])?);
+        for (i, (pending_opt, block)) in all_pending.into_iter().enumerate() {
+            match pending_opt {
+                Some(pending) => {
+                    // Buffer is already mapped, just wait for the channel signal
+                    if let Some(rx) = &map_receivers[i] {
+                        rx.recv().unwrap().map_err(|_| PzError::Unsupported)?;
                     }
-                    None => {
-                        if chunk[i].is_empty() {
-                            all_results.push(Vec::new());
-                        } else {
-                            all_results.push(crate::lz77::compress_lazy_to_matches(chunk[i])?);
-                        }
+
+                    let slice = pending.staging_buf.slice(..);
+                    let raw = slice.get_mapped_range().to_vec();
+                    pending.staging_buf.unmap();
+
+                    let gpu_matches: Vec<GpuMatch> = bytemuck::cast_slice(&raw).to_vec();
+                    all_results.push(dedupe_gpu_matches(&gpu_matches, block));
+                }
+                None => {
+                    if block.is_empty() {
+                        all_results.push(Vec::new());
+                    } else {
+                        all_results.push(crate::lz77::compress_lazy_to_matches(block)?);
                     }
                 }
             }
@@ -792,7 +833,7 @@ impl WebGpuEngine {
 
         if self.profiling {
             eprintln!(
-                "[pz-gpu] lz77_lazy_batched: {} blocks processed",
+                "[pz-gpu] lz77_lazy_batched_pipelined: {} blocks processed",
                 blocks.len()
             );
         }
