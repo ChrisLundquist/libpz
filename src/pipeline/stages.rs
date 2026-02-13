@@ -916,7 +916,7 @@ pub(crate) fn run_compress_stage(
         (Pipeline::Lzr, 1) => stage_rans_encode(block),
         (Pipeline::Lzf, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
         (Pipeline::Lzf, 1) => stage_fse_encode(block),
-        (Pipeline::Lzfi, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
+        (Pipeline::Lzfi, 0) => stage_demux_compress(block, &LzDemuxer::Lzss, options),
         (Pipeline::Lzfi, 1) => {
             #[cfg(feature = "opencl")]
             {
@@ -992,7 +992,7 @@ pub(crate) fn run_decompress_stage(
             let _ = options;
             stage_fse_interleaved_decode(block)
         }
-        (Pipeline::Lzfi, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
+        (Pipeline::Lzfi, 1) => stage_demux_decompress(block, &LzDemuxer::Lzss),
         // LzssR: rANS decode(0) → LZSS decompress(1)
         (Pipeline::LzssR, 0) => stage_rans_decode(block),
         (Pipeline::LzssR, 1) => stage_demux_decompress(block, &LzDemuxer::Lzss),
