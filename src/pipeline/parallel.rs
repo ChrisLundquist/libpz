@@ -161,7 +161,7 @@ pub(crate) fn compress_parallel(
 /// entropy-encode the current batch, the GPU is already processing the next
 /// batch. This overlaps GPU and CPU work, improving throughput on large inputs.
 ///
-/// This is used for LZ77-based pipelines (Deflate, Lzr, Lzf, Lzfi) when the
+/// This is used for LZ-based pipelines (Deflate, Lzr, Lzf, Lzfi) when the
 /// WebGPU backend is active and there are multiple blocks.
 #[cfg(feature = "webgpu")]
 fn compress_parallel_gpu_batched(
@@ -363,8 +363,8 @@ fn compress_streaming_gpu(
             }
 
             // Drain remaining in-flight slots
-            for slot_idx in 0..ring_depth {
-                if let Some(prev_idx) = slot_inflight[slot_idx].take() {
+            for (slot_idx, inflight) in slot_inflight.iter_mut().enumerate() {
+                if let Some(prev_idx) = inflight.take() {
                     engine.poll_wait();
                     let prev_block = blocks[prev_idx];
                     let result = engine.complete_lz77_from_slot(&ring.slots[slot_idx], prev_block);
@@ -680,8 +680,11 @@ fn compress_parallel_gpu_batched_opencl(
     assemble_multiblock_output(input, pipeline, block_size, &compressed_blocks)
 }
 
-/// Demux LZ77 matches into 3 streams (offsets, lengths, literals) and apply
-/// the appropriate entropy encoder for the given pipeline.
+/// Demux LZ77 matches and apply the appropriate entropy encoder for the given pipeline.
+///
+/// For LZ77-based pipelines (Deflate, Lzr, Lzf): demux into 3 streams (offsets, lengths, literals).
+/// For LZSS-based pipelines (Lzfi, LzssR): convert matches to LZSS 4 streams (flags, literals,
+/// offsets, lengths).
 #[cfg(any(feature = "webgpu", feature = "opencl"))]
 fn entropy_encode_lz77_block(
     matches: &[crate::lz77::Match],
@@ -693,47 +696,147 @@ fn entropy_encode_lz77_block(
     };
     use crate::lz77;
 
-    // Serialize matches
-    let match_size = lz77::Match::SERIALIZED_SIZE;
-    let num_matches = matches.len();
-    let lz_len = num_matches * match_size;
+    let uses_lzss = matches!(pipeline, Pipeline::Lzfi | Pipeline::LzssR);
 
-    // Demux into 3 streams: offsets (2 bytes each), lengths (2 bytes each), literals (1 byte each)
-    let mut offsets = Vec::with_capacity(num_matches * 2);
-    let mut lengths = Vec::with_capacity(num_matches * 2);
-    let mut literals = Vec::with_capacity(num_matches);
+    if uses_lzss {
+        // Convert LZ77 matches to LZSS 4-stream format: [flags, literals, offsets, lengths]
+        // Each LZ77 match {offset, length, next} becomes:
+        //   - If length > 0 && offset > 0: a match token (flag=0) + a literal token (flag=1, byte=next)
+        //   - If length == 0: just a literal token (flag=1, byte=next)
+        let mut flags = Vec::new();
+        let mut literals = Vec::new();
+        let mut offsets = Vec::new();
+        let mut lengths = Vec::new();
+        let mut num_tokens: u32 = 0;
+        let mut flag_byte: u8 = 0;
+        let mut flag_bit = 0usize;
 
-    for m in matches {
-        let bytes = m.to_bytes();
-        offsets.push(bytes[0]);
-        offsets.push(bytes[1]);
-        lengths.push(bytes[2]);
-        lengths.push(bytes[3]);
-        literals.push(bytes[4]);
+        // Helper closure to push a literal token (flag=1)
+        let push_literal = |flag_byte: &mut u8,
+                            flag_bit: &mut usize,
+                            flags: &mut Vec<u8>,
+                            literals: &mut Vec<u8>,
+                            num_tokens: &mut u32,
+                            byte: u8| {
+            *flag_byte |= 1 << (7 - *flag_bit);
+            *flag_bit += 1;
+            if *flag_bit == 8 {
+                flags.push(*flag_byte);
+                *flag_byte = 0;
+                *flag_bit = 0;
+            }
+            literals.push(byte);
+            *num_tokens += 1;
+        };
+
+        // Helper closure to push a match token (flag=0)
+        let push_match = |flag_byte: &mut u8,
+                          flag_bit: &mut usize,
+                          flags: &mut Vec<u8>,
+                          offsets: &mut Vec<u8>,
+                          lengths_out: &mut Vec<u8>,
+                          num_tokens: &mut u32,
+                          offset: u16,
+                          length: u16| {
+            // flag=0, bit stays clear
+            *flag_bit += 1;
+            if *flag_bit == 8 {
+                flags.push(*flag_byte);
+                *flag_byte = 0;
+                *flag_bit = 0;
+            }
+            offsets.extend_from_slice(&offset.to_le_bytes());
+            lengths_out.extend_from_slice(&length.to_le_bytes());
+            *num_tokens += 1;
+        };
+
+        for m in matches {
+            if m.length > 0 && m.offset > 0 {
+                // Back-reference: emit LZSS match token + literal for `next`
+                push_match(
+                    &mut flag_byte,
+                    &mut flag_bit,
+                    &mut flags,
+                    &mut offsets,
+                    &mut lengths,
+                    &mut num_tokens,
+                    m.offset,
+                    m.length,
+                );
+            }
+            // Always emit the `next` byte as a literal
+            push_literal(
+                &mut flag_byte,
+                &mut flag_bit,
+                &mut flags,
+                &mut literals,
+                &mut num_tokens,
+                m.next,
+            );
+        }
+
+        // Flush partial flag byte
+        if flag_bit > 0 {
+            flags.push(flag_byte);
+        }
+
+        // pre_entropy_len: approximate the LZSS encoded blob size
+        let pre_entropy_len = 12 + flags.len() + offsets.len() + lengths.len() + literals.len();
+
+        let streams = vec![flags, literals, offsets, lengths];
+        let mut block = StageBlock {
+            block_index: 0,
+            original_len,
+            data: Vec::new(),
+            streams: Some(streams),
+            metadata: StageMetadata::default(),
+        };
+        block.metadata.pre_entropy_len = Some(pre_entropy_len);
+        block.metadata.demux_meta = num_tokens.to_le_bytes().to_vec();
+
+        let block = match pipeline {
+            Pipeline::Lzfi => stage_fse_interleaved_encode(block)?,
+            Pipeline::LzssR => stage_rans_encode(block)?,
+            _ => unreachable!(),
+        };
+        Ok(block.data)
+    } else {
+        // LZ77 3-stream format: [offsets, lengths, literals]
+        let match_size = lz77::Match::SERIALIZED_SIZE;
+        let num_matches = matches.len();
+        let lz_len = num_matches * match_size;
+
+        let mut offsets = Vec::with_capacity(num_matches * 2);
+        let mut lengths = Vec::with_capacity(num_matches * 2);
+        let mut literals = Vec::with_capacity(num_matches);
+
+        for m in matches {
+            let bytes = m.to_bytes();
+            offsets.push(bytes[0]);
+            offsets.push(bytes[1]);
+            lengths.push(bytes[2]);
+            lengths.push(bytes[3]);
+            literals.push(bytes[4]);
+        }
+
+        let streams = vec![offsets, lengths, literals];
+        let mut block = StageBlock {
+            block_index: 0,
+            original_len,
+            data: Vec::new(),
+            streams: Some(streams),
+            metadata: StageMetadata::default(),
+        };
+        block.metadata.pre_entropy_len = Some(lz_len);
+
+        let block = match pipeline {
+            Pipeline::Deflate => stage_huffman_encode(block)?,
+            Pipeline::Lzr => stage_rans_encode(block)?,
+            Pipeline::Lzf => stage_fse_encode(block)?,
+            _ => return Err(PzError::Unsupported),
+        };
+        Ok(block.data)
     }
-
-    let streams = vec![offsets, lengths, literals];
-
-    // Build a StageBlock with the demuxed streams
-    let mut block = StageBlock {
-        block_index: 0,
-        original_len,
-        data: Vec::new(),
-        streams: Some(streams),
-        metadata: StageMetadata::default(),
-    };
-    block.metadata.pre_entropy_len = Some(lz_len);
-
-    // Apply the appropriate entropy encoder
-    let block = match pipeline {
-        Pipeline::Deflate => stage_huffman_encode(block)?,
-        Pipeline::Lzr => stage_rans_encode(block)?,
-        Pipeline::Lzf => stage_fse_encode(block)?,
-        Pipeline::Lzfi => stage_fse_interleaved_encode(block)?,
-        _ => return Err(PzError::Unsupported),
-    };
-
-    Ok(block.data)
 }
 
 /// Multi-block parallel decompression.

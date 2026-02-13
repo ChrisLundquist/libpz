@@ -557,8 +557,8 @@ pub(crate) fn stage_fse_interleaved_encode_gpu(
         pre_entropy_len,
         &block.metadata.demux_meta,
         |stream, output| {
-            // Use higher interleave count for GPU parallelism
-            let num_states = 32;
+            // Match CPU's DEFAULT_INTERLEAVE=4 so the decoder's SIMD fast path activates
+            let num_states = 4;
             let fse_data =
                 engine.fse_encode_interleaved_gpu(stream, num_states, fse::DEFAULT_ACCURACY_LOG)?;
             output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
@@ -591,8 +591,8 @@ pub(crate) fn stage_fse_interleaved_encode_webgpu(
         pre_entropy_len,
         &block.metadata.demux_meta,
         |stream, output| {
-            // Use higher interleave count for GPU parallelism
-            let num_states = 32;
+            // Match CPU's DEFAULT_INTERLEAVE=4 so the decoder's SIMD fast path activates
+            let num_states = 4;
             let fse_data =
                 engine.fse_encode_interleaved_gpu(stream, num_states, fse::DEFAULT_ACCURACY_LOG)?;
             output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
@@ -916,7 +916,7 @@ pub(crate) fn run_compress_stage(
         (Pipeline::Lzr, 1) => stage_rans_encode(block),
         (Pipeline::Lzf, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
         (Pipeline::Lzf, 1) => stage_fse_encode(block),
-        (Pipeline::Lzfi, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
+        (Pipeline::Lzfi, 0) => stage_demux_compress(block, &LzDemuxer::Lzss, options),
         (Pipeline::Lzfi, 1) => {
             #[cfg(feature = "opencl")]
             {
@@ -971,7 +971,7 @@ pub(crate) fn run_decompress_stage(
         // Lzf: FSE decode(0) → LZ77 decompress(1)
         (Pipeline::Lzf, 0) => stage_fse_decode(block),
         (Pipeline::Lzf, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
-        // Lzfi: interleaved FSE decode(0) → LZ77 decompress(1)
+        // Lzfi: interleaved FSE decode(0) → LZSS decompress(1)
         (Pipeline::Lzfi, 0) => {
             #[cfg(feature = "opencl")]
             {
@@ -992,7 +992,7 @@ pub(crate) fn run_decompress_stage(
             let _ = options;
             stage_fse_interleaved_decode(block)
         }
-        (Pipeline::Lzfi, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
+        (Pipeline::Lzfi, 1) => stage_demux_decompress(block, &LzDemuxer::Lzss),
         // LzssR: rANS decode(0) → LZSS decompress(1)
         (Pipeline::LzssR, 0) => stage_rans_decode(block),
         (Pipeline::LzssR, 1) => stage_demux_decompress(block, &LzDemuxer::Lzss),

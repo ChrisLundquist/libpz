@@ -1187,7 +1187,7 @@ fn test_lz78r_round_trip_all_same() {
     assert_eq!(decompressed, input);
 }
 
-// --- Lzfi pipeline tests (LZ77 + interleaved FSE) ---
+// --- Lzfi pipeline tests (LZSS + interleaved FSE) ---
 
 #[test]
 fn test_lzfi_empty() {
