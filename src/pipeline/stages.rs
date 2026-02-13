@@ -557,8 +557,8 @@ pub(crate) fn stage_fse_interleaved_encode_gpu(
         pre_entropy_len,
         &block.metadata.demux_meta,
         |stream, output| {
-            // Use higher interleave count for GPU parallelism
-            let num_states = 32;
+            // Match CPU's DEFAULT_INTERLEAVE=4 so the decoder's SIMD fast path activates
+            let num_states = 4;
             let fse_data =
                 engine.fse_encode_interleaved_gpu(stream, num_states, fse::DEFAULT_ACCURACY_LOG)?;
             output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
@@ -591,8 +591,8 @@ pub(crate) fn stage_fse_interleaved_encode_webgpu(
         pre_entropy_len,
         &block.metadata.demux_meta,
         |stream, output| {
-            // Use higher interleave count for GPU parallelism
-            let num_states = 32;
+            // Match CPU's DEFAULT_INTERLEAVE=4 so the decoder's SIMD fast path activates
+            let num_states = 4;
             let fse_data =
                 engine.fse_encode_interleaved_gpu(stream, num_states, fse::DEFAULT_ACCURACY_LOG)?;
             output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
