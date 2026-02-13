@@ -242,9 +242,9 @@ pub(crate) fn decompress_parallel(
     pipeline: Pipeline,
     orig_len: usize,
     num_blocks: usize,
-    threads: usize,
+    options: &super::DecompressOptions,
 ) -> PzResult<Vec<u8>> {
-    let num_threads = super::resolve_thread_count(threads);
+    let num_threads = super::resolve_thread_count(options.threads);
 
     // Parse block table (starts after num_blocks field)
     let table_start = 4; // skip num_blocks u32
@@ -302,7 +302,7 @@ pub(crate) fn decompress_parallel(
                 results.push(handle.join().unwrap_or(Err(PzError::InvalidInput)));
             }
             handles.push(scope.spawn(move || {
-                super::blocks::decompress_block(comp_data, pipeline, orig_block_len)
+                super::blocks::decompress_block(comp_data, pipeline, orig_block_len, options)
             }));
         }
 
@@ -430,6 +430,7 @@ pub(crate) fn decompress_pipeline_parallel(
     pipeline: Pipeline,
     orig_len: usize,
     num_blocks: usize,
+    _options: &super::DecompressOptions,
 ) -> PzResult<Vec<u8>> {
     let stage_count = pipeline_stage_count(pipeline);
 

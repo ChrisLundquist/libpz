@@ -775,6 +775,7 @@ pub(crate) fn stage_fse_interleaved_decode_bwi(mut block: StageBlock) -> PzResul
 
 /// Bwi decompress stage 0 (WebGPU GPU): parse metadata + GPU FSE decode.
 #[cfg(feature = "webgpu")]
+#[allow(dead_code)]
 pub(crate) fn stage_fse_interleaved_decode_bwi_webgpu(
     mut block: StageBlock,
     engine: &crate::webgpu::WebGpuEngine,

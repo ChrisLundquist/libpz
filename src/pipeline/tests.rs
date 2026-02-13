@@ -1542,4 +1542,130 @@ mod gpu_batched_tests {
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
+
+    #[test]
+    fn test_gpu_batched_lzfi_round_trip() {
+        let opts = match make_webgpu_options() {
+            Some(o) => o,
+            None => return,
+        };
+
+        let pattern = b"the quick brown fox jumps over the lazy dog. ";
+        let input: Vec<u8> = pattern.iter().cycle().take(256 * 1024).copied().collect();
+        let compressed = compress_with_options(&input, Pipeline::Lzfi, &opts).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU FSE decode tests: compress on CPU, decompress with WebGPU FSE decode
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "webgpu")]
+mod gpu_fse_decode_tests {
+    use super::*;
+
+    fn make_webgpu_decompress_options() -> Option<DecompressOptions> {
+        let engine = match crate::webgpu::WebGpuEngine::new() {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(_) => return None,
+        };
+        Some(DecompressOptions {
+            backend: Backend::WebGpu,
+            webgpu_engine: Some(engine),
+            threads: 1,
+        })
+    }
+
+    #[test]
+    fn test_gpu_fse_decode_lzfi_round_trip() {
+        let decomp_opts = match make_webgpu_decompress_options() {
+            Some(o) => o,
+            None => return,
+        };
+
+        let pattern = b"the quick brown fox jumps over the lazy dog. ";
+        let input: Vec<u8> = pattern.iter().cycle().take(128 * 1024).copied().collect();
+        let compressed = compress(&input, Pipeline::Lzfi).unwrap();
+        let decompressed = decompress_with_options(&compressed, &decomp_opts).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_gpu_fse_decode_lzfi_multiblock() {
+        let decomp_opts = match make_webgpu_decompress_options() {
+            Some(o) => o,
+            None => return,
+        };
+
+        // Force multi-block: 512KB with default 256KB block size
+        let input: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+        let compressed = compress(&input, Pipeline::Lzfi).unwrap();
+        let decompressed = decompress_with_options(&compressed, &decomp_opts).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_gpu_fse_decode_bwi_round_trip() {
+        let decomp_opts = match make_webgpu_decompress_options() {
+            Some(o) => o,
+            None => return,
+        };
+
+        let pattern = b"abracadabra banana bandana ";
+        let input: Vec<u8> = pattern.iter().cycle().take(64 * 1024).copied().collect();
+        let compressed = compress(&input, Pipeline::Bwi).unwrap();
+        let decompressed = decompress_with_options(&compressed, &decomp_opts).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_gpu_fse_decode_bwi_multiblock() {
+        let decomp_opts = match make_webgpu_decompress_options() {
+            Some(o) => o,
+            None => return,
+        };
+
+        // Force multi-block
+        let input: Vec<u8> = (0..512 * 1024).map(|i| ((i * 3 + 7) % 200) as u8).collect();
+        let compressed = compress(&input, Pipeline::Bwi).unwrap();
+        let decompressed = decompress_with_options(&compressed, &decomp_opts).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    /// Cross-check: GPU decompress == CPU decompress for Lzfi
+    #[test]
+    fn test_gpu_vs_cpu_lzfi() {
+        let decomp_opts = match make_webgpu_decompress_options() {
+            Some(o) => o,
+            None => return,
+        };
+
+        let input: Vec<u8> = (0..256 * 1024)
+            .map(|i| ((i * 13 + 5) % 251) as u8)
+            .collect();
+        let compressed = compress(&input, Pipeline::Lzfi).unwrap();
+        let cpu_result = decompress(&compressed).unwrap();
+        let gpu_result = decompress_with_options(&compressed, &decomp_opts).unwrap();
+        assert_eq!(cpu_result, gpu_result);
+        assert_eq!(cpu_result, input);
+    }
+
+    /// Cross-check: GPU decompress == CPU decompress for Bwi
+    #[test]
+    fn test_gpu_vs_cpu_bwi() {
+        let decomp_opts = match make_webgpu_decompress_options() {
+            Some(o) => o,
+            None => return,
+        };
+
+        let pattern = b"the quick brown fox ";
+        let input: Vec<u8> = pattern.iter().cycle().take(64 * 1024).copied().collect();
+        let compressed = compress(&input, Pipeline::Bwi).unwrap();
+        let cpu_result = decompress(&compressed).unwrap();
+        let gpu_result = decompress_with_options(&compressed, &decomp_opts).unwrap();
+        assert_eq!(cpu_result, gpu_result);
+        assert_eq!(cpu_result, input);
+    }
 }

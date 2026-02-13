@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::pipeline::{
     compress_block, decompress_block, resolve_thread_count, write_header, CompressOptions,
-    Pipeline, BLOCK_HEADER_SIZE, FRAMED_SENTINEL, MAGIC, VERSION,
+    DecompressOptions, Pipeline, BLOCK_HEADER_SIZE, FRAMED_SENTINEL, MAGIC, VERSION,
 };
 use crate::{PzError, PzResult};
 
@@ -340,7 +340,12 @@ fn decompress_framed_stream<R: Read, W: Write>(
         read_exact(input, &mut block_data)?;
 
         // Decompress and write
-        let decompressed = decompress_block(&block_data, pipeline, original_len)?;
+        let decompressed = decompress_block(
+            &block_data,
+            pipeline,
+            original_len,
+            &DecompressOptions::default(),
+        )?;
         output.write_all(&decompressed)?;
         total_decompressed += decompressed.len() as u64;
     }
@@ -403,7 +408,12 @@ fn decompress_table_mode_from_stream<R: Read, W: Write>(
         let block_data = &remaining[pos..pos + comp_len];
         pos += comp_len;
 
-        let decompressed = decompress_block(block_data, pipeline, *orig_block_len)?;
+        let decompressed = decompress_block(
+            block_data,
+            pipeline,
+            *orig_block_len,
+            &DecompressOptions::default(),
+        )?;
         output.write_all(&decompressed)?;
         total_decompressed += decompressed.len() as u64;
     }
@@ -470,7 +480,12 @@ fn decompress_stream_parallel<R: Read + Send, W: Write>(
                     Ok(msg) => msg,
                     Err(_) => break,
                 };
-                let result = decompress_block(&block_data, pipeline, orig_len);
+                let result = decompress_block(
+                    &block_data,
+                    pipeline,
+                    orig_len,
+                    &DecompressOptions::default(),
+                );
                 if tx.send((idx, result)).is_err() {
                     break;
                 }
