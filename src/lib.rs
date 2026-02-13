@@ -17,7 +17,6 @@ pub mod rans;
 pub mod rle;
 pub mod simd;
 pub mod streaming;
-pub mod wht;
 
 #[allow(dead_code)]
 mod gpu_cost;
