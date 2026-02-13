@@ -1,4 +1,10 @@
-//! FSE decode GPU kernel.
+//! FSE (tANS) GPU encode and decode via WebGPU.
+//!
+//! **Decode**: Each workgroup (size 1) decodes one interleaved stream.
+//!
+//! **Encode**: Each workgroup (size 1) encodes one lane of N-way interleaved
+//! FSE. Two-phase per lane: reverse symbol scan → forward bit-pack.
+//! All operations are 32-bit (no u64), making this WebGPU-compatible.
 
 use super::*;
 
@@ -214,5 +220,174 @@ impl WebGpuEngine {
         let result = raw_output[..original_len].to_vec();
 
         Ok(result)
+    }
+
+    /// GPU-accelerated N-way interleaved FSE encode (single stream) via WebGPU.
+    ///
+    /// Computes frequency normalization and encode table on the CPU (small
+    /// O(table_size) work), then dispatches the GPU kernel where each
+    /// workgroup (size 1) encodes one lane.
+    ///
+    /// Returns the serialized interleaved FSE wire format (identical to
+    /// `fse::encode_interleaved_n()`), decodable by both CPU
+    /// `fse::decode_interleaved()` and GPU `fse_decode()`.
+    pub fn fse_encode_interleaved_gpu(
+        &self,
+        input: &[u8],
+        num_states: usize,
+        accuracy_log: u8,
+    ) -> PzResult<Vec<u8>> {
+        use crate::fse::{
+            build_gpu_encode_table, normalize_frequencies, FREQ_TABLE_BYTES, MAX_ACCURACY_LOG,
+            MIN_ACCURACY_LOG,
+        };
+
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let num_states = num_states.max(1);
+        let accuracy_log = accuracy_log.clamp(MIN_ACCURACY_LOG, MAX_ACCURACY_LOG);
+
+        // CPU: frequency counting + normalization + encode table
+        let mut freq = crate::frequency::FrequencyTable::new();
+        freq.count(input);
+
+        let mut al = accuracy_log;
+        while (1u32 << al) < freq.used {
+            al += 1;
+            if al > MAX_ACCURACY_LOG {
+                break;
+            }
+        }
+
+        let norm = normalize_frequencies(&freq, al)?;
+        let table_size = 1u32 << al;
+        let packed_encode_table = build_gpu_encode_table(&norm);
+
+        // Compute worst-case output per lane.
+        // Phase 1 stores chunks as u32, phase 2 overwrites with bitstream.
+        let symbols_per_lane = input.len().div_ceil(num_states);
+        let max_output_words_per_lane =
+            symbols_per_lane.max((symbols_per_lane * al as usize).div_ceil(32) + 4);
+
+        // Pad input to u32 alignment for the WGSL byte-reading helper.
+        let padded_input = Self::pad_input_bytes(input);
+
+        // Create GPU buffers.
+        let encode_table_buf = self.create_buffer_init(
+            "fse_encode_table",
+            bytemuck::cast_slice(&packed_encode_table),
+            wgpu::BufferUsages::STORAGE,
+        );
+
+        let symbols_buf =
+            self.create_buffer_init("fse_symbols", &padded_input, wgpu::BufferUsages::STORAGE);
+
+        // Output buffer: per-lane sections of u32 words.
+        let total_output_words = num_states * max_output_words_per_lane;
+        let output_buf = self.create_buffer_init(
+            "fse_encode_output",
+            &vec![0u8; total_output_words * 4],
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        // Lane results: 3 u32 per lane [initial_state, total_bits, byte_len].
+        let lane_results_buf = self.create_buffer_init(
+            "fse_lane_results",
+            &vec![0u8; num_states * 3 * 4],
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        // Params: [num_lanes, total_input_len, table_size, max_output_words_per_lane]
+        let params = [
+            num_states as u32,
+            input.len() as u32,
+            table_size,
+            max_output_words_per_lane as u32,
+        ];
+        let params_buf = self.create_buffer_init(
+            "fse_encode_params",
+            bytemuck::cast_slice(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
+        // Bind group — matches the WGSL kernel bindings.
+        let bg_layout = self.pipeline_fse_encode.get_bind_group_layout(0);
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fse_encode_bg"),
+            layout: &bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: encode_table_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: symbols_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: lane_results_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Dispatch: one workgroup per lane.
+        self.dispatch(
+            &self.pipeline_fse_encode,
+            &bg,
+            num_states as u32,
+            "fse_encode",
+        )?;
+
+        // Read back lane results.
+        let lane_results_raw = self.read_buffer(&lane_results_buf, (num_states * 3 * 4) as u64);
+        let lane_results: &[u32] = bytemuck::cast_slice(&lane_results_raw);
+
+        // Read back output data.
+        let output_raw = self.read_buffer(&output_buf, (total_output_words * 4) as u64);
+
+        // Serialize to interleaved wire format (same as encode_interleaved_n).
+        let mut total_bitstream_bytes = 0usize;
+        for lane in 0..num_states {
+            total_bitstream_bytes += lane_results[lane * 3 + 2] as usize;
+        }
+
+        let header_size = 1 + FREQ_TABLE_BYTES + 1 + num_states * (2 + 4 + 4);
+        let mut output = Vec::with_capacity(header_size + total_bitstream_bytes);
+
+        output.push(al);
+        for &f in &norm.freq {
+            output.extend_from_slice(&f.to_le_bytes());
+        }
+        output.push(num_states as u8);
+
+        for lane in 0..num_states {
+            let initial_state = lane_results[lane * 3] as u16;
+            let total_bits = lane_results[lane * 3 + 1];
+            let byte_len = lane_results[lane * 3 + 2] as usize;
+
+            // Extract this lane's bitstream from the output buffer.
+            // The kernel writes u32 words starting at lane * max_output_words.
+            let word_offset = lane * max_output_words_per_lane;
+            let byte_offset = word_offset * 4;
+            let bitstream = &output_raw[byte_offset..byte_offset + byte_len];
+
+            output.extend_from_slice(&initial_state.to_le_bytes());
+            output.extend_from_slice(&total_bits.to_le_bytes());
+            output.extend_from_slice(&(byte_len as u32).to_le_bytes());
+            output.extend_from_slice(bitstream);
+        }
+
+        Ok(output)
     }
 }

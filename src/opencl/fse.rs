@@ -1,8 +1,12 @@
-//! FSE (tANS) GPU decode via OpenCL.
+//! FSE (tANS) GPU encode and decode via OpenCL.
 //!
-//! Port of the WebGPU FSE decode kernel. Each work-item decodes one
-//! interleaved stream — parallelism comes from decoding N streams
-//! simultaneously.
+//! **Decode**: Port of the WebGPU FSE decode kernel. Each work-item
+//! decodes one interleaved stream — parallelism comes from decoding
+//! N streams simultaneously.
+//!
+//! **Encode**: Each work-item encodes one lane of N-way interleaved
+//! FSE. Two-phase per lane: reverse symbol scan → forward bit-pack.
+//! All operations are 32-bit (no u64), matching the WebGPU kernel.
 
 use super::*;
 
@@ -518,6 +522,201 @@ impl OpenClEngine {
         ev.wait().map_err(|_| PzError::Unsupported)?;
 
         Ok(result)
+    }
+
+    /// GPU-accelerated N-way interleaved FSE encode (single stream).
+    ///
+    /// Computes frequency normalization and encode table on the CPU (small
+    /// O(table_size) work), then dispatches the GPU kernel where each
+    /// work-item encodes one lane.
+    ///
+    /// Returns the serialized interleaved FSE wire format (identical to
+    /// `fse::encode_interleaved_n()`), decodable by both CPU
+    /// `fse::decode_interleaved()` and GPU `fse_decode()`.
+    pub fn fse_encode_interleaved_gpu(
+        &self,
+        input: &[u8],
+        num_states: usize,
+        accuracy_log: u8,
+    ) -> PzResult<Vec<u8>> {
+        use crate::frequency::FrequencyTable;
+        use crate::fse::{
+            build_gpu_encode_table, normalize_frequencies, FREQ_TABLE_BYTES, MAX_ACCURACY_LOG,
+            MIN_ACCURACY_LOG,
+        };
+
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let num_states = num_states.max(1);
+        let accuracy_log = accuracy_log.clamp(MIN_ACCURACY_LOG, MAX_ACCURACY_LOG);
+
+        // CPU: frequency counting + normalization + encode table
+        let mut freq = FrequencyTable::new();
+        freq.count(input);
+
+        let mut al = accuracy_log;
+        while (1u32 << al) < freq.used {
+            al += 1;
+            if al > MAX_ACCURACY_LOG {
+                break;
+            }
+        }
+
+        let norm = normalize_frequencies(&freq, al)?;
+        let table_size = 1u32 << al;
+        let packed_encode_table = build_gpu_encode_table(&norm);
+
+        // Compute worst-case output: each symbol produces at most
+        // accuracy_log bits. Worst case bytes ≈ (symbols_per_lane * al + 7) / 8.
+        // Add margin for chunk storage in phase 1 (4 bytes per symbol).
+        let symbols_per_lane = input.len().div_ceil(num_states);
+        // Phase 1 stores chunks as u32 in the output buffer, phase 2 overwrites
+        // with the actual bitstream. Need max(4 * symbols_per_lane, bitstream).
+        let max_output_bytes_per_lane =
+            (symbols_per_lane * 4).max((symbols_per_lane * al as usize).div_ceil(8) + 16);
+
+        // Compile kernel
+        let source = include_str!("../../kernels/fse_encode.cl");
+        let program = Program::create_and_build_from_source(&self.context, source, "-Werror")
+            .map_err(|_| PzError::Unsupported)?;
+        let kernel = Kernel::create(&program, "FseEncode").map_err(|_| PzError::Unsupported)?;
+
+        // Upload input symbols
+        let mut symbols_buf = unsafe {
+            Buffer::<u8>::create(
+                &self.context,
+                CL_MEM_READ_ONLY,
+                input.len(),
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+        let ev = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut symbols_buf, CL_BLOCKING, 0, input, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        ev.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Upload encode table
+        let mut encode_table_buf = unsafe {
+            Buffer::<cl_uint>::create(
+                &self.context,
+                CL_MEM_READ_ONLY,
+                packed_encode_table.len(),
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+        let ev = unsafe {
+            self.queue
+                .enqueue_write_buffer(
+                    &mut encode_table_buf,
+                    CL_BLOCKING,
+                    0,
+                    &packed_encode_table,
+                    &[],
+                )
+                .map_err(|_| PzError::Unsupported)?
+        };
+        ev.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Allocate output buffer (per-lane sections)
+        let total_output_bytes = num_states * max_output_bytes_per_lane;
+        let output_buf = unsafe {
+            Buffer::<u8>::create(
+                &self.context,
+                CL_MEM_READ_WRITE,
+                total_output_bytes,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        // Allocate lane results: 3 u32 per lane
+        let lane_results_buf = unsafe {
+            Buffer::<cl_uint>::create(
+                &self.context,
+                CL_MEM_WRITE_ONLY,
+                num_states * 3,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        // Dispatch kernel
+        let wg_size = num_states.min(self.max_work_group_size).max(1);
+        let global_size = num_states;
+
+        let kernel_event = unsafe {
+            ExecuteKernel::new(&kernel)
+                .set_arg(&symbols_buf)
+                .set_arg(&encode_table_buf)
+                .set_arg(&output_buf)
+                .set_arg(&lane_results_buf)
+                .set_arg(&(num_states as cl_uint))
+                .set_arg(&(input.len() as cl_uint))
+                .set_arg(&table_size)
+                .set_arg(&(max_output_bytes_per_lane as cl_uint))
+                .set_global_work_size(global_size)
+                .set_local_work_size(wg_size)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        kernel_event.wait().map_err(|_| PzError::Unsupported)?;
+        self.profile_event("fse_encode: encode kernel", &kernel_event);
+
+        // Download lane results
+        let mut lane_results = vec![0u32; num_states * 3];
+        let ev = unsafe {
+            self.queue
+                .enqueue_read_buffer(&lane_results_buf, CL_BLOCKING, 0, &mut lane_results, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        ev.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Download output bitstreams
+        let mut output_data = vec![0u8; total_output_bytes];
+        let ev = unsafe {
+            self.queue
+                .enqueue_read_buffer(&output_buf, CL_BLOCKING, 0, &mut output_data, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        ev.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Serialize to interleaved wire format (same as encode_interleaved_n)
+        let mut total_bitstream_bytes = 0usize;
+        for lane in 0..num_states {
+            total_bitstream_bytes += lane_results[lane * 3 + 2] as usize;
+        }
+
+        let header_size = 1 + FREQ_TABLE_BYTES + 1 + num_states * (2 + 4 + 4);
+        let mut output = Vec::with_capacity(header_size + total_bitstream_bytes);
+
+        output.push(al);
+        for &f in &norm.freq {
+            output.extend_from_slice(&f.to_le_bytes());
+        }
+        output.push(num_states as u8);
+
+        for lane in 0..num_states {
+            let initial_state = lane_results[lane * 3] as u16;
+            let total_bits = lane_results[lane * 3 + 1];
+            let byte_len = lane_results[lane * 3 + 2] as usize;
+
+            // Extract this lane's bitstream from the output buffer
+            let lane_offset = lane * max_output_bytes_per_lane;
+            let bitstream = &output_data[lane_offset..lane_offset + byte_len];
+
+            output.extend_from_slice(&initial_state.to_le_bytes());
+            output.extend_from_slice(&total_bits.to_le_bytes());
+            output.extend_from_slice(&(byte_len as u32).to_le_bytes());
+            output.extend_from_slice(bitstream);
+        }
+
+        Ok(output)
     }
 }
 

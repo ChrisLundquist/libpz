@@ -14,7 +14,7 @@ use crate::{PzError, PzResult};
 
 use super::demux::{demuxer_for_pipeline, LzDemuxer};
 use super::stages::*;
-#[cfg(feature = "opencl")]
+#[cfg(any(feature = "opencl", feature = "webgpu"))]
 use super::Backend;
 use super::{resolve_max_match_len, CompressOptions, Pipeline};
 
@@ -161,6 +161,22 @@ fn entropy_encode(
             stage_fse_encode(block)
         }
         Pipeline::Lzfi => {
+            #[cfg(feature = "opencl")]
+            {
+                if let Backend::OpenCl = options.backend {
+                    if let Some(ref engine) = options.opencl_engine {
+                        return stage_fse_interleaved_encode_gpu(block, engine);
+                    }
+                }
+            }
+            #[cfg(feature = "webgpu")]
+            {
+                if let Backend::WebGpu = options.backend {
+                    if let Some(ref engine) = options.webgpu_engine {
+                        return stage_fse_interleaved_encode_webgpu(block, engine);
+                    }
+                }
+            }
             let _ = (input_len, options);
             stage_fse_interleaved_encode(block)
         }
