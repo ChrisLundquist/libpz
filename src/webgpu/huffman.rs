@@ -268,100 +268,9 @@ impl WebGpuEngine {
         Ok((output_bytes, total_bits))
     }
 
-    /// Run an in-place exclusive prefix sum on a GPU buffer using Blelloch scan.
-    fn run_exclusive_prefix_sum(&self, data_buf: &wgpu::Buffer, count: usize) -> PzResult<()> {
-        let block_size = 512usize; // workgroup_size(256) * 2
-        let num_blocks = count.div_ceil(block_size);
-
-        let block_sums_buf = self.create_buffer(
-            "eps_block_sums",
-            (num_blocks.max(1) * 4) as u64,
-            wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-        );
-
-        let params = [count as u32, 0, 0, 0];
-        let params_buf = self.create_buffer_init(
-            "eps_params",
-            bytemuck::cast_slice(&params),
-            wgpu::BufferUsages::UNIFORM,
-        );
-
-        // Phase 1: Block-level exclusive scan
-        let bg_layout = self.pipeline_prefix_sum_block.get_bind_group_layout(0);
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("eps_block_bg"),
-            layout: &bg_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: data_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: block_sums_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: params_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        self.dispatch(
-            &self.pipeline_prefix_sum_block,
-            &bg,
-            num_blocks.max(1) as u32,
-            "eps_block",
-        )?;
-
-        if num_blocks > 1 {
-            // Recursively scan block sums
-            self.run_exclusive_prefix_sum(&block_sums_buf, num_blocks)?;
-
-            // Apply block offsets
-            let apply_params = [count as u32, block_size as u32, 0, 0];
-            let apply_params_buf = self.create_buffer_init(
-                "eps_apply_params",
-                bytemuck::cast_slice(&apply_params),
-                wgpu::BufferUsages::UNIFORM,
-            );
-
-            let apply_bg_layout = self.pipeline_prefix_sum_apply.get_bind_group_layout(0);
-            let apply_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("eps_apply_bg"),
-                layout: &apply_bg_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: data_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: block_sums_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: apply_params_buf.as_entire_binding(),
-                    },
-                ],
-            });
-
-            let apply_wg = (count as u32).div_ceil(256);
-            self.dispatch(
-                &self.pipeline_prefix_sum_apply,
-                &apply_bg,
-                apply_wg,
-                "eps_apply",
-            )?;
-        }
-
-        Ok(())
-    }
-
-    /// Encode data using Huffman coding with GPU Blelloch prefix sum.
-    /// Only transfers 8 bytes for prefix sum instead of downloading/uploading the full array.
+    /// Encode data using Huffman coding with GPU compute + CPU prefix sum.
+    /// Pass 1 (ComputeBitLengths) and Pass 2 (WriteCodes) run on GPU;
+    /// the prefix sum between them runs on CPU to avoid recursive kernel overhead.
     pub fn huffman_encode_gpu_scan(
         &self,
         input: &[u8],
@@ -430,16 +339,24 @@ impl WebGpuEngine {
             "huff_gs_pass1",
         )?;
 
-        // Compute last bit length on the CPU (avoids GPU->CPU readback sync).
-        // The kernel writes: bit_lengths[i] = code_lut[input[i]] >> 24
-        let last_bit_length = code_lut[input[n - 1] as usize] >> 24;
+        // Download bit_lengths and compute prefix sum on CPU.
+        // This is faster than the GPU Blelloch scan because the recursive
+        // multi-level decomposition generates many kernel launches whose
+        // overhead dominates the actual O(n) sequential scan.
+        let raw_lengths = self.read_buffer(&bit_lengths_buf, (n * 4) as u64);
+        let bit_lengths: &[u32] = bytemuck::cast_slice(&raw_lengths);
 
-        // GPU exclusive prefix sum (in-place on bit_lengths_buf)
-        self.run_exclusive_prefix_sum(&bit_lengths_buf, n)?;
+        let mut bit_offsets = vec![0u32; n];
+        let mut running_sum: u64 = 0;
+        for i in 0..n {
+            bit_offsets[i] = running_sum as u32;
+            running_sum += bit_lengths[i] as u64;
+        }
+        let total_bits = running_sum as usize;
 
-        // Read last offset to compute total bits
-        let last_offset = self.read_buffer_scalar_u32(&bit_lengths_buf, n - 1);
-        let total_bits = (last_offset + last_bit_length) as usize;
+        // Upload bit_offsets back to GPU (overwrite bit_lengths_buf)
+        self.queue
+            .write_buffer(&bit_lengths_buf, 0, bytemuck::cast_slice(&bit_offsets));
 
         let output_uints = total_bits.div_ceil(32);
         if output_uints == 0 {
@@ -576,20 +493,24 @@ impl WebGpuEngine {
             "huff_od_pass1",
         )?;
 
-        // We need the last input byte to compute last_bit_length on the CPU.
-        // Read the u32 word containing the last byte from the device buffer.
-        let last_byte_word_index = (n - 1) / 4;
-        let last_byte_word = self.read_buffer_scalar_u32(&input.buf, last_byte_word_index);
-        let last_byte_in_word = (n - 1) % 4;
-        let last_byte = ((last_byte_word >> (last_byte_in_word * 8)) & 0xFF) as u8;
-        let last_bit_length = code_lut[last_byte as usize] >> 24;
+        // Download bit_lengths and compute prefix sum on CPU.
+        // This is faster than the GPU Blelloch scan because the recursive
+        // multi-level decomposition generates many kernel launches whose
+        // overhead dominates the actual O(n) sequential scan.
+        let raw_lengths = self.read_buffer(&bit_lengths_buf, (n * 4) as u64);
+        let bit_lengths: &[u32] = bytemuck::cast_slice(&raw_lengths);
 
-        // GPU exclusive prefix sum (in-place on bit_lengths_buf)
-        self.run_exclusive_prefix_sum(&bit_lengths_buf, n)?;
+        let mut bit_offsets = vec![0u32; n];
+        let mut running_sum: u64 = 0;
+        for i in 0..n {
+            bit_offsets[i] = running_sum as u32;
+            running_sum += bit_lengths[i] as u64;
+        }
+        let total_bits = running_sum as usize;
 
-        // Read last offset to compute total bits
-        let last_offset = self.read_buffer_scalar_u32(&bit_lengths_buf, n - 1);
-        let total_bits = (last_offset + last_bit_length) as usize;
+        // Upload bit_offsets back to GPU (overwrite bit_lengths_buf)
+        self.queue
+            .write_buffer(&bit_lengths_buf, 0, bytemuck::cast_slice(&bit_offsets));
 
         let output_uints = total_bits.div_ceil(32);
         if output_uints == 0 {

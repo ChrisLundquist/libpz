@@ -174,8 +174,6 @@ pub struct WebGpuEngine {
     pipeline_byte_histogram: wgpu::ComputePipeline,
     pipeline_compute_bit_lengths: wgpu::ComputePipeline,
     pipeline_write_codes: wgpu::ComputePipeline,
-    pipeline_prefix_sum_block: wgpu::ComputePipeline,
-    pipeline_prefix_sum_apply: wgpu::ComputePipeline,
     pipeline_fse_decode: wgpu::ComputePipeline,
     /// Device name for diagnostics.
     device_name: String,
@@ -369,10 +367,6 @@ impl WebGpuEngine {
             "compute_bit_lengths",
         );
         let pipeline_write_codes = make_pipeline("write_codes", &huffman_module, "write_codes");
-        let pipeline_prefix_sum_block =
-            make_pipeline("prefix_sum_block", &huffman_module, "prefix_sum_block");
-        let pipeline_prefix_sum_apply =
-            make_pipeline("prefix_sum_apply", &huffman_module, "prefix_sum_apply");
         let pipeline_fse_decode = make_pipeline("fse_decode", &fse_decode_module, "fse_decode");
 
         // Create profiling resources when GPU timestamps are available.
@@ -419,8 +413,6 @@ impl WebGpuEngine {
             pipeline_byte_histogram,
             pipeline_compute_bit_lengths,
             pipeline_write_codes,
-            pipeline_prefix_sum_block,
-            pipeline_prefix_sum_apply,
             pipeline_fse_decode,
             device_name,
             max_work_group_size,
