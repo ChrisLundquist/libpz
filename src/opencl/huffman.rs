@@ -735,14 +735,18 @@ impl OpenClEngine {
     /// literals) matching the CPU pipeline's multistream format, then
     /// each stream is independently Huffman-encoded on the GPU.
     ///
-    /// **Data flow:**
+    /// **Data flow (zero-copy where possible):**
     /// 1. GPU: LZ77 hash-table match finding → download match array
     /// 2. CPU: deduplicate + serialize matches, demux into 3 streams
     /// 3. For each stream:
-    ///    a. GPU: ByteHistogram → download 256×u32 (1KB)
-    ///    b. CPU: build Huffman tree from histogram, produce code LUT
-    ///    c. GPU: Huffman encode with GPU prefix sum → download bitstream
+    ///    a. Upload once to a `DeviceBuf` (single PCI transfer)
+    ///    b. GPU: ByteHistogram on device buffer → download 256×u32 (1KB)
+    ///    c. CPU: build Huffman tree from histogram, produce code LUT
+    ///    d. GPU: Huffman encode on same device buffer → download bitstream
     /// 4. CPU: serialize multistream container
+    ///
+    /// Each stream crosses the PCI bus once (upload) instead of twice
+    /// (histogram upload + encode upload), saving 3 host→device transfers.
     ///
     /// Returns the serialized Deflate block data in the pipeline's
     /// multistream format, ready for the container.
@@ -777,17 +781,22 @@ impl OpenClEngine {
             literals.push(lz_data[base + 4]);
         }
 
-        let streams = [offsets.as_slice(), lengths.as_slice(), literals.as_slice()];
+        let streams: [&[u8]; 3] = [&offsets, &lengths, &literals];
 
-        // Stage 3: GPU Huffman encode each stream and serialize in multistream format.
-        // Multistream header: [num_streams: u8][pre_entropy_len: u32][meta_len: u16][meta]
+        // Stage 3: Upload each stream once to a DeviceBuf, then use on-device
+        // methods for both histogram and Huffman encoding. This avoids re-uploading
+        // each stream for the Huffman pass.
         let mut output = Vec::new();
         output.push(streams.len() as u8);
         output.extend_from_slice(&(lz_len as u32).to_le_bytes());
         output.extend_from_slice(&0u16.to_le_bytes()); // meta_len = 0 for LZ77
 
         for stream in &streams {
-            let histogram = self.byte_histogram(stream)?;
+            // Single upload: stream → DeviceBuf (stays on GPU)
+            let device_buf = DeviceBuf::from_host(self, stream)?;
+
+            // GPU histogram on the device buffer (no re-upload)
+            let histogram = self.byte_histogram_on_device(&device_buf)?;
 
             let mut freq = crate::frequency::FrequencyTable::new();
             for (i, &count) in histogram.iter().enumerate() {
@@ -806,7 +815,9 @@ impl OpenClEngine {
                 code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
             }
 
-            let (huffman_data, total_bits) = self.huffman_encode_gpu_scan(stream, &code_lut)?;
+            // GPU Huffman encode on the same device buffer (no re-upload)
+            let (huffman_data, total_bits) =
+                self.huffman_encode_on_device(&device_buf, &code_lut)?;
 
             // Per-stream framing: [huffman_data_len: u32][total_bits: u32][freq_table: 256×u32][huffman_data]
             output.extend_from_slice(&(huffman_data.len() as u32).to_le_bytes());
