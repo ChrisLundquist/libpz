@@ -53,6 +53,7 @@ use opencl3::program::Program;
 use opencl3::types::{cl_device_type, cl_uint, CL_BLOCKING};
 
 use std::ptr;
+use std::sync::OnceLock;
 
 /// Embedded OpenCL kernel source: one work-item per input position,
 /// 128KB sliding window.
@@ -194,10 +195,68 @@ pub fn device_count() -> usize {
         .unwrap_or(0)
 }
 
+// ---------------------------------------------------------------------------
+// Lazy kernel group structs — one per OpenCL program compilation unit.
+// Kernels are compiled on first use via OnceLock, not at engine creation.
+// ---------------------------------------------------------------------------
+
+/// LZ77 per-position kernel (1 kernel from lz77.cl).
+struct Lz77PerPosKernels {
+    per_pos: Kernel,
+}
+
+/// LZ77 batch kernel (1 kernel from lz77_batch.cl).
+struct Lz77BatchKernels {
+    batch: Kernel,
+}
+
+/// LZ77 top-K kernel (1 kernel from lz77_topk.cl).
+struct Lz77TopkKernels {
+    topk: Kernel,
+}
+
+/// LZ77 hash-table kernels (2 kernels from lz77_hash.cl).
+struct Lz77HashKernels {
+    build: Kernel,
+    find: Kernel,
+}
+
+/// BWT rank kernels (4 kernels from bwt_rank.cl).
+struct BwtRankKernels {
+    rank_compare: Kernel,
+    prefix_sum_local: Kernel,
+    prefix_sum_propagate: Kernel,
+    rank_scatter: Kernel,
+}
+
+/// BWT radix sort kernels (4 kernels from bwt_radix.cl).
+struct BwtRadixKernels {
+    compute_keys: Kernel,
+    histogram: Kernel,
+    scatter: Kernel,
+    inclusive_to_exclusive: Kernel,
+}
+
+/// Huffman encoding kernels (5 kernels from huffman_encode.cl).
+struct HuffmanKernels {
+    bit_lengths: Kernel,
+    write_codes: Kernel,
+    byte_histogram: Kernel,
+    prefix_sum_block: Kernel,
+    prefix_sum_apply: Kernel,
+}
+
+/// FSE decode kernel (1 kernel from fse_decode.cl).
+struct FseDecodeKernels {
+    decode: Kernel,
+}
+
 /// OpenCL compute engine.
 ///
-/// Manages the device, context, command queue, and compiled kernels.
+/// Manages the device, context, command queue, and lazily-compiled kernels.
 /// Create one engine at library init time and reuse it across calls.
+/// Kernels are compiled on first use to avoid paying startup cost for
+/// pipelines that don't need them.
 ///
 /// Note: `Debug` is implemented manually because the OpenCL handle
 /// types from `opencl3` don't implement `Debug`.
@@ -205,46 +264,17 @@ pub struct OpenClEngine {
     _device: Device,
     context: Context,
     queue: CommandQueue,
-    /// Compiled per-position LZ77 kernel.
-    kernel_per_pos: Kernel,
-    /// Compiled batched LZ77 kernel.
-    kernel_batch: Kernel,
-    /// Compiled top-K LZ77 match finding kernel.
-    kernel_topk: Kernel,
-    /// Compiled hash-table build kernel.
-    kernel_hash_build: Kernel,
-    /// Compiled hash-table find-matches kernel.
-    kernel_hash_find: Kernel,
-    /// Compiled rank comparison kernel (BWT prefix-doubling phase 1).
-    kernel_rank_compare: Kernel,
-    /// Compiled per-workgroup prefix sum kernel (BWT phase 2a).
-    kernel_prefix_sum_local: Kernel,
-    /// Compiled prefix sum propagation kernel (BWT phase 2b).
-    kernel_prefix_sum_propagate: Kernel,
-    /// Compiled rank scatter kernel (BWT phase 3).
-    kernel_rank_scatter: Kernel,
-    /// Compiled radix sort key computation kernel.
-    kernel_radix_compute_keys: Kernel,
-    /// Compiled radix sort histogram kernel.
-    kernel_radix_histogram: Kernel,
-    /// Compiled radix sort scatter kernel.
-    kernel_radix_scatter: Kernel,
-    /// Compiled inclusive-to-exclusive prefix sum conversion kernel.
-    kernel_inclusive_to_exclusive: Kernel,
+    // Lazily-compiled kernel groups (one OnceLock per OpenCL program).
+    lz77_per_pos: OnceLock<Lz77PerPosKernels>,
+    lz77_batch: OnceLock<Lz77BatchKernels>,
+    lz77_topk: OnceLock<Lz77TopkKernels>,
+    lz77_hash: OnceLock<Lz77HashKernels>,
+    bwt_rank: OnceLock<BwtRankKernels>,
+    bwt_radix: OnceLock<BwtRadixKernels>,
+    huffman: OnceLock<HuffmanKernels>,
+    fse_decode: OnceLock<FseDecodeKernels>,
     /// Workgroup size for prefix sum kernels (power of 2, capped at 256).
     scan_workgroup_size: usize,
-    /// Compiled Huffman bit-length computation kernel.
-    kernel_huffman_bit_lengths: Kernel,
-    /// Compiled Huffman codeword writing kernel.
-    kernel_huffman_write_codes: Kernel,
-    /// Compiled byte histogram kernel.
-    kernel_byte_histogram: Kernel,
-    /// Compiled block-level prefix sum kernel (Blelloch scan).
-    kernel_prefix_sum_block: Kernel,
-    /// Compiled prefix sum apply-offsets kernel.
-    kernel_prefix_sum_apply: Kernel,
-    /// Compiled FSE decode kernel.
-    kernel_fse_decode: Kernel,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum work-group size.
@@ -383,132 +413,28 @@ impl OpenClEngine {
         let is_cpu = (dev_type & CL_DEVICE_TYPE_GPU) == 0;
         let global_mem_size = device.global_mem_size().unwrap_or(0);
 
-        // Compile both kernel variants
-        let program_per_pos =
-            Program::create_and_build_from_source(&context, LZ77_KERNEL_SOURCE, "-Werror")
-                .map_err(|_| PzError::Unsupported)?;
-
-        let program_batch =
-            Program::create_and_build_from_source(&context, LZ77_BATCH_KERNEL_SOURCE, "-Werror")
-                .map_err(|_| PzError::Unsupported)?;
-
-        let kernel_per_pos =
-            Kernel::create(&program_per_pos, "Encode").map_err(|_| PzError::Unsupported)?;
-
-        let kernel_batch =
-            Kernel::create(&program_batch, "Encode").map_err(|_| PzError::Unsupported)?;
-
-        // Compile top-K LZ77 kernel for optimal parsing
-        let program_topk =
-            Program::create_and_build_from_source(&context, LZ77_TOPK_KERNEL_SOURCE, "-Werror")
-                .map_err(|_| PzError::Unsupported)?;
-
-        let kernel_topk =
-            Kernel::create(&program_topk, "EncodeTopK").map_err(|_| PzError::Unsupported)?;
-
-        // Compile hash-table-based LZ77 kernel (two entry points)
-        let program_hash =
-            Program::create_and_build_from_source(&context, LZ77_HASH_KERNEL_SOURCE, "-Werror")
-                .map_err(|_| PzError::Unsupported)?;
-
-        let kernel_hash_build =
-            Kernel::create(&program_hash, "BuildHashTable").map_err(|_| PzError::Unsupported)?;
-
-        let kernel_hash_find =
-            Kernel::create(&program_hash, "FindMatches").map_err(|_| PzError::Unsupported)?;
-
-        // Compile BWT rank assignment kernels with workgroup size define.
-        // Cap at 256 and round down to the nearest power of 2 for portability.
+        // Compute scan workgroup size eagerly (needed for BWT kernel compile flags).
         let capped = max_work_group_size.clamp(1, 256);
         let scan_workgroup_size = 1 << (usize::BITS - 1 - capped.leading_zeros());
-        let rank_flags = format!("-Werror -DWORKGROUP_SIZE={scan_workgroup_size}");
-        let program_bwt_rank =
-            Program::create_and_build_from_source(&context, BWT_RANK_KERNEL_SOURCE, &rank_flags)
-                .map_err(|_| PzError::Unsupported)?;
 
-        let kernel_rank_compare =
-            Kernel::create(&program_bwt_rank, "rank_compare").map_err(|_| PzError::Unsupported)?;
-        let kernel_prefix_sum_local = Kernel::create(&program_bwt_rank, "prefix_sum_local")
-            .map_err(|_| PzError::Unsupported)?;
-        let kernel_prefix_sum_propagate = Kernel::create(&program_bwt_rank, "prefix_sum_propagate")
-            .map_err(|_| PzError::Unsupported)?;
-        let kernel_rank_scatter =
-            Kernel::create(&program_bwt_rank, "rank_scatter").map_err(|_| PzError::Unsupported)?;
-
-        // Compile radix sort kernels (same workgroup size define)
-        let program_bwt_radix =
-            Program::create_and_build_from_source(&context, BWT_RADIX_KERNEL_SOURCE, &rank_flags)
-                .map_err(|_| PzError::Unsupported)?;
-
-        let kernel_radix_compute_keys = Kernel::create(&program_bwt_radix, "radix_compute_keys")
-            .map_err(|_| PzError::Unsupported)?;
-        let kernel_radix_histogram = Kernel::create(&program_bwt_radix, "radix_histogram")
-            .map_err(|_| PzError::Unsupported)?;
-        let kernel_radix_scatter = Kernel::create(&program_bwt_radix, "radix_scatter")
-            .map_err(|_| PzError::Unsupported)?;
-        let kernel_inclusive_to_exclusive =
-            Kernel::create(&program_bwt_radix, "inclusive_to_exclusive")
-                .map_err(|_| PzError::Unsupported)?;
-
-        // Compile Huffman encoding kernels
-        let program_huffman = Program::create_and_build_from_source(
-            &context,
-            HUFFMAN_ENCODE_KERNEL_SOURCE,
-            "-Werror",
-        )
-        .map_err(|_| PzError::Unsupported)?;
-
-        let kernel_huffman_bit_lengths = Kernel::create(&program_huffman, "ComputeBitLengths")
-            .map_err(|_| PzError::Unsupported)?;
-
-        let kernel_huffman_write_codes =
-            Kernel::create(&program_huffman, "WriteCodes").map_err(|_| PzError::Unsupported)?;
-
-        let kernel_byte_histogram =
-            Kernel::create(&program_huffman, "ByteHistogram").map_err(|_| PzError::Unsupported)?;
-
-        let kernel_prefix_sum_block =
-            Kernel::create(&program_huffman, "PrefixSumBlock").map_err(|_| PzError::Unsupported)?;
-
-        let kernel_prefix_sum_apply =
-            Kernel::create(&program_huffman, "PrefixSumApply").map_err(|_| PzError::Unsupported)?;
-
-        // Compile FSE decode kernel
-        let program_fse_decode =
-            Program::create_and_build_from_source(&context, FSE_DECODE_KERNEL_SOURCE, "-Werror")
-                .map_err(|_| PzError::Unsupported)?;
-
-        let kernel_fse_decode =
-            Kernel::create(&program_fse_decode, "FseDecode").map_err(|_| PzError::Unsupported)?;
-
-        // Parse kernel cost annotations for batch scheduling.
+        // Parse kernel cost annotations for batch scheduling (cheap string parse).
         let cost_lz77_hash = KernelCost::parse(LZ77_HASH_KERNEL_SOURCE)
             .expect("lz77_hash.cl missing @pz_cost annotation");
 
+        // All kernel compilation is deferred to first use via OnceLock.
         Ok(OpenClEngine {
             _device: device,
             context,
             queue,
-            kernel_per_pos,
-            kernel_batch,
-            kernel_topk,
-            kernel_hash_build,
-            kernel_hash_find,
-            kernel_rank_compare,
-            kernel_prefix_sum_local,
-            kernel_prefix_sum_propagate,
-            kernel_rank_scatter,
-            kernel_radix_compute_keys,
-            kernel_radix_histogram,
-            kernel_radix_scatter,
-            kernel_inclusive_to_exclusive,
+            lz77_per_pos: OnceLock::new(),
+            lz77_batch: OnceLock::new(),
+            lz77_topk: OnceLock::new(),
+            lz77_hash: OnceLock::new(),
+            bwt_rank: OnceLock::new(),
+            bwt_radix: OnceLock::new(),
+            huffman: OnceLock::new(),
+            fse_decode: OnceLock::new(),
             scan_workgroup_size,
-            kernel_huffman_bit_lengths,
-            kernel_huffman_write_codes,
-            kernel_byte_histogram,
-            kernel_prefix_sum_block,
-            kernel_prefix_sum_apply,
-            kernel_fse_decode,
             device_name,
             max_work_group_size,
             is_cpu,
@@ -574,6 +500,226 @@ impl OpenClEngine {
                 eprintln!("[pz-gpu] {label}: {ms:.3} ms");
             }
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Lazy kernel accessors — compile on first use via OnceLock.
+    // -------------------------------------------------------------------
+
+    fn kernel_per_pos(&self) -> &Kernel {
+        &self
+            .lz77_per_pos
+            .get_or_init(|| {
+                let program = Program::create_and_build_from_source(
+                    &self.context,
+                    LZ77_KERNEL_SOURCE,
+                    "-Werror",
+                )
+                .expect("failed to compile lz77.cl");
+                Lz77PerPosKernels {
+                    per_pos: Kernel::create(&program, "Encode")
+                        .expect("failed to create Encode kernel"),
+                }
+            })
+            .per_pos
+    }
+
+    fn kernel_batch(&self) -> &Kernel {
+        &self
+            .lz77_batch
+            .get_or_init(|| {
+                let program = Program::create_and_build_from_source(
+                    &self.context,
+                    LZ77_BATCH_KERNEL_SOURCE,
+                    "-Werror",
+                )
+                .expect("failed to compile lz77_batch.cl");
+                Lz77BatchKernels {
+                    batch: Kernel::create(&program, "Encode")
+                        .expect("failed to create Encode kernel"),
+                }
+            })
+            .batch
+    }
+
+    fn kernel_topk(&self) -> &Kernel {
+        &self
+            .lz77_topk
+            .get_or_init(|| {
+                let program = Program::create_and_build_from_source(
+                    &self.context,
+                    LZ77_TOPK_KERNEL_SOURCE,
+                    "-Werror",
+                )
+                .expect("failed to compile lz77_topk.cl");
+                Lz77TopkKernels {
+                    topk: Kernel::create(&program, "EncodeTopK")
+                        .expect("failed to create EncodeTopK kernel"),
+                }
+            })
+            .topk
+    }
+
+    fn lz77_hash_kernels(&self) -> &Lz77HashKernels {
+        self.lz77_hash.get_or_init(|| {
+            let program = Program::create_and_build_from_source(
+                &self.context,
+                LZ77_HASH_KERNEL_SOURCE,
+                "-Werror",
+            )
+            .expect("failed to compile lz77_hash.cl");
+            Lz77HashKernels {
+                build: Kernel::create(&program, "BuildHashTable")
+                    .expect("failed to create BuildHashTable kernel"),
+                find: Kernel::create(&program, "FindMatches")
+                    .expect("failed to create FindMatches kernel"),
+            }
+        })
+    }
+
+    fn kernel_hash_build(&self) -> &Kernel {
+        &self.lz77_hash_kernels().build
+    }
+
+    fn kernel_hash_find(&self) -> &Kernel {
+        &self.lz77_hash_kernels().find
+    }
+
+    fn bwt_rank_kernels(&self) -> &BwtRankKernels {
+        self.bwt_rank.get_or_init(|| {
+            let flags = format!("-Werror -DWORKGROUP_SIZE={}", self.scan_workgroup_size);
+            let program = Program::create_and_build_from_source(
+                &self.context,
+                BWT_RANK_KERNEL_SOURCE,
+                &flags,
+            )
+            .expect("failed to compile bwt_rank.cl");
+            BwtRankKernels {
+                rank_compare: Kernel::create(&program, "rank_compare")
+                    .expect("failed to create rank_compare kernel"),
+                prefix_sum_local: Kernel::create(&program, "prefix_sum_local")
+                    .expect("failed to create prefix_sum_local kernel"),
+                prefix_sum_propagate: Kernel::create(&program, "prefix_sum_propagate")
+                    .expect("failed to create prefix_sum_propagate kernel"),
+                rank_scatter: Kernel::create(&program, "rank_scatter")
+                    .expect("failed to create rank_scatter kernel"),
+            }
+        })
+    }
+
+    fn kernel_rank_compare(&self) -> &Kernel {
+        &self.bwt_rank_kernels().rank_compare
+    }
+
+    fn kernel_prefix_sum_local(&self) -> &Kernel {
+        &self.bwt_rank_kernels().prefix_sum_local
+    }
+
+    fn kernel_prefix_sum_propagate(&self) -> &Kernel {
+        &self.bwt_rank_kernels().prefix_sum_propagate
+    }
+
+    fn kernel_rank_scatter(&self) -> &Kernel {
+        &self.bwt_rank_kernels().rank_scatter
+    }
+
+    fn bwt_radix_kernels(&self) -> &BwtRadixKernels {
+        self.bwt_radix.get_or_init(|| {
+            let flags = format!("-Werror -DWORKGROUP_SIZE={}", self.scan_workgroup_size);
+            let program = Program::create_and_build_from_source(
+                &self.context,
+                BWT_RADIX_KERNEL_SOURCE,
+                &flags,
+            )
+            .expect("failed to compile bwt_radix.cl");
+            BwtRadixKernels {
+                compute_keys: Kernel::create(&program, "radix_compute_keys")
+                    .expect("failed to create radix_compute_keys kernel"),
+                histogram: Kernel::create(&program, "radix_histogram")
+                    .expect("failed to create radix_histogram kernel"),
+                scatter: Kernel::create(&program, "radix_scatter")
+                    .expect("failed to create radix_scatter kernel"),
+                inclusive_to_exclusive: Kernel::create(&program, "inclusive_to_exclusive")
+                    .expect("failed to create inclusive_to_exclusive kernel"),
+            }
+        })
+    }
+
+    fn kernel_radix_compute_keys(&self) -> &Kernel {
+        &self.bwt_radix_kernels().compute_keys
+    }
+
+    fn kernel_radix_histogram(&self) -> &Kernel {
+        &self.bwt_radix_kernels().histogram
+    }
+
+    fn kernel_radix_scatter(&self) -> &Kernel {
+        &self.bwt_radix_kernels().scatter
+    }
+
+    fn kernel_inclusive_to_exclusive(&self) -> &Kernel {
+        &self.bwt_radix_kernels().inclusive_to_exclusive
+    }
+
+    fn huffman_kernels(&self) -> &HuffmanKernels {
+        self.huffman.get_or_init(|| {
+            let program = Program::create_and_build_from_source(
+                &self.context,
+                HUFFMAN_ENCODE_KERNEL_SOURCE,
+                "-Werror",
+            )
+            .expect("failed to compile huffman_encode.cl");
+            HuffmanKernels {
+                bit_lengths: Kernel::create(&program, "ComputeBitLengths")
+                    .expect("failed to create ComputeBitLengths kernel"),
+                write_codes: Kernel::create(&program, "WriteCodes")
+                    .expect("failed to create WriteCodes kernel"),
+                byte_histogram: Kernel::create(&program, "ByteHistogram")
+                    .expect("failed to create ByteHistogram kernel"),
+                prefix_sum_block: Kernel::create(&program, "PrefixSumBlock")
+                    .expect("failed to create PrefixSumBlock kernel"),
+                prefix_sum_apply: Kernel::create(&program, "PrefixSumApply")
+                    .expect("failed to create PrefixSumApply kernel"),
+            }
+        })
+    }
+
+    fn kernel_huffman_bit_lengths(&self) -> &Kernel {
+        &self.huffman_kernels().bit_lengths
+    }
+
+    fn kernel_huffman_write_codes(&self) -> &Kernel {
+        &self.huffman_kernels().write_codes
+    }
+
+    fn kernel_byte_histogram(&self) -> &Kernel {
+        &self.huffman_kernels().byte_histogram
+    }
+
+    fn kernel_prefix_sum_block(&self) -> &Kernel {
+        &self.huffman_kernels().prefix_sum_block
+    }
+
+    fn kernel_prefix_sum_apply(&self) -> &Kernel {
+        &self.huffman_kernels().prefix_sum_apply
+    }
+
+    fn kernel_fse_decode(&self) -> &Kernel {
+        &self
+            .fse_decode
+            .get_or_init(|| {
+                let program = Program::create_and_build_from_source(
+                    &self.context,
+                    FSE_DECODE_KERNEL_SOURCE,
+                    "-Werror",
+                )
+                .expect("failed to compile fse_decode.cl");
+                FseDecodeKernels {
+                    decode: Kernel::create(&program, "FseDecode")
+                        .expect("failed to create FseDecode kernel"),
+                }
+            })
+            .decode
     }
 }
 
