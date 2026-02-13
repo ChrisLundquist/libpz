@@ -753,7 +753,10 @@ impl DeviceBuf {
         })
     }
 
-    /// Allocate a zero-initialized device buffer of the given size.
+    /// Allocate a device buffer of the given size.
+    ///
+    /// **Note:** The buffer contents are *not* guaranteed to be zero-initialized.
+    /// Callers that need zeroed memory should write zeros explicitly.
     pub fn alloc(engine: &WebGpuEngine, len: usize) -> PzResult<Self> {
         let actual_len = len.max(4); // avoid zero-size allocation
         let buf = engine.create_buffer(

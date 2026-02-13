@@ -171,7 +171,10 @@ fn decode_multistream(
 ///   [stream_data_len: u32] [total_bits: u32] [freq_table: 256×u32] [huffman_data]
 pub(crate) fn stage_huffman_encode(mut block: StageBlock) -> PzResult<StageBlock> {
     let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
-    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+    let pre_entropy_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
 
     block.data = encode_multistream(
         &streams,
@@ -211,7 +214,10 @@ pub(crate) fn stage_huffman_encode_gpu(
     use crate::opencl::DeviceBuf;
 
     let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
-    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+    let pre_entropy_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
 
     block.data = encode_multistream(
         &streams,
@@ -274,7 +280,10 @@ pub(crate) fn stage_huffman_encode_webgpu(
     use crate::webgpu::DeviceBuf;
 
     let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
-    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+    let pre_entropy_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
 
     block.data = encode_multistream(
         &streams,
@@ -369,7 +378,10 @@ pub(crate) fn stage_huffman_decode(mut block: StageBlock) -> PzResult<StageBlock
 /// Per-stream framing: [orig_len: u32] [compressed_len: u32] [rans_data]
 pub(crate) fn stage_rans_encode(mut block: StageBlock) -> PzResult<StageBlock> {
     let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
-    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+    let pre_entropy_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
 
     block.data = encode_multistream(
         &streams,
@@ -448,7 +460,10 @@ fn adaptive_accuracy_log(data: &[u8]) -> u8 {
 /// Per-stream framing: [orig_len: u32] [compressed_len: u32] [fse_data]
 pub(crate) fn stage_fse_encode(mut block: StageBlock) -> PzResult<StageBlock> {
     let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
-    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+    let pre_entropy_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
 
     block.data = encode_multistream(
         &streams,
@@ -575,8 +590,14 @@ pub(crate) fn stage_rle_encode(mut block: StageBlock) -> PzResult<StageBlock> {
 
 /// Bw stage 3: FSE encoding + serialization.
 pub(crate) fn stage_fse_encode_bw(mut block: StageBlock) -> PzResult<StageBlock> {
-    let primary_index = block.metadata.bwt_primary_index.unwrap();
-    let rle_len = block.metadata.pre_entropy_len.unwrap();
+    let primary_index = block
+        .metadata
+        .bwt_primary_index
+        .ok_or(PzError::InvalidInput)?;
+    let rle_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
     let fse_data = fse::encode(&block.data);
 
     let mut output = Vec::new();
@@ -617,7 +638,10 @@ pub(crate) fn stage_mtf_decode(mut block: StageBlock) -> PzResult<StageBlock> {
 
 /// Bw decompress stage 3: BWT decode.
 pub(crate) fn stage_bwt_decode(mut block: StageBlock) -> PzResult<StageBlock> {
-    let primary_index = block.metadata.bwt_primary_index.unwrap();
+    let primary_index = block
+        .metadata
+        .bwt_primary_index
+        .ok_or(PzError::InvalidInput)?;
     block.data = bwt::decode(&block.data, primary_index)?;
     Ok(block)
 }
@@ -641,8 +665,15 @@ pub(crate) fn stage_bbwt_encode(
 ///
 /// Format: [num_factors: u16] [factor_lengths: u32 × num_factors] [rle_len: u32] [fse_data...]
 pub(crate) fn stage_fse_encode_bbw(mut block: StageBlock) -> PzResult<StageBlock> {
-    let factor_lengths = block.metadata.bbwt_factor_lengths.take().unwrap();
-    let rle_len = block.metadata.pre_entropy_len.unwrap();
+    let factor_lengths = block
+        .metadata
+        .bbwt_factor_lengths
+        .take()
+        .ok_or(PzError::InvalidInput)?;
+    let rle_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
     let fse_data = fse::encode(&block.data);
 
     let mut output = Vec::new();
