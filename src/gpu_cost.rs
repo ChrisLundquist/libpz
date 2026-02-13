@@ -352,6 +352,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn print_cost_table() {
+        let kernels: &[(&str, &str)] = &[
+            ("lz77.cl", include_str!("../kernels/lz77.cl")),
+            ("lz77_batch.cl", include_str!("../kernels/lz77_batch.cl")),
+            ("lz77_hash.cl", include_str!("../kernels/lz77_hash.cl")),
+            ("lz77_lazy.wgsl", include_str!("../kernels/lz77_lazy.wgsl")),
+            ("lz77_topk.cl", include_str!("../kernels/lz77_topk.cl")),
+            (
+                "huffman_encode.cl",
+                include_str!("../kernels/huffman_encode.cl"),
+            ),
+            ("bwt_rank.cl", include_str!("../kernels/bwt_rank.cl")),
+            ("bwt_radix.cl", include_str!("../kernels/bwt_radix.cl")),
+            ("bwt_sort.cl", include_str!("../kernels/bwt_sort.cl")),
+            (
+                "fse_decode.wgsl",
+                include_str!("../kernels/fse_decode.wgsl"),
+            ),
+        ];
+        let sizes: &[usize] = &[64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024];
+
+        eprintln!();
+        eprintln!(
+            "{:<22} {:>5} {:>7}  {:>10}  {:>10}  {:>10}  {:>10}",
+            "KERNEL", "PASS", "TPE", "64KB", "256KB", "1MB", "4MB"
+        );
+        eprintln!("{}", "-".repeat(88));
+        for (name, src) in kernels {
+            let cost = KernelCost::parse(src).unwrap();
+            eprint!(
+                "{:<22} {:>5} {:>7.5}",
+                name, cost.passes, cost.threads_per_element
+            );
+            for &n in sizes {
+                let mb = cost.memory_bytes(n) as f64 / (1024.0 * 1024.0);
+                eprint!("  {:>8.1} MB", mb);
+            }
+            eprintln!();
+        }
+        eprintln!();
+
+        // Show max_in_flight at 128MB budget (typical Apple M-series GPU)
+        let budget: usize = 128 * 1024 * 1024;
+        eprintln!("max_in_flight (128 MB budget):");
+        eprintln!(
+            "{:<22}  {:>6}  {:>6}  {:>6}  {:>6}",
+            "KERNEL", "64KB", "256KB", "1MB", "4MB"
+        );
+        eprintln!("{}", "-".repeat(54));
+        for (name, src) in kernels {
+            let cost = KernelCost::parse(src).unwrap();
+            eprint!("{:<22}", name);
+            for &n in sizes {
+                let per_block = cost.memory_bytes(n);
+                let max = if per_block == 0 {
+                    8
+                } else {
+                    (budget / per_block).max(1)
+                };
+                eprint!("  {:>6}", max);
+            }
+            eprintln!();
+        }
+        eprintln!();
+    }
+
     // Non-feature-gated test that parses all 15 kernels (include_str! works without features)
     #[test]
     fn parse_all_kernels() {
