@@ -23,8 +23,6 @@ pub(crate) struct DemuxOutput {
 /// them back on decompression.
 pub(crate) trait StreamDemuxer {
     /// Number of independent streams this format produces.
-    // TODO: Use in decode validation to verify stream count matches before decoding.
-    #[allow(dead_code)]
     fn stream_count(&self) -> usize;
 
     /// Compress input bytes and split into independent streams + metadata.

@@ -71,11 +71,17 @@ pub(crate) fn stage_demux_compress(
 }
 
 /// Generic decompress stage: reinterleave streams with a demuxer.
+///
+/// Validates that the number of decoded streams matches the demuxer's
+/// expected `stream_count()` before passing them to `remux_and_decompress`.
 pub(crate) fn stage_demux_decompress(
     mut block: StageBlock,
     demuxer: &LzDemuxer,
 ) -> PzResult<StageBlock> {
     let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
+    if streams.len() != demuxer.stream_count() {
+        return Err(PzError::InvalidInput);
+    }
     let decoded =
         demuxer.remux_and_decompress(streams, &block.metadata.demux_meta, block.original_len)?;
     block.data = decoded;
@@ -725,5 +731,39 @@ pub(crate) fn run_decompress_stage(
         (Pipeline::Lz78R, 0) => stage_rans_decode(block),
         (Pipeline::Lz78R, 1) => stage_demux_decompress(block, &LzDemuxer::Lz78),
         _ => Err(PzError::Unsupported),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PzError;
+
+    #[test]
+    fn test_demux_decompress_wrong_stream_count() {
+        // LZ77 expects 3 streams; provide 2 → should fail with InvalidInput
+        let block = StageBlock {
+            block_index: 0,
+            original_len: 100,
+            data: Vec::new(),
+            streams: Some(vec![vec![0u8; 10], vec![0u8; 10]]), // 2 streams, need 3
+            metadata: StageMetadata::default(),
+        };
+        let result = stage_demux_decompress(block, &LzDemuxer::Lz77);
+        assert!(matches!(result, Err(PzError::InvalidInput)));
+    }
+
+    #[test]
+    fn test_demux_decompress_no_streams() {
+        // No streams at all → should fail with InvalidInput
+        let block = StageBlock {
+            block_index: 0,
+            original_len: 100,
+            data: Vec::new(),
+            streams: None,
+            metadata: StageMetadata::default(),
+        };
+        let result = stage_demux_decompress(block, &LzDemuxer::Lz77);
+        assert!(matches!(result, Err(PzError::InvalidInput)));
     }
 }
