@@ -510,16 +510,22 @@ impl OpenClEngine {
         &self
             .lz77_per_pos
             .get_or_init(|| {
+                let t0 = std::time::Instant::now();
                 let program = Program::create_and_build_from_source(
                     &self.context,
                     LZ77_KERNEL_SOURCE,
                     "-Werror",
                 )
                 .expect("failed to compile lz77.cl");
-                Lz77PerPosKernels {
+                let group = Lz77PerPosKernels {
                     per_pos: Kernel::create(&program, "Encode")
                         .expect("failed to create Encode kernel"),
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile lz77.cl: {ms:.3} ms");
                 }
+                group
             })
             .per_pos
     }
@@ -528,16 +534,22 @@ impl OpenClEngine {
         &self
             .lz77_batch
             .get_or_init(|| {
+                let t0 = std::time::Instant::now();
                 let program = Program::create_and_build_from_source(
                     &self.context,
                     LZ77_BATCH_KERNEL_SOURCE,
                     "-Werror",
                 )
                 .expect("failed to compile lz77_batch.cl");
-                Lz77BatchKernels {
+                let group = Lz77BatchKernels {
                     batch: Kernel::create(&program, "Encode")
                         .expect("failed to create Encode kernel"),
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile lz77_batch.cl: {ms:.3} ms");
                 }
+                group
             })
             .batch
     }
@@ -546,34 +558,46 @@ impl OpenClEngine {
         &self
             .lz77_topk
             .get_or_init(|| {
+                let t0 = std::time::Instant::now();
                 let program = Program::create_and_build_from_source(
                     &self.context,
                     LZ77_TOPK_KERNEL_SOURCE,
                     "-Werror",
                 )
                 .expect("failed to compile lz77_topk.cl");
-                Lz77TopkKernels {
+                let group = Lz77TopkKernels {
                     topk: Kernel::create(&program, "EncodeTopK")
                         .expect("failed to create EncodeTopK kernel"),
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile lz77_topk.cl: {ms:.3} ms");
                 }
+                group
             })
             .topk
     }
 
     fn lz77_hash_kernels(&self) -> &Lz77HashKernels {
         self.lz77_hash.get_or_init(|| {
+            let t0 = std::time::Instant::now();
             let program = Program::create_and_build_from_source(
                 &self.context,
                 LZ77_HASH_KERNEL_SOURCE,
                 "-Werror",
             )
             .expect("failed to compile lz77_hash.cl");
-            Lz77HashKernels {
+            let group = Lz77HashKernels {
                 build: Kernel::create(&program, "BuildHashTable")
                     .expect("failed to create BuildHashTable kernel"),
                 find: Kernel::create(&program, "FindMatches")
                     .expect("failed to create FindMatches kernel"),
+            };
+            if self.profiling {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[pz-gpu] compile lz77_hash.cl: {ms:.3} ms");
             }
+            group
         })
     }
 
@@ -587,6 +611,7 @@ impl OpenClEngine {
 
     fn bwt_rank_kernels(&self) -> &BwtRankKernels {
         self.bwt_rank.get_or_init(|| {
+            let t0 = std::time::Instant::now();
             let flags = format!("-Werror -DWORKGROUP_SIZE={}", self.scan_workgroup_size);
             let program = Program::create_and_build_from_source(
                 &self.context,
@@ -594,7 +619,7 @@ impl OpenClEngine {
                 &flags,
             )
             .expect("failed to compile bwt_rank.cl");
-            BwtRankKernels {
+            let group = BwtRankKernels {
                 rank_compare: Kernel::create(&program, "rank_compare")
                     .expect("failed to create rank_compare kernel"),
                 prefix_sum_local: Kernel::create(&program, "prefix_sum_local")
@@ -603,7 +628,12 @@ impl OpenClEngine {
                     .expect("failed to create prefix_sum_propagate kernel"),
                 rank_scatter: Kernel::create(&program, "rank_scatter")
                     .expect("failed to create rank_scatter kernel"),
+            };
+            if self.profiling {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[pz-gpu] compile bwt_rank.cl: {ms:.3} ms");
             }
+            group
         })
     }
 
@@ -625,6 +655,7 @@ impl OpenClEngine {
 
     fn bwt_radix_kernels(&self) -> &BwtRadixKernels {
         self.bwt_radix.get_or_init(|| {
+            let t0 = std::time::Instant::now();
             let flags = format!("-Werror -DWORKGROUP_SIZE={}", self.scan_workgroup_size);
             let program = Program::create_and_build_from_source(
                 &self.context,
@@ -632,7 +663,7 @@ impl OpenClEngine {
                 &flags,
             )
             .expect("failed to compile bwt_radix.cl");
-            BwtRadixKernels {
+            let group = BwtRadixKernels {
                 compute_keys: Kernel::create(&program, "radix_compute_keys")
                     .expect("failed to create radix_compute_keys kernel"),
                 histogram: Kernel::create(&program, "radix_histogram")
@@ -641,7 +672,12 @@ impl OpenClEngine {
                     .expect("failed to create radix_scatter kernel"),
                 inclusive_to_exclusive: Kernel::create(&program, "inclusive_to_exclusive")
                     .expect("failed to create inclusive_to_exclusive kernel"),
+            };
+            if self.profiling {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[pz-gpu] compile bwt_radix.cl: {ms:.3} ms");
             }
+            group
         })
     }
 
@@ -663,13 +699,14 @@ impl OpenClEngine {
 
     fn huffman_kernels(&self) -> &HuffmanKernels {
         self.huffman.get_or_init(|| {
+            let t0 = std::time::Instant::now();
             let program = Program::create_and_build_from_source(
                 &self.context,
                 HUFFMAN_ENCODE_KERNEL_SOURCE,
                 "-Werror",
             )
             .expect("failed to compile huffman_encode.cl");
-            HuffmanKernels {
+            let group = HuffmanKernels {
                 bit_lengths: Kernel::create(&program, "ComputeBitLengths")
                     .expect("failed to create ComputeBitLengths kernel"),
                 write_codes: Kernel::create(&program, "WriteCodes")
@@ -680,7 +717,12 @@ impl OpenClEngine {
                     .expect("failed to create PrefixSumBlock kernel"),
                 prefix_sum_apply: Kernel::create(&program, "PrefixSumApply")
                     .expect("failed to create PrefixSumApply kernel"),
+            };
+            if self.profiling {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[pz-gpu] compile huffman_encode.cl: {ms:.3} ms");
             }
+            group
         })
     }
 
@@ -708,16 +750,22 @@ impl OpenClEngine {
         &self
             .fse_decode
             .get_or_init(|| {
+                let t0 = std::time::Instant::now();
                 let program = Program::create_and_build_from_source(
                     &self.context,
                     FSE_DECODE_KERNEL_SOURCE,
                     "-Werror",
                 )
                 .expect("failed to compile fse_decode.cl");
-                FseDecodeKernels {
+                let group = FseDecodeKernels {
                     decode: Kernel::create(&program, "FseDecode")
                         .expect("failed to create FseDecode kernel"),
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile fse_decode.cl: {ms:.3} ms");
                 }
+                group
             })
             .decode
     }
