@@ -1171,3 +1171,321 @@ fn test_gpu_lzfi_pipeline_webgpu_round_trip() {
     }
     gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Lzfi);
 }
+
+// --- GPU LZ77 match quality regression tests ---
+//
+// These parallel the CPU golden tests in lz77.rs, but use bound-based
+// assertions since the GPU hash table uses parallel atomics and may
+// produce slightly different (but valid) results across runs.
+//
+// Each test asserts:
+//   1. Round-trip correctness (exact).
+//   2. total_seqs ≤ MAX_SEQS (regression ceiling — if GPU quality improves,
+//      lower the bound; if it gets worse, the test catches it).
+//   3. matched bytes ≥ MIN_MATCHED (most of the input is covered by matches).
+//   4. Serialized output ≤ input size (GPU actually compresses, not expands).
+
+/// Count total and match-only sequences from a Vec<Match>.
+fn gpu_count_sequences(matches: &[Match]) -> (usize, usize) {
+    let total = matches.len();
+    let match_seqs = matches
+        .iter()
+        .filter(|m| m.length > 0 && m.offset > 0)
+        .count();
+    (total, match_seqs)
+}
+
+/// Sum of all match lengths.
+fn gpu_total_match_bytes(matches: &[Match]) -> usize {
+    matches.iter().map(|m| m.length as usize).sum()
+}
+
+/// Round-trip verify GPU matches against original input.
+fn gpu_verify_round_trip(matches: &[Match], input: &[u8], label: &str) {
+    let mut serialized = Vec::with_capacity(matches.len() * Match::SERIALIZED_SIZE);
+    for m in matches {
+        serialized.extend_from_slice(&m.to_bytes());
+    }
+    let decompressed = crate::lz77::decompress(&serialized).unwrap();
+    assert_eq!(
+        decompressed.len(),
+        input.len(),
+        "{label}: GPU round-trip length mismatch"
+    );
+    assert_eq!(decompressed, input, "{label}: GPU round-trip data mismatch");
+}
+
+#[test]
+fn test_gpu_lazy_quality_repeated_pattern() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // 200 repeats of a 38-byte pattern = 7600 bytes.
+    // CPU golden: 65 seqs, 31 matches, 7535 bytes matched.
+    let pattern = b"Hello, World! This is a test pattern. ";
+    let mut input = Vec::new();
+    for _ in 0..200 {
+        input.extend_from_slice(pattern);
+    }
+
+    let matches = engine.find_matches(&input).unwrap();
+    gpu_verify_round_trip(&matches, &input, "repeated_pattern");
+
+    let (total_seqs, _match_seqs) = gpu_count_sequences(&matches);
+    let matched = gpu_total_match_bytes(&matches);
+    let serialized_size = total_seqs * Match::SERIALIZED_SIZE;
+
+    // GPU should compress this well — very repetitive pattern.
+    assert!(
+        total_seqs <= 100,
+        "repeated_pattern: too many seqs ({total_seqs} > 100), quality regression"
+    );
+    assert!(
+        matched >= 7000,
+        "repeated_pattern: too few matched bytes ({matched} < 7000)"
+    );
+    assert!(
+        serialized_size < input.len(),
+        "repeated_pattern: GPU output ({serialized_size}) >= input ({}), not compressing",
+        input.len()
+    );
+}
+
+#[test]
+fn test_gpu_lazy_quality_all_same() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // 10000 identical bytes.
+    // CPU golden: 40 seqs, 39 matches, 9960 bytes matched.
+    // GPU is non-deterministic here (2-98 seqs across runs) due to atomics.
+    let input = vec![b'A'; 10000];
+
+    let matches = engine.find_matches(&input).unwrap();
+    gpu_verify_round_trip(&matches, &input, "all_same");
+
+    let (total_seqs, _match_seqs) = gpu_count_sequences(&matches);
+    let matched = gpu_total_match_bytes(&matches);
+    let serialized_size = total_seqs * Match::SERIALIZED_SIZE;
+
+    // All-same byte: GPU should find very long matches.
+    assert!(
+        total_seqs <= 200,
+        "all_same: too many seqs ({total_seqs} > 200), quality regression"
+    );
+    assert!(
+        matched >= 9000,
+        "all_same: too few matched bytes ({matched} < 9000)"
+    );
+    assert!(
+        serialized_size < input.len(),
+        "all_same: GPU output ({serialized_size}) >= input ({}), not compressing",
+        input.len()
+    );
+}
+
+#[test]
+fn test_gpu_lazy_quality_pattern_64kb() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // 64KB repetitive text — this is the GPU's sweet spot.
+    let pattern = b"the quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::new();
+    while input.len() < 65536 {
+        input.extend_from_slice(pattern);
+    }
+    input.truncate(65536);
+
+    let matches = engine.find_matches(&input).unwrap();
+    gpu_verify_round_trip(&matches, &input, "pattern_64KB");
+
+    let (total_seqs, _) = gpu_count_sequences(&matches);
+    let matched = gpu_total_match_bytes(&matches);
+    let serialized_size = total_seqs * Match::SERIALIZED_SIZE;
+
+    // 64KB repetitive: GPU should compress very well (ratio < 1.0).
+    assert!(
+        total_seqs <= 200,
+        "pattern_64KB: too many seqs ({total_seqs} > 200), quality regression"
+    );
+    assert!(
+        matched >= 60000,
+        "pattern_64KB: too few matched bytes ({matched} < 60000)"
+    );
+    assert!(
+        serialized_size < input.len(),
+        "pattern_64KB: GPU output ({serialized_size}) >= input ({}), not compressing",
+        input.len()
+    );
+}
+
+#[test]
+fn test_gpu_lazy_quality_vs_cpu_64kb() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Compare GPU vs CPU match quality on 64KB text data.
+    // After the hash table fix, GPU should be within 2x of CPU seqs at this size.
+    let pattern = b"the quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::new();
+    while input.len() < 65536 {
+        input.extend_from_slice(pattern);
+    }
+    input.truncate(65536);
+
+    let gpu_matches = engine.find_matches(&input).unwrap();
+    let cpu_matches = crate::lz77::compress_lazy_to_matches(&input).unwrap();
+
+    gpu_verify_round_trip(&gpu_matches, &input, "vs_cpu_64KB");
+
+    let (gpu_seqs, _) = gpu_count_sequences(&gpu_matches);
+    let (cpu_seqs, _) = gpu_count_sequences(&cpu_matches);
+
+    // GPU should produce no more than 2x the CPU's sequence count at 64KB.
+    // With the improved hash table, it should be much closer to 1x.
+    let ratio = gpu_seqs as f64 / cpu_seqs as f64;
+    assert!(
+        ratio <= 2.0,
+        "GPU/CPU seq ratio {ratio:.2} > 2.0 at 64KB (GPU={gpu_seqs}, CPU={cpu_seqs})"
+    );
+}
+
+#[test]
+fn test_gpu_lazy_quality_vs_cpu_128kb() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Use realistic text data (diverse byte distribution) rather than a
+    // short repeating pattern which concentrates all positions into a
+    // handful of hash buckets.
+    // Multiple distinct sentences → many unique 3-byte prefixes → even hash spread.
+    let sentences = [
+        b"the quick brown fox jumps over the lazy dog. " as &[u8],
+        b"pack my box with five dozen liquor jugs now. ",
+        b"how vexingly quick daft zebras jump high up! ",
+        b"the five boxing wizards jump quickly at dawn. ",
+        b"sphinx of black quartz, judge my vow today!! ",
+        b"two driven jocks help fax my big quiz plan. ",
+        b"crazy frederick bought many very exquisite. ",
+        b"we promptly judged antique ivory buckles ok. ",
+    ];
+    let mut input = Vec::new();
+    let mut i = 0;
+    while input.len() < 131072 {
+        input.extend_from_slice(sentences[i % sentences.len()]);
+        i += 1;
+    }
+    input.truncate(131072);
+
+    let gpu_matches = engine.find_matches(&input).unwrap();
+    let cpu_matches = crate::lz77::compress_lazy_to_matches(&input).unwrap();
+
+    gpu_verify_round_trip(&gpu_matches, &input, "vs_cpu_128KB");
+
+    let (gpu_seqs, _) = gpu_count_sequences(&gpu_matches);
+    let (cpu_seqs, _) = gpu_count_sequences(&cpu_matches);
+
+    // At 128KB with diverse data, GPU should be within 3x of CPU.
+    let ratio = gpu_seqs as f64 / cpu_seqs as f64;
+    assert!(
+        ratio <= 3.0,
+        "GPU/CPU seq ratio {ratio:.2} > 3.0 at 128KB (GPU={gpu_seqs}, CPU={cpu_seqs})"
+    );
+}
+
+#[cfg(test)]
+fn corpus_file_for_gpu(name: &str) -> Option<Vec<u8>> {
+    for dir in &["samples/cantrbry", "/home/user/libpz/samples/cantrbry"] {
+        let path = format!("{}/{}", dir, name);
+        if let Ok(data) = std::fs::read(&path) {
+            return Some(data);
+        }
+    }
+    None
+}
+
+#[test]
+fn test_gpu_lazy_quality_alice29() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let Some(data) = corpus_file_for_gpu("alice29.txt") else {
+        eprintln!("skipping: alice29.txt not found");
+        return;
+    };
+    assert_eq!(data.len(), 152089);
+
+    let gpu_matches = engine.find_matches(&data).unwrap();
+    let cpu_matches = crate::lz77::compress_lazy_to_matches(&data).unwrap();
+    gpu_verify_round_trip(&gpu_matches, &data, "alice29.txt");
+
+    let (gpu_seqs, _) = gpu_count_sequences(&gpu_matches);
+    let (cpu_seqs, _) = gpu_count_sequences(&cpu_matches);
+    let gpu_matched = gpu_total_match_bytes(&gpu_matches);
+
+    // alice29.txt is 152KB — GPU hash table has some pressure.
+    // CPU golden: 27564 seqs. GPU should be within 4x.
+    let ratio = gpu_seqs as f64 / cpu_seqs as f64;
+    assert!(
+        ratio <= 4.0,
+        "alice29.txt: GPU/CPU seq ratio {ratio:.2} > 4.0 (GPU={gpu_seqs}, CPU={cpu_seqs})"
+    );
+    assert!(
+        gpu_matched >= 100000,
+        "alice29.txt: too few GPU matched bytes ({gpu_matched} < 100000)"
+    );
+}
+
+#[test]
+fn test_gpu_lazy_quality_fields_c() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let Some(data) = corpus_file_for_gpu("fields.c") else {
+        eprintln!("skipping: fields.c not found");
+        return;
+    };
+    assert_eq!(data.len(), 11150);
+
+    let gpu_matches = engine.find_matches(&data).unwrap();
+    let cpu_matches = crate::lz77::compress_lazy_to_matches(&data).unwrap();
+    gpu_verify_round_trip(&gpu_matches, &data, "fields.c");
+
+    let (gpu_seqs, _) = gpu_count_sequences(&gpu_matches);
+    let (cpu_seqs, _) = gpu_count_sequences(&cpu_matches);
+    let gpu_matched = gpu_total_match_bytes(&gpu_matches);
+
+    // fields.c is only 11KB — should be well within GPU hash table capacity.
+    // CPU golden: 1943 seqs. GPU should be within 2x.
+    let ratio = gpu_seqs as f64 / cpu_seqs as f64;
+    assert!(
+        ratio <= 2.0,
+        "fields.c: GPU/CPU seq ratio {ratio:.2} > 2.0 (GPU={gpu_seqs}, CPU={cpu_seqs})"
+    );
+    assert!(
+        gpu_matched >= 8000,
+        "fields.c: too few GPU matched bytes ({gpu_matched} < 8000)"
+    );
+}
