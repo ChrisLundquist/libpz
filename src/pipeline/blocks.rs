@@ -161,6 +161,14 @@ fn entropy_encode(
             stage_fse_encode(block)
         }
         Pipeline::Lzfi => {
+            #[cfg(feature = "opencl")]
+            {
+                if let Backend::OpenCl = options.backend {
+                    if let Some(ref engine) = options.opencl_engine {
+                        return stage_fse_interleaved_encode_gpu(block, engine);
+                    }
+                }
+            }
             let _ = (input_len, options);
             stage_fse_interleaved_encode(block)
         }

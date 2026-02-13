@@ -537,6 +537,40 @@ pub(crate) fn stage_fse_interleaved_encode(mut block: StageBlock) -> PzResult<St
     Ok(block)
 }
 
+/// GPU interleaved FSE encoding stage: encode each stream with GPU-accelerated
+/// N-way interleaved FSE via OpenCL.
+///
+/// Per-stream framing: [orig_len: u32] [compressed_len: u32] [interleaved_fse_data]
+///
+/// The output wire format is identical to [`stage_fse_interleaved_encode()`], so
+/// the same decoder works for both CPU and GPU encoded data.
+#[cfg(feature = "opencl")]
+pub(crate) fn stage_fse_interleaved_encode_gpu(
+    mut block: StageBlock,
+    engine: &crate::opencl::OpenClEngine,
+) -> PzResult<StageBlock> {
+    let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
+    let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
+
+    block.data = encode_multistream(
+        &streams,
+        pre_entropy_len,
+        &block.metadata.demux_meta,
+        |stream, output| {
+            // Use higher interleave count for GPU parallelism
+            let num_states = 32;
+            let fse_data =
+                engine.fse_encode_interleaved_gpu(stream, num_states, fse::DEFAULT_ACCURACY_LOG)?;
+            output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+            output.extend_from_slice(&(fse_data.len() as u32).to_le_bytes());
+            output.extend_from_slice(&fse_data);
+            Ok(())
+        },
+    )?;
+
+    Ok(block)
+}
+
 /// Interleaved FSE decoding stage (CPU): parse multi-stream container + decode each stream.
 ///
 /// Per-stream framing: [orig_len: u32] [compressed_len: u32] [interleaved_fse_data]
@@ -785,7 +819,17 @@ pub(crate) fn run_compress_stage(
         (Pipeline::Lzf, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
         (Pipeline::Lzf, 1) => stage_fse_encode(block),
         (Pipeline::Lzfi, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
-        (Pipeline::Lzfi, 1) => stage_fse_interleaved_encode(block),
+        (Pipeline::Lzfi, 1) => {
+            #[cfg(feature = "opencl")]
+            {
+                if let super::Backend::OpenCl = options.backend {
+                    if let Some(ref engine) = options.opencl_engine {
+                        return stage_fse_interleaved_encode_gpu(block, engine);
+                    }
+                }
+            }
+            stage_fse_interleaved_encode(block)
+        }
         (Pipeline::LzssR, 0) => stage_demux_compress(block, &LzDemuxer::Lzss, options),
         (Pipeline::LzssR, 1) => stage_rans_encode(block),
         (Pipeline::Lz78R, 0) => stage_demux_compress(block, &LzDemuxer::Lz78, options),
