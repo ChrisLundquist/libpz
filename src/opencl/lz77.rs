@@ -654,7 +654,7 @@ impl OpenClEngine {
 
         // Pass 1: Build hash table (depends on upload + zero completion)
         let build_event = unsafe {
-            let mut exec = ExecuteKernel::new(&self.kernel_hash_build());
+            let mut exec = ExecuteKernel::new(self.kernel_hash_build());
             exec.set_arg(&slot.input_buf)
                 .set_arg(&count)
                 .set_arg(&slot.hash_counts_buf)
@@ -668,7 +668,7 @@ impl OpenClEngine {
 
         // Pass 2: Find matches (depends on build completion)
         let find_event = unsafe {
-            let mut exec = ExecuteKernel::new(&self.kernel_hash_find());
+            let mut exec = ExecuteKernel::new(self.kernel_hash_find());
             exec.set_arg(&slot.input_buf)
                 .set_arg(&count)
                 .set_arg(&slot.hash_counts_buf)
@@ -712,6 +712,119 @@ impl OpenClEngine {
         self.profile_event("streaming slot: download matches", &read_event);
 
         Ok(dedupe_gpu_matches(&gpu_matches, input))
+    }
+
+    /// GPU-accelerated LZ77 match finding for multiple blocks (batched).
+    ///
+    /// Allocates a pool of buffer slots, then processes blocks in batches
+    /// that fit within GPU memory. For each batch:
+    /// 1. Submit all blocks to their respective slots (non-blocking).
+    /// 2. Complete (wait + readback + dedup) each slot sequentially.
+    ///
+    /// Blocks smaller than `MIN_GPU_INPUT_SIZE` or empty blocks fall back
+    /// to CPU lazy matching. Returns one `Vec<Match>` per input block.
+    pub(crate) fn find_matches_batched(&self, blocks: &[&[u8]]) -> PzResult<Vec<Vec<Match>>> {
+        if blocks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if blocks.len() == 1 {
+            let block = blocks[0];
+            if block.is_empty() || block.len() < MIN_GPU_INPUT_SIZE {
+                return Ok(vec![crate::lz77::compress_lazy_to_matches(block)?]);
+            }
+            return Ok(vec![self.find_matches(block, KernelVariant::HashTable)?]);
+        }
+
+        let block_size = blocks.iter().map(|b| b.len()).max().unwrap_or(256 * 1024);
+        let batch_size = self.lz77_batch_size(block_size);
+
+        // Pre-allocate a pool of slots (one per batch position).
+        let actual_batch_size = batch_size.min(blocks.len());
+        let mut slots: Vec<Lz77BufferSlot> = Vec::with_capacity(actual_batch_size);
+        for _ in 0..actual_batch_size {
+            match self.alloc_lz77_slot(block_size) {
+                Ok(slot) => slots.push(slot),
+                Err(_) => break,
+            }
+        }
+
+        if slots.is_empty() {
+            // GPU memory too small — fall back to CPU for all blocks
+            let mut results = Vec::with_capacity(blocks.len());
+            for block in blocks {
+                if block.is_empty() {
+                    results.push(Vec::new());
+                } else {
+                    results.push(crate::lz77::compress_lazy_to_matches(block)?);
+                }
+            }
+            return Ok(results);
+        }
+
+        let pool_size = slots.len();
+        let mut all_results: Vec<Vec<Match>> = Vec::with_capacity(blocks.len());
+
+        for chunk in blocks.chunks(pool_size) {
+            // Phase 1: Submit all blocks in this chunk to their slots
+            let mut pending: Vec<Option<(usize, PendingSlotWork)>> =
+                Vec::with_capacity(chunk.len());
+
+            for (local_i, block) in chunk.iter().enumerate() {
+                if block.is_empty() || block.len() < MIN_GPU_INPUT_SIZE {
+                    pending.push(None);
+                } else {
+                    match self.submit_lz77_to_slot(block, &mut slots[local_i]) {
+                        Ok(p) => pending.push(Some((local_i, p))),
+                        Err(e) => {
+                            eprintln!("[pz-gpu] opencl batched slot submission failed: {e}");
+                            pending.push(None);
+                        }
+                    }
+                }
+            }
+
+            // Phase 2: Complete all pending GPU work, collect results
+            for (block_i, p) in pending.into_iter().enumerate() {
+                match p {
+                    Some((slot_i, pending_work)) => {
+                        match self.complete_lz77_from_slot(
+                            &slots[slot_i],
+                            &pending_work,
+                            chunk[block_i],
+                        ) {
+                            Ok(matches) => all_results.push(matches),
+                            Err(e) => {
+                                eprintln!("[pz-gpu] opencl batched readback failed: {e}");
+                                let matches = crate::lz77::compress_lazy_to_matches(chunk[block_i])
+                                    .unwrap_or_default();
+                                all_results.push(matches);
+                            }
+                        }
+                    }
+                    None => {
+                        if chunk[block_i].is_empty() {
+                            all_results.push(Vec::new());
+                        } else {
+                            all_results.push(
+                                crate::lz77::compress_lazy_to_matches(chunk[block_i])
+                                    .unwrap_or_default(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.profiling() {
+            eprintln!(
+                "[pz-gpu] lz77_hash_batched: {} blocks processed (pool_size={})",
+                blocks.len(),
+                pool_size,
+            );
+        }
+
+        Ok(all_results)
     }
 }
 
