@@ -469,6 +469,7 @@ impl OpenClEngine {
 
     /// Max blocks of `block_size` bytes in flight for a kernel without
     /// exceeding the GPU memory budget.
+    #[allow(dead_code)] // Will be used when OpenCL batched path adopts backpressure
     pub(crate) fn max_in_flight(&self, kernel: &KernelCost, block_size: usize) -> usize {
         let per_block = kernel.memory_bytes(block_size);
         if per_block == 0 {
