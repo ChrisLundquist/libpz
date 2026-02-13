@@ -250,10 +250,10 @@ pub struct WebGpuEngine {
     cost_lz77_lazy: KernelCost,
     /// Whether profiling is enabled (timestamp queries).
     profiling: bool,
-    /// Query set for timestamp profiling (begin + end).
-    query_set: Option<wgpu::QuerySet>,
-    /// Buffer to resolve timestamp queries into.
-    resolve_buf: Option<wgpu::Buffer>,
+    /// GPU profiler for timestamp queries (None when profiling disabled or unsupported).
+    /// Wrapped in Mutex because resolve_queries/end_frame/process_finished_frame
+    /// require &mut self, but WebGpuEngine methods use &self (engine is behind Arc).
+    profiler: Option<std::sync::Mutex<wgpu_profiler::GpuProfiler>>,
 }
 
 impl std::fmt::Debug for WebGpuEngine {
@@ -279,7 +279,9 @@ impl WebGpuEngine {
     /// Create a new engine with profiling enabled.
     ///
     /// When profiling is on, `TIMESTAMP_QUERY` is requested on the device
-    /// and major kernel dispatches print timing via `eprintln!`.
+    /// and GPU dispatches are timed via `wgpu-profiler`. Call
+    /// [`profiler_end_frame()`] after a batch of work to collect results,
+    /// and [`profiler_write_trace()`] to export a Chrome trace file.
     pub fn with_profiling(profiling: bool) -> PzResult<Self> {
         Self::create(true, profiling)
     }
@@ -301,7 +303,7 @@ impl WebGpuEngine {
             force_fallback_adapter: false,
             compatible_surface: None,
         }))
-        .ok_or(PzError::Unsupported)?;
+        .map_err(|_| PzError::Unsupported)?;
 
         let info = adapter.get_info();
         let device_name = info.name.clone();
@@ -328,15 +330,14 @@ impl WebGpuEngine {
             wgpu::Features::empty()
         };
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("libpz-webgpu"),
-                required_features,
-                required_limits: wgpu::Limits::downlevel_defaults(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("libpz-webgpu"),
+            required_features,
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            trace: wgpu::Trace::Off,
+        }))
         .map_err(|_| PzError::Unsupported)?;
 
         let capped = max_work_group_size.clamp(1, 256);
@@ -346,22 +347,17 @@ impl WebGpuEngine {
         let cost_lz77_lazy = KernelCost::parse(LZ77_LAZY_KERNEL_SOURCE)
             .expect("lz77_lazy.wgsl missing @pz_cost annotation");
 
-        // Create profiling resources when GPU timestamps are available.
-        let (query_set, resolve_buf) = if use_timestamps {
-            let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
-                label: Some("timestamp_query_set"),
-                ty: wgpu::QueryType::Timestamp,
-                count: 2,
-            });
-            let resolve = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("timestamp_resolve"),
-                size: 2 * std::mem::size_of::<u64>() as u64,
-                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-            (Some(qs), Some(resolve))
+        // Create wgpu-profiler when GPU timestamps are available.
+        let profiler = if use_timestamps {
+            match wgpu_profiler::GpuProfiler::new(
+                &device,
+                wgpu_profiler::GpuProfilerSettings::default(),
+            ) {
+                Ok(p) => Some(std::sync::Mutex::new(p)),
+                Err(_) => None,
+            }
         } else {
-            (None, None)
+            None
         };
 
         // All pipeline compilation is deferred to first use via OnceLock.
@@ -384,8 +380,7 @@ impl WebGpuEngine {
             max_buffer_size,
             cost_lz77_lazy,
             profiling,
-            query_set,
-            resolve_buf,
+            profiler,
         })
     }
 
@@ -396,7 +391,7 @@ impl WebGpuEngine {
 
     /// Block the host until all submitted GPU work completes.
     pub(crate) fn poll_wait(&self) {
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
     }
 
     /// Return the maximum work-group size for the device.
@@ -522,7 +517,7 @@ impl WebGpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv()
             .unwrap()
             .map_err(|_| PzError::Unsupported)
@@ -556,7 +551,7 @@ impl WebGpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();
@@ -590,15 +585,19 @@ impl WebGpuEngine {
         label: &str,
     ) -> PzResult<()> {
         let (wx, wy) = self.tile_workgroups(workgroups_x)?;
+
+        // Start a profiler query if the profiler is active.
+        let profiler_query = self
+            .profiler
+            .as_ref()
+            .map(|p| p.lock().unwrap().begin_pass_query(label, encoder));
+
+        // Get timestamp writes from the profiler query (borrows the query).
+        let timestamp_writes = profiler_query
+            .as_ref()
+            .and_then(|q| q.compute_pass_timestamp_writes());
+
         {
-            let timestamp_writes =
-                self.query_set
-                    .as_ref()
-                    .map(|qs| wgpu::ComputePassTimestampWrites {
-                        query_set: qs,
-                        beginning_of_pass_write_index: Some(0),
-                        end_of_pass_write_index: Some(1),
-                    });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some(label),
                 timestamp_writes,
@@ -607,54 +606,49 @@ impl WebGpuEngine {
             pass.set_bind_group(0, bind_group, &[]);
             pass.dispatch_workgroups(wx, wy, 1);
         }
+
+        // End the profiler query (consumes it).
+        if let Some(query) = profiler_query {
+            if let Some(p) = &self.profiler {
+                p.lock().unwrap().end_query(encoder, query);
+            }
+        }
+
         Ok(())
     }
 
-    /// Resolve timestamp queries, read back, and print elapsed time.
-    ///
-    /// Uses a per-call staging buffer instead of the shared `self.staging_buf`
-    /// to avoid "buffer is still mapped" panics when called from multiple
-    /// threads or re-entrantly within the same dispatch sequence.
-    fn read_and_print_timestamps(&self, label: &str) {
-        let (Some(qs), Some(resolve)) = (&self.query_set, &self.resolve_buf) else {
-            return;
-        };
-
-        // Allocate a per-call staging buffer to avoid races with the shared one.
-        let staging = self.create_buffer(
-            "timestamp_staging_local",
-            2 * std::mem::size_of::<u64>() as u64,
-            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        );
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("timestamp_resolve"),
-            });
-        encoder.resolve_query_set(qs, 0..2, resolve, 0);
-        encoder.copy_buffer_to_buffer(resolve, 0, &staging, 0, 16);
-        self.queue.submit(Some(encoder.finish()));
-
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).unwrap();
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        if rx.recv().unwrap().is_ok() {
-            let data = slice.get_mapped_range();
-            let timestamps: &[u64] = bytemuck::cast_slice(&data);
-            let start_ns = timestamps[0];
-            let end_ns = timestamps[1];
-            drop(data);
-            staging.unmap();
-            let elapsed_ns = end_ns.saturating_sub(start_ns);
-            let ms = elapsed_ns as f64 / 1_000_000.0;
-            eprintln!("[pz-gpu] {label}: {ms:.3} ms");
-        } else {
-            staging.unmap();
+    /// Resolve profiler queries into the command encoder.
+    /// Call before `encoder.finish()` when manually managing encoders.
+    pub(crate) fn profiler_resolve(&self, encoder: &mut wgpu::CommandEncoder) {
+        if let Some(p) = &self.profiler {
+            p.lock().unwrap().resolve_queries(encoder);
         }
+    }
+
+    /// End the current profiler frame and collect timing results.
+    ///
+    /// Call after all GPU work for the frame has been submitted.
+    /// Returns `None` if profiling is disabled or no results are ready.
+    pub fn profiler_end_frame(&self) -> Option<Vec<wgpu_profiler::GpuTimerQueryResult>> {
+        let p = self.profiler.as_ref()?;
+        {
+            p.lock().unwrap().end_frame().ok()?;
+        }
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        p.lock()
+            .unwrap()
+            .process_finished_frame(self.queue.get_timestamp_period())
+    }
+
+    /// Write collected profiler results to a Chrome trace file.
+    ///
+    /// The resulting JSON file can be viewed at `chrome://tracing`,
+    /// `edge://tracing`, or <https://ui.perfetto.dev/>.
+    pub fn profiler_write_trace(
+        path: &std::path::Path,
+        results: &[wgpu_profiler::GpuTimerQueryResult],
+    ) -> std::io::Result<()> {
+        wgpu_profiler::chrometrace::write_chrometrace(path, results)
     }
 
     /// Record and immediately submit a single compute dispatch.
@@ -674,17 +668,13 @@ impl WebGpuEngine {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
         self.record_dispatch(&mut encoder, pipeline, bind_group, workgroups_x, label)?;
+        self.profiler_resolve(&mut encoder);
         self.queue.submit(Some(encoder.finish()));
-        if self.profiling {
-            if self.query_set.is_some() {
-                // GPU timestamps available -- use precise device timings.
-                self.read_and_print_timestamps(label);
-            } else {
-                // Fall back to CPU wall-clock (includes submit + sync overhead).
-                self.device.poll(wgpu::Maintain::Wait);
-                let ms = t0.unwrap().elapsed().as_secs_f64() * 1000.0;
-                eprintln!("[pz-gpu] {label}: {ms:.3} ms");
-            }
+        // Wall-clock fallback when profiler is not available
+        if self.profiling && self.profiler.is_none() {
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            let ms = t0.unwrap().elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[pz-gpu] {label}: {ms:.3} ms");
         }
         Ok(())
     }
