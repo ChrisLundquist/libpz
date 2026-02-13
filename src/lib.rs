@@ -21,6 +21,9 @@ pub mod streaming;
 #[allow(dead_code)]
 mod gpu_cost;
 
+#[allow(dead_code)]
+mod gpu_common;
+
 #[cfg(feature = "opencl")]
 pub mod opencl;
 
