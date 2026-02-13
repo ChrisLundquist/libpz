@@ -717,6 +717,101 @@ impl WebGpuEngine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DeviceBuf — data residing on the GPU, not read back unless requested
+// ---------------------------------------------------------------------------
+
+/// A buffer residing on the GPU device.
+///
+/// Data stays on-device until explicitly downloaded via [`read_to_host()`].
+/// This avoids unnecessary PCI-bus round-trips when one GPU stage feeds
+/// directly into another (e.g., LZ77 output → Huffman histogram on the
+/// same device buffer).
+pub struct DeviceBuf {
+    pub(crate) buf: wgpu::Buffer,
+    pub(crate) len: usize,
+}
+
+impl DeviceBuf {
+    /// Upload host data to the GPU, returning a device-resident buffer.
+    ///
+    /// The data is padded to u32-aligned + 4 bytes (matching WGSL's `array<u32>`
+    /// byte reading convention). The `len` field stores the logical (unpadded)
+    /// length.
+    pub fn from_host(engine: &WebGpuEngine, data: &[u8]) -> PzResult<Self> {
+        if data.is_empty() {
+            let buf = engine.create_buffer(
+                "device_buf_empty",
+                4,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            );
+            return Ok(DeviceBuf { buf, len: 0 });
+        }
+
+        let padded = WebGpuEngine::pad_input_bytes(data);
+        let buf = engine.create_buffer_init(
+            "device_buf",
+            &padded,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        Ok(DeviceBuf {
+            buf,
+            len: data.len(),
+        })
+    }
+
+    /// Allocate a zero-initialized device buffer of the given size.
+    pub fn alloc(engine: &WebGpuEngine, len: usize) -> PzResult<Self> {
+        let actual_len = len.max(4); // avoid zero-size allocation
+        let buf = engine.create_buffer(
+            "device_buf_alloc",
+            actual_len as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        Ok(DeviceBuf { buf, len })
+    }
+
+    /// Download the buffer contents from the GPU to host memory.
+    pub fn read_to_host(&self, engine: &WebGpuEngine) -> PzResult<Vec<u8>> {
+        if self.len == 0 {
+            return Ok(Vec::new());
+        }
+
+        // The buffer may be padded, so read the full buffer and truncate.
+        let raw = engine.read_buffer(&self.buf, self.buf.size());
+        Ok(raw[..self.len].to_vec())
+    }
+
+    /// The logical length of the data in this buffer.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether this buffer is empty (zero-length data).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// An opaque GPU-resident buffer of LZ77 match results.
+///
+/// Produced by [`WebGpuEngine::find_matches_to_device()`] and consumed by
+/// [`WebGpuEngine::download_and_dedupe()`]. The match data stays on the GPU
+/// until explicitly downloaded, enabling zero-copy stage chaining.
+pub struct GpuMatchBuf {
+    pub(crate) buf: wgpu::Buffer,
+    pub(crate) input_len: usize,
+}
+
+impl GpuMatchBuf {
+    /// The number of input positions this match buffer covers.
+    pub fn input_len(&self) -> usize {
+        self.input_len
+    }
+}
+
 /// Deduplicate raw GPU match output into a non-overlapping match sequence.
 fn dedupe_gpu_matches(gpu_matches: &[GpuMatch], input: &[u8]) -> Vec<Match> {
     if gpu_matches.is_empty() {

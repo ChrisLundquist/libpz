@@ -28,6 +28,209 @@ impl WebGpuEngine {
         self.find_matches_hash(input)
     }
 
+    /// Find LZ77 matches on the GPU, keeping the match buffer on-device.
+    ///
+    /// Unlike [`find_matches()`] which downloads and deduplicates immediately,
+    /// this returns a [`GpuMatchBuf`] that stays on the GPU. The caller can:
+    /// - Download later via [`download_and_dedupe()`] for CPU processing
+    /// - (future) Pass to a GPU demux kernel without any PCI transfer
+    ///
+    /// This is the building block for zero-copy GPU pipeline composition.
+    pub fn find_matches_to_device(&self, input: &[u8]) -> PzResult<GpuMatchBuf> {
+        if input.is_empty() {
+            let buf = self.create_buffer(
+                "lz77_empty_matches",
+                std::mem::size_of::<GpuMatch>() as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            );
+            return Ok(GpuMatchBuf { buf, input_len: 0 });
+        }
+
+        let input_len = input.len();
+        let padded = Self::pad_input_bytes(input);
+        let match_buf_size = (input_len * std::mem::size_of::<GpuMatch>()) as u64;
+
+        let input_buf =
+            self.create_buffer_init("lz77_tod_input", &padded, wgpu::BufferUsages::STORAGE);
+
+        let workgroups = (input_len as u32).div_ceil(64);
+        let params = [input_len as u32, 0, 0, self.dispatch_width(workgroups, 64)];
+        let params_buf = self.create_buffer_init(
+            "lz77_tod_params",
+            bytemuck::cast_slice(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
+        // Hash counts and table buffers (pass 1)
+        let hash_counts_buf = self.create_buffer_init(
+            "tod_hash_counts",
+            &vec![0u8; HASH_TABLE_SIZE * 4],
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        let hash_table_buf = self.create_buffer(
+            "tod_hash_table",
+            (HASH_TABLE_SIZE * HASH_BUCKET_CAP * 4) as u64,
+            wgpu::BufferUsages::STORAGE,
+        );
+
+        // Raw match output (pass 2 writes, pass 3 reads)
+        let raw_match_buf = self.create_buffer(
+            "tod_raw_matches",
+            match_buf_size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        // Resolved match output (pass 3 writes) — this stays on GPU
+        let resolved_buf = self.create_buffer(
+            "tod_resolved",
+            match_buf_size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        // --- Pass 1 bind group: build_hash_table ---
+        let build_bg_layout = self.pipeline_lz77_lazy_build.get_bind_group_layout(0);
+        let build_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lz77_tod_build_bg"),
+            layout: &build_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: hash_counts_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: hash_table_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // --- Pass 2 bind group: find_matches ---
+        let find_bg_layout = self.pipeline_lz77_lazy_find.get_bind_group_layout(0);
+        let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lz77_tod_find_bg"),
+            layout: &find_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: raw_match_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: hash_counts_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: hash_table_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // --- Pass 3 bind group: resolve_lazy ---
+        let resolve_bg_layout = self.pipeline_lz77_lazy_resolve.get_bind_group_layout(0);
+        let resolve_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lz77_tod_resolve_bg"),
+            layout: &resolve_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: resolved_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: raw_match_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Submit all 3 passes in a single command encoder
+        let t0 = if self.profiling {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("lz77_to_device"),
+            });
+        self.record_dispatch(
+            &mut encoder,
+            &self.pipeline_lz77_lazy_build,
+            &build_bg,
+            workgroups,
+            "lz77_tod_build",
+        )?;
+        self.record_dispatch(
+            &mut encoder,
+            &self.pipeline_lz77_lazy_find,
+            &find_bg,
+            workgroups,
+            "lz77_tod_find",
+        )?;
+        self.record_dispatch(
+            &mut encoder,
+            &self.pipeline_lz77_lazy_resolve,
+            &resolve_bg,
+            workgroups,
+            "lz77_tod_resolve",
+        )?;
+        self.queue.submit(Some(encoder.finish()));
+        if let Some(t0) = t0 {
+            self.device.poll(wgpu::Maintain::Wait);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[pz-gpu] lz77_to_device (build+find+resolve): {ms:.3} ms");
+        }
+
+        Ok(GpuMatchBuf {
+            buf: resolved_buf,
+            input_len,
+        })
+    }
+
+    /// Download a device-resident match buffer and deduplicate into `Match` structs.
+    ///
+    /// This is the download counterpart to [`find_matches_to_device()`].
+    pub fn download_and_dedupe(
+        &self,
+        match_buf: &GpuMatchBuf,
+        input: &[u8],
+    ) -> PzResult<Vec<Match>> {
+        if match_buf.input_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let buf_size = (match_buf.input_len * std::mem::size_of::<GpuMatch>()) as u64;
+        let raw = self.read_buffer(&match_buf.buf, buf_size);
+        let gpu_matches: Vec<GpuMatch> = bytemuck::cast_slice(&raw).to_vec();
+
+        Ok(dedupe_gpu_matches(&gpu_matches, input))
+    }
+
     fn find_matches_hash(&self, input: &[u8]) -> PzResult<Vec<Match>> {
         let input_len = input.len();
         let padded = Self::pad_input_bytes(input);

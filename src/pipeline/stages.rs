@@ -258,10 +258,12 @@ pub(crate) fn stage_huffman_encode_gpu(
 }
 
 /// GPU Huffman encoding stage (WebGPU): same output format as [`stage_huffman_encode()`]
-/// but uses the WebGPU backend for histogram computation and Huffman encoding.
+/// but uses the WebGPU backend for histogram computation and Huffman encoding
+/// via [`DeviceBuf`].
 ///
-/// Each stream is uploaded to the GPU for both histogram and encoding. The output
-/// is byte-identical to the CPU path, so the same decoder works for both.
+/// Each stream is uploaded to the GPU once, then both the histogram and encoding
+/// run on-device — no extra PCI transfers. The output is byte-identical to the
+/// CPU path, so the same decoder works for both.
 ///
 /// Falls back to CPU for empty streams where GPU overhead dominates.
 #[cfg(feature = "webgpu")]
@@ -269,6 +271,8 @@ pub(crate) fn stage_huffman_encode_webgpu(
     mut block: StageBlock,
     engine: &crate::webgpu::WebGpuEngine,
 ) -> PzResult<StageBlock> {
+    use crate::webgpu::DeviceBuf;
+
     let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
     let pre_entropy_len = block.metadata.pre_entropy_len.unwrap();
 
@@ -277,8 +281,11 @@ pub(crate) fn stage_huffman_encode_webgpu(
         pre_entropy_len,
         &block.metadata.demux_meta,
         |stream, output| {
-            // GPU histogram
-            let histogram = engine.byte_histogram(stream)?;
+            // Upload stream to GPU once
+            let device_buf = DeviceBuf::from_host(engine, stream)?;
+
+            // GPU histogram (no re-upload)
+            let histogram = engine.byte_histogram_on_device(&device_buf)?;
 
             let mut freq = crate::frequency::FrequencyTable::new();
             for (i, &count) in histogram.iter().enumerate() {
@@ -296,8 +303,9 @@ pub(crate) fn stage_huffman_encode_webgpu(
                 code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
             }
 
-            // GPU Huffman encode
-            let (huffman_data, total_bits) = engine.huffman_encode_gpu_scan(stream, &code_lut)?;
+            // GPU Huffman encode on same device buffer (no re-upload)
+            let (huffman_data, total_bits) =
+                engine.huffman_encode_on_device(&device_buf, &code_lut)?;
 
             output.extend_from_slice(&(huffman_data.len() as u32).to_le_bytes());
             output.extend_from_slice(&(total_bits as u32).to_le_bytes());
