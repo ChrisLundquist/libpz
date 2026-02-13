@@ -8,6 +8,7 @@ pub mod gzip;
 pub mod huffman;
 pub mod lz77;
 pub mod lz78;
+pub mod lz78_static;
 pub mod lzss;
 pub mod mtf;
 pub mod optimal;

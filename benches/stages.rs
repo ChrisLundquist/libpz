@@ -962,6 +962,83 @@ fn bench_lz77_webgpu(_c: &mut Criterion) {}
 #[cfg(not(feature = "webgpu"))]
 fn bench_deflate_webgpu_chained(_c: &mut Criterion) {}
 
+fn bench_lz78_static(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lz78_static");
+    cap(&mut group);
+
+    // Test with various dict sizes at a fixed input size
+    let size = 262_144; // 256KB — large enough for dictionary overhead to amortize
+    let data = get_test_data(size);
+    group.throughput(Throughput::Bytes(size as u64));
+
+    for &dict_size in &[512u16, 1024, 2048, 4096] {
+        for &max_entry_len in &[16u16, 32, 64] {
+            let label = format!("encode_d{dict_size}_l{max_entry_len}");
+            let ds = dict_size;
+            let mel = max_entry_len;
+            group.bench_with_input(BenchmarkId::new(&label, size), &data, |b, data| {
+                b.iter(|| pz::lz78_static::encode_with_params(data, ds, mel).unwrap());
+            });
+        }
+    }
+
+    // Decode benchmarks: encode once with default params, benchmark decode
+    let compressed = pz::lz78_static::encode(&data).unwrap();
+    group.bench_with_input(
+        BenchmarkId::new("decode_cpu", size),
+        &compressed,
+        |b, compressed| {
+            b.iter(|| pz::lz78_static::decode(compressed).unwrap());
+        },
+    );
+
+    group.finish();
+}
+
+#[cfg(feature = "opencl")]
+fn bench_lz78_static_gpu(c: &mut Criterion) {
+    let engine = match pz::opencl::OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut group = c.benchmark_group("lz78_static_gpu");
+    cap(&mut group);
+
+    for &size in SIZES_LARGE {
+        let data = get_test_data(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // Encode on CPU, then benchmark GPU decode vs CPU decode
+        let compressed = pz::lz78_static::encode(&data).unwrap();
+        let (dict, packed_codes, num_codes, original_len) =
+            pz::lz78_static::parse_for_gpu(&compressed).unwrap();
+
+        // CPU decode baseline
+        group.bench_with_input(
+            BenchmarkId::new("decode_cpu", size),
+            &compressed,
+            |b, compressed| {
+                b.iter(|| pz::lz78_static::decode(compressed).unwrap());
+            },
+        );
+
+        // GPU decode
+        group.bench_function(BenchmarkId::new("decode_gpu", size), |b| {
+            b.iter(|| {
+                engine
+                    .lzw_decode_static(packed_codes, num_codes, &dict, original_len)
+                    .unwrap()
+            });
+        });
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_lz78_static_gpu(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_bwt,
@@ -989,6 +1066,8 @@ criterion_group!(
     bench_lz77_webgpu,
     bench_lz77_webgpu_batched,
     bench_huffman_webgpu,
-    bench_deflate_webgpu_chained
+    bench_deflate_webgpu_chained,
+    bench_lz78_static,
+    bench_lz78_static_gpu
 );
 criterion_main!(benches);

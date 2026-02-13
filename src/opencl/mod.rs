@@ -78,6 +78,10 @@ const BWT_RADIX_KERNEL_SOURCE: &str = include_str!("../../kernels/bwt_radix.cl")
 /// Two-pass: ComputeBitLengths + WriteCodes, plus a ByteHistogram helper.
 const HUFFMAN_ENCODE_KERNEL_SOURCE: &str = include_str!("../../kernels/huffman_encode.cl");
 
+/// Embedded OpenCL kernel source: static-dictionary LZW decode.
+/// Two entry points: DecodeLengths + WriteOutput, with prefix sum between.
+const LZW_DECODE_KERNEL_SOURCE: &str = include_str!("../../kernels/lzw_decode.cl");
+
 /// Step size used by the batch kernel (must match STEP_SIZE in lz77_batch.cl).
 const BATCH_STEP_SIZE: usize = 32;
 
@@ -238,6 +242,10 @@ pub struct OpenClEngine {
     kernel_prefix_sum_block: Kernel,
     /// Compiled prefix sum apply-offsets kernel.
     kernel_prefix_sum_apply: Kernel,
+    /// Compiled LZW decode-lengths kernel.
+    kernel_lzw_decode_lengths: Kernel,
+    /// Compiled LZW write-output kernel.
+    kernel_lzw_write_output: Kernel,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum work-group size.
@@ -461,6 +469,17 @@ impl OpenClEngine {
         let kernel_prefix_sum_apply =
             Kernel::create(&program_huffman, "PrefixSumApply").map_err(|_| PzError::Unsupported)?;
 
+        // Compile LZW decode kernels
+        let program_lzw_decode =
+            Program::create_and_build_from_source(&context, LZW_DECODE_KERNEL_SOURCE, "-Werror")
+                .map_err(|_| PzError::Unsupported)?;
+
+        let kernel_lzw_decode_lengths = Kernel::create(&program_lzw_decode, "DecodeLengths")
+            .map_err(|_| PzError::Unsupported)?;
+
+        let kernel_lzw_write_output =
+            Kernel::create(&program_lzw_decode, "WriteOutput").map_err(|_| PzError::Unsupported)?;
+
         Ok(OpenClEngine {
             _device: device,
             context,
@@ -484,6 +503,8 @@ impl OpenClEngine {
             kernel_byte_histogram,
             kernel_prefix_sum_block,
             kernel_prefix_sum_apply,
+            kernel_lzw_decode_lengths,
+            kernel_lzw_write_output,
             device_name,
             max_work_group_size,
             is_cpu,
@@ -717,6 +738,7 @@ fn dedupe_gpu_matches(gpu_matches: &[GpuMatch], input: &[u8]) -> Vec<Match> {
 mod bwt;
 mod huffman;
 mod lz77;
+mod lz78;
 
 #[cfg(test)]
 #[path = "tests.rs"]
