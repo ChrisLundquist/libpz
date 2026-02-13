@@ -232,7 +232,7 @@ impl WebGpuEngine {
             wgpu::BufferUsages::UNIFORM,
         );
 
-        let bg_layout = self.pipeline_rank_compare.get_bind_group_layout(0);
+        let bg_layout = self.pipeline_rank_compare().get_bind_group_layout(0);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rank_compare_bg"),
             layout: &bg_layout,
@@ -257,7 +257,12 @@ impl WebGpuEngine {
         });
 
         let workgroups = padded_n.div_ceil(256);
-        self.dispatch(&self.pipeline_rank_compare, &bg, workgroups, "rank_compare")?;
+        self.dispatch(
+            self.pipeline_rank_compare(),
+            &bg,
+            workgroups,
+            "rank_compare",
+        )?;
         Ok(())
     }
 
@@ -286,7 +291,7 @@ impl WebGpuEngine {
                 | wgpu::BufferUsages::COPY_DST,
         );
 
-        let bg_layout = self.pipeline_prefix_sum_local.get_bind_group_layout(0);
+        let bg_layout = self.pipeline_prefix_sum_local().get_bind_group_layout(0);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ps_local_bg"),
             layout: &bg_layout,
@@ -312,7 +317,7 @@ impl WebGpuEngine {
 
         let workgroups = num_blocks as u32;
         self.dispatch(
-            &self.pipeline_prefix_sum_local,
+            self.pipeline_prefix_sum_local(),
             &bg,
             workgroups.max(1),
             "prefix_sum_local",
@@ -337,7 +342,9 @@ impl WebGpuEngine {
                 wgpu::BufferUsages::UNIFORM,
             );
 
-            let prop_bg_layout = self.pipeline_prefix_sum_propagate.get_bind_group_layout(0);
+            let prop_bg_layout = self
+                .pipeline_prefix_sum_propagate()
+                .get_bind_group_layout(0);
             let prop_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ps_propagate_bg"),
                 layout: &prop_bg_layout,
@@ -359,7 +366,7 @@ impl WebGpuEngine {
 
             let prop_wg = (count as u32).div_ceil(256);
             self.dispatch(
-                &self.pipeline_prefix_sum_propagate,
+                self.pipeline_prefix_sum_propagate(),
                 &prop_bg,
                 prop_wg,
                 "prefix_sum_propagate",
@@ -384,7 +391,7 @@ impl WebGpuEngine {
             wgpu::BufferUsages::UNIFORM,
         );
 
-        let bg_layout = self.pipeline_rank_scatter.get_bind_group_layout(0);
+        let bg_layout = self.pipeline_rank_scatter().get_bind_group_layout(0);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scatter_bg"),
             layout: &bg_layout,
@@ -409,7 +416,12 @@ impl WebGpuEngine {
         });
 
         let workgroups = padded_n.div_ceil(256);
-        self.dispatch(&self.pipeline_rank_scatter, &bg, workgroups, "rank_scatter")?;
+        self.dispatch(
+            self.pipeline_rank_scatter(),
+            &bg,
+            workgroups,
+            "rank_scatter",
+        )?;
         Ok(())
     }
 
@@ -455,7 +467,7 @@ impl WebGpuEngine {
                 wgpu::BufferUsages::UNIFORM,
             );
 
-            let key_bg_layout = self.pipeline_radix_compute_keys.get_bind_group_layout(0);
+            let key_bg_layout = self.pipeline_radix_compute_keys().get_bind_group_layout(0);
             let key_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rk_bg"),
                 layout: &key_bg_layout,
@@ -492,7 +504,7 @@ impl WebGpuEngine {
             self.queue
                 .write_buffer(histogram_buf, 0, bytemuck::cast_slice(&hist_zeros));
 
-            let hist_bg_layout = self.pipeline_radix_histogram.get_bind_group_layout(0);
+            let hist_bg_layout = self.pipeline_radix_histogram().get_bind_group_layout(0);
             let hist_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("hist_bg"),
                 layout: &hist_bg_layout,
@@ -525,14 +537,14 @@ impl WebGpuEngine {
                 });
             self.record_dispatch(
                 &mut encoder,
-                &self.pipeline_radix_compute_keys,
+                self.pipeline_radix_compute_keys(),
                 &key_bg,
                 global_wg,
                 "radix_keys",
             )?;
             self.record_dispatch(
                 &mut encoder,
-                &self.pipeline_radix_histogram,
+                self.pipeline_radix_histogram(),
                 &hist_bg,
                 num_groups as u32,
                 "radix_histogram",
@@ -563,7 +575,7 @@ impl WebGpuEngine {
             );
 
             let ite_bg_layout = self
-                .pipeline_inclusive_to_exclusive
+                .pipeline_inclusive_to_exclusive()
                 .get_bind_group_layout(0);
             let ite_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ite_bg"),
@@ -586,7 +598,7 @@ impl WebGpuEngine {
 
             let ite_wg = (histogram_len as u32).div_ceil(256);
             self.dispatch(
-                &self.pipeline_inclusive_to_exclusive,
+                self.pipeline_inclusive_to_exclusive(),
                 &ite_bg,
                 ite_wg,
                 "ite",
@@ -600,7 +612,7 @@ impl WebGpuEngine {
                 wgpu::BufferUsages::UNIFORM,
             );
 
-            let scat_bg_layout = self.pipeline_radix_scatter.get_bind_group_layout(0);
+            let scat_bg_layout = self.pipeline_radix_scatter().get_bind_group_layout(0);
             let scat_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("scat_bg"),
                 layout: &scat_bg_layout,
@@ -629,7 +641,7 @@ impl WebGpuEngine {
             });
 
             self.dispatch(
-                &self.pipeline_radix_scatter,
+                self.pipeline_radix_scatter(),
                 &scat_bg,
                 num_groups as u32,
                 "radix_scatter",

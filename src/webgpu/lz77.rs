@@ -111,7 +111,7 @@ impl WebGpuEngine {
         );
 
         // --- Pass 1 bind group: build_hash_table ---
-        let build_bg_layout = self.pipeline_lz77_lazy_build.get_bind_group_layout(0);
+        let build_bg_layout = self.pipeline_lz77_lazy_build().get_bind_group_layout(0);
         let build_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_tod_build_bg"),
             layout: &build_bg_layout,
@@ -136,7 +136,7 @@ impl WebGpuEngine {
         });
 
         // --- Pass 2 bind group: find_matches ---
-        let find_bg_layout = self.pipeline_lz77_lazy_find.get_bind_group_layout(0);
+        let find_bg_layout = self.pipeline_lz77_lazy_find().get_bind_group_layout(0);
         let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_tod_find_bg"),
             layout: &find_bg_layout,
@@ -165,7 +165,7 @@ impl WebGpuEngine {
         });
 
         // --- Pass 3 bind group: resolve_lazy ---
-        let resolve_bg_layout = self.pipeline_lz77_lazy_resolve.get_bind_group_layout(0);
+        let resolve_bg_layout = self.pipeline_lz77_lazy_resolve().get_bind_group_layout(0);
         let resolve_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_tod_resolve_bg"),
             layout: &resolve_bg_layout,
@@ -202,21 +202,21 @@ impl WebGpuEngine {
             });
         self.record_dispatch(
             &mut encoder,
-            &self.pipeline_lz77_lazy_build,
+            self.pipeline_lz77_lazy_build(),
             &build_bg,
             workgroups,
             "lz77_tod_build",
         )?;
         self.record_dispatch(
             &mut encoder,
-            &self.pipeline_lz77_lazy_find,
+            self.pipeline_lz77_lazy_find(),
             &find_bg,
             workgroups,
             "lz77_tod_find",
         )?;
         self.record_dispatch(
             &mut encoder,
-            &self.pipeline_lz77_lazy_resolve,
+            self.pipeline_lz77_lazy_resolve(),
             &resolve_bg,
             workgroups,
             "lz77_tod_resolve",
@@ -296,7 +296,7 @@ impl WebGpuEngine {
         );
 
         // Build + Find passes batched into a single command encoder submission
-        let build_bg_layout = self.pipeline_lz77_hash_build.get_bind_group_layout(0);
+        let build_bg_layout = self.pipeline_lz77_hash_build().get_bind_group_layout(0);
         let build_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_hash_build_bg"),
             layout: &build_bg_layout,
@@ -320,7 +320,7 @@ impl WebGpuEngine {
             ],
         });
 
-        let find_bg_layout = self.pipeline_lz77_hash_find.get_bind_group_layout(0);
+        let find_bg_layout = self.pipeline_lz77_hash_find().get_bind_group_layout(0);
         let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_hash_find_bg"),
             layout: &find_bg_layout,
@@ -360,14 +360,14 @@ impl WebGpuEngine {
             });
         self.record_dispatch(
             &mut encoder,
-            &self.pipeline_lz77_hash_build,
+            self.pipeline_lz77_hash_build(),
             &build_bg,
             workgroups,
             "lz77_hash_build",
         )?;
         self.record_dispatch(
             &mut encoder,
-            &self.pipeline_lz77_hash_find,
+            self.pipeline_lz77_hash_find(),
             &find_bg,
             workgroups,
             "lz77_hash_find",
@@ -472,7 +472,7 @@ impl WebGpuEngine {
         );
 
         // Build bind groups (same as find_matches_lazy)
-        let build_bg_layout = self.pipeline_lz77_lazy_build.get_bind_group_layout(0);
+        let build_bg_layout = self.pipeline_lz77_lazy_build().get_bind_group_layout(0);
         let build_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_lazy_build_bg"),
             layout: &build_bg_layout,
@@ -496,7 +496,7 @@ impl WebGpuEngine {
             ],
         });
 
-        let find_bg_layout = self.pipeline_lz77_lazy_find.get_bind_group_layout(0);
+        let find_bg_layout = self.pipeline_lz77_lazy_find().get_bind_group_layout(0);
         let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_lazy_find_bg"),
             layout: &find_bg_layout,
@@ -524,7 +524,7 @@ impl WebGpuEngine {
             ],
         });
 
-        let resolve_bg_layout = self.pipeline_lz77_lazy_resolve.get_bind_group_layout(0);
+        let resolve_bg_layout = self.pipeline_lz77_lazy_resolve().get_bind_group_layout(0);
         let resolve_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_lazy_resolve_bg"),
             layout: &resolve_bg_layout,
@@ -556,21 +556,21 @@ impl WebGpuEngine {
             });
         self.record_dispatch(
             &mut encoder,
-            &self.pipeline_lz77_lazy_build,
+            self.pipeline_lz77_lazy_build(),
             &build_bg,
             workgroups,
             "lz77_lazy_build",
         )?;
         self.record_dispatch(
             &mut encoder,
-            &self.pipeline_lz77_lazy_find,
+            self.pipeline_lz77_lazy_find(),
             &find_bg,
             workgroups,
             "lz77_lazy_find",
         )?;
         self.record_dispatch(
             &mut encoder,
-            &self.pipeline_lz77_lazy_resolve,
+            self.pipeline_lz77_lazy_resolve(),
             &resolve_bg,
             workgroups,
             "lz77_lazy_resolve",
@@ -743,7 +743,7 @@ impl WebGpuEngine {
             wgpu::BufferUsages::UNIFORM,
         );
 
-        let bind_group_layout = self.pipeline_lz77_topk.get_bind_group_layout(0);
+        let bind_group_layout = self.pipeline_lz77_topk().get_bind_group_layout(0);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_topk_bg"),
             layout: &bind_group_layout,
@@ -764,7 +764,7 @@ impl WebGpuEngine {
         });
 
         self.dispatch(
-            &self.pipeline_lz77_topk,
+            self.pipeline_lz77_topk(),
             &bind_group,
             workgroups,
             "lz77_topk",
