@@ -300,8 +300,12 @@ mod tests {
             for &p in &[
                 Pipeline::Deflate,
                 Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -313,8 +317,12 @@ mod tests {
             for &p in &[
                 Pipeline::Deflate,
                 Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -326,8 +334,12 @@ mod tests {
             for &p in &[
                 Pipeline::Deflate,
                 Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -339,8 +351,12 @@ mod tests {
             for &p in &[
                 Pipeline::Deflate,
                 Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -352,8 +368,12 @@ mod tests {
             for &p in &[
                 Pipeline::Deflate,
                 Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -365,8 +385,12 @@ mod tests {
             for &p in &[
                 Pipeline::Deflate,
                 Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -378,8 +402,12 @@ mod tests {
             for &p in &[
                 Pipeline::Deflate,
                 Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -593,40 +621,55 @@ mod tests {
     mod corpus {
         use super::*;
         use std::fs;
-        use std::path::Path;
+        use std::path::{Path, PathBuf};
+
+        /// Build a path relative to the crate root (CARGO_MANIFEST_DIR).
+        fn samples_dir(subdir: &str) -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("samples")
+                .join(subdir)
+        }
 
         /// Run all pipeline round-trips on a file if it exists.
-        fn test_file_all_pipelines(path: &str) {
-            let p = Path::new(path);
-            if !p.exists() {
+        fn test_file_all_pipelines(path: &Path) {
+            if !path.exists() {
                 // Skip if corpus not extracted (CI environments)
-                eprintln!("SKIP: corpus file not found: {}", path);
+                eprintln!("SKIP: corpus file not found: {}", path.display());
                 return;
             }
-            let input = fs::read(p).unwrap();
+            let input = fs::read(path).unwrap();
             if input.is_empty() {
                 return;
             }
 
-            for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+            for &pipe in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
+                Pipeline::Lzf,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
+            ] {
                 let compressed = pipeline::compress(&input, pipe).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(
-                    decompressed, input,
+                    decompressed,
+                    input,
                     "corpus round-trip failed: {:?} on {}",
-                    pipe, path
+                    pipe,
+                    path.display()
                 );
             }
         }
 
         /// Test individual algorithm round-trips on a file.
-        fn test_file_individual_algorithms(path: &str) {
-            let p = Path::new(path);
-            if !p.exists() {
-                eprintln!("SKIP: corpus file not found: {}", path);
+        fn test_file_individual_algorithms(path: &Path) {
+            if !path.exists() {
+                eprintln!("SKIP: corpus file not found: {}", path.display());
                 return;
             }
-            let input = fs::read(p).unwrap();
+            let input = fs::read(path).unwrap();
             if input.is_empty() {
                 return;
             }
@@ -634,13 +677,13 @@ mod tests {
             // LZ77 (lazy matching)
             let compressed = lz77::compress_lazy(&input).unwrap();
             let decompressed = lz77::decompress(&compressed).unwrap();
-            assert_eq!(decompressed, input, "LZ77 failed on {}", path);
+            assert_eq!(decompressed, input, "LZ77 failed on {}", path.display());
 
             // Huffman
             let tree = HuffmanTree::from_data(&input).unwrap();
             let (encoded, bits) = tree.encode(&input).unwrap();
             let decoded = tree.decode(&encoded, bits).unwrap();
-            assert_eq!(decoded, input, "Huffman failed on {}", path);
+            assert_eq!(decoded, input, "Huffman failed on {}", path.display());
 
             // BWT + MTF + RLE chain
             let bwt_result = bwt::encode(&input).unwrap();
@@ -649,62 +692,72 @@ mod tests {
             let inv_rle = rle::decode(&rle_data).unwrap();
             let inv_mtf = mtf::decode(&inv_rle);
             let inv_bwt = bwt::decode(&inv_mtf, bwt_result.primary_index).unwrap();
-            assert_eq!(inv_bwt, input, "BWT+MTF+RLE chain failed on {}", path);
+            assert_eq!(
+                inv_bwt,
+                input,
+                "BWT+MTF+RLE chain failed on {}",
+                path.display()
+            );
         }
 
-        // Canterbury corpus files
-        static CANTRBRY_DIR: &str = "/home/user/libpz/samples/cantrbry";
+        // Canterbury corpus files — path built from CARGO_MANIFEST_DIR
 
         #[test]
         fn canterbury_alice() {
-            test_file_all_pipelines(&format!("{}/alice29.txt", CANTRBRY_DIR));
+            test_file_all_pipelines(&samples_dir("cantrbry").join("alice29.txt"));
         }
 
         #[test]
         fn canterbury_asyoulik() {
-            test_file_all_pipelines(&format!("{}/asyoulik.txt", CANTRBRY_DIR));
+            test_file_all_pipelines(&samples_dir("cantrbry").join("asyoulik.txt"));
         }
 
         #[test]
         fn canterbury_cp_html() {
-            test_file_all_pipelines(&format!("{}/cp.html", CANTRBRY_DIR));
+            test_file_all_pipelines(&samples_dir("cantrbry").join("cp.html"));
         }
 
         #[test]
         fn canterbury_fields_c() {
-            test_file_all_pipelines(&format!("{}/fields.c", CANTRBRY_DIR));
+            test_file_all_pipelines(&samples_dir("cantrbry").join("fields.c"));
         }
 
         #[test]
         fn canterbury_grammar_lsp() {
-            test_file_all_pipelines(&format!("{}/grammar.lsp", CANTRBRY_DIR));
+            test_file_all_pipelines(&samples_dir("cantrbry").join("grammar.lsp"));
         }
 
         #[test]
         fn canterbury_xargs() {
-            test_file_all_pipelines(&format!("{}/xargs.1", CANTRBRY_DIR));
+            test_file_all_pipelines(&samples_dir("cantrbry").join("xargs.1"));
         }
 
         #[test]
         fn canterbury_algorithms_individual() {
             // Test individual algorithms on a representative text file
-            test_file_individual_algorithms(&format!("{}/alice29.txt", CANTRBRY_DIR));
+            test_file_individual_algorithms(&samples_dir("cantrbry").join("alice29.txt"));
         }
 
         // Large corpus files (longer running, test individual algos on smaller slices)
-        static LARGE_DIR: &str = "/home/user/libpz/samples/large";
 
         #[test]
         fn large_bible_first_64k() {
-            let path = format!("{}/bible.txt", LARGE_DIR);
-            let p = Path::new(&path);
-            if !p.exists() {
-                eprintln!("SKIP: {}", path);
+            let path = samples_dir("large").join("bible.txt");
+            if !path.exists() {
+                eprintln!("SKIP: {}", path.display());
                 return;
             }
-            let full = fs::read(p).unwrap();
+            let full = fs::read(&path).unwrap();
             let input = &full[..full.len().min(65536)];
-            for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+            for &pipe in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
+                Pipeline::Lzf,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
+            ] {
                 let compressed = pipeline::compress(input, pipe).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(
@@ -717,15 +770,22 @@ mod tests {
 
         #[test]
         fn large_ecoli_first_64k() {
-            let path = format!("{}/E.coli", LARGE_DIR);
-            let p = Path::new(&path);
-            if !p.exists() {
-                eprintln!("SKIP: {}", path);
+            let path = samples_dir("large").join("E.coli");
+            if !path.exists() {
+                eprintln!("SKIP: {}", path.display());
                 return;
             }
-            let full = fs::read(p).unwrap();
+            let full = fs::read(&path).unwrap();
             let input = &full[..full.len().min(65536)];
-            for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+            for &pipe in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
+                Pipeline::Lzf,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
+            ] {
                 let compressed = pipeline::compress(input, pipe).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(
@@ -748,7 +808,15 @@ mod tests {
         fn pipeline_two_bytes() {
             // Smallest non-trivial input
             let input = vec![0u8, 1];
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+            for &p in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
+                Pipeline::Lzf,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
+            ] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -759,7 +827,15 @@ mod tests {
         fn alternating_bytes() {
             // Worst case for RLE (no runs), but structured for LZ77
             let input: Vec<u8> = (0..1000).map(|i| if i % 2 == 0 { 0 } else { 1 }).collect();
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+            for &p in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
+                Pipeline::Lzf,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
+            ] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -770,7 +846,15 @@ mod tests {
         fn all_256_byte_values() {
             // Every byte value appears exactly once
             let input: Vec<u8> = (0..=255).collect();
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+            for &p in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
+                Pipeline::Lzf,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
+            ] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -789,7 +873,15 @@ mod tests {
             assert_eq!(decoded, input);
 
             // Full pipeline test
-            for &p in &[Pipeline::Bw, Pipeline::Lzf] {
+            for &p in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
+                Pipeline::Lzf,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
+            ] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -799,7 +891,15 @@ mod tests {
         #[test]
         fn descending_bytes() {
             let input: Vec<u8> = (0..=255).rev().collect();
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+            for &p in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
+                Pipeline::Lzf,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
+            ] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -810,7 +910,15 @@ mod tests {
         fn repeated_short_pattern() {
             // "ab" repeated 500 times - good for LZ77
             let input: Vec<u8> = b"ab".iter().copied().cycle().take(1000).collect();
-            for &p in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+            for &p in &[
+                Pipeline::Deflate,
+                Pipeline::Bw,
+                Pipeline::Bbw,
+                Pipeline::Lzr,
+                Pipeline::Lzf,
+                Pipeline::LzssR,
+                Pipeline::Lz78R,
+            ] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);

@@ -634,7 +634,10 @@ impl DeviceBuf {
         })
     }
 
-    /// Allocate a zero-initialized device buffer of the given size.
+    /// Allocate a device buffer of the given size.
+    ///
+    /// **Note:** The buffer contents are *not* guaranteed to be zero-initialized.
+    /// Callers that need zeroed memory should write zeros explicitly.
     pub fn alloc(engine: &OpenClEngine, len: usize) -> PzResult<Self> {
         let actual_len = len.max(1); // avoid zero-size allocation
         let buf = unsafe {
@@ -729,8 +732,23 @@ fn dedupe_gpu_matches(gpu_matches: &[GpuMatch], input: &[u8]) -> Vec<Match> {
             gm.next
         };
 
+        // Clamp offset to u16 range. The PerPosition kernel uses a 128KB
+        // window which can produce offsets > u16::MAX; matches with such
+        // offsets are unrepresentable, so emit a literal instead.
+        let offset = gm.offset;
+        if offset > u16::MAX as u32 && match_length > 0 {
+            // Unrepresentable match — emit as literal (offset=0, length=0).
+            result.push(Match {
+                offset: 0,
+                length: 0,
+                next: input[index],
+            });
+            index += 1;
+            continue;
+        }
+
         result.push(Match {
-            offset: gm.offset as u16,
+            offset: offset as u16,
             length: match_length as u16,
             next,
         });

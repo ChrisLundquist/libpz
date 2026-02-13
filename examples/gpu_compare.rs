@@ -6,14 +6,18 @@
 //! cargo run --example gpu_compare --release --features opencl,webgpu
 //! ```
 
+#[cfg(all(feature = "opencl", feature = "webgpu"))]
 use std::time::Instant;
 
 /// Number of timed iterations per benchmark.
+#[cfg(all(feature = "opencl", feature = "webgpu"))]
 const ITERS: usize = 5;
 
 /// Input sizes to test (bytes).
+#[cfg(all(feature = "opencl", feature = "webgpu"))]
 const SIZES: &[usize] = &[8_192, 65_536, 262_144, 1_048_576];
 
+#[cfg(all(feature = "opencl", feature = "webgpu"))]
 fn make_test_data(size: usize) -> Vec<u8> {
     let pattern = b"The quick brown fox jumps over the lazy dog. ";
     let mut data = Vec::with_capacity(size);
@@ -25,11 +29,13 @@ fn make_test_data(size: usize) -> Vec<u8> {
     data
 }
 
+#[cfg(all(feature = "opencl", feature = "webgpu"))]
 struct BenchResult {
     size: usize,
     median_us: f64,
 }
 
+#[cfg(all(feature = "opencl", feature = "webgpu"))]
 impl BenchResult {
     fn throughput_mbs(&self) -> f64 {
         if self.median_us == 0.0 {
@@ -39,6 +45,7 @@ impl BenchResult {
     }
 }
 
+#[cfg(all(feature = "opencl", feature = "webgpu"))]
 fn bench<F: FnMut()>(_label: &str, size: usize, mut f: F) -> BenchResult {
     // Warmup
     f();
@@ -55,6 +62,7 @@ fn bench<F: FnMut()>(_label: &str, size: usize, mut f: F) -> BenchResult {
     BenchResult { size, median_us }
 }
 
+#[cfg(all(feature = "opencl", feature = "webgpu"))]
 fn print_comparison(group: &str, results: &[(BenchResult, BenchResult)]) {
     println!("\n=== {group} ===");
     println!(
@@ -86,6 +94,7 @@ fn print_comparison(group: &str, results: &[(BenchResult, BenchResult)]) {
     }
 }
 
+#[cfg(all(feature = "opencl", feature = "webgpu"))]
 fn format_size(bytes: usize) -> String {
     if bytes >= 1_048_576 {
         format!("{}MB", bytes / 1_048_576)
@@ -239,22 +248,35 @@ fn run_comparison() {
         print_comparison("Byte Histogram", &results);
     }
 
-    // --- Deflate Chained (end-to-end) ---
+    // --- Deflate Chained (LZ77 + Huffman, end-to-end) ---
     {
         let mut results = Vec::new();
         for &size in &[65_536, 262_144, 1_048_576] {
             let data = make_test_data(size);
+
+            // Build Huffman lookup table from the data
+            let tree = pz::huffman::HuffmanTree::from_data(&data).unwrap();
+            let mut code_lut = [0u32; 256];
+            for byte in 0..=255u8 {
+                let (codeword, bits) = tree.get_code(byte);
+                code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+            }
+
             let cl = cl_engine.clone();
+            let lut1 = code_lut;
             let cl_res = bench("opencl", size, || {
-                cl.deflate_chained(&data).unwrap();
+                let lz_data = cl.lz77_compress(&data, KernelVariant::HashTable).unwrap();
+                let _ = cl.huffman_encode_gpu_scan(&lz_data, &lut1).unwrap();
             });
             let wg = wg_engine.clone();
+            let lut2 = code_lut;
             let wg_res = bench("webgpu", size, || {
-                wg.deflate_chained(&data).unwrap();
+                let lz_data = wg.lz77_compress(&data).unwrap();
+                let _ = wg.huffman_encode_gpu_scan(&lz_data, &lut2).unwrap();
             });
             results.push((cl_res, wg_res));
         }
-        print_comparison("Deflate Chained (end-to-end)", &results);
+        print_comparison("Deflate Chained (LZ77 + Huffman, end-to-end)", &results);
     }
 
     println!("\nDone.");

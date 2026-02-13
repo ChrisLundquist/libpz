@@ -337,6 +337,15 @@ pub(crate) fn compress_pipeline_parallel(
     let num_blocks = blocks.len();
     let stage_count = pipeline_stage_count(pipeline);
 
+    // Pre-resolve max_match_len so pipeline-parallel stages see the correct
+    // limit (Deflate → 258, other LZ → u16::MAX).  The block-parallel path
+    // resolves this inside compress_block(), but the pipeline-parallel path
+    // bypasses compress_block() and feeds directly into run_compress_stage().
+    let mut resolved_options = options.clone();
+    if resolved_options.max_match_len.is_none() {
+        resolved_options.max_match_len = Some(super::resolve_max_match_len(pipeline, options));
+    }
+
     // Capture original block lengths before `blocks` is moved into the scope.
     let orig_block_lens: Vec<usize> = blocks.iter().map(|b| b.len()).collect();
 
@@ -349,7 +358,7 @@ pub(crate) fn compress_pipeline_parallel(
         for stage_idx in 0..stage_count {
             let (tx_out, rx_next) = mpsc::sync_channel::<PzResult<StageBlock>>(2);
             let rx = prev_rx;
-            let opts = options.clone();
+            let opts = resolved_options.clone();
 
             scope.spawn(move || {
                 while let Ok(result) = rx.recv() {
