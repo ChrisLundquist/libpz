@@ -222,6 +222,112 @@ pub fn decode(input: &[u8]) -> PzResult<Vec<u8>> {
     Ok(output)
 }
 
+/// Result of sparse thresholding on a single WHT block.
+///
+/// After forward WHT, coefficients above the threshold are stored explicitly
+/// as (index, value) pairs. The residual is computed as:
+///   residual = original_block - iWHT(sparse_coefficients_only)
+/// This is exact and lossless.
+#[derive(Debug, Clone)]
+pub struct SparseBlock {
+    /// Number of significant coefficients kept.
+    pub num_significant: usize,
+    /// Packed sparse data: for each significant coeff, [index: u8, value_lo: u8, value_hi: u8].
+    /// Total size = num_significant * 3 bytes.
+    pub sparse_data: Vec<u8>,
+    /// Residual: original bytes minus the approximation from sparse coefficients.
+    /// These values cluster tightly around zero, ideal for entropy coding.
+    pub residual: Vec<u8>,
+}
+
+/// Apply sparse thresholding to a single 256-byte block.
+///
+/// 1. Lift bytes → centered i32, forward WHT
+/// 2. Partition coefficients by |coeff| >= threshold * N (unnormalized domain)
+/// 3. Reconstruct approximation from significant coefficients via iWHT
+/// 4. Compute exact residual = original - approximation
+///
+/// The threshold operates in the *normalized* domain conceptually:
+/// a coefficient is "significant" if |coeff| >= threshold * BLOCK_SIZE.
+/// We work in unnormalized domain to avoid any rounding.
+pub fn sparse_threshold_block(input: &[u8], threshold: i32) -> SparseBlock {
+    assert!(input.len() <= BLOCK_SIZE);
+
+    let mut block = [0i32; BLOCK_SIZE];
+    lift_bytes(input, &mut block[..input.len()]);
+    for x in &mut block[input.len()..] {
+        *x = -128;
+    }
+
+    forward(&mut block);
+
+    // The threshold in unnormalized domain
+    let thresh_unnorm = threshold * BLOCK_SIZE as i32;
+
+    // Partition: significant vs zeroed
+    let mut sparse_data = Vec::new();
+    let mut approx_coeffs = [0i32; BLOCK_SIZE];
+
+    for (i, &coeff) in block.iter().enumerate() {
+        if coeff.abs() >= thresh_unnorm {
+            // Store as (index: u8, value: i16 LE)
+            sparse_data.push(i as u8);
+            let val = coeff as i16;
+            sparse_data.push(val as u8);
+            sparse_data.push((val >> 8) as u8);
+            approx_coeffs[i] = coeff;
+        }
+    }
+
+    let num_significant = sparse_data.len() / 3;
+
+    // Reconstruct approximation via inverse WHT
+    inverse(&mut approx_coeffs);
+
+    // Compute residual in byte domain
+    let mut approx_bytes = [0u8; BLOCK_SIZE];
+    unlift_bytes(&approx_coeffs, &mut approx_bytes);
+
+    // Residual = original - approximation, stored as wrapping byte difference
+    let mut residual = vec![0u8; input.len()];
+    for (i, r) in residual.iter_mut().enumerate() {
+        *r = input[i].wrapping_sub(approx_bytes[i]);
+    }
+
+    SparseBlock {
+        num_significant,
+        sparse_data,
+        residual,
+    }
+}
+
+/// Reconstruct the original block from a SparseBlock.
+///
+/// 1. Unpack sparse coefficients into a 256-element array (rest zero)
+/// 2. Inverse WHT → approximation bytes
+/// 3. Add residual to get exact original
+pub fn reconstruct_sparse_block(sb: &SparseBlock, output: &mut [u8]) {
+    let mut coeffs = [0i32; BLOCK_SIZE];
+
+    // Unpack sparse data
+    for i in 0..sb.num_significant {
+        let base = i * 3;
+        let idx = sb.sparse_data[base] as usize;
+        let val = i16::from_le_bytes([sb.sparse_data[base + 1], sb.sparse_data[base + 2]]);
+        coeffs[idx] = val as i32;
+    }
+
+    inverse(&mut coeffs);
+
+    let mut approx_bytes = [0u8; BLOCK_SIZE];
+    unlift_bytes(&coeffs, &mut approx_bytes);
+
+    // Add residual
+    for (i, &r) in sb.residual.iter().enumerate() {
+        output[i] = approx_bytes[i].wrapping_add(r);
+    }
+}
+
 /// Compute Shannon entropy of WHT coefficients stored as i16 values.
 ///
 /// This measures the entropy over the full i16 symbol space, which tells
@@ -634,5 +740,336 @@ mod tests {
         }
 
         // Informational test — always passes
+    }
+
+    #[test]
+    fn test_sparse_block_roundtrip() {
+        // Verify sparse thresholding + reconstruction is lossless
+        let input: Vec<u8> = (0..=255).collect();
+        for threshold in [1, 2, 4, 8, 16, 32] {
+            let sb = sparse_threshold_block(&input, threshold);
+            let mut output = [0u8; BLOCK_SIZE];
+            reconstruct_sparse_block(&sb, &mut output);
+            assert_eq!(
+                &output[..],
+                &input[..],
+                "round-trip failed at threshold={threshold}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sparse_block_roundtrip_text() {
+        let text = b"The quick brown fox jumps over the lazy dog. ";
+        let input: Vec<u8> = text.iter().cycle().take(256).copied().collect();
+        for threshold in [1, 4, 16, 64] {
+            let sb = sparse_threshold_block(&input, threshold);
+            let mut output = [0u8; BLOCK_SIZE];
+            reconstruct_sparse_block(&sb, &mut output);
+            assert_eq!(
+                &output[..],
+                &input[..],
+                "round-trip failed at threshold={threshold}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sparse_sparsity_increases_with_threshold() {
+        let input: Vec<u8> = (0..=255).collect();
+        let sb_low = sparse_threshold_block(&input, 1);
+        let sb_high = sparse_threshold_block(&input, 16);
+        // Higher threshold should keep fewer coefficients
+        assert!(
+            sb_high.num_significant <= sb_low.num_significant,
+            "low={} high={}",
+            sb_low.num_significant,
+            sb_high.num_significant
+        );
+    }
+
+    /// The critical experiment: actual rANS compression comparison.
+    ///
+    /// For each file in the Canterbury corpus, at various thresholds, measure:
+    /// - raw_rans: rANS(original_bytes) — the baseline
+    /// - sparse_total: sparse_header + sparse_data + rANS(residual_bytes)
+    ///
+    /// If sparse_total < raw_rans for any threshold, the spectral
+    /// sparsification is earning its keep.
+    #[test]
+    fn test_sparse_rans_comparison_corpus() {
+        use crate::rans;
+
+        let corpus_dir = std::path::Path::new("samples/cantrbry");
+        if !corpus_dir.exists() {
+            eprintln!("Skipping: samples/cantrbry not found");
+            return;
+        }
+
+        let thresholds = [1, 2, 4, 8, 16, 32, 64];
+
+        println!("\n=== WHT Sparse + rANS vs Raw rANS (Canterbury Corpus) ===\n");
+        println!(
+            "{:<16} {:>7} {:>10} | {:>5} {:>6} {:>10} {:>10} {:>7}",
+            "File", "Size", "rANS raw", "Thr", "Kept", "Sparse", "rANS res", "Total"
+        );
+        println!("{}", "-".repeat(90));
+
+        let mut files: Vec<_> = std::fs::read_dir(corpus_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        files.sort_by_key(|e| e.file_name());
+
+        for entry in &files {
+            let path = entry.path();
+            let data = std::fs::read(&path).unwrap();
+            if data.is_empty() {
+                continue;
+            }
+
+            let file_name = path.file_name().unwrap().to_str().unwrap();
+
+            // Baseline: rANS on raw bytes
+            let raw_rans = rans::encode(&data);
+            let raw_rans_size = raw_rans.len();
+
+            // Verify raw rANS round-trips
+            let raw_decoded = rans::decode(&raw_rans, data.len()).unwrap();
+            assert_eq!(
+                raw_decoded, data,
+                "raw rANS round-trip failed for {file_name}"
+            );
+
+            let mut best_total = usize::MAX;
+            let mut best_thresh = 0;
+
+            for &threshold in &thresholds {
+                let num_blocks = data.len().div_ceil(BLOCK_SIZE);
+                let mut total_sparse_bytes: usize = 0;
+                let mut total_kept: usize = 0;
+                let mut all_residuals = Vec::with_capacity(data.len());
+
+                // 4 bytes: original length header
+                total_sparse_bytes += 4;
+                // 1 byte per block: num_significant count
+                total_sparse_bytes += num_blocks;
+
+                for b in 0..num_blocks {
+                    let start = b * BLOCK_SIZE;
+                    let end = (start + BLOCK_SIZE).min(data.len());
+                    let chunk = &data[start..end];
+
+                    let sb = sparse_threshold_block(chunk, threshold);
+
+                    // Verify lossless round-trip
+                    let mut reconstructed = vec![0u8; chunk.len()];
+                    reconstruct_sparse_block(&sb, &mut reconstructed);
+                    assert_eq!(
+                        &reconstructed[..],
+                        chunk,
+                        "sparse round-trip failed: file={file_name} block={b} threshold={threshold}"
+                    );
+
+                    total_sparse_bytes += sb.sparse_data.len(); // 3 bytes per kept coeff
+                    total_kept += sb.num_significant;
+                    all_residuals.extend_from_slice(&sb.residual);
+                }
+
+                // Compress residuals with rANS
+                let residual_rans = rans::encode(&all_residuals);
+                let residual_rans_size = residual_rans.len();
+
+                // Verify residual rANS round-trips
+                let res_decoded = rans::decode(&residual_rans, all_residuals.len()).unwrap();
+                assert_eq!(res_decoded, all_residuals, "residual rANS failed");
+
+                let total = total_sparse_bytes + residual_rans_size;
+                let avg_kept = total_kept as f64 / num_blocks as f64;
+
+                if total < best_total {
+                    best_total = total;
+                    best_thresh = threshold;
+                }
+
+                println!(
+                    "{:<16} {:>7} {:>10} | {:>5} {:>6.1} {:>10} {:>10} {:>7}",
+                    if threshold == thresholds[0] {
+                        file_name
+                    } else {
+                        ""
+                    },
+                    if threshold == thresholds[0] {
+                        format!("{}", data.len())
+                    } else {
+                        String::new()
+                    },
+                    if threshold == thresholds[0] {
+                        format!("{raw_rans_size}")
+                    } else {
+                        String::new()
+                    },
+                    threshold,
+                    avg_kept,
+                    total_sparse_bytes,
+                    residual_rans_size,
+                    total
+                );
+            }
+
+            let ratio = best_total as f64 / raw_rans_size as f64;
+            let winner = if best_total < raw_rans_size {
+                "WHT WINS"
+            } else {
+                "raw wins"
+            };
+            println!(
+                "{:>16} best: thr={:<3} total={:<8} ratio={:.3} {}",
+                "", best_thresh, best_total, ratio, winner
+            );
+            println!();
+        }
+    }
+
+    /// Same experiment on synthetic data where WHT showed promise.
+    #[test]
+    fn test_sparse_rans_comparison_synthetic() {
+        use crate::rans;
+
+        println!("\n=== WHT Sparse + rANS vs Raw rANS (Synthetic Data) ===\n");
+        println!(
+            "{:<20} {:>8} {:>10} | {:>5} {:>6} {:>10} {:>10} {:>8} {:>8}",
+            "Data type", "Size", "rANS raw", "Thr", "Kept", "Sparse", "rANS res", "Total", "Ratio"
+        );
+        println!("{}", "-".repeat(105));
+
+        let test_cases: Vec<(&str, Vec<u8>)> = vec![
+            // Smooth ramp — WHT concentrates energy heavily
+            ("smooth_ramp_1k", (0..=255u8).cycle().take(1024).collect()),
+            // Sawtooth
+            (
+                "sawtooth_1k",
+                (0..1024).map(|i| ((i % 16) * 16) as u8).collect(),
+            ),
+            // Step function
+            ("step_1k", {
+                let mut v = vec![50u8; 512];
+                v.extend(vec![200u8; 512]);
+                v
+            }),
+            // Sine wave
+            (
+                "sine_1k",
+                (0..1024)
+                    .map(|i| {
+                        let t = i as f64 * std::f64::consts::TAU / 256.0;
+                        ((t.sin() * 100.0) + 128.0).clamp(0.0, 255.0) as u8
+                    })
+                    .collect(),
+            ),
+            // Text
+            ("text_1k", {
+                let text = b"The quick brown fox jumps over the lazy dog. ";
+                text.iter().cycle().take(1024).copied().collect()
+            }),
+            // Pseudo-random (control — WHT should not help)
+            ("random_1k", {
+                let mut state: u32 = 12345;
+                (0..1024)
+                    .map(|_| {
+                        state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                        (state >> 16) as u8
+                    })
+                    .collect()
+            }),
+            // Mostly constant with occasional spikes
+            ("sparse_signal_1k", {
+                let mut v = vec![128u8; 1024];
+                for i in (0..1024).step_by(64) {
+                    v[i] = 255;
+                }
+                v
+            }),
+            // Slowly varying gradient
+            (
+                "gradient_4k",
+                (0..4096).map(|i| (i * 256 / 4096) as u8).collect(),
+            ),
+        ];
+
+        let thresholds = [1, 2, 4, 8, 16, 32, 64];
+
+        for (name, data) in &test_cases {
+            let raw_rans = rans::encode(data);
+            let raw_rans_size = raw_rans.len();
+
+            let mut best_total = usize::MAX;
+            let mut best_thresh = 0;
+
+            for &threshold in &thresholds {
+                let num_blocks = data.len().div_ceil(BLOCK_SIZE);
+                let mut total_sparse_bytes: usize = 4 + num_blocks; // header + per-block counts
+                let mut total_kept: usize = 0;
+                let mut all_residuals = Vec::with_capacity(data.len());
+
+                for b in 0..num_blocks {
+                    let start = b * BLOCK_SIZE;
+                    let end = (start + BLOCK_SIZE).min(data.len());
+                    let chunk = &data[start..end];
+
+                    let sb = sparse_threshold_block(chunk, threshold);
+                    total_sparse_bytes += sb.sparse_data.len();
+                    total_kept += sb.num_significant;
+                    all_residuals.extend_from_slice(&sb.residual);
+                }
+
+                let residual_rans = rans::encode(&all_residuals);
+                let total = total_sparse_bytes + residual_rans.len();
+                let avg_kept = total_kept as f64 / num_blocks as f64;
+
+                if total < best_total {
+                    best_total = total;
+                    best_thresh = threshold;
+                }
+
+                let ratio = total as f64 / raw_rans_size as f64;
+                println!(
+                    "{:<20} {:>8} {:>10} | {:>5} {:>6.1} {:>10} {:>10} {:>8} {:>8.3}",
+                    if threshold == thresholds[0] {
+                        name
+                    } else {
+                        &""
+                    },
+                    if threshold == thresholds[0] {
+                        format!("{}", data.len())
+                    } else {
+                        String::new()
+                    },
+                    if threshold == thresholds[0] {
+                        format!("{raw_rans_size}")
+                    } else {
+                        String::new()
+                    },
+                    threshold,
+                    avg_kept,
+                    total_sparse_bytes,
+                    residual_rans.len(),
+                    total,
+                    ratio
+                );
+            }
+
+            let best_ratio = best_total as f64 / raw_rans_size as f64;
+            let winner = if best_total < raw_rans_size {
+                "WHT WINS"
+            } else {
+                "raw wins"
+            };
+            println!(
+                "{:>20} best: thr={:<3} ratio={:.3} {}",
+                "", best_thresh, best_ratio, winner
+            );
+            println!();
+        }
     }
 }
