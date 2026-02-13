@@ -1268,6 +1268,122 @@ fn bench_rans_gpu(c: &mut Criterion) {
 #[cfg(not(feature = "opencl"))]
 fn bench_rans_gpu(_c: &mut Criterion) {}
 
+/// Experiment 6: Combined LZ77 + entropy GPU decode pipeline.
+///
+/// Measures end-to-end GPU decode of independently-compressed LZ77 blocks
+/// with FSE or rANS entropy coding, compared to CPU sequential decode.
+/// Demonstrates the combined speedup potential of GPU entropy + LZ77 decode.
+#[cfg(feature = "opencl")]
+fn bench_combined_gpu_decode(c: &mut Criterion) {
+    let engine = match pz::opencl::OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut group = c.benchmark_group("combined_gpu_decode");
+    cap(&mut group);
+
+    let block_sizes: &[usize] = &[16384, 65536];
+
+    for &size in SIZES_LARGE {
+        let data = get_test_data(size);
+        let label_size = if size >= 1_048_576 {
+            format!("{}MB", size / 1_048_576)
+        } else {
+            format!("{}KB", size / 1024)
+        };
+
+        group.throughput(Throughput::Bytes(size as u64));
+
+        for &block_size in block_sizes {
+            let label_bs = format!("{}KB", block_size / 1024);
+
+            // Compress into independent blocks then entropy-code each block's LZ77 output
+            let (block_data, block_meta) =
+                pz::opencl::lz77::lz77_compress_blocks(&data, block_size).unwrap();
+
+            // Also compress with FSE for entropy decode benchmarking
+            let mut fse_encoded_blocks: Vec<Vec<u8>> = Vec::new();
+            let mut fse_original_lens: Vec<usize> = Vec::new();
+            for &(offset, num_matches, _decompressed_size) in &block_meta {
+                let end = offset + num_matches * 5;
+                let block_compressed = &block_data[offset..end];
+                let fse_encoded = pz::fse::encode(block_compressed);
+                fse_original_lens.push(block_compressed.len());
+                fse_encoded_blocks.push(fse_encoded);
+            }
+
+            // CPU baseline: FSE decode + LZ77 decompress per block
+            group.bench_function(
+                BenchmarkId::new("cpu_fse_lz77", format!("{label_size}_{label_bs}")),
+                |b| {
+                    b.iter(|| {
+                        let mut result = Vec::with_capacity(data.len());
+                        for (i, fse_block) in fse_encoded_blocks.iter().enumerate() {
+                            let lz77_data =
+                                pz::fse::decode(fse_block, fse_original_lens[i]).unwrap();
+                            let decoded = pz::lz77::decompress(&lz77_data).unwrap();
+                            result.extend_from_slice(&decoded);
+                        }
+                        result
+                    });
+                },
+            );
+
+            // GPU: LZ77 block-parallel decompress only (from pre-decoded LZ77 data)
+            group.bench_function(
+                BenchmarkId::new("gpu_lz77_only", format!("{label_size}_{label_bs}")),
+                |b| {
+                    b.iter(|| {
+                        engine
+                            .lz77_decompress_blocks(&block_data, &block_meta, 32)
+                            .unwrap()
+                    });
+                },
+            );
+
+            // GPU: rANS decode + LZ77 decompress (combined)
+            let mut rans_encoded_blocks: Vec<Vec<u8>> = Vec::new();
+            for &(offset, num_matches, _decompressed_size) in &block_meta {
+                let end = offset + num_matches * 5;
+                let block_compressed = &block_data[offset..end];
+                let rans_encoded = pz::rans::encode_interleaved(block_compressed);
+                rans_encoded_blocks.push(rans_encoded);
+            }
+
+            group.bench_function(
+                BenchmarkId::new("gpu_rans_lz77", format!("{label_size}_{label_bs}")),
+                |b| {
+                    b.iter(|| {
+                        // Stage 1: GPU rANS decode each block's entropy layer
+                        let mut all_lz77 = Vec::new();
+                        let mut decoded_meta = Vec::new();
+                        let mut lz77_offset = 0usize;
+                        for (i, rans_block) in rans_encoded_blocks.iter().enumerate() {
+                            let lz77_data = engine
+                                .rans_decode_interleaved(rans_block, fse_original_lens[i])
+                                .unwrap();
+                            let num_matches = lz77_data.len() / 5;
+                            decoded_meta.push((lz77_offset, num_matches, block_meta[i].2));
+                            lz77_offset += lz77_data.len();
+                            all_lz77.extend_from_slice(&lz77_data);
+                        }
+                        // Stage 2: GPU LZ77 block-parallel decompress
+                        engine
+                            .lz77_decompress_blocks(&all_lz77, &decoded_meta, 32)
+                            .unwrap()
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_combined_gpu_decode(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_bwt,
@@ -1301,6 +1417,7 @@ criterion_group!(
     bench_lz77_gpu_params,
     bench_fse_gpu,
     bench_lz77_decompress_blocks,
-    bench_rans_gpu
+    bench_rans_gpu,
+    bench_combined_gpu_decode
 );
 criterion_main!(benches);
