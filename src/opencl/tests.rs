@@ -1033,6 +1033,58 @@ fn test_gpu_bwt_cpu_pipeline_round_trip() {
 }
 
 #[test]
+fn test_gpu_rans_decode_interleaved() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let pattern = b"abracadabra alakazam abracadabra ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+
+    let encoded = crate::rans::encode_interleaved(&input);
+    let cpu_decoded = crate::rans::decode_interleaved(&encoded, input.len()).unwrap();
+    assert_eq!(cpu_decoded, input);
+
+    let gpu_decoded = engine
+        .rans_decode_interleaved(&encoded, input.len())
+        .unwrap();
+    assert_eq!(
+        gpu_decoded, input,
+        "GPU rANS decode should match CPU decode"
+    );
+}
+
+#[test]
+fn test_gpu_rans_decode_various_interleave() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let pattern = b"the quick brown fox jumps over the lazy dog ";
+    let mut input = Vec::new();
+    for _ in 0..200 {
+        input.extend_from_slice(pattern);
+    }
+
+    // Test with different interleave counts and scale bits
+    for (num_states, scale_bits) in [(4, 12), (8, 11), (16, 10), (32, 12)] {
+        let encoded = crate::rans::encode_interleaved_n(&input, num_states, scale_bits);
+        let gpu_decoded = engine
+            .rans_decode_interleaved(&encoded, input.len())
+            .unwrap();
+        assert_eq!(
+            gpu_decoded, input,
+            "mismatch with num_states={num_states}, scale_bits={scale_bits}"
+        );
+    }
+}
+
+#[test]
 fn test_gpu_lz77_block_decompress_small() {
     let engine = match OpenClEngine::new() {
         Ok(e) => e,

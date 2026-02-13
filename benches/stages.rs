@@ -1213,6 +1213,61 @@ fn bench_lz77_decompress_blocks(c: &mut Criterion) {
 #[cfg(not(feature = "opencl"))]
 fn bench_lz77_decompress_blocks(_c: &mut Criterion) {}
 
+/// Experiment 1: rANS interleaved GPU decode.
+///
+/// Sweeps K (interleaved lanes: 4, 8, 16, 32, 64) and scale_bits (10, 11, 12).
+/// Compares GPU decode vs CPU decode throughput.
+#[cfg(feature = "opencl")]
+fn bench_rans_gpu(c: &mut Criterion) {
+    let engine = match pz::opencl::OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut group = c.benchmark_group("rans_gpu_decode");
+    cap(&mut group);
+
+    let interleave_counts: &[usize] = &[4, 8, 16, 32, 64];
+    let scale_values: &[u8] = &[10, 11, 12];
+
+    for &size in SIZES_LARGE {
+        let data = get_test_data(size);
+        let label_size = if size >= 1_048_576 {
+            format!("{}MB", size / 1_048_576)
+        } else {
+            format!("{}KB", size / 1024)
+        };
+
+        group.throughput(Throughput::Bytes(size as u64));
+
+        for &scale_bits in scale_values {
+            for &k in interleave_counts {
+                let encoded = pz::rans::encode_interleaved_n(&data, k, scale_bits);
+                let label = format!("K{k}_s{scale_bits}_{label_size}");
+
+                // CPU baseline
+                group.bench_function(BenchmarkId::new("cpu", &label), |b| {
+                    b.iter(|| pz::rans::decode_interleaved(&encoded, data.len()).unwrap());
+                });
+
+                // GPU
+                group.bench_function(BenchmarkId::new("gpu", &label), |b| {
+                    b.iter(|| {
+                        engine
+                            .rans_decode_interleaved(&encoded, data.len())
+                            .unwrap()
+                    });
+                });
+            }
+        }
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_rans_gpu(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_bwt,
@@ -1245,6 +1300,7 @@ criterion_group!(
     bench_lz78_static_gpu,
     bench_lz77_gpu_params,
     bench_fse_gpu,
-    bench_lz77_decompress_blocks
+    bench_lz77_decompress_blocks,
+    bench_rans_gpu
 );
 criterion_main!(benches);

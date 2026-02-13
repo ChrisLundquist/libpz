@@ -755,6 +755,7 @@ mod fse;
 mod huffman;
 pub mod lz77;
 mod lz78;
+mod rans;
 
 #[cfg(test)]
 #[path = "tests.rs"]

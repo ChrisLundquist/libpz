@@ -90,13 +90,13 @@ const HEADER_SIZE: usize = 1 + NUM_SYMBOLS * 2 + 4 + 4;
 /// Frequencies sum to exactly `1 << scale_bits`. The cumulative table
 /// enables O(1) symbol lookup during decode via a direct-index array.
 #[derive(Debug, Clone, PartialEq)]
-struct NormalizedFreqs {
+pub(crate) struct NormalizedFreqs {
     /// Normalized frequency for each symbol. Sum = 1 << scale_bits.
-    freq: [u16; NUM_SYMBOLS],
+    pub(crate) freq: [u16; NUM_SYMBOLS],
     /// Cumulative frequency: cum[i] = sum of freq[0..i].
-    cum: [u16; NUM_SYMBOLS],
+    pub(crate) cum: [u16; NUM_SYMBOLS],
     /// The scale bits. table_size = 1 << scale_bits.
-    scale_bits: u8,
+    pub(crate) scale_bits: u8,
 }
 
 /// Normalize raw frequencies so they sum to exactly `1 << scale_bits`.
@@ -198,7 +198,7 @@ fn normalize_frequencies(raw: &FrequencyTable, scale_bits: u8) -> PzResult<Norma
 /// Given the low `scale_bits` bits of the rANS state (which equal the
 /// cumulative frequency slot), this table maps directly to the symbol.
 /// Size: `1 << scale_bits` bytes.
-fn build_symbol_lookup(norm: &NormalizedFreqs) -> Vec<u8> {
+pub(crate) fn build_symbol_lookup(norm: &NormalizedFreqs) -> Vec<u8> {
     let table_size = 1usize << norm.scale_bits;
     let mut lookup = vec![0u8; table_size];
 
@@ -528,7 +528,7 @@ fn rans_decode_interleaved(
 // ---------------------------------------------------------------------------
 
 /// Result of zero-copy word slice access: either borrowed or owned.
-enum WordSlice<'a> {
+pub(crate) enum WordSlice<'a> {
     Borrowed(&'a [u16]),
     Owned(Vec<u16>),
 }
@@ -550,7 +550,7 @@ impl<'a> std::ops::Deref for WordSlice<'a> {
 /// cast when alignment permits, returning a borrowed slice. Falls back to
 /// byte-at-a-time parsing only when the slice is misaligned or on big-endian.
 #[inline]
-fn bytes_as_u16_le(data: &[u8], count: usize) -> WordSlice<'_> {
+pub(crate) fn bytes_as_u16_le(data: &[u8], count: usize) -> WordSlice<'_> {
     debug_assert!(data.len() >= count * 2);
 
     #[cfg(target_endian = "little")]
@@ -609,7 +609,7 @@ fn serialize_freq_table(norm: &NormalizedFreqs, output: &mut Vec<u8>) {
 }
 
 /// Deserialize a normalized frequency table and validate sum.
-fn deserialize_freq_table(input: &[u8], scale_bits: u8) -> PzResult<NormalizedFreqs> {
+pub(crate) fn deserialize_freq_table(input: &[u8], scale_bits: u8) -> PzResult<NormalizedFreqs> {
     if input.len() < NUM_SYMBOLS * 2 {
         return Err(PzError::InvalidInput);
     }
