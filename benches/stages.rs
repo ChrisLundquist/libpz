@@ -1146,6 +1146,73 @@ fn bench_lz78_static_gpu(c: &mut Criterion) {
 #[cfg(not(feature = "opencl"))]
 fn bench_lz78_static_gpu(_c: &mut Criterion) {}
 
+/// Experiment 4: LZ77 block-parallel GPU decompression.
+///
+/// Sweeps block_size (4KB-256KB) and cooperative_threads (1, 8, 32, 64).
+/// Compares GPU block-parallel decode vs CPU sequential decode.
+#[cfg(feature = "opencl")]
+fn bench_lz77_decompress_blocks(c: &mut Criterion) {
+    let engine = match pz::opencl::OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut group = c.benchmark_group("lz77_decompress_blocks");
+    cap(&mut group);
+
+    let block_sizes: &[usize] = &[4096, 16384, 65536, 262144];
+    let thread_counts: &[usize] = &[1, 8, 32, 64];
+
+    // Use 1MB test data
+    let data = get_test_data(1_048_576);
+
+    for &block_size in block_sizes {
+        // Compress into independent blocks
+        let (block_data, block_meta) =
+            pz::opencl::lz77::lz77_compress_blocks(&data, block_size).unwrap();
+
+        let label_bs = if block_size >= 1024 {
+            format!("{}KB", block_size / 1024)
+        } else {
+            format!("{}B", block_size)
+        };
+
+        // CPU baseline: decompress each block independently
+        group.throughput(Throughput::Bytes(data.len() as u64));
+        group.bench_function(BenchmarkId::new("cpu", &label_bs), |b| {
+            b.iter(|| {
+                let mut result = Vec::with_capacity(data.len());
+                for &(offset, num_matches, _decompressed_size) in &block_meta {
+                    let end = offset + num_matches * 5;
+                    let block_compressed = &block_data[offset..end];
+                    let decoded = pz::lz77::decompress(block_compressed).unwrap();
+                    result.extend_from_slice(&decoded);
+                }
+                result
+            });
+        });
+
+        // GPU: sweep cooperative thread counts
+        for &threads in thread_counts {
+            group.bench_function(
+                BenchmarkId::new(format!("gpu_t{threads}"), &label_bs),
+                |b| {
+                    b.iter(|| {
+                        engine
+                            .lz77_decompress_blocks(&block_data, &block_meta, threads)
+                            .unwrap()
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_lz77_decompress_blocks(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_bwt,
@@ -1177,6 +1244,7 @@ criterion_group!(
     bench_lz78_static,
     bench_lz78_static_gpu,
     bench_lz77_gpu_params,
-    bench_fse_gpu
+    bench_fse_gpu,
+    bench_lz77_decompress_blocks
 );
 criterion_main!(benches);

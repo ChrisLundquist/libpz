@@ -1031,3 +1031,67 @@ fn test_gpu_bwt_cpu_pipeline_round_trip() {
     }
     gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Bw);
 }
+
+#[test]
+fn test_gpu_lz77_block_decompress_small() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    // Small repetitive input — fits in one block
+    let input = b"abcabcabcabcabcabcabcabc";
+    let (block_data, block_meta) = crate::opencl::lz77::lz77_compress_blocks(input, 1024).unwrap();
+
+    let gpu_result = engine
+        .lz77_decompress_blocks(&block_data, &block_meta, 32)
+        .unwrap();
+    assert_eq!(gpu_result, input);
+}
+
+#[test]
+fn test_gpu_lz77_block_decompress_multiblock() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    // Larger input split into multiple 4KB blocks
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::new();
+    for _ in 0..400 {
+        input.extend_from_slice(pattern);
+    }
+
+    let (block_data, block_meta) = crate::opencl::lz77::lz77_compress_blocks(&input, 4096).unwrap();
+    assert!(block_meta.len() > 1, "should have multiple blocks");
+
+    let gpu_result = engine
+        .lz77_decompress_blocks(&block_data, &block_meta, 32)
+        .unwrap();
+    assert_eq!(gpu_result, input);
+}
+
+#[test]
+fn test_gpu_lz77_block_decompress_various_threads() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let pattern = b"hello world compression test data ";
+    let mut input = Vec::new();
+    for _ in 0..200 {
+        input.extend_from_slice(pattern);
+    }
+
+    let (block_data, block_meta) = crate::opencl::lz77::lz77_compress_blocks(&input, 2048).unwrap();
+
+    // Test with different cooperative thread counts
+    for threads in [1, 8, 32, 64] {
+        let result = engine
+            .lz77_decompress_blocks(&block_data, &block_meta, threads)
+            .unwrap();
+        assert_eq!(result, input, "mismatch with cooperative_threads={threads}");
+    }
+}

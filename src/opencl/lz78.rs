@@ -143,7 +143,7 @@ impl OpenClEngine {
 
         // Allocate output buffer
         let output_size = total_output.max(1); // avoid zero-size allocation
-        let mut output_buf = unsafe {
+        let output_buf = unsafe {
             Buffer::<u8>::create(
                 &self.context,
                 CL_MEM_WRITE_ONLY,
