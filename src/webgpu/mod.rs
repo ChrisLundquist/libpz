@@ -301,7 +301,7 @@ impl WebGpuEngine {
             force_fallback_adapter: false,
             compatible_surface: None,
         }))
-        .ok_or(PzError::Unsupported)?;
+        .map_err(|_| PzError::Unsupported)?;
 
         let info = adapter.get_info();
         let device_name = info.name.clone();
@@ -334,8 +334,9 @@ impl WebGpuEngine {
                 required_features,
                 required_limits: wgpu::Limits::downlevel_defaults(),
                 memory_hints: wgpu::MemoryHints::Performance,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                trace: wgpu::Trace::Off,
             },
-            None,
         ))
         .map_err(|_| PzError::Unsupported)?;
 
@@ -396,7 +397,7 @@ impl WebGpuEngine {
 
     /// Block the host until all submitted GPU work completes.
     pub(crate) fn poll_wait(&self) {
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
     }
 
     /// Return the maximum work-group size for the device.
@@ -522,7 +523,7 @@ impl WebGpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv()
             .unwrap()
             .map_err(|_| PzError::Unsupported)
@@ -556,7 +557,7 @@ impl WebGpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();
@@ -641,7 +642,7 @@ impl WebGpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         if rx.recv().unwrap().is_ok() {
             let data = slice.get_mapped_range();
             let timestamps: &[u64] = bytemuck::cast_slice(&data);
@@ -681,7 +682,7 @@ impl WebGpuEngine {
                 self.read_and_print_timestamps(label);
             } else {
                 // Fall back to CPU wall-clock (includes submit + sync overhead).
-                self.device.poll(wgpu::Maintain::Wait);
+                let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
                 let ms = t0.unwrap().elapsed().as_secs_f64() * 1000.0;
                 eprintln!("[pz-gpu] {label}: {ms:.3} ms");
             }

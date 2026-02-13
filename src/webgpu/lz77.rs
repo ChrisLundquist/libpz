@@ -223,7 +223,7 @@ impl WebGpuEngine {
         )?;
         self.queue.submit(Some(encoder.finish()));
         if let Some(t0) = t0 {
-            self.device.poll(wgpu::Maintain::Wait);
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             eprintln!("[pz-gpu] lz77_to_device (build+find+resolve): {ms:.3} ms");
         }
@@ -377,7 +377,7 @@ impl WebGpuEngine {
         self.queue.submit(Some(encoder.finish()));
 
         // Wait for all work including the copy
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         if let Some(t0) = t0 {
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             eprintln!("[pz-gpu] lz77_hash (build+find): {ms:.3} ms");
@@ -389,7 +389,7 @@ impl WebGpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().map_err(|_| PzError::Unsupported)?;
 
         let raw = slice.get_mapped_range().to_vec();
@@ -410,7 +410,7 @@ impl WebGpuEngine {
     /// and synchronization round-trip.
     fn find_matches_lazy(&self, input: &[u8]) -> PzResult<Vec<Match>> {
         let pending = self.submit_find_matches_lazy(input)?;
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         if self.profiling {
             eprintln!("[pz-gpu] lz77_lazy (build+find+resolve): submitted");
         }
@@ -602,7 +602,7 @@ impl WebGpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().map_err(|_| PzError::Unsupported)?;
 
         let raw = slice.get_mapped_range().to_vec();
@@ -661,7 +661,7 @@ impl WebGpuEngine {
             }
 
             // Phase 2: Wait for ALL GPU work in this batch to complete
-            self.device.poll(wgpu::Maintain::Wait);
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
 
             // Phase 3: Read back + dedup
             for (i, p) in pending.into_iter().enumerate() {
@@ -1029,7 +1029,7 @@ impl WebGpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().map_err(|_| PzError::Unsupported)?;
 
         let raw = slice.get_mapped_range().to_vec();

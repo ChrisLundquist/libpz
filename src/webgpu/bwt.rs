@@ -551,7 +551,7 @@ impl WebGpuEngine {
             )?;
             self.queue.submit(Some(encoder.finish()));
             if let Some(t0) = t0 {
-                self.device.poll(wgpu::Maintain::Wait);
+                let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
                 eprintln!("[pz-gpu] radix_keys+hist (pass={pass}): {ms:.3} ms");
             }
