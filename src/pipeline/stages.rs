@@ -629,6 +629,70 @@ pub(crate) fn stage_fse_interleaved_decode(mut block: StageBlock) -> PzResult<St
     Ok(block)
 }
 
+/// GPU interleaved FSE decoding stage (OpenCL): parse multi-stream container
+/// + decode each stream's interleaved FSE data on the GPU.
+///
+/// Per-stream framing: [orig_len: u32] [compressed_len: u32] [interleaved_fse_data]
+///
+/// The input wire format is identical to [`stage_fse_interleaved_decode()`], so
+/// GPU decode works on data produced by either CPU or GPU encode.
+#[cfg(feature = "opencl")]
+pub(crate) fn stage_fse_interleaved_decode_gpu(
+    mut block: StageBlock,
+    engine: &crate::opencl::OpenClEngine,
+) -> PzResult<StageBlock> {
+    let (streams, pre_entropy_len, meta) = decode_multistream(&block.data, |data| {
+        if data.len() < 8 {
+            return Err(PzError::InvalidInput);
+        }
+        let orig_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let comp_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        if 8 + comp_len > data.len() {
+            return Err(PzError::InvalidInput);
+        }
+        let decoded = engine.fse_decode(&data[8..8 + comp_len], orig_len)?;
+        Ok((decoded, 8 + comp_len))
+    })?;
+
+    block.metadata.pre_entropy_len = Some(pre_entropy_len);
+    block.metadata.demux_meta = meta;
+    block.streams = Some(streams);
+    block.data.clear();
+    Ok(block)
+}
+
+/// GPU interleaved FSE decoding stage (WebGPU): parse multi-stream container
+/// + decode each stream's interleaved FSE data on the GPU.
+///
+/// Per-stream framing: [orig_len: u32] [compressed_len: u32] [interleaved_fse_data]
+///
+/// The input wire format is identical to [`stage_fse_interleaved_decode()`], so
+/// GPU decode works on data produced by either CPU or GPU encode.
+#[cfg(feature = "webgpu")]
+pub(crate) fn stage_fse_interleaved_decode_webgpu(
+    mut block: StageBlock,
+    engine: &crate::webgpu::WebGpuEngine,
+) -> PzResult<StageBlock> {
+    let (streams, pre_entropy_len, meta) = decode_multistream(&block.data, |data| {
+        if data.len() < 8 {
+            return Err(PzError::InvalidInput);
+        }
+        let orig_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let comp_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        if 8 + comp_len > data.len() {
+            return Err(PzError::InvalidInput);
+        }
+        let decoded = engine.fse_decode(&data[8..8 + comp_len], orig_len)?;
+        Ok((decoded, 8 + comp_len))
+    })?;
+
+    block.metadata.pre_entropy_len = Some(pre_entropy_len);
+    block.metadata.demux_meta = meta;
+    block.streams = Some(streams);
+    block.data.clear();
+    Ok(block)
+}
+
 // ---------------------------------------------------------------------------
 // BWT pipeline stages (Bw)
 // ---------------------------------------------------------------------------
@@ -885,6 +949,7 @@ pub(crate) fn run_decompress_stage(
     pipeline: Pipeline,
     stage_idx: usize,
     block: StageBlock,
+    options: &super::DecompressOptions,
 ) -> PzResult<StageBlock> {
     match (pipeline, stage_idx) {
         // Deflate: Huffman decode(0) → LZ77 decompress(1)
@@ -907,7 +972,26 @@ pub(crate) fn run_decompress_stage(
         (Pipeline::Lzf, 0) => stage_fse_decode(block),
         (Pipeline::Lzf, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
         // Lzfi: interleaved FSE decode(0) → LZ77 decompress(1)
-        (Pipeline::Lzfi, 0) => stage_fse_interleaved_decode(block),
+        (Pipeline::Lzfi, 0) => {
+            #[cfg(feature = "opencl")]
+            {
+                if let super::Backend::OpenCl = options.backend {
+                    if let Some(ref engine) = options.opencl_engine {
+                        return stage_fse_interleaved_decode_gpu(block, engine);
+                    }
+                }
+            }
+            #[cfg(feature = "webgpu")]
+            {
+                if let super::Backend::WebGpu = options.backend {
+                    if let Some(ref engine) = options.webgpu_engine {
+                        return stage_fse_interleaved_decode_webgpu(block, engine);
+                    }
+                }
+            }
+            let _ = options;
+            stage_fse_interleaved_decode(block)
+        }
         (Pipeline::Lzfi, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
         // LzssR: rANS decode(0) → LZSS decompress(1)
         (Pipeline::LzssR, 0) => stage_rans_decode(block),
