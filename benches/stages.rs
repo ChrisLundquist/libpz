@@ -1160,7 +1160,7 @@ fn bench_lz77_decompress_blocks(c: &mut Criterion) {
     let mut group = c.benchmark_group("lz77_decompress_blocks");
     cap(&mut group);
 
-    let block_sizes: &[usize] = &[4096, 16384, 65536, 262144];
+    let block_sizes: &[usize] = &[4096, 16384, 32768, 65536, 262144];
     let thread_counts: &[usize] = &[1, 8, 32, 64];
 
     // Use 1MB test data
@@ -1343,31 +1343,42 @@ fn bench_combined_gpu_decode(c: &mut Criterion) {
             );
 
             // GPU: rANS decode + LZ77 decompress (combined)
-            let mut rans_encoded_blocks: Vec<Vec<u8>> = Vec::new();
-            for &(offset, num_matches, _decompressed_size) in &block_meta {
-                let end = offset + num_matches * 5;
-                let block_compressed = &block_data[offset..end];
-                let rans_encoded = pz::rans::encode_interleaved(block_compressed);
-                rans_encoded_blocks.push(rans_encoded);
-            }
+            // Collect each block's LZ77 match data as separate slices, then encode
+            // with a shared frequency table for batched GPU decode.
+            let match_slices: Vec<&[u8]> = block_meta
+                .iter()
+                .map(|&(offset, num_matches, _)| {
+                    let end = offset + num_matches * 5;
+                    &block_data[offset..end]
+                })
+                .collect();
+            let rans_encoded_result =
+                pz::opencl::rans::rans_encode_block_slices(&match_slices, 4, 12).unwrap();
+
+            // GPU: batched rANS decode (single kernel launch) + LZ77 decompress
+            let rans_block_refs: Vec<(&[u8], usize)> = rans_encoded_result
+                .iter()
+                .map(|(enc, len)| (enc.as_slice(), *len))
+                .collect();
 
             group.bench_function(
                 BenchmarkId::new("gpu_rans_lz77", format!("{label_size}_{label_bs}")),
                 |b| {
                     b.iter(|| {
-                        // Stage 1: GPU rANS decode each block's entropy layer
-                        let mut all_lz77 = Vec::new();
+                        // Stage 1: GPU batched rANS decode (all blocks in one launch)
+                        let all_lz77 = engine
+                            .rans_decode_interleaved_blocks(&rans_block_refs)
+                            .unwrap();
+
+                        // Build metadata for LZ77 decompress
                         let mut decoded_meta = Vec::new();
                         let mut lz77_offset = 0usize;
-                        for (i, rans_block) in rans_encoded_blocks.iter().enumerate() {
-                            let lz77_data = engine
-                                .rans_decode_interleaved(rans_block, fse_original_lens[i])
-                                .unwrap();
-                            let num_matches = lz77_data.len() / 5;
+                        for (i, &orig_len) in fse_original_lens.iter().enumerate() {
+                            let num_matches = orig_len / 5;
                             decoded_meta.push((lz77_offset, num_matches, block_meta[i].2));
-                            lz77_offset += lz77_data.len();
-                            all_lz77.extend_from_slice(&lz77_data);
+                            lz77_offset += orig_len;
                         }
+
                         // Stage 2: GPU LZ77 block-parallel decompress
                         engine
                             .lz77_decompress_blocks(&all_lz77, &decoded_meta, 32)
@@ -1383,6 +1394,234 @@ fn bench_combined_gpu_decode(c: &mut Criterion) {
 
 #[cfg(not(feature = "opencl"))]
 fn bench_combined_gpu_decode(_c: &mut Criterion) {}
+
+/// Experiment 1 (gap fix): Multi-block rANS GPU decode.
+///
+/// Splits input into independent blocks (e.g., 16KB each), encodes each
+/// with K-way interleaved rANS, then decodes all blocks in a single GPU
+/// kernel launch. Total work-items = num_blocks × K.
+#[cfg(feature = "opencl")]
+fn bench_rans_gpu_blocks(c: &mut Criterion) {
+    let engine = match pz::opencl::OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut group = c.benchmark_group("rans_gpu_blocks");
+    cap(&mut group);
+
+    let block_sizes: &[usize] = &[4096, 16384, 65536];
+    let interleave_counts: &[usize] = &[8, 16, 32];
+
+    for &size in SIZES_LARGE {
+        let data = get_test_data(size);
+        let label_size = if size >= 1_048_576 {
+            format!("{}MB", size / 1_048_576)
+        } else {
+            format!("{}KB", size / 1024)
+        };
+        group.throughput(Throughput::Bytes(size as u64));
+
+        for &block_size in block_sizes {
+            for &k in interleave_counts {
+                let label_bs = format!("{}KB", block_size / 1024);
+                let scale_bits = 11u8;
+
+                // Encode all blocks with shared frequency table
+                let encoded_blocks =
+                    pz::opencl::rans::rans_encode_blocks(&data, block_size, k, scale_bits).unwrap();
+                let num_blocks = encoded_blocks.len();
+
+                let label = format!("K{k}_bs{label_bs}_{label_size}_n{num_blocks}");
+
+                // CPU baseline: decode each block sequentially
+                group.bench_function(BenchmarkId::new("cpu", &label), |b| {
+                    b.iter(|| {
+                        let mut result = Vec::with_capacity(data.len());
+                        for (enc, orig_len) in &encoded_blocks {
+                            let decoded = pz::rans::decode_interleaved(enc, *orig_len).unwrap();
+                            result.extend_from_slice(&decoded);
+                        }
+                        result
+                    });
+                });
+
+                // GPU: batched multi-block decode
+                let block_refs: Vec<(&[u8], usize)> = encoded_blocks
+                    .iter()
+                    .map(|(enc, len)| (enc.as_slice(), *len))
+                    .collect();
+                group.bench_function(BenchmarkId::new("gpu_blocks", &label), |b| {
+                    b.iter(|| engine.rans_decode_interleaved_blocks(&block_refs).unwrap());
+                });
+            }
+        }
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_rans_gpu_blocks(_c: &mut Criterion) {}
+
+/// Experiment 3 (gap fix): Variant B short-chain hash match finder.
+///
+/// Compares Variant A (default 64-entry buckets) vs Variant B (2-4 entry
+/// short buckets) in terms of compression ratio and throughput.
+#[cfg(feature = "opencl")]
+fn bench_lz77_gpu_short_chain(c: &mut Criterion) {
+    let engine = match pz::opencl::OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut group = c.benchmark_group("lz77_short_chain");
+    cap(&mut group);
+
+    let size = 262144; // 256KB
+    let data = get_test_data(size);
+    group.throughput(Throughput::Bytes(size as u64));
+
+    // Variant A baseline (default params: hash_bits=15, max_chain=64, bucket_cap=64)
+    group.bench_function("variant_a_default", |b| {
+        b.iter(|| engine.find_matches_with_params(&data, 15, 64, 64).unwrap());
+    });
+
+    // Variant B: short buckets
+    for &bucket_cap in &[2u32, 3, 4] {
+        group.bench_function(
+            BenchmarkId::new("variant_b", format!("b{bucket_cap}")),
+            |b| {
+                b.iter(|| {
+                    engine
+                        .find_matches_short_chain(&data, 15, bucket_cap)
+                        .unwrap()
+                });
+            },
+        );
+    }
+
+    // Compare compression ratios
+    let matches_a = engine.find_matches_with_params(&data, 15, 64, 64).unwrap();
+    let ratio_a = {
+        let mut comp = Vec::new();
+        for m in &matches_a {
+            comp.extend_from_slice(&m.offset.to_le_bytes());
+            comp.extend_from_slice(&m.length.to_le_bytes());
+            comp.push(m.next);
+        }
+        data.len() as f64 / comp.len() as f64
+    };
+
+    for &bucket_cap in &[2u32, 3, 4] {
+        let matches_b = engine
+            .find_matches_short_chain(&data, 15, bucket_cap)
+            .unwrap();
+        let ratio_b = {
+            let mut comp = Vec::new();
+            for m in &matches_b {
+                comp.extend_from_slice(&m.offset.to_le_bytes());
+                comp.extend_from_slice(&m.length.to_le_bytes());
+                comp.push(m.next);
+            }
+            data.len() as f64 / comp.len() as f64
+        };
+        eprintln!(
+            "[variant_b b{bucket_cap}] ratio: {ratio_b:.3} (vs variant_a: {ratio_a:.3}, diff: {:.1}%)",
+            (ratio_b - ratio_a) / ratio_a * 100.0
+        );
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_lz77_gpu_short_chain(_c: &mut Criterion) {}
+
+/// Experiment 5 (gap fix): Out-of-domain LZW benchmark.
+///
+/// Trains a dictionary on one dataset (alice29.txt) and encodes a different
+/// dataset (synthetic random). Measures how domain mismatch affects ratio.
+#[cfg(feature = "opencl")]
+fn bench_lzw_out_of_domain(c: &mut Criterion) {
+    let engine = match pz::opencl::OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut group = c.benchmark_group("lzw_out_of_domain");
+    cap(&mut group);
+
+    let size = 262144; // 256KB
+
+    // Training data: repetitive structured data
+    let training_pattern = b"the quick brown fox jumps over the lazy dog ";
+    let mut training_data = Vec::with_capacity(size);
+    while training_data.len() < size {
+        training_data.extend_from_slice(training_pattern);
+    }
+    training_data.truncate(size);
+
+    // In-domain test: similar to training data
+    let in_domain_pattern = b"a quick red fox leaps across the sleeping cat ";
+    let mut in_domain = Vec::with_capacity(size);
+    while in_domain.len() < size {
+        in_domain.extend_from_slice(in_domain_pattern);
+    }
+    in_domain.truncate(size);
+
+    // Out-of-domain test: random bytes (maximally different)
+    let mut out_of_domain = vec![0u8; size];
+    let mut rng_state = 42u64;
+    for b in out_of_domain.iter_mut() {
+        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *b = (rng_state >> 33) as u8;
+    }
+
+    group.throughput(Throughput::Bytes(size as u64));
+
+    // Train dictionary on training data
+    let dict = pz::lz78_static::FrozenDict::train(&training_data, 4096).unwrap();
+
+    // In-domain encode + GPU decode
+    let in_encoded = pz::lz78_static::encode_with_dict(&in_domain, &dict).unwrap();
+    let (in_dict, in_codes, in_num_codes, in_orig_len) =
+        pz::lz78_static::parse_for_gpu(&in_encoded).unwrap();
+    let in_ratio = in_domain.len() as f64 / in_encoded.len() as f64;
+
+    group.bench_function("in_domain_gpu", |b| {
+        b.iter(|| {
+            engine
+                .lzw_decode_static(in_codes, in_num_codes, &in_dict, in_orig_len)
+                .unwrap()
+        });
+    });
+
+    // Out-of-domain encode + GPU decode
+    let out_encoded = pz::lz78_static::encode_with_dict(&out_of_domain, &dict).unwrap();
+    let (out_dict, out_codes, out_num_codes, out_orig_len) =
+        pz::lz78_static::parse_for_gpu(&out_encoded).unwrap();
+    let out_ratio = out_of_domain.len() as f64 / out_encoded.len() as f64;
+
+    group.bench_function("out_of_domain_gpu", |b| {
+        b.iter(|| {
+            engine
+                .lzw_decode_static(out_codes, out_num_codes, &out_dict, out_orig_len)
+                .unwrap()
+        });
+    });
+
+    eprintln!(
+        "[lzw out-of-domain] in-domain ratio: {in_ratio:.3}, out-of-domain ratio: {out_ratio:.3}, \
+         degradation: {:.1}%",
+        (in_ratio - out_ratio) / in_ratio * 100.0
+    );
+
+    group.finish();
+}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_lzw_out_of_domain(_c: &mut Criterion) {}
 
 criterion_group!(
     benches,
@@ -1418,6 +1657,9 @@ criterion_group!(
     bench_fse_gpu,
     bench_lz77_decompress_blocks,
     bench_rans_gpu,
-    bench_combined_gpu_decode
+    bench_combined_gpu_decode,
+    bench_rans_gpu_blocks,
+    bench_lz77_gpu_short_chain,
+    bench_lzw_out_of_domain
 );
 criterion_main!(benches);

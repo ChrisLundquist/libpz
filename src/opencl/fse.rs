@@ -12,6 +12,10 @@ impl OpenClEngine {
     /// Takes the serialized interleaved FSE data (as produced by
     /// `fse::encode_interleaved()`) and decodes it on the GPU.
     /// Each stream is decoded by one GPU work-item.
+    ///
+    /// The decode table is cached in `__local` (shared) memory when it
+    /// fits (≤4096 entries = 16KB), significantly reducing global memory
+    /// traffic in the hot decode loop.
     pub fn fse_decode(&self, input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
         if original_len == 0 {
             return Ok(Vec::new());
@@ -208,9 +212,15 @@ impl OpenClEngine {
         };
         ev.wait().map_err(|_| PzError::Unsupported)?;
 
-        // Dispatch kernel: one work-item per stream
+        // Dispatch kernel: one work-item per stream, with __local decode table
         let num_streams_arg = num_streams as cl_uint;
         let total_output_len_arg = original_len as cl_uint;
+        let table_size_arg = table_size;
+        // __local memory: table_size entries × 4 bytes each (u32 packed)
+        let local_table_bytes = (table_size as usize) * std::mem::size_of::<u32>();
+        // Workgroup size for cooperative __local load (at least num_streams, capped)
+        let wg_size = num_streams.min(self.max_work_group_size).max(1);
+        let global_size = num_streams.div_ceil(wg_size) * wg_size;
         let kernel_event = unsafe {
             ExecuteKernel::new(&self.kernel_fse_decode)
                 .set_arg(&decode_table_buf)
@@ -219,7 +229,10 @@ impl OpenClEngine {
                 .set_arg(&output_buf)
                 .set_arg(&num_streams_arg)
                 .set_arg(&total_output_len_arg)
-                .set_global_work_size(num_streams)
+                .set_arg(&table_size_arg)
+                .set_arg_local_buffer(local_table_bytes)
+                .set_global_work_size(global_size)
+                .set_local_work_size(wg_size)
                 .enqueue_nd_range(&self.queue)
                 .map_err(|_| PzError::Unsupported)?
         };

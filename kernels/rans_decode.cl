@@ -3,6 +3,10 @@
 // Each work-item decodes one lane of N-way interleaved rANS output.
 // Uses 64-bit intermediate for the state transition to avoid u32 overflow.
 //
+// The cum2sym lookup table is cached in __local (shared) memory for fast
+// access. At scale_bits=12 this is 4KB, fitting easily in local memory
+// and leaving room for multiple warps/SM to be active.
+//
 // Decode table:
 //   cum2sym[slot] = symbol for cumulative frequency slot (size: 1 << scale_bits)
 //   freq[256]     = per-symbol frequency
@@ -17,6 +21,12 @@
 #define RANS_L 65536u
 #define IO_BITS 16u
 
+// Maximum lookup table size for __local caching.
+// scale_bits=14 → 16384 bytes.
+#ifndef MAX_LOCAL_TABLE
+#define MAX_LOCAL_TABLE 16384u
+#endif
+
 __kernel void RansDecode(
     __global const unsigned char *cum2sym,     // symbol lookup table [1 << scale_bits]
     __global const unsigned short *freq_table, // per-symbol frequency [256]
@@ -26,12 +36,26 @@ __kernel void RansDecode(
     __global unsigned char *output,            // output buffer
     const unsigned int num_lanes,
     const unsigned int total_output_len,
-    const unsigned int scale_bits)
+    const unsigned int scale_bits,
+    __local unsigned char *local_cum2sym)      // __local cache for cum2sym
 {
     unsigned int lane_id = get_global_id(0);
+    unsigned int lid = get_local_id(0);
+    unsigned int wg_size = get_local_size(0);
+
+    unsigned int table_size = 1u << scale_bits;
+    unsigned int scale_mask = table_size - 1u;
+
+    // Cooperatively load cum2sym into __local memory
+    unsigned int load_size = min(table_size, MAX_LOCAL_TABLE);
+    for (unsigned int i = lid; i < load_size; i += wg_size) {
+        local_cum2sym[i] = cum2sym[i];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
     if (lane_id >= num_lanes) return;
 
-    unsigned int scale_mask = (1u << scale_bits) - 1u;
+    int use_local = (table_size <= MAX_LOCAL_TABLE) ? 1 : 0;
 
     // Read per-lane metadata
     unsigned int meta_base = lane_id * 3u;
@@ -46,9 +70,14 @@ __kernel void RansDecode(
     unsigned int num_symbols = (total_output_len + num_lanes - 1u - lane_id) / num_lanes;
 
     for (unsigned int sym_idx = 0u; sym_idx < num_symbols; sym_idx++) {
-        // Decode: table lookup
+        // Decode: table lookup from __local or __global
         unsigned int slot = state & scale_mask;
-        unsigned char sym = cum2sym[slot];
+        unsigned char sym;
+        if (use_local) {
+            sym = local_cum2sym[slot];
+        } else {
+            sym = cum2sym[slot];
+        }
         unsigned int freq = (unsigned int)freq_table[sym];
         unsigned int cum = (unsigned int)cum_table[sym];
 

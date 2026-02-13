@@ -402,6 +402,46 @@ pub fn encode_with_params(input: &[u8], max_entries: u16, max_entry_len: u16) ->
     Ok(output)
 }
 
+/// Encode data using a pre-trained frozen dictionary.
+///
+/// This is used for out-of-domain experiments: train on one dataset,
+/// encode a different dataset. The dictionary is serialized into the
+/// output alongside the encoded data.
+pub fn encode_with_dict(input: &[u8], dict: &FrozenDict) -> PzResult<Vec<u8>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (packed_codes, num_codes) = encode_static(input, dict)?;
+    let (flat_entries, lengths) = dict.to_gpu_layout();
+
+    let dict_data_len = flat_entries.len();
+    let dict_lengths_len = lengths.len() * 2;
+    let total_size = HEADER_SIZE + dict_data_len + dict_lengths_len + packed_codes.len();
+
+    let mut output = Vec::with_capacity(total_size);
+
+    // Header
+    output.extend_from_slice(&dict.num_entries.to_le_bytes());
+    output.extend_from_slice(&dict.max_entry_len.to_le_bytes());
+    output.push(dict.code_bits);
+    output.extend_from_slice(&(input.len() as u32).to_le_bytes());
+    output.extend_from_slice(&num_codes.to_le_bytes());
+
+    // Dictionary data (flat layout)
+    output.extend_from_slice(&flat_entries);
+
+    // Dictionary lengths
+    for &len in &lengths {
+        output.extend_from_slice(&len.to_le_bytes());
+    }
+
+    // Packed codes
+    output.extend_from_slice(&packed_codes);
+
+    Ok(output)
+}
+
 /// Decompress static-dictionary LZW data.
 pub fn decode(input: &[u8]) -> PzResult<Vec<u8>> {
     if input.is_empty() {

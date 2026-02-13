@@ -407,6 +407,130 @@ impl OpenClEngine {
         Ok(matches)
     }
 
+    /// Find matches using the Variant B short-chain hash kernel.
+    ///
+    /// Uses short buckets (2-4 entries) instead of the default 64-entry
+    /// buckets. This trades match quality for throughput — fewer candidates
+    /// per position means less warp divergence and better GPU utilization.
+    ///
+    /// Used for parameter sweep experiments (Experiment 3, Variant B).
+    pub fn find_matches_short_chain(
+        &self,
+        input: &[u8],
+        hash_bits: u32,
+        bucket_cap: u32,
+    ) -> PzResult<Vec<Match>> {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let input_len = input.len();
+        let hash_size = 1usize << hash_bits;
+        let table_entries = hash_size * bucket_cap as usize;
+
+        // Compile short-chain kernel at runtime
+        let defines = format!(
+            "-Werror -DHASH_BITS={hash_bits}u -DMAX_CHAIN={bucket_cap}u -DBUCKET_CAP={bucket_cap}u"
+        );
+        let source = include_str!("../../kernels/lz77_hash_short.cl");
+        let program = opencl3::program::Program::create_and_build_from_source(
+            &self.context,
+            source,
+            &defines,
+        )
+        .map_err(|_| PzError::Unsupported)?;
+
+        let kernel_build =
+            Kernel::create(&program, "BuildHashTableShort").map_err(|_| PzError::Unsupported)?;
+        let kernel_find =
+            Kernel::create(&program, "FindMatchesShort").map_err(|_| PzError::Unsupported)?;
+
+        // Allocate buffers
+        let mut input_buf = unsafe {
+            Buffer::<u8>::create(&self.context, CL_MEM_READ_ONLY, input_len, ptr::null_mut())
+                .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        let output_buf = unsafe {
+            Buffer::<GpuMatch>::create(&self.context, CL_MEM_WRITE_ONLY, input_len, ptr::null_mut())
+                .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        let mut hash_counts_buf = unsafe {
+            Buffer::<cl_uint>::create(&self.context, CL_MEM_READ_WRITE, hash_size, ptr::null_mut())
+                .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        let hash_table_buf = unsafe {
+            Buffer::<cl_uint>::create(
+                &self.context,
+                CL_MEM_READ_WRITE,
+                table_entries,
+                ptr::null_mut(),
+            )
+            .map_err(|_| PzError::BufferTooSmall)?
+        };
+
+        // Upload input
+        let ev = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut input_buf, CL_BLOCKING, 0, input, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        ev.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Zero hash counts
+        let zeros = vec![0u32; hash_size];
+        let ev = unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut hash_counts_buf, CL_BLOCKING, 0, &zeros, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        ev.wait().map_err(|_| PzError::Unsupported)?;
+
+        // Pass 1: Build hash table
+        let count = input_len as cl_uint;
+        let build_ev = unsafe {
+            ExecuteKernel::new(&kernel_build)
+                .set_arg(&input_buf)
+                .set_arg(&count)
+                .set_arg(&hash_counts_buf)
+                .set_arg(&hash_table_buf)
+                .set_global_work_size(input_len)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        build_ev.wait().map_err(|_| PzError::Unsupported)?;
+        self.profile_event("lz77 short-chain: build table", &build_ev);
+
+        // Pass 2: Find matches
+        let find_ev = unsafe {
+            ExecuteKernel::new(&kernel_find)
+                .set_arg(&input_buf)
+                .set_arg(&count)
+                .set_arg(&hash_counts_buf)
+                .set_arg(&hash_table_buf)
+                .set_arg(&output_buf)
+                .set_global_work_size(input_len)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|_| PzError::Unsupported)?
+        };
+        find_ev.wait().map_err(|_| PzError::Unsupported)?;
+        self.profile_event("lz77 short-chain: find matches", &find_ev);
+
+        // Read back results
+        let mut gpu_matches = vec![GpuMatch::default(); input_len];
+        let ev = unsafe {
+            self.queue
+                .enqueue_read_buffer(&output_buf, CL_BLOCKING, 0, &mut gpu_matches, &[])
+                .map_err(|_| PzError::Unsupported)?
+        };
+        ev.wait().map_err(|_| PzError::Unsupported)?;
+
+        let matches = dedupe_gpu_matches(&gpu_matches, input);
+        Ok(matches)
+    }
+
     /// GPU-accelerated LZ77 compression.
     ///
     /// Uses the GPU to find matches, deduplicates them, and serializes

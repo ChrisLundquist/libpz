@@ -1147,3 +1147,83 @@ fn test_gpu_lz77_block_decompress_various_threads() {
         assert_eq!(result, input, "mismatch with cooperative_threads={threads}");
     }
 }
+
+#[test]
+fn test_gpu_rans_decode_interleaved_blocks() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    // Create test data and split into independent blocks
+    let pattern = b"abracadabra alakazam ";
+    let mut input = Vec::new();
+    for _ in 0..500 {
+        input.extend_from_slice(pattern);
+    }
+
+    let block_size = 2048;
+    let k = 8;
+    let scale_bits = 11u8;
+
+    // Encode all blocks with a shared frequency table (required for GPU batch decode)
+    let encoded_blocks =
+        crate::opencl::rans::rans_encode_blocks(&input, block_size, k, scale_bits).unwrap();
+
+    // Verify CPU decode of each block works
+    let mut cpu_result = Vec::new();
+    for (enc, orig_len) in &encoded_blocks {
+        let decoded = crate::rans::decode_interleaved(enc, *orig_len).unwrap();
+        cpu_result.extend_from_slice(&decoded);
+    }
+    assert_eq!(
+        cpu_result, input,
+        "CPU round-trip with shared freq table failed"
+    );
+
+    // Build the encoded_blocks slice for the GPU method
+    let block_refs: Vec<(&[u8], usize)> = encoded_blocks
+        .iter()
+        .map(|(enc, len)| (enc.as_slice(), *len))
+        .collect();
+
+    let gpu_result = engine.rans_decode_interleaved_blocks(&block_refs).unwrap();
+    assert_eq!(
+        gpu_result, input,
+        "multi-block GPU rANS decode should match original"
+    );
+}
+
+#[test]
+fn test_gpu_lz77_short_chain_round_trip() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let pattern = b"the quick brown fox jumps over the lazy dog ";
+    let mut input = Vec::new();
+    for _ in 0..200 {
+        input.extend_from_slice(pattern);
+    }
+
+    // Test Variant B short-chain with different bucket capacities
+    for bucket_cap in [2, 4] {
+        let matches = engine
+            .find_matches_short_chain(&input, 15, bucket_cap)
+            .unwrap();
+
+        // Serialize and decompress to verify round-trip
+        let mut compressed = Vec::new();
+        for m in &matches {
+            compressed.extend_from_slice(&m.offset.to_le_bytes());
+            compressed.extend_from_slice(&m.length.to_le_bytes());
+            compressed.push(m.next);
+        }
+        let decompressed = crate::lz77::decompress(&compressed).unwrap();
+        assert_eq!(
+            decompressed, input,
+            "short-chain round-trip failed with bucket_cap={bucket_cap}"
+        );
+    }
+}

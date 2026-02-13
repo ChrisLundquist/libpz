@@ -10,6 +10,17 @@
 //   bits 16..31 = next_state_base (16 bits)
 //
 // Bitstream is LSB-first (matching the CPU FSE BitWriter).
+//
+// The decode table is cached in __local (shared) memory when it fits
+// (up to 4096 entries = 16KB). This avoids repeated global memory reads
+// in the hot decode loop.
+
+// Maximum decode table entries that fit in __local memory.
+// 4096 entries × 4 bytes = 16KB. Most GPUs have 32-64KB local memory,
+// so this leaves room for ≥2 warps/SM to be active concurrently.
+#ifndef MAX_LOCAL_TABLE_ENTRIES
+#define MAX_LOCAL_TABLE_ENTRIES 4096u
+#endif
 
 // Read a byte from the bitstream data given a byte offset.
 static inline unsigned int read_bitstream_byte(
@@ -42,10 +53,25 @@ __kernel void FseDecode(
     __global const unsigned int *stream_meta,          // per-stream metadata
     __global volatile unsigned int *output,            // output buffer (u32-packed bytes)
     const unsigned int num_streams,
-    const unsigned int total_output_len)
+    const unsigned int total_output_len,
+    const unsigned int table_size,                     // 1 << accuracy_log
+    __local unsigned int *local_decode_table)          // __local cache for decode table
 {
     unsigned int stream_id = get_global_id(0);
+    unsigned int lid = get_local_id(0);
+    unsigned int wg_size = get_local_size(0);
+
+    // Cooperatively load decode table into __local memory
+    unsigned int load_size = min(table_size, MAX_LOCAL_TABLE_ENTRIES);
+    for (unsigned int i = lid; i < load_size; i += wg_size) {
+        local_decode_table[i] = decode_table[i];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
     if (stream_id >= num_streams) return;
+
+    // Choose table source: __local if it fits, __global otherwise
+    int use_local = (table_size <= MAX_LOCAL_TABLE_ENTRIES) ? 1 : 0;
 
     // Read per-stream metadata
     unsigned int meta_base = stream_id * 4u;
@@ -73,8 +99,13 @@ __kernel void FseDecode(
 
     // Decode loop: emit one symbol per iteration
     for (unsigned int sym_idx = 0; sym_idx < num_symbols; sym_idx++) {
-        // Table lookup: decode_table[state] -> packed entry
-        unsigned int entry = decode_table[state];
+        // Table lookup: use __local or __global depending on table size
+        unsigned int entry;
+        if (use_local) {
+            entry = local_decode_table[state];
+        } else {
+            entry = decode_table[state];
+        }
         unsigned int symbol = entry & 0xFFu;
         unsigned int bits_to_read = (entry >> 8u) & 0xFFu;
         unsigned int next_state_base = entry >> 16u;

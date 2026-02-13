@@ -62,7 +62,7 @@ pub const MIN_SCALE_BITS: u8 = 9;
 pub const MAX_SCALE_BITS: u8 = 14;
 
 /// Number of symbols in the byte alphabet.
-const NUM_SYMBOLS: usize = 256;
+pub(crate) const NUM_SYMBOLS: usize = 256;
 
 /// Lower bound of the normalized rANS state.
 ///
@@ -104,7 +104,10 @@ pub(crate) struct NormalizedFreqs {
 /// Every symbol with a nonzero raw count is guaranteed at least 1 in the
 /// normalized table. Rounding remainder is distributed to the symbols
 /// with the largest raw counts.
-fn normalize_frequencies(raw: &FrequencyTable, scale_bits: u8) -> PzResult<NormalizedFreqs> {
+pub(crate) fn normalize_frequencies(
+    raw: &FrequencyTable,
+    scale_bits: u8,
+) -> PzResult<NormalizedFreqs> {
     let table_size = 1u32 << scale_bits;
     let total = raw.total;
 
@@ -396,7 +399,7 @@ fn rans_decode_internal(
 /// dependencies.
 ///
 /// Returns (per-stream word vectors, per-stream final states).
-fn rans_encode_interleaved(
+pub(crate) fn rans_encode_interleaved(
     input: &[u8],
     norm: &NormalizedFreqs,
     num_states: usize,
@@ -578,7 +581,7 @@ pub(crate) fn bytes_as_u16_le(data: &[u8], count: usize) -> WordSlice<'_> {
 ///
 /// On little-endian platforms, this is a single memcpy when aligned.
 #[inline]
-fn serialize_u16_le_bulk(words: &[u16], output: &mut Vec<u8>) {
+pub(crate) fn serialize_u16_le_bulk(words: &[u16], output: &mut Vec<u8>) {
     #[cfg(target_endian = "little")]
     {
         let byte_len = words.len() * 2;
@@ -602,7 +605,7 @@ fn serialize_u16_le_bulk(words: &[u16], output: &mut Vec<u8>) {
 }
 
 /// Serialize a normalized frequency table (256 × u16 LE).
-fn serialize_freq_table(norm: &NormalizedFreqs, output: &mut Vec<u8>) {
+pub(crate) fn serialize_freq_table(norm: &NormalizedFreqs, output: &mut Vec<u8>) {
     for &f in &norm.freq {
         output.extend_from_slice(&f.to_le_bytes());
     }
