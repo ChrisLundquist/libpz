@@ -469,7 +469,6 @@ impl OpenClEngine {
 
     /// Max blocks of `block_size` bytes in flight for a kernel without
     /// exceeding the GPU memory budget.
-    #[allow(dead_code)] // Will be used when OpenCL batched path adopts backpressure
     pub(crate) fn max_in_flight(&self, kernel: &KernelCost, block_size: usize) -> usize {
         let per_block = kernel.memory_bytes(block_size);
         if per_block == 0 {
@@ -481,6 +480,14 @@ impl OpenClEngine {
     /// Conservative GPU memory budget: 50% of global_mem_size.
     fn gpu_memory_budget(&self) -> usize {
         (self.global_mem_size as usize) / 2
+    }
+
+    /// Compute the batch size for LZ77 GPU dispatches, based on the cost
+    /// model and memory budget.
+    pub(crate) fn lz77_batch_size(&self, block_size: usize) -> usize {
+        const GPU_MAX_BATCH: usize = 64;
+        let mem_limit = self.max_in_flight(&self.cost_lz77_hash, block_size);
+        mem_limit.min(GPU_MAX_BATCH)
     }
 
     /// Extract elapsed time in milliseconds from a completed OpenCL event.

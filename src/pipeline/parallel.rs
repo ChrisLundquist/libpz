@@ -81,7 +81,15 @@ pub(crate) fn compress_parallel(
                         );
                     }
                 }
-                // Single-block: fall through to default block-parallel path
+                // Single-block or insufficient GPU memory for streaming ring:
+                // use batched path as fallback
+                return compress_parallel_gpu_batched_opencl(
+                    input,
+                    pipeline,
+                    options,
+                    num_threads,
+                    engine,
+                );
             }
         }
     }
@@ -589,6 +597,84 @@ fn compress_streaming_gpu_opencl(
             .into_iter()
             .map(|r| r.unwrap_or(Err(PzError::InvalidInput)))
             .collect::<Vec<_>>()
+    });
+
+    assemble_multiblock_output(input, pipeline, block_size, &compressed_blocks)
+}
+
+/// Batched GPU LZ77 compression for multi-block inputs (OpenCL).
+///
+/// Mirrors the WebGPU `compress_parallel_gpu_batched` path: chunks blocks
+/// into GPU-memory-aware batches, runs GPU LZ77 matching per batch, then
+/// spawns CPU threads for entropy encoding.
+///
+/// Handles both single-block and multi-block cases where the streaming ring
+/// cannot be created (insufficient GPU memory for 2+ slots).
+#[cfg(feature = "opencl")]
+fn compress_parallel_gpu_batched_opencl(
+    input: &[u8],
+    pipeline: Pipeline,
+    options: &CompressOptions,
+    num_threads: usize,
+    engine: &crate::opencl::OpenClEngine,
+) -> PzResult<Vec<u8>> {
+    let block_size = options.block_size;
+    let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
+    let num_blocks = blocks.len();
+
+    let gpu_batch_size = engine.lz77_batch_size(block_size);
+    let block_chunks: Vec<&[&[u8]]> = blocks.chunks(gpu_batch_size).collect();
+
+    let compressed_blocks: Vec<PzResult<Vec<u8>>> = std::thread::scope(|scope| {
+        let max_concurrent = num_threads.min(num_blocks);
+        let mut handles: Vec<(usize, std::thread::ScopedJoinHandle<PzResult<Vec<u8>>>)> =
+            Vec::with_capacity(max_concurrent);
+        let mut results: Vec<Option<PzResult<Vec<u8>>>> = (0..num_blocks).map(|_| None).collect();
+
+        let mut global_block_idx = 0usize;
+
+        for chunk in &block_chunks {
+            // GPU: batch LZ77 for this chunk
+            let match_vecs = match engine.find_matches_batched(chunk) {
+                Ok(v) => v,
+                Err(e) => {
+                    for local_i in 0..chunk.len() {
+                        let block_idx = global_block_idx + local_i;
+                        results[block_idx] = Some(Err(e.clone()));
+                    }
+                    global_block_idx += chunk.len();
+                    continue;
+                }
+            };
+
+            // CPU: entropy-encode each block
+            for (local_i, matches) in match_vecs.into_iter().enumerate() {
+                let block_idx = global_block_idx + local_i;
+
+                // Drain finished handles to maintain concurrency limit
+                while handles.len() >= max_concurrent {
+                    let (idx, handle) = handles.remove(0);
+                    results[idx] = Some(handle.join().unwrap_or(Err(PzError::InvalidInput)));
+                }
+
+                let block_input = blocks[block_idx];
+                handles.push((
+                    block_idx,
+                    scope.spawn(move || {
+                        entropy_encode_lz77_block(&matches, block_input.len(), pipeline)
+                    }),
+                ));
+            }
+
+            global_block_idx += chunk.len();
+        }
+
+        // Collect remaining handles
+        for (idx, handle) in handles {
+            results[idx] = Some(handle.join().unwrap_or(Err(PzError::InvalidInput)));
+        }
+
+        results.into_iter().map(|r| r.unwrap()).collect::<Vec<_>>()
     });
 
     assemble_multiblock_output(input, pipeline, block_size, &compressed_blocks)
