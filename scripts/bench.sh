@@ -313,7 +313,7 @@ for file in "${FILES[@]}"; do
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
         cp "$TMPDIR/$name.src" "$TMPDIR/$name"
-        "$PZ" -f -p "$p" $GPU_FLAG "$TMPDIR/$name"
+        "$PZ" -k -f -p "$p" $GPU_FLAG "$TMPDIR/$name"
         mv "$TMPDIR/$name.pz" "$TMPDIR/$name.$p.pz"
     done
 
