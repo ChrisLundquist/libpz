@@ -46,7 +46,7 @@ impl OpenClEngine {
         // Run histogram kernel
         let n_arg = n as cl_uint;
         let kernel_event = unsafe {
-            ExecuteKernel::new(&self.kernel_byte_histogram)
+            ExecuteKernel::new(self.kernel_byte_histogram())
                 .set_arg(&input_buf)
                 .set_arg(&hist_buf)
                 .set_arg(&n_arg)
@@ -100,7 +100,7 @@ impl OpenClEngine {
         // Run histogram kernel — input buffer is already on device
         let n_arg = n as cl_uint;
         let kernel_event = unsafe {
-            ExecuteKernel::new(&self.kernel_byte_histogram)
+            ExecuteKernel::new(self.kernel_byte_histogram())
                 .set_arg(&input.buf)
                 .set_arg(&hist_buf)
                 .set_arg(&n_arg)
@@ -176,7 +176,7 @@ impl OpenClEngine {
         // Pass 1: compute bit lengths per symbol
         let n_arg = n as cl_uint;
         let pass1_event = unsafe {
-            ExecuteKernel::new(&self.kernel_huffman_bit_lengths)
+            ExecuteKernel::new(self.kernel_huffman_bit_lengths())
                 .set_arg(&input_buf)
                 .set_arg(&lut_buf)
                 .set_arg(&bit_lengths_buf)
@@ -245,7 +245,7 @@ impl OpenClEngine {
 
         // Pass 2: write codewords at computed offsets
         let pass2_event = unsafe {
-            ExecuteKernel::new(&self.kernel_huffman_write_codes)
+            ExecuteKernel::new(self.kernel_huffman_write_codes())
                 .set_arg(&input_buf)
                 .set_arg(&lut_buf)
                 .set_arg(&offsets_buf)
@@ -356,7 +356,7 @@ impl OpenClEngine {
         let kernel_event = match block_sums_buf {
             Some(sums_buf) => unsafe {
                 let local_mem_bytes = block_size * std::mem::size_of::<cl_uint>();
-                ExecuteKernel::new(&self.kernel_prefix_sum_block)
+                ExecuteKernel::new(self.kernel_prefix_sum_block())
                     .set_arg(data_buf)
                     .set_arg(sums_buf)
                     .set_arg(&n_arg)
@@ -370,7 +370,7 @@ impl OpenClEngine {
                 // Null block_sums pointer — kernel checks for NULL
                 let null_ptr: *const cl_uint = ptr::null();
                 let local_mem_bytes = block_size * std::mem::size_of::<cl_uint>();
-                ExecuteKernel::new(&self.kernel_prefix_sum_block)
+                ExecuteKernel::new(self.kernel_prefix_sum_block())
                     .set_arg(data_buf)
                     .set_arg(&null_ptr)
                     .set_arg(&n_arg)
@@ -404,7 +404,7 @@ impl OpenClEngine {
         let global_size = n.div_ceil(apply_local) * apply_local;
 
         let kernel_event = unsafe {
-            ExecuteKernel::new(&self.kernel_prefix_sum_apply)
+            ExecuteKernel::new(self.kernel_prefix_sum_apply())
                 .set_arg(data_buf)
                 .set_arg(block_sums_buf)
                 .set_arg(&n_arg)
@@ -468,7 +468,7 @@ impl OpenClEngine {
         // Pass 1: compute bit lengths per symbol
         let n_arg = n as cl_uint;
         let pass1_event = unsafe {
-            ExecuteKernel::new(&self.kernel_huffman_bit_lengths)
+            ExecuteKernel::new(self.kernel_huffman_bit_lengths())
                 .set_arg(&input_buf)
                 .set_arg(&lut_buf)
                 .set_arg(&bit_lengths_buf)
@@ -535,7 +535,7 @@ impl OpenClEngine {
 
         // Pass 2: write codewords at GPU-computed offsets
         let pass2_event = unsafe {
-            ExecuteKernel::new(&self.kernel_huffman_write_codes)
+            ExecuteKernel::new(self.kernel_huffman_write_codes())
                 .set_arg(&input_buf)
                 .set_arg(&lut_buf)
                 .set_arg(&bit_lengths_buf) // now contains bit_offsets
@@ -610,7 +610,7 @@ impl OpenClEngine {
         // Pass 1: compute bit lengths per symbol (input buffer is on-device)
         let n_arg = n as cl_uint;
         let pass1_event = unsafe {
-            ExecuteKernel::new(&self.kernel_huffman_bit_lengths)
+            ExecuteKernel::new(self.kernel_huffman_bit_lengths())
                 .set_arg(&input.buf)
                 .set_arg(&lut_buf)
                 .set_arg(&bit_lengths_buf)
@@ -677,7 +677,7 @@ impl OpenClEngine {
 
         // Pass 2: write codewords at GPU-computed offsets (input is on-device)
         let pass2_event = unsafe {
-            ExecuteKernel::new(&self.kernel_huffman_write_codes)
+            ExecuteKernel::new(self.kernel_huffman_write_codes())
                 .set_arg(&input.buf)
                 .set_arg(&lut_buf)
                 .set_arg(&bit_lengths_buf) // now contains bit_offsets

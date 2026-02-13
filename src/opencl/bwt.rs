@@ -384,7 +384,7 @@ impl OpenClEngine {
 
             // Phase 1: Compute 8-bit digit for each element
             let key_event = unsafe {
-                let mut exec = ExecuteKernel::new(&self.kernel_radix_compute_keys);
+                let mut exec = ExecuteKernel::new(self.kernel_radix_compute_keys());
                 exec.set_arg(sa_buf as &Buffer<cl_uint>)
                     .set_arg(rank_buf)
                     .set_arg(keys_buf)
@@ -402,7 +402,7 @@ impl OpenClEngine {
 
             // Phase 2: Per-workgroup histogram
             let hist_event = unsafe {
-                let mut exec = ExecuteKernel::new(&self.kernel_radix_histogram);
+                let mut exec = ExecuteKernel::new(self.kernel_radix_histogram());
                 exec.set_arg(keys_buf as &Buffer<cl_uint>)
                     .set_arg(histogram_buf)
                     .set_arg(&padded_n_arg)
@@ -430,7 +430,7 @@ impl OpenClEngine {
             // Phase 3b: Convert inclusive to exclusive prefix sum
             let hist_len_arg = histogram_len as cl_uint;
             let excl_event = unsafe {
-                let mut exec = ExecuteKernel::new(&self.kernel_inclusive_to_exclusive);
+                let mut exec = ExecuteKernel::new(self.kernel_inclusive_to_exclusive());
                 exec.set_arg(histogram_buf_scan as &Buffer<cl_uint>)
                     .set_arg(histogram_buf)
                     .set_arg(&hist_len_arg)
@@ -442,7 +442,7 @@ impl OpenClEngine {
 
             // Phase 4: Scatter sa elements to sorted positions
             let scatter_event = unsafe {
-                let mut exec = ExecuteKernel::new(&self.kernel_radix_scatter);
+                let mut exec = ExecuteKernel::new(self.kernel_radix_scatter());
                 exec.set_arg(sa_buf as &Buffer<cl_uint>)
                     .set_arg(keys_buf as &Buffer<cl_uint>)
                     .set_arg(histogram_buf)
@@ -482,7 +482,7 @@ impl OpenClEngine {
         wait_event: Option<&Event>,
     ) -> PzResult<Event> {
         let kernel_event = unsafe {
-            let mut exec = ExecuteKernel::new(&self.kernel_rank_compare);
+            let mut exec = ExecuteKernel::new(self.kernel_rank_compare());
             exec.set_arg(sa_buf)
                 .set_arg(rank_buf)
                 .set_arg(diff_buf)
@@ -611,7 +611,7 @@ impl OpenClEngine {
         let count_arg = count as cl_uint;
         let global_size = count.div_ceil(wg_size * 2) * wg_size;
         let kernel_event = unsafe {
-            let mut exec = ExecuteKernel::new(&self.kernel_prefix_sum_local);
+            let mut exec = ExecuteKernel::new(self.kernel_prefix_sum_local());
             exec.set_arg(input_buf)
                 .set_arg(output_buf)
                 .set_arg(block_sums_buf)
@@ -641,7 +641,7 @@ impl OpenClEngine {
         let count_arg = count as cl_uint;
         let _ = block_elems; // BLOCK_ELEMS is a compile-time constant in the kernel
         let kernel_event = unsafe {
-            let mut exec = ExecuteKernel::new(&self.kernel_prefix_sum_propagate);
+            let mut exec = ExecuteKernel::new(self.kernel_prefix_sum_propagate());
             exec.set_arg(data_buf)
                 .set_arg(offsets_buf)
                 .set_arg(&count_arg)
@@ -669,7 +669,7 @@ impl OpenClEngine {
         wait_event: Option<&Event>,
     ) -> PzResult<Event> {
         let kernel_event = unsafe {
-            let mut exec = ExecuteKernel::new(&self.kernel_rank_scatter);
+            let mut exec = ExecuteKernel::new(self.kernel_rank_scatter());
             exec.set_arg(sa_buf)
                 .set_arg(prefix_buf)
                 .set_arg(new_rank_buf)
