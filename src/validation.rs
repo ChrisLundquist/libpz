@@ -1079,4 +1079,104 @@ mod tests {
         let decompressed = pipeline::decompress(&compressed).unwrap();
         assert_eq!(decompressed, input, "WebGPU Lzf GPU→CPU round-trip");
     }
+
+    // -----------------------------------------------------------------------
+    // GPU streaming pipeline round-trip tests
+    //
+    // These use multi-block inputs (>1 block) to exercise the double-buffered
+    // streaming GPU path. A small block size forces multiple blocks even on
+    // moderately sized inputs, ensuring the ring/slot logic is exercised.
+    // -----------------------------------------------------------------------
+
+    /// Generate multi-block test input: ~512KB of structured text, guaranteeing
+    /// at least 2 blocks at default block size (256KB).
+    #[cfg(any(feature = "opencl", feature = "webgpu"))]
+    fn gpu_streaming_test_input() -> Vec<u8> {
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let target_size = 512 * 1024; // 512KB = 2 blocks at 256KB default
+        let mut input = Vec::with_capacity(target_size);
+        while input.len() < target_size {
+            input.extend_from_slice(pattern);
+        }
+        input.truncate(target_size);
+        input
+    }
+
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn webgpu_streaming_round_trip_deflate() {
+        use crate::pipeline::{Backend, CompressOptions};
+        let engine = match crate::webgpu::WebGpuEngine::new() {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(crate::PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+        let input = gpu_streaming_test_input();
+        let options = CompressOptions {
+            backend: Backend::WebGpu,
+            webgpu_engine: Some(engine),
+            threads: 2,
+            ..Default::default()
+        };
+        let compressed =
+            pipeline::compress_with_options(&input, Pipeline::Deflate, &options).unwrap();
+        let decompressed = pipeline::decompress(&compressed).unwrap();
+        assert_eq!(
+            decompressed, input,
+            "WebGPU streaming Deflate round-trip (multi-block)"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn webgpu_streaming_round_trip_lzf() {
+        use crate::pipeline::{Backend, CompressOptions};
+        let engine = match crate::webgpu::WebGpuEngine::new() {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(crate::PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+        let input = gpu_streaming_test_input();
+        let options = CompressOptions {
+            backend: Backend::WebGpu,
+            webgpu_engine: Some(engine),
+            threads: 2,
+            ..Default::default()
+        };
+        let compressed = pipeline::compress_with_options(&input, Pipeline::Lzf, &options).unwrap();
+        let decompressed = pipeline::decompress(&compressed).unwrap();
+        assert_eq!(
+            decompressed, input,
+            "WebGPU streaming Lzf round-trip (multi-block)"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn webgpu_streaming_round_trip_small_blocks() {
+        use crate::pipeline::{Backend, CompressOptions};
+        let engine = match crate::webgpu::WebGpuEngine::new() {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(crate::PzError::Unsupported) => return,
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+        // Use a smaller input with small block size to create many blocks
+        let input = gpu_test_input(); // 80KB
+        let options = CompressOptions {
+            backend: Backend::WebGpu,
+            webgpu_engine: Some(engine),
+            block_size: 16 * 1024, // 16KB blocks → 5 blocks from 80KB
+            threads: 2,
+            ..Default::default()
+        };
+        // This should go through the streaming path (5 blocks > 1)
+        // or batched path, both exercising multi-block GPU code
+        let compressed =
+            pipeline::compress_with_options(&input, Pipeline::Deflate, &options).unwrap();
+        let decompressed = pipeline::decompress(&compressed).unwrap();
+        assert_eq!(
+            decompressed, input,
+            "WebGPU streaming Deflate round-trip (small blocks)"
+        );
+    }
 }

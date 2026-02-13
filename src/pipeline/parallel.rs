@@ -24,41 +24,64 @@ pub(crate) fn compress_parallel(
     options: &CompressOptions,
     num_threads: usize,
 ) -> PzResult<Vec<u8>> {
-    // Try streaming or batched GPU LZ77 path for LZ77-based pipelines with WebGPU backend
+    // Try streaming or batched GPU LZ77 path for LZ77-based pipelines
+    #[cfg(any(feature = "webgpu", feature = "opencl"))]
+    let is_batchable = {
+        let is_lz77_pipeline = matches!(
+            pipeline,
+            Pipeline::Deflate | Pipeline::Lzr | Pipeline::Lzf | Pipeline::Lzfi
+        );
+        is_lz77_pipeline && options.parse_strategy != super::ParseStrategy::Optimal
+    };
+
     #[cfg(feature = "webgpu")]
-    {
+    if is_batchable {
         if let super::Backend::WebGpu = options.backend {
             if let Some(ref engine) = options.webgpu_engine {
-                let is_lz77_pipeline = matches!(
-                    pipeline,
-                    Pipeline::Deflate | Pipeline::Lzr | Pipeline::Lzf | Pipeline::Lzfi
-                );
-                let is_batchable =
-                    is_lz77_pipeline && options.parse_strategy != super::ParseStrategy::Optimal;
-                if is_batchable {
-                    // Multi-block: use double-buffered streaming for GPU/CPU overlap
-                    let block_size = options.block_size;
-                    if input.len() > block_size {
-                        if let Some(ring) = engine.create_lz77_ring(block_size) {
-                            return compress_streaming_gpu(
-                                input,
-                                pipeline,
-                                options,
-                                num_threads,
-                                engine,
-                                ring,
-                            );
-                        }
+                // Multi-block: use double-buffered streaming for GPU/CPU overlap
+                let block_size = options.block_size;
+                if input.len() > block_size {
+                    if let Some(ring) = engine.create_lz77_ring(block_size) {
+                        return compress_streaming_gpu(
+                            input,
+                            pipeline,
+                            options,
+                            num_threads,
+                            engine,
+                            ring,
+                        );
                     }
-                    // Single-block or insufficient GPU memory: use existing batched path
-                    return compress_parallel_gpu_batched(
-                        input,
-                        pipeline,
-                        options,
-                        num_threads,
-                        engine,
-                    );
                 }
+                // Single-block or insufficient GPU memory: use existing batched path
+                return compress_parallel_gpu_batched(
+                    input,
+                    pipeline,
+                    options,
+                    num_threads,
+                    engine,
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "opencl")]
+    if is_batchable {
+        if let super::Backend::OpenCl = options.backend {
+            if let Some(ref engine) = options.opencl_engine {
+                let block_size = options.block_size;
+                if input.len() > block_size {
+                    if let Some(ring) = engine.create_lz77_ring(block_size) {
+                        return compress_streaming_gpu_opencl(
+                            input,
+                            pipeline,
+                            options,
+                            num_threads,
+                            engine,
+                            ring,
+                        );
+                    }
+                }
+                // Single-block: fall through to default block-parallel path
             }
         }
     }
@@ -204,27 +227,7 @@ fn compress_parallel_gpu_batched(
         results.into_iter().map(|r| r.unwrap()).collect::<Vec<_>>()
     });
 
-    // Check for errors and collect
-    let mut block_data_vec: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
-    for result in compressed_blocks {
-        block_data_vec.push(result?);
-    }
-
-    // Build output: V2 header + num_blocks + block_table + block_data
-    let mut output = Vec::new();
-    write_header(&mut output, pipeline, input.len());
-    output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
-    for (i, compressed) in block_data_vec.iter().enumerate() {
-        let orig_block_len = blocks[i].len() as u32;
-        let comp_block_len = compressed.len() as u32;
-        output.extend_from_slice(&comp_block_len.to_le_bytes());
-        output.extend_from_slice(&orig_block_len.to_le_bytes());
-    }
-    for compressed in &block_data_vec {
-        output.extend_from_slice(compressed);
-    }
-
-    Ok(output)
+    assemble_multiblock_output(input, pipeline, block_size, &compressed_blocks)
 }
 
 /// Double-buffered streaming GPU compression for multi-block inputs.
@@ -285,25 +288,42 @@ fn compress_streaming_gpu(
 
         // GPU coordinator thread — owns worker_txs so it can signal
         // completion by dropping all senders when done.
+        //
+        // `slot_inflight` tracks which block index is in-flight on each slot.
+        // We borrow from `blocks` (which borrows `input`) to avoid copying.
         scope.spawn(move || {
             let worker_txs = worker_txs; // move into closure
-            let mut slot_inflight: Vec<Option<(usize, Vec<u8>)>> = vec![None; ring_depth];
+            let mut slot_inflight: Vec<Option<usize>> = vec![None; ring_depth];
             let mut next_worker = 0usize;
 
             for (block_idx, block) in blocks.iter().enumerate() {
                 let slot_idx = ring.acquire();
 
                 // If this slot has previous in-flight work, complete it first
-                if let Some((prev_idx, prev_input)) = slot_inflight[slot_idx].take() {
+                if let Some(prev_idx) = slot_inflight[slot_idx].take() {
                     engine.poll_wait();
-                    let matches = engine
-                        .complete_lz77_from_slot(&ring.slots[slot_idx], &prev_input)
-                        .unwrap_or_default();
-                    let _ = worker_txs[next_worker % cpu_workers].send((
-                        prev_idx,
-                        matches,
-                        prev_input.len(),
-                    ));
+                    let prev_block = blocks[prev_idx];
+                    let result = engine.complete_lz77_from_slot(&ring.slots[slot_idx], prev_block);
+                    match result {
+                        Ok(matches) => {
+                            let _ = worker_txs[next_worker % cpu_workers].send((
+                                prev_idx,
+                                matches,
+                                prev_block.len(),
+                            ));
+                        }
+                        Err(e) => {
+                            eprintln!("[pz-gpu] streaming slot readback failed: {e}");
+                            // Fall back to CPU for this block
+                            let matches = crate::lz77::compress_lazy_to_matches(prev_block)
+                                .unwrap_or_default();
+                            let _ = worker_txs[next_worker % cpu_workers].send((
+                                prev_idx,
+                                matches,
+                                prev_block.len(),
+                            ));
+                        }
+                    }
                     next_worker += 1;
                 }
 
@@ -320,8 +340,8 @@ fn compress_streaming_gpu(
                         block.len(),
                     ));
                     next_worker += 1;
-                } else if let Err(_e) = engine.submit_lz77_to_slot(block, &ring.slots[slot_idx]) {
-                    // GPU submission failed — fall back to CPU
+                } else if let Err(e) = engine.submit_lz77_to_slot(block, &ring.slots[slot_idx]) {
+                    eprintln!("[pz-gpu] streaming slot submission failed: {e}");
                     let matches = crate::lz77::compress_lazy_to_matches(block).unwrap_or_default();
                     let _ = worker_txs[next_worker % cpu_workers].send((
                         block_idx,
@@ -330,22 +350,35 @@ fn compress_streaming_gpu(
                     ));
                     next_worker += 1;
                 } else {
-                    slot_inflight[slot_idx] = Some((block_idx, block.to_vec()));
+                    slot_inflight[slot_idx] = Some(block_idx);
                 }
             }
 
             // Drain remaining in-flight slots
             for slot_idx in 0..ring_depth {
-                if let Some((prev_idx, prev_input)) = slot_inflight[slot_idx].take() {
+                if let Some(prev_idx) = slot_inflight[slot_idx].take() {
                     engine.poll_wait();
-                    let matches = engine
-                        .complete_lz77_from_slot(&ring.slots[slot_idx], &prev_input)
-                        .unwrap_or_default();
-                    let _ = worker_txs[next_worker % cpu_workers].send((
-                        prev_idx,
-                        matches,
-                        prev_input.len(),
-                    ));
+                    let prev_block = blocks[prev_idx];
+                    let result = engine.complete_lz77_from_slot(&ring.slots[slot_idx], prev_block);
+                    match result {
+                        Ok(matches) => {
+                            let _ = worker_txs[next_worker % cpu_workers].send((
+                                prev_idx,
+                                matches,
+                                prev_block.len(),
+                            ));
+                        }
+                        Err(e) => {
+                            eprintln!("[pz-gpu] streaming slot readback failed: {e}");
+                            let matches = crate::lz77::compress_lazy_to_matches(prev_block)
+                                .unwrap_or_default();
+                            let _ = worker_txs[next_worker % cpu_workers].send((
+                                prev_idx,
+                                matches,
+                                prev_block.len(),
+                            ));
+                        }
+                    }
                     next_worker += 1;
                 }
             }
@@ -364,19 +397,37 @@ fn compress_streaming_gpu(
             .collect::<Vec<_>>()
     });
 
-    // Check for errors and collect
-    let mut block_data_vec: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
+    // Build output
+    assemble_multiblock_output(input, pipeline, block_size, &compressed_blocks)
+}
+
+/// Assemble the multi-block container from per-block compressed results.
+///
+/// Shared by all GPU paths (batched, streaming-webgpu, streaming-opencl)
+/// to avoid duplicating the header/table/data assembly logic.
+#[cfg(any(feature = "webgpu", feature = "opencl"))]
+fn assemble_multiblock_output(
+    input: &[u8],
+    pipeline: Pipeline,
+    block_size: usize,
+    compressed_blocks: &[PzResult<Vec<u8>>],
+) -> PzResult<Vec<u8>> {
+    let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
+    let num_blocks = blocks.len();
+
+    let mut block_data_vec: Vec<&Vec<u8>> = Vec::with_capacity(num_blocks);
     for result in compressed_blocks {
-        block_data_vec.push(result?);
+        match result {
+            Ok(data) => block_data_vec.push(data),
+            Err(e) => return Err(e.clone()),
+        }
     }
 
-    // Build output: V2 header + num_blocks + block_table + block_data
     let mut output = Vec::new();
     write_header(&mut output, pipeline, input.len());
     output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
-    let block_chunks: Vec<&[u8]> = input.chunks(block_size).collect();
     for (i, compressed) in block_data_vec.iter().enumerate() {
-        let orig_block_len = block_chunks[i].len() as u32;
+        let orig_block_len = blocks[i].len() as u32;
         let comp_block_len = compressed.len() as u32;
         output.extend_from_slice(&comp_block_len.to_le_bytes());
         output.extend_from_slice(&orig_block_len.to_le_bytes());
@@ -386,6 +437,159 @@ fn compress_streaming_gpu(
     }
 
     Ok(output)
+}
+
+/// Double-buffered streaming GPU compression for multi-block inputs (OpenCL).
+///
+/// Same architecture as the WebGPU streaming path: overlaps GPU LZ77 matching
+/// with CPU entropy encoding via a ring of pre-allocated OpenCL buffer slots.
+/// OpenCL uses event-chained kernel dispatches (non-blocking uploads +
+/// `set_wait_event`) instead of WebGPU's command buffer model.
+#[cfg(feature = "opencl")]
+fn compress_streaming_gpu_opencl(
+    input: &[u8],
+    pipeline: Pipeline,
+    options: &CompressOptions,
+    num_threads: usize,
+    engine: &crate::opencl::OpenClEngine,
+    mut ring: crate::opencl::lz77::BufferRing<crate::opencl::lz77::Lz77BufferSlot>,
+) -> PzResult<Vec<u8>> {
+    let block_size = options.block_size;
+    let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
+    let num_blocks = blocks.len();
+    let ring_depth = ring.depth();
+
+    let cpu_workers = (num_threads.saturating_sub(1)).max(1);
+
+    let compressed_blocks: Vec<PzResult<Vec<u8>>> = std::thread::scope(|scope| {
+        use std::sync::mpsc;
+
+        let mut worker_txs: Vec<mpsc::SyncSender<(usize, Vec<crate::lz77::Match>, usize)>> =
+            Vec::with_capacity(cpu_workers);
+        let (result_tx, result_rx) = mpsc::sync_channel::<(usize, PzResult<Vec<u8>>)>(num_blocks);
+
+        for _ in 0..cpu_workers {
+            let (tx, rx) =
+                mpsc::sync_channel::<(usize, Vec<crate::lz77::Match>, usize)>(ring_depth);
+            worker_txs.push(tx);
+            let rtx = result_tx.clone();
+            scope.spawn(move || {
+                while let Ok((block_idx, matches, original_len)) = rx.recv() {
+                    let result = entropy_encode_lz77_block(&matches, original_len, pipeline);
+                    let _ = rtx.send((block_idx, result));
+                }
+            });
+        }
+        drop(result_tx);
+
+        scope.spawn(move || {
+            let worker_txs = worker_txs;
+            // Track (block_index, PendingSlotWork) per slot
+            let mut slot_inflight: Vec<Option<(usize, crate::opencl::lz77::PendingSlotWork)>> =
+                vec![None; ring_depth];
+            let mut next_worker = 0usize;
+
+            for (block_idx, block) in blocks.iter().enumerate() {
+                let slot_idx = ring.acquire();
+
+                // Complete previous in-flight work on this slot
+                if let Some((prev_idx, pending)) = slot_inflight[slot_idx].take() {
+                    let prev_block = blocks[prev_idx];
+                    let result =
+                        engine.complete_lz77_from_slot(&ring.slots[slot_idx], &pending, prev_block);
+                    match result {
+                        Ok(matches) => {
+                            let _ = worker_txs[next_worker % cpu_workers].send((
+                                prev_idx,
+                                matches,
+                                prev_block.len(),
+                            ));
+                        }
+                        Err(e) => {
+                            eprintln!("[pz-gpu] opencl streaming slot readback failed: {e}");
+                            let matches = crate::lz77::compress_lazy_to_matches(prev_block)
+                                .unwrap_or_default();
+                            let _ = worker_txs[next_worker % cpu_workers].send((
+                                prev_idx,
+                                matches,
+                                prev_block.len(),
+                            ));
+                        }
+                    }
+                    next_worker += 1;
+                }
+
+                // Submit new block
+                if block.is_empty() || block.len() < crate::opencl::MIN_GPU_INPUT_SIZE {
+                    let matches = crate::lz77::compress_lazy_to_matches(block).unwrap_or_default();
+                    let _ = worker_txs[next_worker % cpu_workers].send((
+                        block_idx,
+                        matches,
+                        block.len(),
+                    ));
+                    next_worker += 1;
+                } else {
+                    match engine.submit_lz77_to_slot(block, &mut ring.slots[slot_idx]) {
+                        Ok(pending) => {
+                            slot_inflight[slot_idx] = Some((block_idx, pending));
+                        }
+                        Err(e) => {
+                            eprintln!("[pz-gpu] opencl streaming slot submission failed: {e}");
+                            let matches =
+                                crate::lz77::compress_lazy_to_matches(block).unwrap_or_default();
+                            let _ = worker_txs[next_worker % cpu_workers].send((
+                                block_idx,
+                                matches,
+                                block.len(),
+                            ));
+                            next_worker += 1;
+                        }
+                    }
+                }
+            }
+
+            // Drain remaining in-flight slots
+            for slot_idx in 0..ring_depth {
+                if let Some((prev_idx, pending)) = slot_inflight[slot_idx].take() {
+                    let prev_block = blocks[prev_idx];
+                    let result =
+                        engine.complete_lz77_from_slot(&ring.slots[slot_idx], &pending, prev_block);
+                    match result {
+                        Ok(matches) => {
+                            let _ = worker_txs[next_worker % cpu_workers].send((
+                                prev_idx,
+                                matches,
+                                prev_block.len(),
+                            ));
+                        }
+                        Err(e) => {
+                            eprintln!("[pz-gpu] opencl streaming slot readback failed: {e}");
+                            let matches = crate::lz77::compress_lazy_to_matches(prev_block)
+                                .unwrap_or_default();
+                            let _ = worker_txs[next_worker % cpu_workers].send((
+                                prev_idx,
+                                matches,
+                                prev_block.len(),
+                            ));
+                        }
+                    }
+                    next_worker += 1;
+                }
+            }
+        });
+
+        // Collector
+        let mut results: Vec<Option<PzResult<Vec<u8>>>> = (0..num_blocks).map(|_| None).collect();
+        for (idx, result) in result_rx {
+            results[idx] = Some(result);
+        }
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or(Err(PzError::InvalidInput)))
+            .collect::<Vec<_>>()
+    });
+
+    assemble_multiblock_output(input, pipeline, block_size, &compressed_blocks)
 }
 
 /// Demux LZ77 matches into 3 streams (offsets, lengths, literals) and apply

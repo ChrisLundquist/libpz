@@ -519,25 +519,7 @@ impl OpenClEngine {
 // Streaming buffer slots for double/triple-buffered GPU pipeline
 // ---------------------------------------------------------------------------
 
-/// Round-robin ring of pre-allocated buffer slots for streaming GPU work.
-pub(crate) struct BufferRing<S> {
-    pub(crate) slots: Vec<S>,
-    pub(crate) next: usize,
-}
-
-impl<S> BufferRing<S> {
-    /// Acquire the next slot index, advancing the ring pointer.
-    pub(crate) fn acquire(&mut self) -> usize {
-        let idx = self.next;
-        self.next = (self.next + 1) % self.slots.len();
-        idx
-    }
-
-    /// Number of slots in the ring.
-    pub(crate) fn depth(&self) -> usize {
-        self.slots.len()
-    }
-}
+pub(crate) use crate::gpu_common::BufferRing;
 
 /// Pre-allocated GPU buffer set for one block's LZ77 hash-table computation.
 ///
@@ -630,7 +612,7 @@ impl OpenClEngine {
                 Err(_) => return None,
             }
         }
-        Some(BufferRing { slots, next: 0 })
+        Some(BufferRing::new(slots))
     }
 
     /// Submit LZ77 hash-table matching to a pre-allocated slot using

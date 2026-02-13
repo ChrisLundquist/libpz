@@ -6,6 +6,8 @@ use super::*;
 // Buffer ring for double/triple-buffered GPU streaming
 // ---------------------------------------------------------------------------
 
+pub(crate) use crate::gpu_common::BufferRing;
+
 /// Pre-allocated GPU buffer set for one block's LZ77 lazy computation.
 ///
 /// Reusing pre-allocated slots across blocks avoids per-block buffer
@@ -20,26 +22,6 @@ pub(crate) struct Lz77BufferSlot {
     pub(crate) resolved_buf: wgpu::Buffer,
     pub(crate) staging_buf: wgpu::Buffer,
     pub(crate) capacity: usize,
-}
-
-/// Round-robin ring of pre-allocated buffer slots for streaming GPU work.
-pub(crate) struct BufferRing<S> {
-    pub(crate) slots: Vec<S>,
-    next: usize,
-}
-
-impl<S> BufferRing<S> {
-    /// Acquire the next slot index, advancing the ring pointer.
-    pub(crate) fn acquire(&mut self) -> usize {
-        let idx = self.next;
-        self.next = (self.next + 1) % self.slots.len();
-        idx
-    }
-
-    /// Number of slots in the ring.
-    pub(crate) fn depth(&self) -> usize {
-        self.slots.len()
-    }
 }
 
 impl WebGpuEngine {
@@ -886,7 +868,7 @@ impl WebGpuEngine {
         let slots = (0..depth)
             .map(|_| self.alloc_lz77_slot(block_size))
             .collect();
-        Some(BufferRing { slots, next: 0 })
+        Some(BufferRing::new(slots))
     }
 
     /// Submit LZ77 lazy matching work to a pre-allocated buffer slot.
