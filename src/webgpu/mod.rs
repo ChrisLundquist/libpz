@@ -192,8 +192,6 @@ pub struct WebGpuEngine {
     query_set: Option<wgpu::QuerySet>,
     /// Buffer to resolve timestamp queries into.
     resolve_buf: Option<wgpu::Buffer>,
-    /// Staging buffer for reading back resolved timestamps.
-    staging_buf: Option<wgpu::Buffer>,
 }
 
 impl std::fmt::Debug for WebGpuEngine {
@@ -373,7 +371,7 @@ impl WebGpuEngine {
             .expect("lz77_lazy.wgsl missing @pz_cost annotation");
 
         // Create profiling resources when GPU timestamps are available.
-        let (query_set, resolve_buf, staging_buf) = if use_timestamps {
+        let (query_set, resolve_buf) = if use_timestamps {
             let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("timestamp_query_set"),
                 ty: wgpu::QueryType::Timestamp,
@@ -385,15 +383,9 @@ impl WebGpuEngine {
                 usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
-            let staging = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("timestamp_staging"),
-                size: 2 * std::mem::size_of::<u64>() as u64,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            (Some(qs), Some(resolve), Some(staging))
+            (Some(qs), Some(resolve))
         } else {
-            (None, None, None)
+            (None, None)
         };
 
         Ok(WebGpuEngine {
@@ -427,7 +419,6 @@ impl WebGpuEngine {
             profiling,
             query_set,
             resolve_buf,
-            staging_buf,
         })
     }
 
@@ -461,9 +452,29 @@ impl WebGpuEngine {
         (self.gpu_memory_budget() / per_block).max(1)
     }
 
-    /// Conservative GPU memory budget: 50% of max_buffer_size.
+    /// GPU memory budget for concurrent in-flight work.
+    ///
+    /// Discrete GPUs have far more VRAM than `max_buffer_size` (which is a
+    /// per-buffer WebGPU limit, typically 256MB-1GB). Use 4× max_buffer_size
+    /// as a proxy for total available memory, which is still conservative for
+    /// cards with 8-16GB VRAM but allows enough headroom to submit many
+    /// blocks in parallel.
     fn gpu_memory_budget(&self) -> usize {
-        (self.max_buffer_size as usize) / 2
+        if self.is_cpu {
+            // Integrated/CPU devices: be conservative
+            (self.max_buffer_size as usize) / 2
+        } else {
+            // Discrete GPU: allow 4× max_buffer_size (~1-4GB on modern cards)
+            (self.max_buffer_size as usize) * 4
+        }
+    }
+
+    /// Compute the batch size for LZ77 GPU dispatches, based on the cost model
+    /// and memory budget. Exposed for the pipelined batched path in `parallel.rs`.
+    pub(crate) fn lz77_batch_size(&self, block_size: usize) -> usize {
+        const GPU_MAX_BATCH: usize = 64;
+        let mem_limit = self.max_in_flight(&self.cost_lz77_lazy, block_size);
+        mem_limit.min(GPU_MAX_BATCH)
     }
 
     /// Maximum input size (bytes) that fits in a single GPU dispatch.
@@ -628,12 +639,21 @@ impl WebGpuEngine {
     }
 
     /// Resolve timestamp queries, read back, and print elapsed time.
+    ///
+    /// Uses a per-call staging buffer instead of the shared `self.staging_buf`
+    /// to avoid "buffer is still mapped" panics when called from multiple
+    /// threads or re-entrantly within the same dispatch sequence.
     fn read_and_print_timestamps(&self, label: &str) {
-        let (Some(qs), Some(resolve), Some(staging)) =
-            (&self.query_set, &self.resolve_buf, &self.staging_buf)
-        else {
+        let (Some(qs), Some(resolve)) = (&self.query_set, &self.resolve_buf) else {
             return;
         };
+
+        // Allocate a per-call staging buffer to avoid races with the shared one.
+        let staging = self.create_buffer(
+            "timestamp_staging_local",
+            2 * std::mem::size_of::<u64>() as u64,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
 
         let mut encoder = self
             .device
@@ -641,7 +661,7 @@ impl WebGpuEngine {
                 label: Some("timestamp_resolve"),
             });
         encoder.resolve_query_set(qs, 0..2, resolve, 0);
-        encoder.copy_buffer_to_buffer(resolve, 0, staging, 0, 16);
+        encoder.copy_buffer_to_buffer(resolve, 0, &staging, 0, 16);
         self.queue.submit(Some(encoder.finish()));
 
         let slice = staging.slice(..);
