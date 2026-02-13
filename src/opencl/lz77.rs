@@ -167,7 +167,7 @@ impl OpenClEngine {
         let global_size = input_len;
 
         let kernel_event = unsafe {
-            ExecuteKernel::new(self.kernel_per_pos())
+            ExecuteKernel::new(&self.kernel_per_pos)
                 .set_arg(input_buf)
                 .set_arg(output_buf)
                 .set_arg(&count)
@@ -193,7 +193,7 @@ impl OpenClEngine {
         let num_work_items = input_len.div_ceil(BATCH_STEP_SIZE);
 
         let kernel_event = unsafe {
-            ExecuteKernel::new(self.kernel_batch())
+            ExecuteKernel::new(&self.kernel_batch)
                 .set_arg(input_buf)
                 .set_arg(output_buf)
                 .set_arg(&count)
@@ -254,7 +254,7 @@ impl OpenClEngine {
 
         // Pass 1: Build hash table
         let build_event = unsafe {
-            ExecuteKernel::new(self.kernel_hash_build())
+            ExecuteKernel::new(&self.kernel_hash_build)
                 .set_arg(input_buf)
                 .set_arg(&count)
                 .set_arg(&hash_counts_buf)
@@ -268,7 +268,7 @@ impl OpenClEngine {
 
         // Pass 2: Find matches
         let find_event = unsafe {
-            ExecuteKernel::new(self.kernel_hash_find())
+            ExecuteKernel::new(&self.kernel_hash_find)
                 .set_arg(input_buf)
                 .set_arg(&count)
                 .set_arg(&hash_counts_buf)
@@ -340,7 +340,7 @@ impl OpenClEngine {
         // Execute top-K kernel
         let count = input_len as cl_uint;
         let kernel_event = unsafe {
-            ExecuteKernel::new(self.kernel_topk())
+            ExecuteKernel::new(&self.kernel_topk)
                 .set_arg(&input_buf)
                 .set_arg(&output_buf)
                 .set_arg(&count)

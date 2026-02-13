@@ -226,7 +226,7 @@ impl OpenClEngine {
         let wg_size = num_streams.min(self.max_work_group_size).max(1);
         let global_size = num_streams.div_ceil(wg_size) * wg_size;
         let kernel_event = unsafe {
-            ExecuteKernel::new(self.kernel_fse_decode())
+            ExecuteKernel::new(&self.kernel_fse_decode)
                 .set_arg(&decode_table_buf)
                 .set_arg(&bitstream_buf)
                 .set_arg(&stream_meta_buf)

@@ -28,7 +28,7 @@ impl WebGpuEngine {
             wgpu::BufferUsages::UNIFORM,
         );
 
-        let bg_layout = self.pipeline_byte_histogram().get_bind_group_layout(0);
+        let bg_layout = self.pipeline_byte_histogram.get_bind_group_layout(0);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("hist_bg"),
             layout: &bg_layout,
@@ -49,7 +49,7 @@ impl WebGpuEngine {
         });
 
         self.dispatch(
-            self.pipeline_byte_histogram(),
+            &self.pipeline_byte_histogram,
             &bg,
             workgroups,
             "byte_histogram",
@@ -88,7 +88,7 @@ impl WebGpuEngine {
             wgpu::BufferUsages::UNIFORM,
         );
 
-        let bg_layout = self.pipeline_byte_histogram().get_bind_group_layout(0);
+        let bg_layout = self.pipeline_byte_histogram.get_bind_group_layout(0);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("hist_od_bg"),
             layout: &bg_layout,
@@ -109,7 +109,7 @@ impl WebGpuEngine {
         });
 
         self.dispatch(
-            self.pipeline_byte_histogram(),
+            &self.pipeline_byte_histogram,
             &bg,
             workgroups,
             "byte_histogram_on_device",
@@ -158,7 +158,7 @@ impl WebGpuEngine {
         );
 
         // Pass 1: compute bit lengths
-        let bg1_layout = self.pipeline_compute_bit_lengths().get_bind_group_layout(0);
+        let bg1_layout = self.pipeline_compute_bit_lengths.get_bind_group_layout(0);
         let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("huff_pass1_bg"),
             layout: &bg1_layout,
@@ -183,7 +183,7 @@ impl WebGpuEngine {
         });
 
         self.dispatch(
-            self.pipeline_compute_bit_lengths(),
+            &self.pipeline_compute_bit_lengths,
             &bg1,
             workgroups,
             "huff_pass1",
@@ -219,7 +219,7 @@ impl WebGpuEngine {
         );
 
         // Pass 2: write codes
-        let bg2_layout = self.pipeline_write_codes().get_bind_group_layout(0);
+        let bg2_layout = self.pipeline_write_codes.get_bind_group_layout(0);
         let bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("huff_pass2_bg"),
             layout: &bg2_layout,
@@ -247,7 +247,7 @@ impl WebGpuEngine {
             ],
         });
 
-        self.dispatch(self.pipeline_write_codes(), &bg2, workgroups, "huff_pass2")?;
+        self.dispatch(&self.pipeline_write_codes, &bg2, workgroups, "huff_pass2")?;
 
         // Download output
         let raw_output = self.read_buffer(&output_buf, (output_uints * 4) as u64);
@@ -309,7 +309,7 @@ impl WebGpuEngine {
         );
 
         // Pass 1: compute bit lengths
-        let bg1_layout = self.pipeline_compute_bit_lengths().get_bind_group_layout(0);
+        let bg1_layout = self.pipeline_compute_bit_lengths.get_bind_group_layout(0);
         let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("huff_gs_pass1_bg"),
             layout: &bg1_layout,
@@ -333,7 +333,7 @@ impl WebGpuEngine {
             ],
         });
         self.dispatch(
-            self.pipeline_compute_bit_lengths(),
+            &self.pipeline_compute_bit_lengths,
             &bg1,
             workgroups,
             "huff_gs_pass1",
@@ -370,7 +370,7 @@ impl WebGpuEngine {
         );
 
         // Pass 2: write codes (bit_lengths_buf now contains offsets)
-        let bg2_layout = self.pipeline_write_codes().get_bind_group_layout(0);
+        let bg2_layout = self.pipeline_write_codes.get_bind_group_layout(0);
         let bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("huff_gs_pass2_bg"),
             layout: &bg2_layout,
@@ -399,7 +399,7 @@ impl WebGpuEngine {
         });
 
         self.dispatch(
-            self.pipeline_write_codes(),
+            &self.pipeline_write_codes,
             &bg2,
             workgroups,
             "huff_gs_pass2",
@@ -463,7 +463,7 @@ impl WebGpuEngine {
         );
 
         // Pass 1: compute bit lengths (input buffer is on-device)
-        let bg1_layout = self.pipeline_compute_bit_lengths().get_bind_group_layout(0);
+        let bg1_layout = self.pipeline_compute_bit_lengths.get_bind_group_layout(0);
         let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("huff_od_pass1_bg"),
             layout: &bg1_layout,
@@ -487,7 +487,7 @@ impl WebGpuEngine {
             ],
         });
         self.dispatch(
-            self.pipeline_compute_bit_lengths(),
+            &self.pipeline_compute_bit_lengths,
             &bg1,
             workgroups,
             "huff_od_pass1",
@@ -524,7 +524,7 @@ impl WebGpuEngine {
         );
 
         // Pass 2: write codes (bit_lengths_buf now contains offsets, input is on-device)
-        let bg2_layout = self.pipeline_write_codes().get_bind_group_layout(0);
+        let bg2_layout = self.pipeline_write_codes.get_bind_group_layout(0);
         let bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("huff_od_pass2_bg"),
             layout: &bg2_layout,
@@ -553,7 +553,7 @@ impl WebGpuEngine {
         });
 
         self.dispatch(
-            self.pipeline_write_codes(),
+            &self.pipeline_write_codes,
             &bg2,
             workgroups,
             "huff_od_pass2",

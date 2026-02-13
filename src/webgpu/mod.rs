@@ -32,8 +32,6 @@ use crate::gpu_cost::KernelCost;
 use crate::lz77::Match;
 use crate::{PzError, PzResult};
 
-use std::sync::OnceLock;
-
 use wgpu::util::DeviceExt;
 
 mod bwt;
@@ -151,80 +149,33 @@ pub fn device_count() -> usize {
     probe_devices().len()
 }
 
-// ---------------------------------------------------------------------------
-// Lazy pipeline group structs — one per WGSL shader module.
-// Pipelines are compiled on first use via OnceLock, not at engine creation.
-// ---------------------------------------------------------------------------
-
-/// LZ77 top-K pipeline (1 pipeline from lz77_topk.wgsl).
-struct Lz77TopkPipelines {
-    topk: wgpu::ComputePipeline,
-}
-
-/// LZ77 hash-table pipelines (2 pipelines from lz77_hash.wgsl).
-struct Lz77HashPipelines {
-    build: wgpu::ComputePipeline,
-    find: wgpu::ComputePipeline,
-}
-
-/// LZ77 lazy-matching pipelines (3 pipelines from lz77_lazy.wgsl).
-struct Lz77LazyPipelines {
-    build: wgpu::ComputePipeline,
-    find: wgpu::ComputePipeline,
-    resolve: wgpu::ComputePipeline,
-}
-
-/// BWT rank pipelines (4 pipelines from bwt_rank.wgsl).
-struct BwtRankPipelines {
-    rank_compare: wgpu::ComputePipeline,
-    prefix_sum_local: wgpu::ComputePipeline,
-    prefix_sum_propagate: wgpu::ComputePipeline,
-    rank_scatter: wgpu::ComputePipeline,
-}
-
-/// BWT radix sort pipelines (4 pipelines from bwt_radix.wgsl).
-struct BwtRadixPipelines {
-    compute_keys: wgpu::ComputePipeline,
-    histogram: wgpu::ComputePipeline,
-    inclusive_to_exclusive: wgpu::ComputePipeline,
-    scatter: wgpu::ComputePipeline,
-}
-
-/// Huffman encoding pipelines (3 pipelines from huffman_encode.wgsl).
-struct HuffmanPipelines {
-    byte_histogram: wgpu::ComputePipeline,
-    compute_bit_lengths: wgpu::ComputePipeline,
-    write_codes: wgpu::ComputePipeline,
-}
-
-/// FSE decode pipeline (1 pipeline from fse_decode.wgsl).
-struct FseDecodePipelines {
-    decode: wgpu::ComputePipeline,
-}
-
-/// FSE encode pipeline (1 pipeline from fse_encode.wgsl).
-struct FseEncodePipelines {
-    encode: wgpu::ComputePipeline,
-}
-
 /// WebGPU compute engine.
 ///
-/// Manages the wgpu device, queue, and lazily-compiled compute pipelines.
+/// Manages the wgpu device, queue, and compiled shader modules.
 /// Create one engine at library init time and reuse it across calls.
-/// Pipelines are compiled on first use to avoid paying startup cost for
-/// shader modules that the requested pipeline doesn't need.
 pub struct WebGpuEngine {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    // Lazily-compiled pipeline groups (one OnceLock per WGSL shader module).
-    lz77_topk: OnceLock<Lz77TopkPipelines>,
-    lz77_hash: OnceLock<Lz77HashPipelines>,
-    lz77_lazy: OnceLock<Lz77LazyPipelines>,
-    bwt_rank: OnceLock<BwtRankPipelines>,
-    bwt_radix: OnceLock<BwtRadixPipelines>,
-    huffman: OnceLock<HuffmanPipelines>,
-    fse_decode: OnceLock<FseDecodePipelines>,
-    fse_encode: OnceLock<FseEncodePipelines>,
+    // Cached compute pipelines (created once at init, like OpenCL kernel objects)
+    pipeline_lz77_topk: wgpu::ComputePipeline,
+    pipeline_lz77_hash_build: wgpu::ComputePipeline,
+    pipeline_lz77_hash_find: wgpu::ComputePipeline,
+    pipeline_lz77_lazy_build: wgpu::ComputePipeline,
+    pipeline_lz77_lazy_find: wgpu::ComputePipeline,
+    pipeline_lz77_lazy_resolve: wgpu::ComputePipeline,
+    pipeline_rank_compare: wgpu::ComputePipeline,
+    pipeline_prefix_sum_local: wgpu::ComputePipeline,
+    pipeline_prefix_sum_propagate: wgpu::ComputePipeline,
+    pipeline_rank_scatter: wgpu::ComputePipeline,
+    pipeline_radix_compute_keys: wgpu::ComputePipeline,
+    pipeline_radix_histogram: wgpu::ComputePipeline,
+    pipeline_inclusive_to_exclusive: wgpu::ComputePipeline,
+    pipeline_radix_scatter: wgpu::ComputePipeline,
+    pipeline_byte_histogram: wgpu::ComputePipeline,
+    pipeline_compute_bit_lengths: wgpu::ComputePipeline,
+    pipeline_write_codes: wgpu::ComputePipeline,
+    pipeline_fse_decode: wgpu::ComputePipeline,
+    pipeline_fse_encode: wgpu::ComputePipeline,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum compute workgroup size.
@@ -326,7 +277,89 @@ impl WebGpuEngine {
         let capped = max_work_group_size.clamp(1, 256);
         let scan_workgroup_size = 1 << (usize::BITS - 1 - capped.leading_zeros());
 
-        // Parse kernel cost annotations for batch scheduling (cheap string parse).
+        // Helper: compile a WGSL shader module, printing elapsed time when profiling.
+        let compile_module = |label: &str, source: &str| -> wgpu::ShaderModule {
+            let t0 = std::time::Instant::now();
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            if profiling {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[pz-gpu] compile {label}.wgsl: {ms:.3} ms");
+            }
+            module
+        };
+
+        let lz77_topk_module = compile_module("lz77_topk", LZ77_TOPK_KERNEL_SOURCE);
+        let lz77_hash_module = compile_module("lz77_hash", LZ77_HASH_KERNEL_SOURCE);
+        let lz77_lazy_module = compile_module("lz77_lazy", LZ77_LAZY_KERNEL_SOURCE);
+        let bwt_rank_module = compile_module("bwt_rank", BWT_RANK_KERNEL_SOURCE);
+        let bwt_radix_module = compile_module("bwt_radix", BWT_RADIX_KERNEL_SOURCE);
+        let huffman_module = compile_module("huffman_encode", HUFFMAN_ENCODE_KERNEL_SOURCE);
+        let fse_decode_module = compile_module("fse_decode", FSE_DECODE_KERNEL_SOURCE);
+        let fse_encode_module = compile_module("fse_encode", FSE_ENCODE_KERNEL_SOURCE);
+
+        // Helper to create a compute pipeline from a module + entry point.
+        let make_pipeline =
+            |label: &str, module: &wgpu::ShaderModule, entry: &str| -> wgpu::ComputePipeline {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(label),
+                    layout: None,
+                    module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+            };
+
+        // Cache all 18 compute pipelines at init time (mirroring OpenCL kernel caching).
+        let pipeline_lz77_topk = make_pipeline("lz77_topk", &lz77_topk_module, "encode_topk");
+        let pipeline_lz77_hash_build =
+            make_pipeline("lz77_hash_build", &lz77_hash_module, "build_hash_table");
+        let pipeline_lz77_hash_find =
+            make_pipeline("lz77_hash_find", &lz77_hash_module, "find_matches");
+        let pipeline_lz77_lazy_build =
+            make_pipeline("lz77_lazy_build", &lz77_lazy_module, "build_hash_table");
+        let pipeline_lz77_lazy_find =
+            make_pipeline("lz77_lazy_find", &lz77_lazy_module, "find_matches");
+        let pipeline_lz77_lazy_resolve =
+            make_pipeline("lz77_lazy_resolve", &lz77_lazy_module, "resolve_lazy");
+        let pipeline_rank_compare = make_pipeline("rank_compare", &bwt_rank_module, "rank_compare");
+        let pipeline_prefix_sum_local =
+            make_pipeline("prefix_sum_local", &bwt_rank_module, "prefix_sum_local");
+        let pipeline_prefix_sum_propagate = make_pipeline(
+            "prefix_sum_propagate",
+            &bwt_rank_module,
+            "prefix_sum_propagate",
+        );
+        let pipeline_rank_scatter = make_pipeline("rank_scatter", &bwt_rank_module, "rank_scatter");
+        let pipeline_radix_compute_keys = make_pipeline(
+            "radix_compute_keys",
+            &bwt_radix_module,
+            "radix_compute_keys",
+        );
+        let pipeline_radix_histogram =
+            make_pipeline("radix_histogram", &bwt_radix_module, "radix_histogram");
+        let pipeline_inclusive_to_exclusive = make_pipeline(
+            "inclusive_to_exclusive",
+            &bwt_radix_module,
+            "inclusive_to_exclusive",
+        );
+        let pipeline_radix_scatter =
+            make_pipeline("radix_scatter", &bwt_radix_module, "radix_scatter");
+        let pipeline_byte_histogram =
+            make_pipeline("byte_histogram", &huffman_module, "byte_histogram");
+        let pipeline_compute_bit_lengths = make_pipeline(
+            "compute_bit_lengths",
+            &huffman_module,
+            "compute_bit_lengths",
+        );
+        let pipeline_write_codes = make_pipeline("write_codes", &huffman_module, "write_codes");
+        let pipeline_fse_decode = make_pipeline("fse_decode", &fse_decode_module, "fse_decode");
+        let pipeline_fse_encode = make_pipeline("fse_encode", &fse_encode_module, "fse_encode");
+
+        // Parse kernel cost annotations for batch scheduling.
         let cost_lz77_lazy = KernelCost::parse(LZ77_LAZY_KERNEL_SOURCE)
             .expect("lz77_lazy.wgsl missing @pz_cost annotation");
 
@@ -348,18 +381,28 @@ impl WebGpuEngine {
             (None, None)
         };
 
-        // All pipeline compilation is deferred to first use via OnceLock.
         Ok(WebGpuEngine {
             device,
             queue,
-            lz77_topk: OnceLock::new(),
-            lz77_hash: OnceLock::new(),
-            lz77_lazy: OnceLock::new(),
-            bwt_rank: OnceLock::new(),
-            bwt_radix: OnceLock::new(),
-            huffman: OnceLock::new(),
-            fse_decode: OnceLock::new(),
-            fse_encode: OnceLock::new(),
+            pipeline_lz77_topk,
+            pipeline_lz77_hash_build,
+            pipeline_lz77_hash_find,
+            pipeline_lz77_lazy_build,
+            pipeline_lz77_lazy_find,
+            pipeline_lz77_lazy_resolve,
+            pipeline_rank_compare,
+            pipeline_prefix_sum_local,
+            pipeline_prefix_sum_propagate,
+            pipeline_rank_scatter,
+            pipeline_radix_compute_keys,
+            pipeline_radix_histogram,
+            pipeline_inclusive_to_exclusive,
+            pipeline_radix_scatter,
+            pipeline_byte_histogram,
+            pipeline_compute_bit_lengths,
+            pipeline_write_codes,
+            pipeline_fse_decode,
+            pipeline_fse_encode,
             device_name,
             max_work_group_size,
             max_workgroups_per_dim,
@@ -677,318 +720,6 @@ impl WebGpuEngine {
         let target = ((input.len() + 3) & !3) + 4;
         padded.resize(target, 0);
         padded
-    }
-
-    // -------------------------------------------------------------------
-    // Lazy pipeline accessors — compile on first use via OnceLock.
-    // -------------------------------------------------------------------
-
-    /// Helper: create a shader module + compute pipeline from WGSL source.
-    fn make_pipeline(&self, label: &str, source: &str, entry: &str) -> wgpu::ComputePipeline {
-        let module = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(label),
-                source: wgpu::ShaderSource::Wgsl(source.into()),
-            });
-        self.device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(label),
-                layout: None,
-                module: &module,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-    }
-
-    fn pipeline_lz77_topk(&self) -> &wgpu::ComputePipeline {
-        &self
-            .lz77_topk
-            .get_or_init(|| {
-                let t0 = std::time::Instant::now();
-                let group = Lz77TopkPipelines {
-                    topk: self.make_pipeline("lz77_topk", LZ77_TOPK_KERNEL_SOURCE, "encode_topk"),
-                };
-                if self.profiling {
-                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("[pz-gpu] compile lz77_topk.wgsl: {ms:.3} ms");
-                }
-                group
-            })
-            .topk
-    }
-
-    fn lz77_hash_pipelines(&self) -> &Lz77HashPipelines {
-        self.lz77_hash.get_or_init(|| {
-            let t0 = std::time::Instant::now();
-            let module = self
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("lz77_hash"),
-                    source: wgpu::ShaderSource::Wgsl(LZ77_HASH_KERNEL_SOURCE.into()),
-                });
-            let make = |label, entry| {
-                self.device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(label),
-                        layout: None,
-                        module: &module,
-                        entry_point: Some(entry),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    })
-            };
-            let group = Lz77HashPipelines {
-                build: make("lz77_hash_build", "build_hash_table"),
-                find: make("lz77_hash_find", "find_matches"),
-            };
-            if self.profiling {
-                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                eprintln!("[pz-gpu] compile lz77_hash.wgsl: {ms:.3} ms");
-            }
-            group
-        })
-    }
-
-    fn pipeline_lz77_hash_build(&self) -> &wgpu::ComputePipeline {
-        &self.lz77_hash_pipelines().build
-    }
-
-    fn pipeline_lz77_hash_find(&self) -> &wgpu::ComputePipeline {
-        &self.lz77_hash_pipelines().find
-    }
-
-    fn lz77_lazy_pipelines(&self) -> &Lz77LazyPipelines {
-        self.lz77_lazy.get_or_init(|| {
-            let t0 = std::time::Instant::now();
-            let module = self
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("lz77_lazy"),
-                    source: wgpu::ShaderSource::Wgsl(LZ77_LAZY_KERNEL_SOURCE.into()),
-                });
-            let make = |label, entry| {
-                self.device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(label),
-                        layout: None,
-                        module: &module,
-                        entry_point: Some(entry),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    })
-            };
-            let group = Lz77LazyPipelines {
-                build: make("lz77_lazy_build", "build_hash_table"),
-                find: make("lz77_lazy_find", "find_matches"),
-                resolve: make("lz77_lazy_resolve", "resolve_lazy"),
-            };
-            if self.profiling {
-                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                eprintln!("[pz-gpu] compile lz77_lazy.wgsl: {ms:.3} ms");
-            }
-            group
-        })
-    }
-
-    fn pipeline_lz77_lazy_build(&self) -> &wgpu::ComputePipeline {
-        &self.lz77_lazy_pipelines().build
-    }
-
-    fn pipeline_lz77_lazy_find(&self) -> &wgpu::ComputePipeline {
-        &self.lz77_lazy_pipelines().find
-    }
-
-    fn pipeline_lz77_lazy_resolve(&self) -> &wgpu::ComputePipeline {
-        &self.lz77_lazy_pipelines().resolve
-    }
-
-    fn bwt_rank_pipelines(&self) -> &BwtRankPipelines {
-        self.bwt_rank.get_or_init(|| {
-            let t0 = std::time::Instant::now();
-            let module = self
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("bwt_rank"),
-                    source: wgpu::ShaderSource::Wgsl(BWT_RANK_KERNEL_SOURCE.into()),
-                });
-            let make = |label, entry| {
-                self.device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(label),
-                        layout: None,
-                        module: &module,
-                        entry_point: Some(entry),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    })
-            };
-            let group = BwtRankPipelines {
-                rank_compare: make("rank_compare", "rank_compare"),
-                prefix_sum_local: make("prefix_sum_local", "prefix_sum_local"),
-                prefix_sum_propagate: make("prefix_sum_propagate", "prefix_sum_propagate"),
-                rank_scatter: make("rank_scatter", "rank_scatter"),
-            };
-            if self.profiling {
-                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                eprintln!("[pz-gpu] compile bwt_rank.wgsl: {ms:.3} ms");
-            }
-            group
-        })
-    }
-
-    fn pipeline_rank_compare(&self) -> &wgpu::ComputePipeline {
-        &self.bwt_rank_pipelines().rank_compare
-    }
-
-    fn pipeline_prefix_sum_local(&self) -> &wgpu::ComputePipeline {
-        &self.bwt_rank_pipelines().prefix_sum_local
-    }
-
-    fn pipeline_prefix_sum_propagate(&self) -> &wgpu::ComputePipeline {
-        &self.bwt_rank_pipelines().prefix_sum_propagate
-    }
-
-    fn pipeline_rank_scatter(&self) -> &wgpu::ComputePipeline {
-        &self.bwt_rank_pipelines().rank_scatter
-    }
-
-    fn bwt_radix_pipelines(&self) -> &BwtRadixPipelines {
-        self.bwt_radix.get_or_init(|| {
-            let t0 = std::time::Instant::now();
-            let module = self
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("bwt_radix"),
-                    source: wgpu::ShaderSource::Wgsl(BWT_RADIX_KERNEL_SOURCE.into()),
-                });
-            let make = |label, entry| {
-                self.device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(label),
-                        layout: None,
-                        module: &module,
-                        entry_point: Some(entry),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    })
-            };
-            let group = BwtRadixPipelines {
-                compute_keys: make("radix_compute_keys", "radix_compute_keys"),
-                histogram: make("radix_histogram", "radix_histogram"),
-                inclusive_to_exclusive: make("inclusive_to_exclusive", "inclusive_to_exclusive"),
-                scatter: make("radix_scatter", "radix_scatter"),
-            };
-            if self.profiling {
-                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                eprintln!("[pz-gpu] compile bwt_radix.wgsl: {ms:.3} ms");
-            }
-            group
-        })
-    }
-
-    fn pipeline_radix_compute_keys(&self) -> &wgpu::ComputePipeline {
-        &self.bwt_radix_pipelines().compute_keys
-    }
-
-    fn pipeline_radix_histogram(&self) -> &wgpu::ComputePipeline {
-        &self.bwt_radix_pipelines().histogram
-    }
-
-    fn pipeline_inclusive_to_exclusive(&self) -> &wgpu::ComputePipeline {
-        &self.bwt_radix_pipelines().inclusive_to_exclusive
-    }
-
-    fn pipeline_radix_scatter(&self) -> &wgpu::ComputePipeline {
-        &self.bwt_radix_pipelines().scatter
-    }
-
-    fn huffman_pipelines(&self) -> &HuffmanPipelines {
-        self.huffman.get_or_init(|| {
-            let t0 = std::time::Instant::now();
-            let module = self
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("huffman_encode"),
-                    source: wgpu::ShaderSource::Wgsl(HUFFMAN_ENCODE_KERNEL_SOURCE.into()),
-                });
-            let make = |label, entry| {
-                self.device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(label),
-                        layout: None,
-                        module: &module,
-                        entry_point: Some(entry),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    })
-            };
-            let group = HuffmanPipelines {
-                byte_histogram: make("byte_histogram", "byte_histogram"),
-                compute_bit_lengths: make("compute_bit_lengths", "compute_bit_lengths"),
-                write_codes: make("write_codes", "write_codes"),
-            };
-            if self.profiling {
-                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                eprintln!("[pz-gpu] compile huffman_encode.wgsl: {ms:.3} ms");
-            }
-            group
-        })
-    }
-
-    fn pipeline_byte_histogram(&self) -> &wgpu::ComputePipeline {
-        &self.huffman_pipelines().byte_histogram
-    }
-
-    fn pipeline_compute_bit_lengths(&self) -> &wgpu::ComputePipeline {
-        &self.huffman_pipelines().compute_bit_lengths
-    }
-
-    fn pipeline_write_codes(&self) -> &wgpu::ComputePipeline {
-        &self.huffman_pipelines().write_codes
-    }
-
-    fn pipeline_fse_decode(&self) -> &wgpu::ComputePipeline {
-        &self
-            .fse_decode
-            .get_or_init(|| {
-                let t0 = std::time::Instant::now();
-                let group = FseDecodePipelines {
-                    decode: self.make_pipeline(
-                        "fse_decode",
-                        FSE_DECODE_KERNEL_SOURCE,
-                        "fse_decode",
-                    ),
-                };
-                if self.profiling {
-                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("[pz-gpu] compile fse_decode.wgsl: {ms:.3} ms");
-                }
-                group
-            })
-            .decode
-    }
-
-    fn pipeline_fse_encode(&self) -> &wgpu::ComputePipeline {
-        &self
-            .fse_encode
-            .get_or_init(|| {
-                let t0 = std::time::Instant::now();
-                let group = FseEncodePipelines {
-                    encode: self.make_pipeline(
-                        "fse_encode",
-                        FSE_ENCODE_KERNEL_SOURCE,
-                        "fse_encode",
-                    ),
-                };
-                if self.profiling {
-                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("[pz-gpu] compile fse_encode.wgsl: {ms:.3} ms");
-                }
-                group
-            })
-            .encode
     }
 }
 

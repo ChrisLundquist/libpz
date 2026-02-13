@@ -179,7 +179,7 @@ impl WebGpuEngine {
         );
 
         // Bind group.
-        let bg_layout = self.pipeline_fse_decode().get_bind_group_layout(0);
+        let bg_layout = self.pipeline_fse_decode.get_bind_group_layout(0);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("fse_decode_bg"),
             layout: &bg_layout,
@@ -209,7 +209,7 @@ impl WebGpuEngine {
 
         // Dispatch: one workgroup per stream.
         self.dispatch(
-            self.pipeline_fse_decode(),
+            &self.pipeline_fse_decode,
             &bg,
             num_streams as u32,
             "fse_decode",
@@ -313,7 +313,7 @@ impl WebGpuEngine {
         );
 
         // Bind group — matches the WGSL kernel bindings.
-        let bg_layout = self.pipeline_fse_encode().get_bind_group_layout(0);
+        let bg_layout = self.pipeline_fse_encode.get_bind_group_layout(0);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("fse_encode_bg"),
             layout: &bg_layout,
@@ -343,7 +343,7 @@ impl WebGpuEngine {
 
         // Dispatch: one workgroup per lane.
         self.dispatch(
-            self.pipeline_fse_encode(),
+            &self.pipeline_fse_encode,
             &bg,
             num_states as u32,
             "fse_encode",

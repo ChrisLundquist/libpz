@@ -14,6 +14,7 @@ PIPELINES=()
 FILES=()
 FEATURES=""
 GPU_FLAG=""
+VERBOSE_FLAG=""
 
 usage() {
     cat <<'EOF'
@@ -30,6 +31,7 @@ Options:
   --opencl               Build with OpenCL feature and pass --gpu to pz
   --webgpu               Build with WebGPU feature and pass --webgpu to pz
   --features FEAT        Cargo features to enable (e.g. opencl,webgpu)
+  -v, --verbose          Pass --verbose to pz (shows GPU kernel compile times)
   -h, --help             Show this help
 
 If no FILEs are given, benchmarks all files in samples/cantrbry and samples/large.
@@ -91,6 +93,10 @@ while [[ $# -gt 0 ]]; do
                 FEATURES="$FEATURES,webgpu"
             fi
             GPU_FLAG="--webgpu"
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE_FLAG="--verbose"
             shift
             ;;
         --features)
@@ -168,7 +174,11 @@ trap 'rm -rf "$TMPDIR"' EXIT
 time_ns() {
     local start end
     start=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1e9')
-    "$@" >/dev/null 2>&1
+    if [[ -n "$VERBOSE_FLAG" ]]; then
+        "$@" >/dev/null
+    else
+        "$@" >/dev/null 2>&1
+    fi
     end=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1e9')
     echo $(( end - start ))
 }
@@ -253,7 +263,7 @@ for file in "${FILES[@]}"; do
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
         cp "$file" "$TMPDIR/$name"
-        pz_comp_ns=$(avg_ns "$PZ" -k -f -p "$p" $GPU_FLAG "$TMPDIR/$name")
+        pz_comp_ns=$(avg_ns "$PZ" -k -f -p "$p" $GPU_FLAG $VERBOSE_FLAG "$TMPDIR/$name")
         pz_size=$(stat -c%s "$TMPDIR/$name.pz" 2>/dev/null || stat -f%z "$TMPDIR/$name.pz" 2>/dev/null)
         rm -f "$TMPDIR/$name" "$TMPDIR/$name.pz"
 
@@ -316,7 +326,7 @@ for file in "${FILES[@]}"; do
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
         cp "$TMPDIR/$name.src" "$TMPDIR/$name"
-        "$PZ" -k -f -p "$p" $GPU_FLAG "$TMPDIR/$name"
+        "$PZ" -k -f -p "$p" $GPU_FLAG $VERBOSE_FLAG "$TMPDIR/$name"
         mv "$TMPDIR/$name.pz" "$TMPDIR/$name.$p.pz"
     done
 
@@ -332,7 +342,7 @@ for file in "${FILES[@]}"; do
 
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
-        pz_dec_ns=$(avg_ns "$PZ" -d -k -f $GPU_FLAG "$TMPDIR/$name.$p.pz")
+        pz_dec_ns=$(avg_ns "$PZ" -d -k -f $GPU_FLAG $VERBOSE_FLAG "$TMPDIR/$name.$p.pz")
         drow+=$(printf " | %7s %8s" \
             "$(fmt_ms $pz_dec_ns)" "$(fmt_throughput $orig_size $pz_dec_ns)")
         dt_pz_ns[$pi]=$(( ${dt_pz_ns[$pi]} + pz_dec_ns ))
