@@ -444,6 +444,63 @@ fn bench_lz77_gpu(c: &mut Criterion) {
 // bench_lz77_parallel removed: parallel LZ77 match-finding was slower than
 // single-threaded lazy. Multi-threading now happens at the pipeline block level.
 
+#[cfg(feature = "opencl")]
+fn bench_lz77_gpu_params(c: &mut Criterion) {
+    use pz::opencl::OpenClEngine;
+
+    let engine = match OpenClEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => return,
+    };
+
+    let mut group = c.benchmark_group("lz77_gpu_params");
+    cap(&mut group);
+
+    // Use 256KB input — the GPU crossover region
+    let size = 262_144;
+    let data = get_test_data(size);
+    group.throughput(Throughput::Bytes(size as u64));
+
+    // Parameter sweep: hash_bits x max_chain x bucket_cap
+    for &hash_bits in &[14u32, 15, 16, 18] {
+        for &max_chain in &[16u32, 64, 128] {
+            for &bucket_cap in &[16u32, 32, 64] {
+                let label = format!("h{hash_bits}_c{max_chain}_b{bucket_cap}");
+                let eng = engine.clone();
+                group.bench_with_input(BenchmarkId::new(&label, size), &data, move |b, data| {
+                    b.iter(|| {
+                        eng.find_matches_with_params(data, hash_bits, max_chain, bucket_cap)
+                            .unwrap()
+                    });
+                });
+            }
+        }
+    }
+
+    // Also measure compression ratio for a few key configurations
+    // (not timed, just ratio comparison)
+    let cpu_compressed = pz::lz77::compress_lazy(&data).unwrap();
+    let cpu_ratio = cpu_compressed.len() as f64 / data.len() as f64;
+
+    for &(hash_bits, max_chain, bucket_cap) in
+        &[(14, 64, 64), (15, 64, 64), (16, 64, 64), (18, 128, 64)]
+    {
+        let matches = engine
+            .find_matches_with_params(&data, hash_bits, max_chain, bucket_cap)
+            .unwrap();
+        let compressed_size = matches.len() * 5; // 5 bytes per match
+        let gpu_ratio = compressed_size as f64 / data.len() as f64;
+        eprintln!(
+            "  h{hash_bits}_c{max_chain}_b{bucket_cap}: ratio={gpu_ratio:.3} (cpu_lazy={cpu_ratio:.3})"
+        );
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "opencl"))]
+fn bench_lz77_gpu_params(_c: &mut Criterion) {}
+
 fn bench_analysis(c: &mut Criterion) {
     let mut group = c.benchmark_group("analysis");
     for &size in &[8192, 65536] {
@@ -1068,6 +1125,7 @@ criterion_group!(
     bench_huffman_webgpu,
     bench_deflate_webgpu_chained,
     bench_lz78_static,
-    bench_lz78_static_gpu
+    bench_lz78_static_gpu,
+    bench_lz77_gpu_params
 );
 criterion_main!(benches);
