@@ -273,6 +273,7 @@ pub(crate) fn stage_huffman_encode_gpu(
 ///
 /// Falls back to CPU for empty streams where GPU overhead dominates.
 #[cfg(feature = "webgpu")]
+#[allow(dead_code)] // Available but not currently called; CPU Huffman is faster (see blocks.rs)
 pub(crate) fn stage_huffman_encode_webgpu(
     mut block: StageBlock,
     engine: &crate::webgpu::WebGpuEngine,
