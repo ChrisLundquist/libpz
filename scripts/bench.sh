@@ -128,7 +128,10 @@ if [[ ${#FILES[@]} -eq 0 ]]; then
     "$SCRIPT_DIR/setup.sh"
 
     for f in "$PROJECT_DIR"/samples/cantrbry/* "$PROJECT_DIR"/samples/large/*; do
-        [[ -f "$f" ]] && FILES+=("$f")
+        # Skip archives and compressed leftovers — only benchmark raw sample files
+        [[ -f "$f" ]] || continue
+        case "$f" in *.tar.gz|*.pz|*.gz) continue ;; esac
+        FILES+=("$f")
     done
     if [[ ${#FILES[@]} -eq 0 ]]; then
         echo "ERROR: No sample files found even after extraction." >&2
@@ -313,7 +316,7 @@ for file in "${FILES[@]}"; do
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
         cp "$TMPDIR/$name.src" "$TMPDIR/$name"
-        "$PZ" -f -p "$p" $GPU_FLAG "$TMPDIR/$name"
+        "$PZ" -k -f -p "$p" $GPU_FLAG "$TMPDIR/$name"
         mv "$TMPDIR/$name.pz" "$TMPDIR/$name.$p.pz"
     done
 

@@ -418,10 +418,10 @@ impl OpenClEngine {
         Ok(())
     }
 
-    /// Encode data using Huffman coding entirely on the GPU with GPU prefix sum.
+    /// Encode data using Huffman coding with GPU compute + CPU prefix sum.
     ///
-    /// Same as `huffman_encode` but uses the GPU Blelloch scan for the prefix
-    /// sum instead of downloading to host. Eliminates one host↔device round-trip.
+    /// Pass 1 (ComputeBitLengths) and Pass 2 (WriteCodes) run on GPU;
+    /// the prefix sum between them runs on CPU to avoid recursive kernel overhead.
     pub fn huffman_encode_gpu_scan(
         &self,
         input: &[u8],
@@ -479,42 +479,34 @@ impl OpenClEngine {
         };
         pass1_event.wait().map_err(|_| PzError::Unsupported)?;
 
-        // We need the total bits before doing the scan.
-        // Read the last element + its bit length to get the total.
-        // First, save the last element before the scan overwrites it.
-        let mut last_val = vec![0u32; 1];
-        let read_last = unsafe {
+        // Download bit_lengths and compute prefix sum on CPU.
+        // This is faster than the GPU Blelloch scan because the recursive
+        // multi-level decomposition generates many kernel launches whose
+        // overhead dominates the actual O(n) sequential scan.
+        let mut bit_lengths_host = vec![0u32; n];
+        let read_lengths = unsafe {
             self.queue
-                .enqueue_read_buffer(
-                    &bit_lengths_buf,
-                    CL_BLOCKING,
-                    (n - 1) * std::mem::size_of::<cl_uint>(),
-                    &mut last_val,
-                    &[],
-                )
+                .enqueue_read_buffer(&bit_lengths_buf, CL_BLOCKING, 0, &mut bit_lengths_host, &[])
                 .map_err(|_| PzError::Unsupported)?
         };
-        read_last.wait().map_err(|_| PzError::Unsupported)?;
-        let last_bit_length = last_val[0];
+        read_lengths.wait().map_err(|_| PzError::Unsupported)?;
 
-        // GPU prefix sum (exclusive): bit_lengths → bit_offsets
-        self.prefix_sum_gpu(&mut bit_lengths_buf, n)?;
+        // CPU exclusive prefix sum
+        let mut bit_offsets = vec![0u32; n];
+        let mut running_sum: u64 = 0;
+        for i in 0..n {
+            bit_offsets[i] = running_sum as u32;
+            running_sum += bit_lengths_host[i] as u64;
+        }
+        let total_bits = running_sum as usize;
 
-        // Read the last offset to compute total_bits
-        let mut last_offset = vec![0u32; 1];
-        let read_offset = unsafe {
+        // Upload bit_offsets back to GPU (reuse bit_lengths_buf)
+        let write_offsets = unsafe {
             self.queue
-                .enqueue_read_buffer(
-                    &bit_lengths_buf,
-                    CL_BLOCKING,
-                    (n - 1) * std::mem::size_of::<cl_uint>(),
-                    &mut last_offset,
-                    &[],
-                )
+                .enqueue_write_buffer(&mut bit_lengths_buf, CL_BLOCKING, 0, &bit_offsets, &[])
                 .map_err(|_| PzError::Unsupported)?
         };
-        read_offset.wait().map_err(|_| PzError::Unsupported)?;
-        let total_bits = (last_offset[0] + last_bit_length) as usize;
+        write_offsets.wait().map_err(|_| PzError::Unsupported)?;
 
         // Allocate output buffer
         let output_uints = total_bits.div_ceil(32);
@@ -580,7 +572,7 @@ impl OpenClEngine {
         Ok((output_bytes, total_bits))
     }
 
-    /// Encode data already on the GPU using Huffman coding with GPU prefix sum.
+    /// Encode data already on the GPU using Huffman coding with CPU prefix sum.
     ///
     /// Same as [`huffman_encode_gpu_scan()`] but the input is a [`DeviceBuf`]
     /// that's already resident on the GPU — no host→device upload for the
@@ -629,40 +621,34 @@ impl OpenClEngine {
         };
         pass1_event.wait().map_err(|_| PzError::Unsupported)?;
 
-        // Read the last bit_length before prefix sum overwrites it
-        let mut last_val = vec![0u32; 1];
-        let read_last = unsafe {
+        // Download bit_lengths and compute prefix sum on CPU.
+        // This is faster than the GPU Blelloch scan because the recursive
+        // multi-level decomposition generates many kernel launches whose
+        // overhead dominates the actual O(n) sequential scan.
+        let mut bit_lengths_host = vec![0u32; n];
+        let read_lengths = unsafe {
             self.queue
-                .enqueue_read_buffer(
-                    &bit_lengths_buf,
-                    CL_BLOCKING,
-                    (n - 1) * std::mem::size_of::<cl_uint>(),
-                    &mut last_val,
-                    &[],
-                )
+                .enqueue_read_buffer(&bit_lengths_buf, CL_BLOCKING, 0, &mut bit_lengths_host, &[])
                 .map_err(|_| PzError::Unsupported)?
         };
-        read_last.wait().map_err(|_| PzError::Unsupported)?;
-        let last_bit_length = last_val[0];
+        read_lengths.wait().map_err(|_| PzError::Unsupported)?;
 
-        // GPU prefix sum (exclusive): bit_lengths → bit_offsets
-        self.prefix_sum_gpu(&mut bit_lengths_buf, n)?;
+        // CPU exclusive prefix sum
+        let mut bit_offsets = vec![0u32; n];
+        let mut running_sum: u64 = 0;
+        for i in 0..n {
+            bit_offsets[i] = running_sum as u32;
+            running_sum += bit_lengths_host[i] as u64;
+        }
+        let total_bits = running_sum as usize;
 
-        // Read the last offset to compute total_bits
-        let mut last_offset = vec![0u32; 1];
-        let read_offset = unsafe {
+        // Upload bit_offsets back to GPU (reuse bit_lengths_buf)
+        let write_offsets = unsafe {
             self.queue
-                .enqueue_read_buffer(
-                    &bit_lengths_buf,
-                    CL_BLOCKING,
-                    (n - 1) * std::mem::size_of::<cl_uint>(),
-                    &mut last_offset,
-                    &[],
-                )
+                .enqueue_write_buffer(&mut bit_lengths_buf, CL_BLOCKING, 0, &bit_offsets, &[])
                 .map_err(|_| PzError::Unsupported)?
         };
-        read_offset.wait().map_err(|_| PzError::Unsupported)?;
-        let total_bits = (last_offset[0] + last_bit_length) as usize;
+        write_offsets.wait().map_err(|_| PzError::Unsupported)?;
 
         // Allocate output buffer
         let output_uints = total_bits.div_ceil(32);
