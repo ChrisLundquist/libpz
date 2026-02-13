@@ -79,10 +79,19 @@ pub const MIN_GPU_INPUT_SIZE: usize = 64 * 1024; // 64KB
 pub const MIN_GPU_BWT_SIZE: usize = 32 * 1024; // 32KB
 
 /// Hash table bucket capacity (must match BUCKET_CAP in lz77_hash.wgsl).
-const HASH_BUCKET_CAP: usize = 64;
+///
+/// Increased from 64 to 256 to prevent bucket overflow on large inputs.
+/// The GPU hash table uses bounded append — once a bucket fills, new
+/// entries are silently dropped. With BUCKET_CAP=64 on 1MB input, hot
+/// buckets overflowed causing 4-5x more literals than CPU matching.
+const HASH_BUCKET_CAP: usize = 256;
 
-/// Hash table size (must match HASH_SIZE in lz77_hash.wgsl).
-const HASH_TABLE_SIZE: usize = 1 << 15; // 32768
+/// Hash table size (must match HASH_SIZE in lz77_hash.wgsl / lz77_lazy.wgsl).
+///
+/// Increased from 1<<15 (32K) to 1<<17 (128K) to reduce hash collisions on
+/// inputs larger than 64KB. The old 32K table caused severe bucket overflow
+/// with inputs >128KB, producing 4-5x more matches than CPU lazy matching.
+const HASH_TABLE_SIZE: usize = 1 << 17; // 131072
 
 /// GPU match struct matching the WGSL kernel's Lz77Match layout.
 /// 3 x u32 = 12 bytes.

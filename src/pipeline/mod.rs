@@ -78,6 +78,15 @@ pub enum ParseStrategy {
 /// Default block size for multi-threaded compression (256KB).
 const DEFAULT_BLOCK_SIZE: usize = 256 * 1024;
 
+/// Default block size for GPU LZ77 pipelines (128KB).
+///
+/// The GPU hash table produces significantly better matches at ≤128KB than at
+/// larger sizes, because bucket overflow degrades match quality. Empirically,
+/// GPU match quality matches CPU lazy at 128KB but collapses at 256KB+.
+/// Using smaller blocks creates more work items for GPU/CPU overlap pipelining,
+/// which also improves throughput on streaming GPU paths.
+const DEFAULT_GPU_BLOCK_SIZE: usize = 128 * 1024;
+
 /// Options controlling pipeline compression behavior.
 #[derive(Debug, Clone)]
 pub struct CompressOptions {
@@ -256,6 +265,11 @@ pub fn compress_with_options(
     if input.is_empty() {
         return Ok(Vec::new());
     }
+
+    // For GPU backends on LZ77 pipelines, use smaller blocks to keep
+    // the hash table within its quality sweet spot (≤128KB). Only
+    // override when the caller hasn't explicitly set a custom block size.
+    let options = &gpu_adjusted_options(pipeline, options);
 
     let num_threads = resolve_thread_count(options.threads);
     let block_size = options.block_size;
@@ -487,6 +501,43 @@ pub(crate) fn write_header(output: &mut Vec<u8>, pipeline: Pipeline, orig_len: u
     output.push(VERSION);
     output.push(pipeline as u8);
     output.extend_from_slice(&(orig_len as u32).to_le_bytes());
+}
+
+/// Return options with GPU-optimal block size for LZ77-based pipelines.
+///
+/// When the caller is using the default block size (256KB) and a GPU backend
+/// on an LZ77 pipeline, shrinks blocks to 128KB. This keeps each block within
+/// the GPU hash table's quality sweet spot, and also produces more blocks for
+/// better GPU/CPU overlap pipelining.
+///
+/// If the caller explicitly set a non-default block size, their choice is
+/// respected.
+fn gpu_adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> CompressOptions {
+    let is_lz_pipeline = matches!(
+        pipeline,
+        Pipeline::Deflate | Pipeline::Lzr | Pipeline::Lzf | Pipeline::Lzfi | Pipeline::LzssR
+    );
+    let is_gpu = {
+        #[allow(unused_mut)]
+        let mut gpu = false;
+        #[cfg(feature = "webgpu")]
+        if matches!(options.backend, Backend::WebGpu) {
+            gpu = true;
+        }
+        #[cfg(feature = "opencl")]
+        if matches!(options.backend, Backend::OpenCl) {
+            gpu = true;
+        }
+        gpu
+    };
+
+    if is_lz_pipeline && is_gpu && options.block_size == DEFAULT_BLOCK_SIZE {
+        let mut adjusted = options.clone();
+        adjusted.block_size = DEFAULT_GPU_BLOCK_SIZE;
+        adjusted
+    } else {
+        options.clone()
+    }
 }
 
 /// Resolve thread count: 0 = auto (available_parallelism), otherwise use the given value.
