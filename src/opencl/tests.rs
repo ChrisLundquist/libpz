@@ -1227,3 +1227,107 @@ fn test_gpu_lz77_short_chain_round_trip() {
         );
     }
 }
+
+#[test]
+fn test_gpu_lzw_static_decode() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    // Build frozen dictionary from training data
+    let training = b"the quick brown fox jumps over the lazy dog ";
+    let mut input = Vec::new();
+    for _ in 0..200 {
+        input.extend_from_slice(training);
+    }
+
+    let dict = crate::lz78_static::FrozenDict::train(&input, 4096).unwrap();
+    let encoded = crate::lz78_static::encode_with_dict(&input, &dict).unwrap();
+
+    // CPU baseline decode
+    let cpu_decoded = crate::lz78_static::decode(&encoded).unwrap();
+    assert_eq!(cpu_decoded, input, "CPU LZW round-trip failed");
+
+    // GPU decode
+    let (gpu_dict, packed_codes, num_codes, orig_len) =
+        crate::lz78_static::parse_for_gpu(&encoded).unwrap();
+    let gpu_decoded = engine
+        .lzw_decode_static(packed_codes, num_codes, &gpu_dict, orig_len)
+        .unwrap();
+    assert_eq!(
+        gpu_decoded, input,
+        "GPU LZW static decode should match original"
+    );
+}
+
+#[test]
+fn test_gpu_combined_rans_lz77_pipeline() {
+    let engine = match OpenClEngine::new() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    // Create repetitive test data that compresses well with LZ77.
+    // Use a larger corpus so LZ77 blocks have enough match data to avoid
+    // rANS encoder buffer underflow on small blocks.
+    let pattern = b"the quick brown fox jumps over the lazy dog and then repeats ";
+    let mut input = Vec::new();
+    for _ in 0..2000 {
+        input.extend_from_slice(pattern);
+    }
+
+    // Larger blocks → each block's LZ77 match data is large enough for
+    // rANS to work correctly (avoids per-lane buffer underflow).
+    let block_size = 16384;
+
+    // Stage 1: CPU LZ77 independent-block compression
+    let (block_data, block_meta) =
+        crate::opencl::lz77::lz77_compress_blocks(&input, block_size).unwrap();
+
+    // Stage 2: CPU rANS encode with shared freq table (for GPU batched decode)
+    // Use 4 interleaved states and scale_bits=11 for safe encoding of binary match data
+    let match_slices: Vec<&[u8]> = block_meta
+        .iter()
+        .map(|&(offset, num_matches, _)| {
+            let end = offset + num_matches * 5;
+            &block_data[offset..end]
+        })
+        .collect();
+    let rans_encoded = crate::opencl::rans::rans_encode_block_slices(&match_slices, 4, 11).unwrap();
+
+    // Stage 3: GPU rANS batched decode (all blocks in one kernel launch)
+    let block_refs: Vec<(&[u8], usize)> = rans_encoded
+        .iter()
+        .map(|(enc, len)| (enc.as_slice(), *len))
+        .collect();
+    let all_lz77 = engine.rans_decode_interleaved_blocks(&block_refs).unwrap();
+
+    // Verify rANS decode matches the original LZ77 match data
+    let mut expected_lz77 = Vec::new();
+    for &(offset, num_matches, _) in &block_meta {
+        let end = offset + num_matches * 5;
+        expected_lz77.extend_from_slice(&block_data[offset..end]);
+    }
+    assert_eq!(
+        all_lz77, expected_lz77,
+        "GPU rANS batched decode should reproduce LZ77 match data"
+    );
+
+    // Stage 4: GPU LZ77 block-parallel decompress
+    // Rebuild metadata for the decoded LZ77 data (contiguous, not offset-based)
+    let mut decoded_meta = Vec::new();
+    let mut lz77_offset = 0usize;
+    for &(_, num_matches, decompressed_size) in &block_meta {
+        decoded_meta.push((lz77_offset, num_matches, decompressed_size));
+        lz77_offset += num_matches * 5;
+    }
+
+    let result = engine
+        .lz77_decompress_blocks(&all_lz77, &decoded_meta, 32)
+        .unwrap();
+    assert_eq!(
+        result, input,
+        "GPU combined rANS+LZ77 pipeline should reproduce original data"
+    );
+}

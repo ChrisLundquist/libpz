@@ -560,10 +560,15 @@ pub fn rans_encode_block_slices(
     let scale_bits = scale_bits.clamp(crate::rans::MIN_SCALE_BITS, crate::rans::MAX_SCALE_BITS);
 
     // Build shared frequency table across all blocks.
-    let mut freq = FrequencyTable::new();
+    // Note: FrequencyTable::count() replaces (not accumulates), so we must
+    // concatenate all data first to get correct combined frequencies.
+    let total_len: usize = blocks.iter().map(|b| b.len()).sum();
+    let mut combined = Vec::with_capacity(total_len);
     for block in blocks {
-        freq.count(block);
+        combined.extend_from_slice(block);
     }
+    let mut freq = FrequencyTable::new();
+    freq.count(&combined);
 
     let mut sb = scale_bits;
     while (1u32 << sb) < freq.used {
