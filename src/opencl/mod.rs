@@ -78,6 +78,10 @@ const BWT_RADIX_KERNEL_SOURCE: &str = include_str!("../../kernels/bwt_radix.cl")
 /// Two-pass: ComputeBitLengths + WriteCodes, plus a ByteHistogram helper.
 const HUFFMAN_ENCODE_KERNEL_SOURCE: &str = include_str!("../../kernels/huffman_encode.cl");
 
+/// Embedded OpenCL kernel source: FSE (tANS) decode.
+/// One work-item per interleaved stream.
+const FSE_DECODE_KERNEL_SOURCE: &str = include_str!("../../kernels/fse_decode.cl");
+
 /// Step size used by the batch kernel (must match STEP_SIZE in lz77_batch.cl).
 const BATCH_STEP_SIZE: usize = 32;
 
@@ -238,6 +242,8 @@ pub struct OpenClEngine {
     kernel_prefix_sum_block: Kernel,
     /// Compiled prefix sum apply-offsets kernel.
     kernel_prefix_sum_apply: Kernel,
+    /// Compiled FSE decode kernel.
+    kernel_fse_decode: Kernel,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum work-group size.
@@ -461,6 +467,14 @@ impl OpenClEngine {
         let kernel_prefix_sum_apply =
             Kernel::create(&program_huffman, "PrefixSumApply").map_err(|_| PzError::Unsupported)?;
 
+        // Compile FSE decode kernel
+        let program_fse_decode =
+            Program::create_and_build_from_source(&context, FSE_DECODE_KERNEL_SOURCE, "-Werror")
+                .map_err(|_| PzError::Unsupported)?;
+
+        let kernel_fse_decode =
+            Kernel::create(&program_fse_decode, "FseDecode").map_err(|_| PzError::Unsupported)?;
+
         Ok(OpenClEngine {
             _device: device,
             context,
@@ -484,6 +498,7 @@ impl OpenClEngine {
             kernel_byte_histogram,
             kernel_prefix_sum_block,
             kernel_prefix_sum_apply,
+            kernel_fse_decode,
             device_name,
             max_work_group_size,
             is_cpu,
@@ -715,8 +730,10 @@ fn dedupe_gpu_matches(gpu_matches: &[GpuMatch], input: &[u8]) -> Vec<Match> {
 }
 
 mod bwt;
+pub mod fse;
 mod huffman;
-mod lz77;
+pub mod lz77;
+pub mod rans;
 
 #[cfg(test)]
 #[path = "tests.rs"]
