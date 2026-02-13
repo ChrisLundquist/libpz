@@ -654,7 +654,7 @@ impl OpenClEngine {
 
         // Pass 1: Build hash table (depends on upload + zero completion)
         let build_event = unsafe {
-            let mut exec = ExecuteKernel::new(&self.kernel_hash_build);
+            let mut exec = ExecuteKernel::new(&self.kernel_hash_build());
             exec.set_arg(&slot.input_buf)
                 .set_arg(&count)
                 .set_arg(&slot.hash_counts_buf)
@@ -668,7 +668,7 @@ impl OpenClEngine {
 
         // Pass 2: Find matches (depends on build completion)
         let find_event = unsafe {
-            let mut exec = ExecuteKernel::new(&self.kernel_hash_find);
+            let mut exec = ExecuteKernel::new(&self.kernel_hash_find());
             exec.set_arg(&slot.input_buf)
                 .set_arg(&count)
                 .set_arg(&slot.hash_counts_buf)

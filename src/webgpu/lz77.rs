@@ -902,7 +902,7 @@ impl WebGpuEngine {
             .write_buffer(&slot.hash_counts_buf, 0, &vec![0u8; HASH_TABLE_SIZE * 4]);
 
         // Build bind groups referencing the slot's buffers
-        let build_bg_layout = self.pipeline_lz77_lazy_build.get_bind_group_layout(0);
+        let build_bg_layout = self.pipeline_lz77_lazy_build().get_bind_group_layout(0);
         let build_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("slot_build_bg"),
             layout: &build_bg_layout,
@@ -926,7 +926,7 @@ impl WebGpuEngine {
             ],
         });
 
-        let find_bg_layout = self.pipeline_lz77_lazy_find.get_bind_group_layout(0);
+        let find_bg_layout = self.pipeline_lz77_lazy_find().get_bind_group_layout(0);
         let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("slot_find_bg"),
             layout: &find_bg_layout,
@@ -954,7 +954,7 @@ impl WebGpuEngine {
             ],
         });
 
-        let resolve_bg_layout = self.pipeline_lz77_lazy_resolve.get_bind_group_layout(0);
+        let resolve_bg_layout = self.pipeline_lz77_lazy_resolve().get_bind_group_layout(0);
         let resolve_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("slot_resolve_bg"),
             layout: &resolve_bg_layout,
@@ -986,21 +986,21 @@ impl WebGpuEngine {
             });
         self.record_dispatch(
             &mut encoder,
-            &self.pipeline_lz77_lazy_build,
+            &self.pipeline_lz77_lazy_build(),
             &build_bg,
             workgroups,
             "slot_build",
         )?;
         self.record_dispatch(
             &mut encoder,
-            &self.pipeline_lz77_lazy_find,
+            &self.pipeline_lz77_lazy_find(),
             &find_bg,
             workgroups,
             "slot_find",
         )?;
         self.record_dispatch(
             &mut encoder,
-            &self.pipeline_lz77_lazy_resolve,
+            &self.pipeline_lz77_lazy_resolve(),
             &resolve_bg,
             workgroups,
             "slot_resolve",
