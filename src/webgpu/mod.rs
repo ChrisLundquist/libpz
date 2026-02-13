@@ -64,6 +64,9 @@ const HUFFMAN_ENCODE_KERNEL_SOURCE: &str = include_str!("../../kernels/huffman_e
 /// Embedded WGSL kernel source: GPU FSE decode.
 const FSE_DECODE_KERNEL_SOURCE: &str = include_str!("../../kernels/fse_decode.wgsl");
 
+/// Embedded WGSL kernel source: GPU FSE encode.
+const FSE_ENCODE_KERNEL_SOURCE: &str = include_str!("../../kernels/fse_encode.wgsl");
+
 /// Number of candidates per position in the top-K kernel (must match K in lz77_topk.wgsl).
 const TOPK_K: usize = 4;
 
@@ -172,6 +175,7 @@ pub struct WebGpuEngine {
     pipeline_compute_bit_lengths: wgpu::ComputePipeline,
     pipeline_write_codes: wgpu::ComputePipeline,
     pipeline_fse_decode: wgpu::ComputePipeline,
+    pipeline_fse_encode: wgpu::ComputePipeline,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum compute workgroup size.
@@ -308,6 +312,11 @@ impl WebGpuEngine {
             source: wgpu::ShaderSource::Wgsl(FSE_DECODE_KERNEL_SOURCE.into()),
         });
 
+        let fse_encode_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fse_encode"),
+            source: wgpu::ShaderSource::Wgsl(FSE_ENCODE_KERNEL_SOURCE.into()),
+        });
+
         // Helper to create a compute pipeline from a module + entry point.
         let make_pipeline =
             |label: &str, module: &wgpu::ShaderModule, entry: &str| -> wgpu::ComputePipeline {
@@ -365,6 +374,7 @@ impl WebGpuEngine {
         );
         let pipeline_write_codes = make_pipeline("write_codes", &huffman_module, "write_codes");
         let pipeline_fse_decode = make_pipeline("fse_decode", &fse_decode_module, "fse_decode");
+        let pipeline_fse_encode = make_pipeline("fse_encode", &fse_encode_module, "fse_encode");
 
         // Parse kernel cost annotations for batch scheduling.
         let cost_lz77_lazy = KernelCost::parse(LZ77_LAZY_KERNEL_SOURCE)
@@ -409,6 +419,7 @@ impl WebGpuEngine {
             pipeline_compute_bit_lengths,
             pipeline_write_codes,
             pipeline_fse_decode,
+            pipeline_fse_encode,
             device_name,
             max_work_group_size,
             max_workgroups_per_dim,

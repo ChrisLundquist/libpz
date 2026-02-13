@@ -571,7 +571,7 @@ impl OpenClEngine {
         // Compute worst-case output: each symbol produces at most
         // accuracy_log bits. Worst case bytes ≈ (symbols_per_lane * al + 7) / 8.
         // Add margin for chunk storage in phase 1 (4 bytes per symbol).
-        let symbols_per_lane = (input.len() + num_states - 1) / num_states;
+        let symbols_per_lane = input.len().div_ceil(num_states);
         // Phase 1 stores chunks as u32 in the output buffer, phase 2 overwrites
         // with the actual bitstream. Need max(4 * symbols_per_lane, bitstream).
         let max_output_bytes_per_lane =
