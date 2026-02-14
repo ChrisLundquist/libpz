@@ -54,6 +54,9 @@ const LZ77_HASH_KERNEL_SOURCE: &str = include_str!("../../kernels/lz77_hash.wgsl
 /// Embedded WGSL kernel source: LZ77 match finding with lazy matching emulation.
 const LZ77_LAZY_KERNEL_SOURCE: &str = include_str!("../../kernels/lz77_lazy.wgsl");
 
+/// Embedded WGSL kernel source: cooperative-stitch LZ77 match finding.
+const LZ77_COOP_KERNEL_SOURCE: &str = include_str!("../../kernels/lz77_coop.wgsl");
+
 /// Embedded WGSL kernel source: GPU rank assignment for BWT prefix-doubling.
 const BWT_RANK_KERNEL_SOURCE: &str = include_str!("../../kernels/bwt_rank.wgsl");
 
@@ -179,9 +182,14 @@ struct Lz77HashPipelines {
     find: wgpu::ComputePipeline,
 }
 
-/// LZ77 lazy-matching pipelines (3 pipelines from lz77_lazy.wgsl).
+/// LZ77 lazy-matching pipelines (2 pipelines from lz77_lazy.wgsl).
 struct Lz77LazyPipelines {
-    build: wgpu::ComputePipeline,
+    find: wgpu::ComputePipeline,
+    resolve: wgpu::ComputePipeline,
+}
+
+/// LZ77 cooperative-stitch pipelines (2 pipelines from lz77_coop.wgsl).
+struct Lz77CoopPipelines {
     find: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
 }
@@ -239,6 +247,7 @@ pub struct WebGpuEngine {
     lz77_topk: OnceLock<Lz77TopkPipelines>,
     lz77_hash: OnceLock<Lz77HashPipelines>,
     lz77_lazy: OnceLock<Lz77LazyPipelines>,
+    lz77_coop: OnceLock<Lz77CoopPipelines>,
     bwt_rank: OnceLock<BwtRankPipelines>,
     bwt_radix: OnceLock<BwtRadixPipelines>,
     huffman: OnceLock<HuffmanPipelines>,
@@ -378,6 +387,7 @@ impl WebGpuEngine {
             lz77_topk: OnceLock::new(),
             lz77_hash: OnceLock::new(),
             lz77_lazy: OnceLock::new(),
+            lz77_coop: OnceLock::new(),
             bwt_rank: OnceLock::new(),
             bwt_radix: OnceLock::new(),
             huffman: OnceLock::new(),
@@ -803,7 +813,6 @@ impl WebGpuEngine {
                     })
             };
             let group = Lz77LazyPipelines {
-                build: make("lz77_lazy_build", "build_hash_table"),
                 find: make("lz77_lazy_find", "find_matches"),
                 resolve: make("lz77_lazy_resolve", "resolve_lazy"),
             };
@@ -815,16 +824,52 @@ impl WebGpuEngine {
         })
     }
 
-    fn pipeline_lz77_lazy_build(&self) -> &wgpu::ComputePipeline {
-        &self.lz77_lazy_pipelines().build
-    }
-
     fn pipeline_lz77_lazy_find(&self) -> &wgpu::ComputePipeline {
         &self.lz77_lazy_pipelines().find
     }
 
     fn pipeline_lz77_lazy_resolve(&self) -> &wgpu::ComputePipeline {
         &self.lz77_lazy_pipelines().resolve
+    }
+
+    fn lz77_coop_pipelines(&self) -> &Lz77CoopPipelines {
+        self.lz77_coop.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("lz77_coop"),
+                    source: wgpu::ShaderSource::Wgsl(LZ77_COOP_KERNEL_SOURCE.into()),
+                });
+            let make = |label, entry| {
+                self.device
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some(label),
+                        layout: None,
+                        module: &module,
+                        entry_point: Some(entry),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    })
+            };
+            let group = Lz77CoopPipelines {
+                find: make("lz77_coop_find", "find_matches_coop"),
+                resolve: make("lz77_coop_resolve", "resolve_lazy"),
+            };
+            if self.profiling {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[pz-gpu] compile lz77_coop.wgsl: {ms:.3} ms");
+            }
+            group
+        })
+    }
+
+    fn pipeline_lz77_coop_find(&self) -> &wgpu::ComputePipeline {
+        &self.lz77_coop_pipelines().find
+    }
+
+    fn pipeline_lz77_coop_resolve(&self) -> &wgpu::ComputePipeline {
+        &self.lz77_coop_pipelines().resolve
     }
 
     fn bwt_rank_pipelines(&self) -> &BwtRankPipelines {
