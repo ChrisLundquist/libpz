@@ -39,7 +39,7 @@ struct Lz77Match {
 
 const NEAR_WINDOW: u32 = 1024u;
 const FAR_WINDOW: u32 = 32768u;
-const FAR_STEP: u32 = 4u;
+const FAR_STEP: u32 = 8u;
 const MIN_MATCH: u32 = 3u;
 // Matches this long skip lazy evaluation (unlikely to be beaten).
 const LAZY_SKIP_THRESHOLD: u32 = 32u;
