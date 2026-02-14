@@ -78,11 +78,12 @@ main "$@"
 
 ## Context Minimization Strategies
 
-1. **Summarize instead of dump** — Don't output all lines; show counts, totals, summaries
-2. **Filter aggressively** — Only show failures, differences, or requested data
-3. **Use structured output** — JSON, CSV, or tables for easy parsing
-4. **Provide comparison tools** — Before/after, baseline vs current
-5. **Cache expensive operations** — Store results in temp files for reuse
+1. **Quiet on success** — Agent-facing scripts should suppress output for passing steps, show context only on failure (e.g., `grep -C 3` for errors/warnings)
+2. **Summarize instead of dump** — Don't output all lines; show counts, totals, summaries
+3. **Filter aggressively** — Only show failures, differences, or requested data
+4. **Use structured output** — JSON, CSV, or tables for easy parsing
+5. **Provide comparison tools** — Before/after, baseline vs current
+6. **Cache expensive operations** — Store results in temp files for reuse
 
 ## Integration with Existing Scripts
 
@@ -90,7 +91,7 @@ main "$@"
 - `scripts/bench.sh` — Handles file discovery, iterations, comparison output
 - `scripts/profile.sh` — Auto-naming, feature flag handling, samply integration
 - `scripts/setup.sh` — Idempotent data extraction with checksum validation
-- `scripts/test.sh` — Simple test runner
+- `scripts/test.sh` — Test suite with autofix support (`--fix`, `--quick`, `--all`)
 
 **Common patterns to reuse:**
 - File discovery: `find samples/ -type f`
@@ -131,3 +132,13 @@ Before finalizing:
 - Make scripts work in worktrees (use `$PWD`, not hardcoded paths)
 - Consider adding to pre-commit hook if it's a validation tool
 - Output to stderr for warnings/errors, stdout for data
+## Friction Backlog
+
+`.claude/friction/` is your work queue. Other agents file friction reports there when they hit workflow impediments (noisy output, missing scripts, broken ergonomics). Your job is to:
+
+1. **Read reports** — check `.claude/friction/` for open reports
+2. **Check for patterns** — before fixing, ask the historian agent whether this friction has come up before. If it's a repeated breakage, invest in a deeper structural fix rather than a quick patch.
+3. **Build fixes** — create or update scripts/tools to resolve the friction
+4. **Delete the report** — once fixed, delete the friction file. The fix itself (the script, the config change) is the durable artifact, not the report.
+
+You do NOT file friction reports yourself. If you encounter friction during your own work, fix it directly — you are the tooling agent. Other agents (historian, benchmarker, tester, and the main agent) are the ones who file reports.

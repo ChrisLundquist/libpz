@@ -1,5 +1,12 @@
 # CLAUDE.md — libpz development guide
 
+This is the entry point for day-to-day development. For detailed documentation, see:
+- **docs/DESIGN.md** - Design principles and patterns
+- **docs/QUALITY.md** - Quality status per module/feature
+- **docs/design-docs/** - Detailed design documentation (GPU, pipelines, etc.)
+- **docs/exec-plans/** - Active execution plans and tech debt tracker
+- **ARCHITECTURE.md** - Technical architecture, benchmarks, roadmap
+
 ## First-time setup
 Extract test sample data (needed for validation/benchmark tests):
 ```bash
@@ -8,6 +15,17 @@ Extract test sample data (needed for validation/benchmark tests):
 This is called automatically by `bench.sh` and other scripts, so manual extraction is rarely needed.
 
 ## Build & test commands
+
+### Quick verification (recommended)
+```bash
+./scripts/test.sh              # Run full test suite (fmt, clippy, build, test)
+./scripts/test.sh --quick      # Skip build step, just lint + test
+./scripts/test.sh --fix        # Auto-fix fmt + clippy before checking
+./scripts/test.sh --webgpu     # Include WebGPU-specific tests
+./scripts/test.sh --all        # Test all feature combinations
+```
+
+### Individual commands
 ```bash
 cargo build                          # compile (WebGPU enabled by default)
 cargo test                           # run all tests (includes GPU tests, skips if no device)
@@ -25,7 +43,11 @@ git config core.hooksPath .githooks
 ```
 
 ## Pre-commit checklist
-Before every commit, **always** run (the pre-commit hook handles 1 and 2 automatically):
+Before every commit, **always** run:
+```bash
+./scripts/test.sh --quick    # Recommended: runs fmt, clippy, test
+```
+Or manually (the pre-commit hook handles 1 and 2 automatically):
 1. `cargo fmt` — format all code
 2. `cargo clippy --all-targets` — fix all warnings, zero warnings policy
 3. `cargo test` — all tests must pass
@@ -34,10 +56,11 @@ Before every commit, **always** run (the pre-commit hook handles 1 and 2 automat
 
 ### Quick comparison vs gzip (end-to-end, real files)
 ```bash
-./scripts/bench.sh                              # all Canterbury + large corpus
+./scripts/bench.sh                              # all Canterbury + large corpus (quiet, summary only)
 ./scripts/bench.sh myfile.bin                   # specific files
-./scripts/bench.sh -p deflate,lza               # subset of pipelines
+./scripts/bench.sh -p deflate,lzf               # subset of pipelines
 ./scripts/bench.sh -n 10                        # more iterations
+./scripts/bench.sh -v                           # verbose mode (per-file breakdown)
 ./scripts/bench.sh --help                       # full usage info
 ```
 
@@ -113,6 +136,7 @@ Use `--format mermaid` for diagrams you can paste into [mermaid.live](https://me
 - `kernels/*.wgsl` — WebGPU kernel source
 - `benches/throughput.rs` — end-to-end pipeline benchmarks
 - `benches/stages.rs` — per-algorithm scaling benchmarks
+- `scripts/test.sh` — comprehensive test suite (fmt, clippy, build, test, feature combinations)
 - `scripts/setup.sh` — extract sample archives (idempotent, called automatically by other scripts)
 - `scripts/bench.sh` — pz vs gzip comparison (ratio, throughput, all pipelines)
 - `scripts/profile.sh` — samply profiling wrapper (headless by default, `--web` for browser)
@@ -120,97 +144,34 @@ Use `--format mermaid` for diagrams you can paste into [mermaid.live](https://me
 - `scripts/trace-pipeline.sh` — pipeline flow diagram generator (text or mermaid format)
 - `profiling/` — saved profiles, organized as `<7-char-sha>/<description>.json.gz` (e.g. `a1b2c3d-dirty/`)
 - `examples/profile.rs` — profiling harness (pipeline or individual stage loops)
+- `docs/` — structured documentation (progressive disclosure):
+  - `DESIGN.md` — design principles and patterns
+  - `QUALITY.md` — quality status per module/feature
+  - `design-docs/` — detailed design docs (core-beliefs.md, gpu-batching.md, pipeline-architecture.md, etc.)
+  - `exec-plans/` — active and completed execution plans, tech debt tracker
+  - `references/` — third-party API docs (compression algorithms, wgpu, criterion, etc.)
+  - `generated/` — auto-generated docs (GPU memory formulas, etc.)
 - `.claude/agents/` — custom Claude Code subagents:
   - `historian.md` — research project history and git archaeology (Haiku)
   - `tooling.md` — build scripts to minimize context usage and streamline workflows (Sonnet)
   - `benchmarker.md` — run benchmarks and generate detailed performance reports (Haiku)
-- `.claude/friction/` — friction reports documenting workflow impediments and tool limitations
+  - `tester.md` — run tests with programmatic autofixes, diagnose remaining errors (Haiku)
+- `.claude/friction/` — friction backlog for the tooling agent (other agents file reports here; the tooling agent consumes them)
 
-## Conventions
-- Public API: `encode()` / `decode()` returning `PzResult<T>`
-- Provide `_to_buf` variants for caller-allocated output buffers
-- Algorithms must be composable and standalone — not tied to a specific pipeline
-- GPU-friendly: prefer table-driven, branchless designs (no data-dependent divisions)
-- Error type: `PzError` (InvalidInput, BufferTooSmall, Unsupported, InternalError)
-- Tests go in `#[cfg(test)] mod tests` at the bottom of each module file
+## Key Conventions
 
-## Feature flags
-- **Default:** WebGPU GPU acceleration is enabled by default via wgpu (Vulkan/Metal/DX12). Tests gracefully skip if no GPU device available.
-- **`--no-default-features`:** Pure CPU build (disables WebGPU). Useful for minimal builds or platforms without GPU support.
-- **`webgpu`:** GPU acceleration feature (enabled by default). Always compile-check GPU changes: `cargo build --features webgpu`
-- GPU is **not faster for small inputs** — LZ77 breaks even ~256KB, Huffman ~128KB. Don't optimize GPU paths for small data.
+For detailed design principles and patterns, see **docs/DESIGN.md**.
+For agent-first operating principles, see **docs/design-docs/core-beliefs.md**.
 
-## Understanding GPU resource usage
-- **Never trust memory estimates in comments or plans — read the actual `create_buffer` / `Buffer::create` calls.** Buffer sizes are computed from input length at runtime; the only source of truth is the Rust code that allocates them. Staging buffers, padding, and alignment are easy to miss.
-- The GPU batched path (`compress_parallel_gpu_batched` in `parallel.rs`) and the pipeline-parallel path (`compress_pipeline_parallel`) solve the same problem differently. Understand both before modifying either.
+**Quick reference:**
+- Public API: `encode()` / `decode()` returning `PzResult<T>`, plus `_to_buf` variants
+- Tests go in `#[cfg(test)] mod tests` at bottom of each module file
+- GPU feature enabled by default, skip gracefully if no device available
+- Zero warnings policy: `cargo clippy --all-targets` must pass clean
+- Commit at every logical completion point (run `./scripts/test.sh --quick` first)
 
-## Tracing data flow through pipelines
-- To understand how a pipeline actually works, trace a single block from `compress_block()` in `blocks.rs` through each stage. The `StageBlock.streams` field is the key handoff point — it's `None` before demux and `Some(Vec<Vec<u8>>)` after. Entropy encoders consume `streams`, not `data`.
-- When GPU and CPU paths produce different output for the same input, the divergence is almost always in the demux (stream splitting), not in the entropy coder. Check stream count and byte ordering first.
-- Adding a new LZ-based pipeline only requires an entry in `demuxer_for_pipeline()` and the `entropy_encode()`/`entropy_decode()` dispatch in `blocks.rs` — no new block function needed.
+## Project Status
 
-## Common pitfalls
-1. **Using `--no-default-features` unintentionally** — This disables WebGPU. If GPU tests/benchmarks aren't running, verify you haven't disabled the default features.
-2. **Multi-stream format changes are subtle** — LZ-based pipelines demux into independent streams (LZ77: 3 streams for offsets/lengths/literals, LZSS: 4, LZ78: 1). The per-block multistream container header is `[num_streams: u8][pre_entropy_len: u32][meta_len: u16][meta]`. Don't change without understanding round-trip implications.
-3. **Pre-commit hook auto-reformats and re-stages files** — `cargo fmt` runs automatically and modifies files in-place. If a commit fails on clippy, fix the warning and make a new commit (don't amend).
-4. **Use dedicated tools instead of shell pipelines** — Prefer Grep/Glob tools over `grep | cut | sort | uniq` shell pipelines. Dedicated tools are faster, don't need permission approval, and produce better-structured output.
-5. **All algorithms must be composable** — New algorithms must work both standalone and in pipelines. See `src/validation.rs` for test patterns.
-6. **In a worktree, run git from the worktree directory** — Never `cd` to the main repo to run git commands. Commits will land on the wrong branch.
+**11 of 12 milestones complete.** See **docs/QUALITY.md** for module-by-module status and **docs/exec-plans/tech-debt-tracker.md** for known gaps.
 
-## Shell command style
-- **Never use `git -C <path>`** — always run git commands from the repo root directly.
-- **Don't chain git commands with `echo`, `printf`, or `bash -c`** — these create compound commands that don't match permission allow-lists. Instead, run git commands as standalone Bash calls and use separate tool calls for any follow-up.
-- **Prefer multiple sequential tool calls** over `&&`-chained shell commands when the chain mixes git with non-git commands.
-- **Use HEREDOC syntax for multi-line commit messages** (see the commit instructions in your system prompt).
-
-## Commit discipline
-- **Commit at every logical completion point** — don't let work accumulate uncommitted.
-- A "logical completion point" is any self-contained change: a bug fix, a new feature, a refactor, a test addition, a docs update, etc.
-- Run the pre-commit checklist (`fmt`, `clippy`, `test`) before each commit.
-- If a task has multiple independent parts, commit each part separately rather than one giant commit at the end.
-
-## Documenting friction points
-When you encounter obstacles, bugs, or workflow impediments during development, document them in `.claude/friction/`:
-
-**What to document:**
-- Permission prompts that shouldn't require approval (e.g., patterns not matching in settings.json)
-- Tool limitations or unexpected behavior (e.g., pattern matching edge cases)
-- Bugs in dependencies or external tools
-- Confusing error messages that needed investigation
-- Workarounds required for common tasks
-- Missing features that would improve the workflow
-
-**Format:**
-Create a new file named `YYYY-MM-DD-short-description.md` with:
-```markdown
-# Short Description of Issue
-
-**Date:** YYYY-MM-DD
-**Agent/User:** (who encountered this)
-**Severity:** Low | Medium | High
-
-## Problem
-Clear description of the friction point and how it impeded work.
-
-## Steps to Reproduce
-1. Step-by-step reproduction if applicable
-
-## Workaround
-What was done to work around the issue (if any).
-
-## Suggested Fix
-Ideas for permanently resolving the issue.
-```
-
-**When to document:**
-- After completing a task where you hit an obstacle
-- When you notice a pattern of repeated friction across sessions
-- When a workaround feels hacky or unsatisfying
-- When you spend >5 minutes debugging a tool or permission issue
-
-These reports help identify patterns and prioritize tooling improvements.
-
-## Project status
-11 of 12 milestones complete. All core algorithms, pipelines, GPU kernels (WebGPU), auto-selection, optimal parsing, multi-threading, and tooling are implemented. Not started: fuzz testing (M5.3).
-
-For detailed GPU benchmarks, architecture notes, and roadmap see `ARCHITECTURE.md`.
+For detailed architecture, GPU benchmarks, and roadmap see **ARCHITECTURE.md**.
