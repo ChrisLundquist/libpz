@@ -1492,3 +1492,171 @@ fn test_gpu_lazy_quality_fields_c() {
         "fields.c: too few GPU matched bytes ({gpu_matched} < 7000)"
     );
 }
+
+// --- GPU prefix sum tests ---
+
+#[test]
+fn test_prefix_sum_small() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let data: Vec<u32> = vec![1, 2, 3, 4, 5];
+    let n = data.len();
+    let buf = engine.create_buffer_init(
+        "ps_test",
+        bytemuck::cast_slice(&data),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    );
+
+    engine.prefix_sum_gpu(&buf, n).unwrap();
+
+    let raw = engine.read_buffer(&buf, (n * 4) as u64);
+    let result: &[u32] = bytemuck::cast_slice(&raw);
+    // Exclusive prefix sum of [1,2,3,4,5] = [0,1,3,6,10]
+    assert_eq!(&result[..n], &[0, 1, 3, 6, 10]);
+}
+
+#[test]
+fn test_prefix_sum_exact_block_size() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Exact block size = 512 (256 * 2)
+    let n = 512;
+    let data: Vec<u32> = (0..n as u32).map(|_| 1).collect();
+    let buf = engine.create_buffer_init(
+        "ps_test_512",
+        bytemuck::cast_slice(&data),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    );
+
+    engine.prefix_sum_gpu(&buf, n).unwrap();
+
+    let raw = engine.read_buffer(&buf, (n * 4) as u64);
+    let result: &[u32] = bytemuck::cast_slice(&raw);
+    // Exclusive prefix sum of all-ones = [0, 1, 2, ..., 511]
+    for (i, &val) in result[..n].iter().enumerate() {
+        assert_eq!(val, i as u32, "mismatch at index {i}");
+    }
+}
+
+#[test]
+fn test_prefix_sum_multi_level() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // 2000 elements requires multi-level (> 512)
+    let n = 2000;
+    let data: Vec<u32> = (0..n as u32).map(|i| (i % 7) + 1).collect();
+    let buf = engine.create_buffer_init(
+        "ps_test_multi",
+        bytemuck::cast_slice(&data),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    );
+
+    engine.prefix_sum_gpu(&buf, n).unwrap();
+
+    let raw = engine.read_buffer(&buf, (n * 4) as u64);
+    let result: &[u32] = bytemuck::cast_slice(&raw);
+
+    // Verify against CPU prefix sum
+    let mut expected = vec![0u32; n];
+    let mut sum = 0u32;
+    for (i, slot) in expected.iter_mut().enumerate() {
+        *slot = sum;
+        sum += (i as u32 % 7) + 1;
+    }
+    assert_eq!(&result[..n], &expected[..]);
+}
+
+#[test]
+fn test_prefix_sum_single_element() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let data: Vec<u32> = vec![42];
+    let buf = engine.create_buffer_init(
+        "ps_test_single",
+        bytemuck::cast_slice(&data),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    );
+
+    engine.prefix_sum_gpu(&buf, 1).unwrap();
+
+    let raw = engine.read_buffer(&buf, 4);
+    let result: &[u32] = bytemuck::cast_slice(&raw);
+    assert_eq!(result[0], 0);
+}
+
+// --- huffman_encode_fully_on_device tests ---
+
+#[test]
+fn test_huffman_encode_fully_on_device_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input = b"hello world hello world hello world!";
+    let tree = crate::huffman::HuffmanTree::from_data(input).unwrap();
+
+    let mut code_lut = [0u32; 256];
+    for byte in 0..=255u8 {
+        let (codeword, bits) = tree.get_code(byte);
+        code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+    }
+
+    let device_input = DeviceBuf::from_host(&engine, input).unwrap();
+    let (gpu_encoded, gpu_bits) = engine
+        .huffman_encode_fully_on_device(&device_input, &code_lut)
+        .unwrap();
+    let (cpu_encoded, cpu_bits) = tree.encode(input).unwrap();
+
+    assert_eq!(gpu_bits, cpu_bits, "bit counts differ");
+    assert_eq!(gpu_encoded, cpu_encoded, "encoded data differs");
+
+    let decoded = tree.decode(&gpu_encoded, gpu_bits).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_huffman_encode_fully_on_device_larger() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+
+    let tree = crate::huffman::HuffmanTree::from_data(&input).unwrap();
+    let mut code_lut = [0u32; 256];
+    for byte in 0..=255u8 {
+        let (codeword, bits) = tree.get_code(byte);
+        code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+    }
+
+    let device_input = DeviceBuf::from_host(&engine, &input).unwrap();
+    let (gpu_encoded, gpu_bits) = engine
+        .huffman_encode_fully_on_device(&device_input, &code_lut)
+        .unwrap();
+    let decoded = tree.decode(&gpu_encoded, gpu_bits).unwrap();
+    assert_eq!(decoded, input);
+}

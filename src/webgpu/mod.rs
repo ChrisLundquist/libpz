@@ -199,11 +199,13 @@ struct BwtRadixPipelines {
     scatter: wgpu::ComputePipeline,
 }
 
-/// Huffman encoding pipelines (3 pipelines from huffman_encode.wgsl).
+/// Huffman encoding pipelines (5 pipelines from huffman_encode.wgsl).
 struct HuffmanPipelines {
     byte_histogram: wgpu::ComputePipeline,
     compute_bit_lengths: wgpu::ComputePipeline,
     write_codes: wgpu::ComputePipeline,
+    prefix_sum_block: wgpu::ComputePipeline,
+    prefix_sum_apply: wgpu::ComputePipeline,
 }
 
 /// FSE decode pipeline (1 pipeline from fse_decode.wgsl).
@@ -939,6 +941,8 @@ impl WebGpuEngine {
                 byte_histogram: make("byte_histogram", "byte_histogram"),
                 compute_bit_lengths: make("compute_bit_lengths", "compute_bit_lengths"),
                 write_codes: make("write_codes", "write_codes"),
+                prefix_sum_block: make("prefix_sum_block", "prefix_sum_block"),
+                prefix_sum_apply: make("prefix_sum_apply", "prefix_sum_apply"),
             };
             if self.profiling {
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -958,6 +962,14 @@ impl WebGpuEngine {
 
     fn pipeline_write_codes(&self) -> &wgpu::ComputePipeline {
         &self.huffman_pipelines().write_codes
+    }
+
+    fn pipeline_prefix_sum_block(&self) -> &wgpu::ComputePipeline {
+        &self.huffman_pipelines().prefix_sum_block
+    }
+
+    fn pipeline_prefix_sum_apply(&self) -> &wgpu::ComputePipeline {
+        &self.huffman_pipelines().prefix_sum_apply
     }
 
     fn pipeline_fse_decode(&self) -> &wgpu::ComputePipeline {
