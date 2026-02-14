@@ -542,7 +542,7 @@ impl WebGpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        self.poll_wait();
         rx.recv()
             .unwrap()
             .map_err(|_| PzError::Unsupported)
@@ -576,7 +576,7 @@ impl WebGpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        self.poll_wait();
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();
@@ -657,12 +657,21 @@ impl WebGpuEngine {
     pub fn profiler_end_frame(&self) -> Option<Vec<wgpu_profiler::GpuTimerQueryResult>> {
         let p = self.profiler.as_ref()?;
         {
-            p.lock().unwrap().end_frame().ok()?;
+            let result = p.lock().unwrap().end_frame();
+            if let Err(ref e) = result {
+                eprintln!("[pz-gpu] profiler end_frame error: {e:?}");
+            }
+            result.ok()?;
         }
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-        p.lock()
+        self.poll_wait();
+        let results = p
+            .lock()
             .unwrap()
-            .process_finished_frame(self.queue.get_timestamp_period())
+            .process_finished_frame(self.queue.get_timestamp_period());
+        if results.is_none() {
+            eprintln!("[pz-gpu] profiler process_finished_frame returned None");
+        }
+        results
     }
 
     /// Write collected profiler results to a Chrome trace file.
@@ -697,7 +706,7 @@ impl WebGpuEngine {
         self.queue.submit(Some(encoder.finish()));
         // Wall-clock fallback when profiler is not available
         if self.profiling && self.profiler.is_none() {
-            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            self.poll_wait();
             let ms = t0.unwrap().elapsed().as_secs_f64() * 1000.0;
             eprintln!("[pz-gpu] {label}: {ms:.3} ms");
         }

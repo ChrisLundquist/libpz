@@ -58,7 +58,7 @@ impl WebGpuEngine {
     /// Internal: cooperative-stitch match finding with submit/complete pattern.
     fn find_matches_coop_impl(&self, input: &[u8]) -> PzResult<Vec<Match>> {
         let pending = self.submit_find_matches_coop(input)?;
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        self.poll_wait();
         if self.profiling {
             eprintln!("[pz-gpu] lz77_coop (find+resolve): submitted");
         }
@@ -328,7 +328,7 @@ impl WebGpuEngine {
         self.profiler_resolve(&mut encoder);
         self.queue.submit(Some(encoder.finish()));
         if let Some(t0) = t0 {
-            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            self.poll_wait();
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             eprintln!("[pz-gpu] lz77_to_device (find+resolve): {ms:.3} ms");
         }
@@ -483,7 +483,7 @@ impl WebGpuEngine {
         self.queue.submit(Some(encoder.finish()));
 
         // Wait for all work including the copy
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        self.poll_wait();
         if let Some(t0) = t0 {
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             eprintln!("[pz-gpu] lz77_hash (build+find): {ms:.3} ms");
@@ -495,7 +495,7 @@ impl WebGpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        self.poll_wait();
         rx.recv().unwrap().map_err(|_| PzError::Unsupported)?;
 
         let raw = slice.get_mapped_range().to_vec();
@@ -512,7 +512,7 @@ impl WebGpuEngine {
     #[allow(dead_code)]
     fn find_matches_lazy(&self, input: &[u8]) -> PzResult<Vec<Match>> {
         let pending = self.submit_find_matches_lazy(input)?;
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        self.poll_wait();
         if self.profiling {
             eprintln!("[pz-gpu] lz77_lazy (find+resolve): submitted");
         }
@@ -656,7 +656,7 @@ impl WebGpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        self.poll_wait();
         rx.recv().unwrap().map_err(|_| PzError::Unsupported)?;
 
         let raw = slice.get_mapped_range().to_vec();
@@ -668,14 +668,12 @@ impl WebGpuEngine {
 
     /// GPU-accelerated LZ77 match finding for multiple blocks.
     ///
-    /// Submits GPU work for all blocks before reading back any results,
-    /// hiding GPU-CPU transfer latency. Falls back to CPU lazy matching
-    /// for blocks that are too small or too large for GPU.
+    /// Uses a ring of pre-allocated buffer slots to avoid per-block buffer
+    /// creation overhead. While the GPU computes on slot N, the CPU reads
+    /// back results from slot N-1 (double-buffered streaming).
     ///
-    /// # Phases
-    /// 1. **Submit**: Encode and submit all block dispatches (non-blocking).
-    /// 2. **Sync**: Single `device.poll(Wait)` for all blocks.
-    /// 3. **Readback**: Map each staging buffer, dedup matches.
+    /// Falls back to CPU lazy matching for blocks that are too small or
+    /// too large for GPU.
     pub fn find_matches_batched(&self, blocks: &[&[u8]]) -> PzResult<Vec<Vec<Match>>> {
         if blocks.is_empty() {
             return Ok(Vec::new());
@@ -686,21 +684,97 @@ impl WebGpuEngine {
         }
 
         let max_dispatch = self.max_dispatch_input_size();
+        let max_block = blocks.iter().map(|b| b.len()).max().unwrap_or(256 * 1024);
+
+        // Try to allocate a ring of pre-allocated slots
+        if let Some(mut ring) = self.create_lz77_ring(max_block) {
+            return self.find_matches_batched_ring(blocks, max_dispatch, &mut ring);
+        }
+
+        // Fallback: no ring available (insufficient GPU memory), use per-block alloc
+        self.find_matches_batched_alloc(blocks, max_dispatch)
+    }
+
+    /// Ring-based batched match finding: double/triple-buffered streaming.
+    ///
+    /// Pre-allocated buffer slots cycle through blocks. While the GPU
+    /// computes on one slot, the CPU reads back from a previously
+    /// completed slot, avoiding per-block buffer allocation overhead.
+    fn find_matches_batched_ring(
+        &self,
+        blocks: &[&[u8]],
+        max_dispatch: usize,
+        ring: &mut BufferRing<Lz77BufferSlot>,
+    ) -> PzResult<Vec<Vec<Match>>> {
+        let ring_depth = ring.depth();
+        let mut all_results: Vec<Option<Vec<Match>>> = (0..blocks.len()).map(|_| None).collect();
+
+        // slot_inflight[slot_idx] = Some(block_idx) if that slot has pending GPU work
+        let mut slot_inflight: Vec<Option<usize>> = vec![None; ring_depth];
+
+        for (block_idx, block) in blocks.iter().enumerate() {
+            // CPU fallback for edge cases
+            if block.is_empty() || block.len() < MIN_GPU_INPUT_SIZE || block.len() > max_dispatch {
+                if block.is_empty() {
+                    all_results[block_idx] = Some(Vec::new());
+                } else {
+                    all_results[block_idx] = Some(crate::lz77::compress_lazy_to_matches(block)?);
+                }
+                continue;
+            }
+
+            let slot_idx = ring.acquire();
+
+            // If this slot has previous in-flight work, complete it first
+            if let Some(prev_idx) = slot_inflight[slot_idx].take() {
+                self.poll_wait();
+                all_results[prev_idx] =
+                    Some(self.complete_lz77_from_slot(&ring.slots[slot_idx], blocks[prev_idx])?);
+            }
+
+            // Submit new block to this slot
+            self.submit_lz77_to_slot(block, &ring.slots[slot_idx])?;
+            slot_inflight[slot_idx] = Some(block_idx);
+        }
+
+        // Drain remaining in-flight slots
+        for (slot_idx, inflight) in slot_inflight.iter_mut().enumerate() {
+            if let Some(prev_idx) = inflight.take() {
+                self.poll_wait();
+                all_results[prev_idx] =
+                    Some(self.complete_lz77_from_slot(&ring.slots[slot_idx], blocks[prev_idx])?);
+            }
+        }
+
+        if self.profiling {
+            eprintln!(
+                "[pz-gpu] lz77_batched_ring: {} blocks, ring depth {}",
+                blocks.len(),
+                ring_depth
+            );
+        }
+
+        Ok(all_results
+            .into_iter()
+            .map(|r| r.unwrap_or_default())
+            .collect())
+    }
+
+    /// Fallback batched match finding with per-block buffer allocation.
+    ///
+    /// Used when the ring can't be allocated (insufficient GPU memory).
+    fn find_matches_batched_alloc(
+        &self,
+        blocks: &[&[u8]],
+        max_dispatch: usize,
+    ) -> PzResult<Vec<Vec<Match>>> {
         let mut all_results: Vec<Vec<Match>> = Vec::with_capacity(blocks.len());
 
-        // Compute batch size from the kernel cost model and device memory budget.
-        // Allow large batches to maximize GPU utilization — submitting all blocks
-        // in one batch lets the GPU pipeline work across blocks while hiding
-        // per-dispatch overhead. On discrete GPUs (e.g. 16GB VRAM) the memory
-        // budget easily accommodates 32+ concurrent 256KB blocks (~18MB each).
-        const GPU_MAX_BATCH: usize = 64;
         let block_size = blocks.first().map(|b| b.len()).unwrap_or(256 * 1024);
         let mem_limit = self.max_in_flight(&self.cost_lz77_lazy, block_size);
-        let batch_size = mem_limit.min(GPU_MAX_BATCH);
+        let batch_size = mem_limit.min(64);
 
-        // Process in batches to cap GPU memory usage
         for chunk in blocks.chunks(batch_size) {
-            // Phase 1: Submit all blocks in this batch
             let mut pending: Vec<Option<PendingLz77>> = Vec::with_capacity(chunk.len());
 
             for block in chunk {
@@ -708,16 +782,14 @@ impl WebGpuEngine {
                     || block.len() < MIN_GPU_INPUT_SIZE
                     || block.len() > max_dispatch
                 {
-                    pending.push(None); // CPU fallback
+                    pending.push(None);
                 } else {
                     pending.push(Some(self.submit_find_matches_coop(block)?));
                 }
             }
 
-            // Phase 2: Wait for ALL GPU work in this batch to complete
-            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            self.poll_wait();
 
-            // Phase 3: Read back + dedup
             for (i, p) in pending.into_iter().enumerate() {
                 match p {
                     Some(pending_lz77) => {
@@ -736,7 +808,7 @@ impl WebGpuEngine {
 
         if self.profiling {
             eprintln!(
-                "[pz-gpu] lz77_lazy_batched: {} blocks processed",
+                "[pz-gpu] lz77_batched_alloc: {} blocks processed",
                 blocks.len()
             );
         }
@@ -1030,7 +1102,7 @@ impl WebGpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        self.poll_wait();
         rx.recv().unwrap().map_err(|_| PzError::Unsupported)?;
 
         let raw = slice.get_mapped_range().to_vec();
