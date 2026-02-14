@@ -20,6 +20,7 @@ The pre-commit hook (auto-configured by `scripts/setup.sh`) runs fmt, clippy, an
 ./scripts/profile.sh           # samply profiling (see --help for options)
 ./scripts/gpu-meminfo.sh       # GPU memory cost calculator
 ./scripts/trace-pipeline.sh    # pipeline flow diagrams (text or mermaid)
+./scripts/webgpu_profile.sh   # GPU vs CPU per-stage timing comparisons
 ```
 
 All scripts support `--help`. Optimization workflow: measure (`bench.sh`) → identify (`profile.sh --stage <stage>`) → change → validate (`cargo test`) → re-measure (`cargo bench -- <stage>`) → confirm (`bench.sh`). Prefer delegating benchmark runs to the **benchmarker** agent.
@@ -35,8 +36,15 @@ Specialized agents in `.claude/agents/` run on cheaper models and keep verbose o
 
 ## Project layout
 
-- `src/{algorithm}.rs` — one file per composable algorithm (bwt, deflate, fse, huffman, lz77, mtf, rans, rle)
-- `src/pipeline/` — multi-stage compression pipelines, auto-selection, block parallelism
+- `src/lib.rs` — crate root, `PzError`/`PzResult` types
+- `src/{algorithm}.rs` — one file per composable algorithm (bwt, crc32, deflate, fse, huffman, lz77, lz78, lzss, mtf, rans, rle)
+- `src/analysis.rs` — data profiling (entropy, match density, run ratio, autocorrelation)
+- `src/optimal.rs` — optimal parsing (GPU top-K + backward DP)
+- `src/simd.rs` — SIMD decode paths for rANS
+- `src/streaming.rs` — streaming compression interface
+- `src/ffi.rs` — C FFI bindings
+- `src/pipeline/` — multi-stage compression pipelines, auto-selection, block parallelism, demux
+- `src/bin/pz.rs` — CLI binary (`pz` with `-a`/`--auto` and `--trial` flags)
 - `src/webgpu/` — WebGPU backend (feature-gated behind `webgpu`)
 - `kernels/*.wgsl` — WebGPU kernel source
 - `scripts/` — test, bench, profile, setup, and analysis tools
