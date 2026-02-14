@@ -1790,3 +1790,160 @@ fn test_fse_decode_blocks_vs_single_decode() {
 
     assert_eq!(multi_decoded, single_decoded);
 }
+
+// --- rANS GPU decode tests ---
+
+#[test]
+fn test_rans_decode_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..500).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+    let encoded = crate::rans::encode_interleaved_n(&input, 4, 12);
+    let decoded = engine.rans_decode_interleaved(&encoded, input.len()).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_rans_decode_various_scale_bits() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..300).map(|i| ((i * 17 + 5) % 256) as u8).collect();
+    for scale_bits in [10, 12, 14] {
+        let encoded = crate::rans::encode_interleaved_n(&input, 4, scale_bits);
+        let decoded = engine
+            .rans_decode_interleaved(&encoded, input.len())
+            .unwrap();
+        assert_eq!(decoded, input, "failed at scale_bits={scale_bits}");
+    }
+}
+
+#[test]
+fn test_rans_decode_vs_cpu() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..1000).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+    let encoded = crate::rans::encode_interleaved_n(&input, 8, 12);
+    let cpu_decoded = crate::rans::decode_interleaved(&encoded, input.len()).unwrap();
+    let gpu_decoded = engine
+        .rans_decode_interleaved(&encoded, input.len())
+        .unwrap();
+    assert_eq!(gpu_decoded, cpu_decoded);
+}
+
+/// Encode multiple blocks of data using rANS with a shared frequency table.
+fn rans_encode_blocks_shared(
+    input: &[u8],
+    block_size: usize,
+    num_states: usize,
+    scale_bits: u8,
+) -> Vec<(Vec<u8>, usize)> {
+    use crate::frequency::FrequencyTable;
+    use crate::rans::{
+        normalize_frequencies, rans_encode_interleaved, serialize_freq_table,
+        serialize_u16_le_bulk, NUM_SYMBOLS,
+    };
+
+    let num_states = num_states.max(1);
+    let scale_bits = scale_bits.clamp(crate::rans::MIN_SCALE_BITS, crate::rans::MAX_SCALE_BITS);
+
+    let mut freq = FrequencyTable::new();
+    freq.count(input);
+
+    let mut sb = scale_bits;
+    while (1u32 << sb) < freq.used {
+        sb += 1;
+        if sb > crate::rans::MAX_SCALE_BITS {
+            break;
+        }
+    }
+
+    let norm = normalize_frequencies(&freq, sb).unwrap();
+
+    let mut result = Vec::new();
+    for chunk in input.chunks(block_size) {
+        let (word_streams, final_states) = rans_encode_interleaved(chunk, &norm, num_states);
+
+        let total_words: usize = word_streams.iter().map(|s| s.len()).sum();
+        let header_size = 1 + NUM_SYMBOLS * 2 + 1 + num_states * 4 + num_states * 4;
+        let mut output = Vec::with_capacity(header_size + total_words * 2);
+
+        output.push(sb);
+        serialize_freq_table(&norm, &mut output);
+        output.push(num_states as u8);
+
+        for &state in &final_states {
+            output.extend_from_slice(&state.to_le_bytes());
+        }
+        for stream in &word_streams {
+            output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+        }
+        for stream in &word_streams {
+            serialize_u16_le_bulk(stream, &mut output);
+        }
+
+        result.push((output, chunk.len()));
+    }
+    result
+}
+
+#[test]
+fn test_rans_decode_blocks_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..2000).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+    let encoded_blocks = rans_encode_blocks_shared(&input, 500, 4, 12);
+
+    // Verify CPU can decode each block
+    let mut cpu_result = Vec::new();
+    for (enc, orig_len) in &encoded_blocks {
+        let decoded = crate::rans::decode_interleaved(enc, *orig_len).unwrap();
+        cpu_result.extend_from_slice(&decoded);
+    }
+    assert_eq!(cpu_result, input, "CPU round-trip failed");
+
+    // GPU multi-block decode
+    let block_refs: Vec<(&[u8], usize)> = encoded_blocks
+        .iter()
+        .map(|(data, len)| (data.as_slice(), *len))
+        .collect();
+
+    let decoded = engine.rans_decode_interleaved_blocks(&block_refs).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_rans_decode_blocks_various_scale_bits() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..1000).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+    for scale_bits in [10, 12, 14] {
+        let encoded_blocks = rans_encode_blocks_shared(&input, 250, 4, scale_bits);
+        let block_refs: Vec<(&[u8], usize)> = encoded_blocks
+            .iter()
+            .map(|(data, len)| (data.as_slice(), *len))
+            .collect();
+
+        let decoded = engine.rans_decode_interleaved_blocks(&block_refs).unwrap();
+        assert_eq!(decoded, input, "failed at scale_bits={scale_bits}");
+    }
+}

@@ -40,6 +40,7 @@ mod bwt;
 mod fse;
 mod huffman;
 pub(crate) mod lz77;
+mod rans;
 
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -71,6 +72,13 @@ const FSE_DECODE_BLOCKS_KERNEL_SOURCE: &str = include_str!("../../kernels/fse_de
 
 /// Embedded WGSL kernel source: GPU FSE encode.
 const FSE_ENCODE_KERNEL_SOURCE: &str = include_str!("../../kernels/fse_encode.wgsl");
+
+/// Embedded WGSL kernel source: GPU rANS decode (single stream).
+const RANS_DECODE_KERNEL_SOURCE: &str = include_str!("../../kernels/rans_decode.wgsl");
+
+/// Embedded WGSL kernel source: GPU rANS multi-block decode.
+const RANS_DECODE_BLOCKS_KERNEL_SOURCE: &str =
+    include_str!("../../kernels/rans_decode_blocks.wgsl");
 
 /// Number of candidates per position in the top-K kernel (must match K in lz77_topk.wgsl).
 const TOPK_K: usize = 4;
@@ -226,6 +234,16 @@ struct FseEncodePipelines {
     encode: wgpu::ComputePipeline,
 }
 
+/// rANS decode pipeline (1 pipeline from rans_decode.wgsl).
+struct RansDecodePipelines {
+    decode: wgpu::ComputePipeline,
+}
+
+/// rANS multi-block decode pipeline (1 pipeline from rans_decode_blocks.wgsl).
+struct RansDecodeBlocksPipelines {
+    decode_blocks: wgpu::ComputePipeline,
+}
+
 /// WebGPU compute engine.
 ///
 /// Manages the wgpu device, queue, and lazily-compiled compute pipelines.
@@ -245,6 +263,8 @@ pub struct WebGpuEngine {
     fse_decode: OnceLock<FseDecodePipelines>,
     fse_decode_blocks: OnceLock<FseDecodeBlocksPipelines>,
     fse_encode: OnceLock<FseEncodePipelines>,
+    rans_decode: OnceLock<RansDecodePipelines>,
+    rans_decode_blocks: OnceLock<RansDecodeBlocksPipelines>,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum compute workgroup size.
@@ -384,6 +404,8 @@ impl WebGpuEngine {
             fse_decode: OnceLock::new(),
             fse_decode_blocks: OnceLock::new(),
             fse_encode: OnceLock::new(),
+            rans_decode: OnceLock::new(),
+            rans_decode_blocks: OnceLock::new(),
             device_name,
             max_work_group_size,
             max_workgroups_per_dim,
@@ -1018,6 +1040,48 @@ impl WebGpuEngine {
                 if self.profiling {
                     let ms = t0.elapsed().as_secs_f64() * 1000.0;
                     eprintln!("[pz-gpu] compile fse_decode_blocks.wgsl: {ms:.3} ms");
+                }
+                group
+            })
+            .decode_blocks
+    }
+
+    fn pipeline_rans_decode(&self) -> &wgpu::ComputePipeline {
+        &self
+            .rans_decode
+            .get_or_init(|| {
+                let t0 = std::time::Instant::now();
+                let group = RansDecodePipelines {
+                    decode: self.make_pipeline(
+                        "rans_decode",
+                        RANS_DECODE_KERNEL_SOURCE,
+                        "rans_decode",
+                    ),
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile rans_decode.wgsl: {ms:.3} ms");
+                }
+                group
+            })
+            .decode
+    }
+
+    fn pipeline_rans_decode_blocks(&self) -> &wgpu::ComputePipeline {
+        &self
+            .rans_decode_blocks
+            .get_or_init(|| {
+                let t0 = std::time::Instant::now();
+                let group = RansDecodeBlocksPipelines {
+                    decode_blocks: self.make_pipeline(
+                        "rans_decode_blocks",
+                        RANS_DECODE_BLOCKS_KERNEL_SOURCE,
+                        "rans_decode_blocks",
+                    ),
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile rans_decode_blocks.wgsl: {ms:.3} ms");
                 }
                 group
             })
