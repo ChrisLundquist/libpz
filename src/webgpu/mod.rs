@@ -662,17 +662,18 @@ impl WebGpuEngine {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("profiler_warmup"),
                 });
-            // Issue a dummy query pair — no actual compute pass needed.
-            let query = p.lock().unwrap().begin_pass_query("_warmup", &mut encoder);
-            // Create an empty compute pass so the timestamp writes are valid.
+            let mut profiler = p.lock().unwrap();
+            let query = profiler.begin_pass_query("_warmup", &mut encoder);
+            // Empty compute pass so the timestamp writes are valid.
             {
                 let _pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("_warmup"),
                     timestamp_writes: query.compute_pass_timestamp_writes(),
                 });
             }
-            p.lock().unwrap().end_query(&mut encoder, query);
-            p.lock().unwrap().resolve_queries(&mut encoder);
+            profiler.end_query(&mut encoder, query);
+            profiler.resolve_queries(&mut encoder);
+            drop(profiler);
             self.queue.submit(Some(encoder.finish()));
         }
     }

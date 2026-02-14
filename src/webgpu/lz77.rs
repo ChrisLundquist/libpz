@@ -240,6 +240,9 @@ impl WebGpuEngine {
     /// - (future) Pass to a GPU demux kernel without any PCI transfer
     ///
     /// This is the building block for zero-copy GPU pipeline composition.
+    ///
+    /// Uses the same cooperative-stitch kernel as [`find_matches()`] but
+    /// keeps results in GPU memory instead of downloading to CPU.
     pub fn find_matches_to_device(&self, input: &[u8]) -> PzResult<GpuMatchBuf> {
         if input.is_empty() {
             let buf = self.create_buffer(
@@ -535,7 +538,7 @@ impl WebGpuEngine {
     /// Pass 1: Near brute-force scan (parallel, no hash table).
     /// Pass 2: Lazy resolve -- demote positions where pos+1 has a longer match.
     #[allow(dead_code)]
-    fn find_matches_lazy(&self, input: &[u8]) -> PzResult<Vec<Match>> {
+    pub(crate) fn find_matches_lazy(&self, input: &[u8]) -> PzResult<Vec<Match>> {
         let pending = self.submit_find_matches_lazy(input)?;
         self.poll_wait();
         if self.profiling {
@@ -1112,8 +1115,10 @@ impl WebGpuEngine {
     /// Complete a previously submitted slot-based LZ77 computation.
     ///
     /// Maps the staging buffer, reads back matches, unmaps, and deduplicates.
-    /// The caller must ensure `device.poll(Wait)` has been called after
-    /// submitting to guarantee GPU work is complete.
+    /// The caller must call `poll_wait()` before this method to ensure GPU
+    /// compute and the staging copy have completed. This method issues its
+    /// own `map_async` + `poll_wait` internally to process the buffer mapping
+    /// callback — that second poll is not redundant with the caller's.
     pub(crate) fn complete_lz77_from_slot(
         &self,
         slot: &Lz77BufferSlot,

@@ -1838,3 +1838,31 @@ fn test_lz77_coop_round_trip_large() {
     let decompressed = crate::lz77::decompress(&compressed).unwrap();
     assert_eq!(decompressed, input);
 }
+
+/// Exercises the lazy kernel path directly to prevent bitrot.
+/// The lazy kernel is kept for A/B benchmarking against the default coop kernel.
+#[test]
+fn test_lz77_lazy_kernel_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::with_capacity(8 * 1024);
+    while input.len() < 8 * 1024 {
+        let chunk = (8 * 1024 - input.len()).min(pattern.len());
+        input.extend_from_slice(&pattern[..chunk]);
+    }
+
+    let matches = engine.find_matches_lazy(&input).unwrap();
+    assert!(!matches.is_empty(), "lazy kernel should produce matches");
+
+    let mut compressed = Vec::new();
+    for m in &matches {
+        compressed.extend_from_slice(&m.to_bytes());
+    }
+    let decompressed = crate::lz77::decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input, "lazy kernel round-trip failed");
+}
