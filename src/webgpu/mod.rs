@@ -66,6 +66,9 @@ const HUFFMAN_ENCODE_KERNEL_SOURCE: &str = include_str!("../../kernels/huffman_e
 /// Embedded WGSL kernel source: GPU FSE decode.
 const FSE_DECODE_KERNEL_SOURCE: &str = include_str!("../../kernels/fse_decode.wgsl");
 
+/// Embedded WGSL kernel source: GPU FSE multi-block decode.
+const FSE_DECODE_BLOCKS_KERNEL_SOURCE: &str = include_str!("../../kernels/fse_decode_blocks.wgsl");
+
 /// Embedded WGSL kernel source: GPU FSE encode.
 const FSE_ENCODE_KERNEL_SOURCE: &str = include_str!("../../kernels/fse_encode.wgsl");
 
@@ -213,6 +216,11 @@ struct FseDecodePipelines {
     decode: wgpu::ComputePipeline,
 }
 
+/// FSE multi-block decode pipeline (1 pipeline from fse_decode_blocks.wgsl).
+struct FseDecodeBlocksPipelines {
+    decode_blocks: wgpu::ComputePipeline,
+}
+
 /// FSE encode pipeline (1 pipeline from fse_encode.wgsl).
 struct FseEncodePipelines {
     encode: wgpu::ComputePipeline,
@@ -235,6 +243,7 @@ pub struct WebGpuEngine {
     bwt_radix: OnceLock<BwtRadixPipelines>,
     huffman: OnceLock<HuffmanPipelines>,
     fse_decode: OnceLock<FseDecodePipelines>,
+    fse_decode_blocks: OnceLock<FseDecodeBlocksPipelines>,
     fse_encode: OnceLock<FseEncodePipelines>,
     /// Device name for diagnostics.
     device_name: String,
@@ -373,6 +382,7 @@ impl WebGpuEngine {
             bwt_radix: OnceLock::new(),
             huffman: OnceLock::new(),
             fse_decode: OnceLock::new(),
+            fse_decode_blocks: OnceLock::new(),
             fse_encode: OnceLock::new(),
             device_name,
             max_work_group_size,
@@ -991,6 +1001,27 @@ impl WebGpuEngine {
                 group
             })
             .decode
+    }
+
+    fn pipeline_fse_decode_blocks(&self) -> &wgpu::ComputePipeline {
+        &self
+            .fse_decode_blocks
+            .get_or_init(|| {
+                let t0 = std::time::Instant::now();
+                let group = FseDecodeBlocksPipelines {
+                    decode_blocks: self.make_pipeline(
+                        "fse_decode_blocks",
+                        FSE_DECODE_BLOCKS_KERNEL_SOURCE,
+                        "fse_decode_blocks",
+                    ),
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile fse_decode_blocks.wgsl: {ms:.3} ms");
+                }
+                group
+            })
+            .decode_blocks
     }
 
     fn pipeline_fse_encode(&self) -> &wgpu::ComputePipeline {

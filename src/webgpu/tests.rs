@@ -1660,3 +1660,133 @@ fn test_huffman_encode_fully_on_device_larger() {
     let decoded = tree.decode(&gpu_encoded, gpu_bits).unwrap();
     assert_eq!(decoded, input);
 }
+
+// --- FSE multi-block decode tests ---
+
+/// Encode multiple blocks of data using FSE with a shared frequency table.
+/// Returns (encoded_block_data, original_len) per block.
+fn fse_encode_blocks_shared(
+    input: &[u8],
+    block_size: usize,
+    num_streams: usize,
+    accuracy_log: u8,
+) -> Vec<(Vec<u8>, usize)> {
+    use crate::fse::{fse_encode_interleaved, normalize_frequencies, FseTable, FREQ_TABLE_BYTES};
+    use crate::frequency::FrequencyTable;
+
+    let mut freq = FrequencyTable::new();
+    freq.count(input);
+
+    let mut al = accuracy_log;
+    while (1u32 << al) < freq.used {
+        al += 1;
+        if al > crate::fse::MAX_ACCURACY_LOG {
+            break;
+        }
+    }
+
+    let norm = normalize_frequencies(&freq, al).unwrap();
+    let table = FseTable::from_normalized(&norm);
+
+    let mut result = Vec::new();
+    for chunk in input.chunks(block_size) {
+        let stream_results = fse_encode_interleaved(chunk, &table, num_streams);
+
+        let total_bs: usize = stream_results.iter().map(|(bs, _, _)| bs.len()).sum();
+        let header_size = 1 + FREQ_TABLE_BYTES + 1 + num_streams * (2 + 4 + 4);
+        let mut output = Vec::with_capacity(header_size + total_bs);
+
+        output.push(al);
+        for &f in &norm.freq {
+            output.extend_from_slice(&f.to_le_bytes());
+        }
+        output.push(num_streams as u8);
+
+        for (bitstream, initial_state, total_bits) in &stream_results {
+            output.extend_from_slice(&initial_state.to_le_bytes());
+            output.extend_from_slice(&total_bits.to_le_bytes());
+            output.extend_from_slice(&(bitstream.len() as u32).to_le_bytes());
+            output.extend_from_slice(bitstream);
+        }
+
+        result.push((output, chunk.len()));
+    }
+    result
+}
+
+#[test]
+fn test_fse_decode_blocks_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..2000).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+    let encoded_blocks = fse_encode_blocks_shared(&input, 500, 4, crate::fse::DEFAULT_ACCURACY_LOG);
+
+    // Verify CPU can decode each block individually first
+    let mut cpu_result = Vec::new();
+    for (enc, orig_len) in &encoded_blocks {
+        let decoded = crate::fse::decode_interleaved(enc, *orig_len).unwrap();
+        cpu_result.extend_from_slice(&decoded);
+    }
+    assert_eq!(cpu_result, input, "CPU round-trip failed");
+
+    // GPU multi-block decode
+    let block_refs: Vec<(&[u8], usize)> = encoded_blocks
+        .iter()
+        .map(|(data, len)| (data.as_slice(), *len))
+        .collect();
+
+    let decoded = engine.fse_decode_blocks(&block_refs).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_fse_decode_blocks_single_block() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..300).map(|i| ((i * 17 + 5) % 256) as u8).collect();
+    let encoded_blocks = fse_encode_blocks_shared(&input, 300, 4, crate::fse::DEFAULT_ACCURACY_LOG);
+
+    let block_refs: Vec<(&[u8], usize)> = encoded_blocks
+        .iter()
+        .map(|(data, len)| (data.as_slice(), *len))
+        .collect();
+
+    let decoded = engine.fse_decode_blocks(&block_refs).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_fse_decode_blocks_vs_single_decode() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..1000).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+    let encoded_blocks = fse_encode_blocks_shared(&input, 250, 4, crate::fse::DEFAULT_ACCURACY_LOG);
+
+    // Multi-block GPU decode
+    let block_refs: Vec<(&[u8], usize)> = encoded_blocks
+        .iter()
+        .map(|(data, len)| (data.as_slice(), *len))
+        .collect();
+    let multi_decoded = engine.fse_decode_blocks(&block_refs).unwrap();
+
+    // Single-block GPU decode (one at a time)
+    let mut single_decoded = Vec::new();
+    for (encoded, orig_len) in &encoded_blocks {
+        let decoded = engine.fse_decode(encoded, *orig_len).unwrap();
+        single_decoded.extend_from_slice(&decoded);
+    }
+
+    assert_eq!(multi_decoded, single_decoded);
+}
