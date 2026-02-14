@@ -309,8 +309,7 @@ impl WebGpuEngine {
                 if input.len() < cursor + 2 + 4 + 4 {
                     return Err(PzError::InvalidInput);
                 }
-                let initial_state =
-                    u16::from_le_bytes([input[cursor], input[cursor + 1]]) as u32;
+                let initial_state = u16::from_le_bytes([input[cursor], input[cursor + 1]]) as u32;
                 cursor += 2;
                 let total_bits = u32::from_le_bytes([
                     input[cursor],

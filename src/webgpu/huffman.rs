@@ -594,11 +594,8 @@ impl WebGpuEngine {
         if n <= BLOCK_SIZE {
             // Single block: no need for multi-level scan
             // Create a dummy block_sums buffer (kernel writes to binding 1)
-            let block_sums_buf = self.create_buffer(
-                "ps_dummy_sums",
-                4,
-                wgpu::BufferUsages::STORAGE,
-            );
+            let block_sums_buf =
+                self.create_buffer("ps_dummy_sums", 4, wgpu::BufferUsages::STORAGE);
             let params = [n as u32, 0u32, 0u32, 0u32];
             let params_buf = self.create_buffer_init(
                 "ps_params",
@@ -626,7 +623,12 @@ impl WebGpuEngine {
                 ],
             });
 
-            self.dispatch(self.pipeline_prefix_sum_block(), &bg, 1, "prefix_sum_single")?;
+            self.dispatch(
+                self.pipeline_prefix_sum_block(),
+                &bg,
+                1,
+                "prefix_sum_single",
+            )?;
             self.poll_wait();
             return Ok(());
         }

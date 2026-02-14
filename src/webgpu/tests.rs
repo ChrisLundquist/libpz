@@ -1671,8 +1671,8 @@ fn fse_encode_blocks_shared(
     num_streams: usize,
     accuracy_log: u8,
 ) -> Vec<(Vec<u8>, usize)> {
-    use crate::fse::{fse_encode_interleaved, normalize_frequencies, FseTable, FREQ_TABLE_BYTES};
     use crate::frequency::FrequencyTable;
+    use crate::fse::{fse_encode_interleaved, normalize_frequencies, FseTable, FREQ_TABLE_BYTES};
 
     let mut freq = FrequencyTable::new();
     freq.count(input);
@@ -1803,7 +1803,9 @@ fn test_rans_decode_round_trip() {
 
     let input: Vec<u8> = (0..500).map(|i| ((i * 37 + 13) % 256) as u8).collect();
     let encoded = crate::rans::encode_interleaved_n(&input, 4, 12);
-    let decoded = engine.rans_decode_interleaved(&encoded, input.len()).unwrap();
+    let decoded = engine
+        .rans_decode_interleaved(&encoded, input.len())
+        .unwrap();
     assert_eq!(decoded, input);
 }
 
@@ -1954,10 +1956,7 @@ fn test_rans_decode_blocks_various_scale_bits() {
 
 /// Helper: compress input into blocks and return (block_data, block_meta).
 /// block_meta entries are (match_data_offset, num_matches, decompressed_size).
-fn lz77_compress_blocks(
-    input: &[u8],
-    block_size: usize,
-) -> (Vec<u8>, Vec<(usize, usize, usize)>) {
+fn lz77_compress_blocks(input: &[u8], block_size: usize) -> (Vec<u8>, Vec<(usize, usize, usize)>) {
     let mut block_data = Vec::new();
     let mut block_meta = Vec::new();
 
@@ -2034,8 +2033,8 @@ fn test_lz77_decompress_blocks_vs_cpu() {
     // CPU decompress each block independently
     let mut cpu_result = Vec::new();
     for &(data_offset, num_matches, _decompressed_size) in &block_meta {
-        let block_bytes =
-            &block_data[data_offset..data_offset + num_matches * crate::lz77::Match::SERIALIZED_SIZE];
+        let block_bytes = &block_data
+            [data_offset..data_offset + num_matches * crate::lz77::Match::SERIALIZED_SIZE];
         let decoded = crate::lz77::decompress(block_bytes).unwrap();
         cpu_result.extend_from_slice(&decoded);
     }

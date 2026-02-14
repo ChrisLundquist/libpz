@@ -122,11 +122,7 @@ impl WebGpuEngine {
         let mut word_data_packed = Vec::with_capacity(word_u32_count);
         for chunk in all_words.chunks(2) {
             let lo = chunk[0] as u32;
-            let hi = if chunk.len() > 1 {
-                chunk[1] as u32
-            } else {
-                0
-            };
+            let hi = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
             word_data_packed.push(lo | (hi << 16));
         }
         if word_data_packed.is_empty() {
@@ -349,11 +345,7 @@ impl WebGpuEngine {
         let mut word_data_packed: Vec<u32> = Vec::with_capacity(all_words.len().div_ceil(2));
         for chunk in all_words.chunks(2) {
             let lo = chunk[0] as u32;
-            let hi = if chunk.len() > 1 {
-                chunk[1] as u32
-            } else {
-                0
-            };
+            let hi = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
             word_data_packed.push(lo | (hi << 16));
         }
         if word_data_packed.is_empty() {
