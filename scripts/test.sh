@@ -3,10 +3,11 @@
 #
 # Usage:
 #   ./scripts/test.sh              # CPU-only (default features)
+#   ./scripts/test.sh --quick      # Skip compilation-only checks, just lint+test
+#   ./scripts/test.sh --fix        # Auto-fix fmt + clippy before checking
 #   ./scripts/test.sh --webgpu     # Include WebGPU backend
 #   ./scripts/test.sh --opencl     # Include OpenCL backend
 #   ./scripts/test.sh --all        # All feature combinations
-#   ./scripts/test.sh --quick      # Skip compilation-only checks, just lint+test
 
 set -euo pipefail
 
@@ -18,6 +19,7 @@ cd "$PROJECT_DIR"
 FEATURES=()
 QUICK=false
 ALL=false
+FIX=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -25,8 +27,9 @@ for arg in "$@"; do
         --opencl)  FEATURES+=(opencl) ;;
         --all)     ALL=true ;;
         --quick)   QUICK=true ;;
+        --fix)     FIX=true ;;
         -h|--help)
-            sed -n '2,8p' "$0" | sed 's/^# \?//'
+            sed -n '2,10p' "$0" | sed 's/^# \?//'
             exit 0
             ;;
         *)
@@ -38,6 +41,7 @@ done
 
 PASSED=0
 FAILED=0
+SLOW_THRESHOLD=30
 STEPS=()
 
 pass() { PASSED=$((PASSED + 1)); STEPS+=("  PASS  $1"); }
@@ -46,14 +50,40 @@ fail() { FAILED=$((FAILED + 1)); STEPS+=("  FAIL  $1"); }
 run_step() {
     local label="$1"
     shift
-    echo ""
-    echo "── $label ──"
-    if "$@"; then
-        pass "$label"
+    local tmpfile
+    tmpfile=$(mktemp)
+
+    local start_time
+    start_time=$(date +%s)
+
+    if "$@" >"$tmpfile" 2>&1; then
+        local elapsed=$(( $(date +%s) - start_time ))
+        if [ "$elapsed" -ge "$SLOW_THRESHOLD" ]; then
+            pass "$label (${elapsed}s — slow)"
+        else
+            pass "$label (${elapsed}s)"
+        fi
     else
-        fail "$label"
+        local elapsed=$(( $(date +%s) - start_time ))
+        fail "$label (${elapsed}s)"
+        echo ""
+        echo "── FAIL: $label ──"
+        # Show warnings, errors, and surrounding context
+        grep -C 3 -E '(^error|^warning|FAILED|panicked|cannot find|unresolved|unused|dead_code)' "$tmpfile" \
+            | head -60
+        echo "..."
+        # Show the last few lines for test summary / exit info
+        tail -5 "$tmpfile"
+        echo ""
     fi
+    rm -f "$tmpfile"
 }
+
+# ── Auto-fix (if requested) ──
+if [ "$FIX" = true ]; then
+    run_step "cargo fmt (autofix)" cargo fmt
+    run_step "clippy --fix (autofix)" cargo clippy --fix --allow-dirty --allow-staged --all-targets -- -D warnings
+fi
 
 # ── Formatting ──
 run_step "cargo fmt --check" cargo fmt --check
@@ -74,13 +104,15 @@ if [ "$ALL" = true ]; then
     FEATURES=(webgpu opencl)
 fi
 
-for feat in "${FEATURES[@]}"; do
-    run_step "clippy --features $feat" cargo clippy --all-targets --features "$feat" -- -D warnings
-    if [ "$QUICK" = false ]; then
-        run_step "build --features $feat" cargo build --features "$feat"
-    fi
-    run_step "test --features $feat" cargo test --features "$feat"
-done
+if [ "${#FEATURES[@]}" -gt 0 ]; then
+    for feat in "${FEATURES[@]}"; do
+        run_step "clippy --features $feat" cargo clippy --all-targets --features "$feat" -- -D warnings
+        if [ "$QUICK" = false ]; then
+            run_step "build --features $feat" cargo build --features "$feat"
+        fi
+        run_step "test --features $feat" cargo test --features "$feat"
+    done
+fi
 
 # ── Summary ──
 echo ""

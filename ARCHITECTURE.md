@@ -142,21 +142,7 @@ is shared conceptually with `src/fse.rs` (both operate on power-of-2 tables).
 
 ### Forward TODOs
 
-1. **SIMD decode paths** (~150 lines in `src/simd.rs`): Wire SSE2 4-way and
-   AVX2 8-way intrinsics into the interleaved decode loop. The scalar N-way
-   interleave already handles the data layout; SIMD replaces the per-state
-   multiply-shift with packed 32×32→64 multiplies (`_mm_mul_epu32` /
-   `_mm256_mul_epu32`).
-
-2. **Reciprocal multiplication trick**: Replace `x / freq` and `x % freq` in
-   the encode loop with precomputed `ceil(2^(32+shift) / freq)` reciprocals.
-   This eliminates data-dependent divisions (critical for GPU throughput).
-   Not yet implemented due to u32 overflow edge cases when `freq` is small;
-   needs u64 intermediate arithmetic or per-frequency shift selection.
-
-3. **Benchmark integration**: Add rANS and Lzr pipeline to
-   `benches/throughput.rs` and `benches/stages.rs` for head-to-head comparison
-   with Huffman and FSE.
+See `docs/exec-plans/tech-debt-tracker.md` for rANS SIMD decode and reciprocal multiplication work items. Benchmark integration (rANS/Lzr in `benches/throughput.rs` and `benches/stages.rs`) is also pending.
 
 ## SIMD acceleration
 `src/simd.rs` provides runtime-dispatched SIMD for CPU hot paths:
@@ -253,17 +239,8 @@ GPU BWT radix sort is 7-14x faster than the old bitonic sort. Still slower than 
 ## Next steps
 
 ### Priority 0: rANS SIMD completion
-Two pieces remain to complete the rANS integration:
 
-1. **SIMD decode paths** (~150 lines in `src/simd.rs`): SSE2 4-way and AVX2 8-way
-   intrinsics for the interleaved rANS decode hot loop. The scalar N-way interleave
-   is implemented; SIMD replaces per-state multiply-shift with packed `_mm_mul_epu32` /
-   `_mm256_mul_epu32`. Expected 3-4x decode throughput improvement.
-
-2. **Reciprocal multiplication trick**: Replace `x / freq` and `x % freq` with
-   precomputed `ceil(2^(32+shift) / freq)` reciprocals to eliminate data-dependent
-   division in encode. Needs u64 intermediate arithmetic or per-frequency adaptive
-   shift to handle overflow when `freq` is small. Critical for GPU encode throughput.
+See `docs/exec-plans/tech-debt-tracker.md` for full details. Two items: SIMD decode paths (SSE2/AVX2 intrinsics for interleaved decode) and reciprocal multiplication (eliminate data-dependent division in encode).
 
 ### Priority 1: Use local/shared memory in LZ77 hash kernel
 - Load hash buckets into `__local` memory for faster repeated access

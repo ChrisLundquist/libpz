@@ -46,10 +46,7 @@ Documentation of optimization attempts, successful iterations, and abandoned app
 - Pre-allocation eliminates this overhead entirely
 - Ring buffer enables async pipelining: GPU computes slot N while CPU reads slot N-1
 
-**Metrics:**
-- 16-block (4MB) batch: 82 ms → 70 ms (17% faster)
-- Full deflate pipeline: 96 ms → 89 ms (7% faster)
-- Full lzfi pipeline: 101 ms → 90 ms (11% faster)
+**Metrics:** 17% faster on 4MB batch, 7-11% faster on full pipelines. See `gpu-batching.md` for detailed numbers.
 
 **Lessons:**
 - GPU memory allocation is non-trivial overhead; pre-allocation is worth the code complexity
@@ -280,19 +277,7 @@ Documentation of optimization attempts, successful iterations, and abandoned app
 
 ### 4. GPU Memory Consumption Predictor
 
-**Status:** Documented gap (friction report)
-
-**Idea:**
-- Predict GPU memory usage before allocation
-- Enable better batching decisions
-
-**Current situation:**
-- Only source of truth is actual `create_buffer` calls
-- Comments say "buffer size = 36×N + overhead" but easy to miss
-
-**Suggested fix:**
-- Central table in ARCHITECTURE.md: Input Size → Buffer Overhead → Recommended Max Batch Size
-- Validate against actual allocations in tests
+**Status:** Documented gap. Use `scripts/gpu-meminfo.sh` for actual buffer analysis. See `design-docs/core-beliefs.md` belief #4 (buffer allocations as source of truth).
 
 ---
 
@@ -318,7 +303,7 @@ Documentation of optimization attempts, successful iterations, and abandoned app
 - Always validate compression ratio, not just speed
 - Use profiling to identify actual bottlenecks, not assumed ones
 - Prefer streaming/ring-buffered patterns for multi-block work
-- Know GPU break-even points (~64-128KB for compute, ~256KB for memory-bound)
+- Know GPU break-even points (see `docs/DESIGN.md` "GPU Break-Even Points")
 
 ---
 

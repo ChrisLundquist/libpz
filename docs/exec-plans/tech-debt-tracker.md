@@ -87,11 +87,7 @@ GPU Huffman encoding is implemented (two-pass with Blelloch prefix sum), but dec
 - exec-plans/active/TODO-huffman-sync-decode.md has full plan
 - Huffman encode GPU is ~400 MB/s, decode could match
 
-**Action items:**
-1. Prototype sync decode kernel (similar to FSE)
-2. Benchmark break-even point
-3. Implement if >2x speedup on large blocks
-4. Otherwise close as "not worth it"
+**Action items:** See [TODO-huffman-sync-decode.md](active/TODO-huffman-sync-decode.md) for full plan.
 
 ---
 
@@ -239,8 +235,7 @@ GPU decode is low priority because:
 **Owner:** Engineering team
 
 **Tasks:**
-- Update wgpu (currently 22.x, stable at 27.x)
-  - See exec-plans/active/upgrade-wgpu-to-27.md
+- ~~Update wgpu~~ — Completed (now at 27.x, see exec-plans/completed/upgrade-wgpu-to-27.md)
 - Update criterion, other dev dependencies
 - Verify all tests/benchmarks still pass
 

@@ -333,21 +333,7 @@ Each module is graded on five dimensions:
 
 ## Known Issues
 
-### High Priority
-1. **M5.3: Fuzz testing not started** (P0, correctness impact)
-   - No cargo-fuzz integration
-   - No random input property tests
-
-### Medium Priority
-2. **Optimal parsing design doc missing** (P1, documentation gap)
-3. **GPU Huffman decode not implemented** (P2, performance opportunity)
-4. **rANS SIMD decode not wired** (P2, performance opportunity)
-
-### Low Priority
-5. **BWT GPU performance** (P3, research topic)
-6. **C FFI test coverage** (P3, usability)
-
-See `exec-plans/tech-debt-tracker.md` for details.
+See `exec-plans/tech-debt-tracker.md` for the full prioritized list of known gaps and their action items.
 
 ## Summary Statistics
 

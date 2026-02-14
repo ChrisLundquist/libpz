@@ -180,24 +180,7 @@ fn find_matches_batched(&self, blocks: &[&[u8]]) {
 
 **Status:** Experimental/documented (commit `246ae37`)
 
-Different compression stages on different GPU blocks:
-
-```
-Block 0: LZ77 encoding (GPU)
-Block 1: Huffman encoding (GPU, consumes LZ77 output from Block 0)
-Block 2: LZ77 encoding (GPU, independent)
-Block 3: Huffman encoding (GPU, consumes LZ77 output from Block 2)
-```
-
-**Benefits:**
-- GPU utilization stays high (pipelined stages)
-- CPU doesn't block on any single stage
-- Overlapped GPU compute
-
-**Challenges:**
-- Synchronization complexity
-- Correct handling of stage dependencies
-- Memory allocation for intermediate results
+Different compression stages on different GPU blocks simultaneously. See `pipeline-architecture.md` "Pipeline-Parallel Compression" for the architecture description and trade-offs.
 
 ## Known Limitations & Future Work
 
@@ -227,14 +210,7 @@ Block 3: Huffman encoding (GPU, consumes LZ77 output from Block 2)
 
 ## Profiling Memory Usage
 
-**Tools:**
-- `./scripts/profile.sh` — CPU profiling with samply
-- `./scripts/bench.sh` — End-to-end throughput comparison
-- `examples/webgpu_diag.rs` — Match quality vs GPU memory trade-off
-
-**GPU-specific:**
-- wgpu-profiler integration (`src/webgpu/mod.rs`) — GPU timestamps
-- AMD Vulkan driver timestamps unreliable (first query slot returns zeros; workaround in `008d8ba`)
+See `CLAUDE.md` for profiling commands (`scripts/profile.sh`, `scripts/bench.sh`, `scripts/gpu-meminfo.sh`). For GPU timestamps, wgpu-profiler is integrated in `src/webgpu/mod.rs` (note: AMD Vulkan timestamps unreliable, workaround in `008d8ba`).
 
 ## Reference Implementation
 

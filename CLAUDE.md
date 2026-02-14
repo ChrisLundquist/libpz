@@ -20,6 +20,7 @@ This is called automatically by `bench.sh` and other scripts, so manual extracti
 ```bash
 ./scripts/test.sh              # Run full test suite (fmt, clippy, build, test)
 ./scripts/test.sh --quick      # Skip build step, just lint + test
+./scripts/test.sh --fix        # Auto-fix fmt + clippy before checking
 ./scripts/test.sh --webgpu     # Include WebGPU-specific tests
 ./scripts/test.sh --all        # Test all feature combinations
 ```
@@ -153,6 +154,7 @@ Use `--format mermaid` for diagrams you can paste into [mermaid.live](https://me
   - `historian.md` — research project history and git archaeology (Haiku)
   - `tooling.md` — build scripts to minimize context usage and streamline workflows (Sonnet)
   - `benchmarker.md` — run benchmarks and generate detailed performance reports (Haiku)
+  - `tester.md` — run tests with programmatic autofixes, diagnose remaining errors (Haiku)
 - `.claude/friction/` — friction reports documenting workflow impediments and tool limitations
 
 ## Key Conventions

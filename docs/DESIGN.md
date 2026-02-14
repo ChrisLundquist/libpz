@@ -159,20 +159,9 @@ No new block function needed - demuxer pattern handles it.
 
 ### Tracing Data Flow Through Pipelines
 
-To understand how a pipeline works, trace a single block from `compress_block()` in `pipeline/blocks.rs` through each stage:
-1. The `StageBlock.streams` field is the key handoff point
-2. It's `None` before demux, `Some(Vec<Vec<u8>>)` after demux
-3. Entropy encoders consume `streams`, not `data`
+To understand how a pipeline works, trace a single block from `compress_block()` in `pipeline/blocks.rs` through each stage. See `docs/design-docs/pipeline-architecture.md` for detailed data flow diagrams and the `StageBlock` struct.
 
-**When GPU and CPU paths diverge:** The bug is almost always in the demux (stream splitting), not the entropy coder. Check:
-- Stream count (should be same for GPU/CPU)
-- Byte ordering within streams
-- Stream length consistency
-
-**Adding a new LZ-based pipeline:** Only requires:
-1. Entry in `demuxer_for_pipeline()` in `pipeline/demux.rs`
-2. Entropy encode/decode dispatch in `pipeline/blocks.rs`
-No new block function needed - demuxer pattern handles it.
+**When GPU and CPU paths diverge:** The bug is almost always in the demux (stream splitting), not the entropy coder. See `docs/design-docs/pipeline-architecture.md` "GPU vs CPU Output Mismatch" section.
 
 ### Understanding GPU Resource Usage
 
@@ -197,14 +186,7 @@ They solve the same problem differently. Understand both before modifying either
 
 ### Multi-Stream Format Details
 
-LZ-based pipelines demux into independent streams:
-- **LZ77 (Deflate/Lzf/Lzr):** 3 streams (offsets high byte, lengths, literals+offsets low)
-- **LZSS:** 4 streams
-- **LZ78:** 1 stream
-
-Per-block multistream container header: `[num_streams: u8][pre_entropy_len: u32][meta_len: u16][meta]`
-
-**Warning:** Multi-stream format changes are subtle. Don't modify without understanding round-trip implications for all pipelines.
+See `design-docs/pipeline-architecture.md` for the stream demuxing table, container format, and `StreamDemuxer` trait. Multi-stream format changes are subtle — don't modify without understanding round-trip implications for all pipelines.
 
 ## Performance Considerations
 
@@ -221,16 +203,7 @@ Below these thresholds, kernel launch overhead dominates.
 
 ### Multi-Stream Entropy Coding
 
-LZ-based pipelines (Deflate, Lzf, Lzr) use multi-stream encoding:
-- **Stream 0:** Match offsets (high byte)
-- **Stream 1:** Match lengths
-- **Stream 2:** Literals + offset low bytes
-
-Each stream gets independent entropy coding, exploiting tighter symbol distributions.
-
-**Results:** 16-18% better compression ratio, 2-8% faster decompression.
-
-**Trade-off:** Overhead of 3 stream headers. Auto-fallback to single-stream for small blocks (<256 bytes).
+LZ-based pipelines (Deflate, Lzf, Lzr) use multi-stream encoding (3 independent streams per block). See `ARCHITECTURE.md` for benchmark results (16-18% better compression, 2-8% faster decompression) and `design-docs/pipeline-architecture.md` for the stream layout.
 
 ### Memory Management
 
@@ -280,10 +253,7 @@ Run via `cargo test validation`.
 
 ### Property Tests
 
-Fuzz testing (M5.3, not yet implemented):
-- Random inputs 0-1MB
-- Verify round-trip property
-- Check error handling on malformed compressed data
+Fuzz testing (M5.3) not yet implemented. See `exec-plans/tech-debt-tracker.md` for the plan.
 
 ## Related Documents
 

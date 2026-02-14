@@ -313,19 +313,7 @@ Kernels are annotated with resource usage for cost-model-driven scheduling:
 
 ### Profiling Commands
 
-```bash
-# CPU profiling (see hotspots)
-./scripts/profile.sh --stage lz77 --size 262144
-
-# GPU profiling (see GPU timeline)
-./scripts/profile.sh --web --pipeline deflate
-
-# End-to-end throughput
-./scripts/bench.sh -p deflate -n 5
-
-# CPU vs GPU comparison
-cargo run --example webgpu_diag --release --features webgpu
-```
+See `CLAUDE.md` "Benchmarking & profiling" for the full command reference (`scripts/profile.sh`, `scripts/bench.sh`, etc.).
 
 ### Key Metrics to Monitor
 

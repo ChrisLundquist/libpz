@@ -4,6 +4,7 @@ description: Run benchmarks and provide detailed reports with comparisons
 tools:
   - Bash
   - Read
+  - Write
   - Glob
   - Grep
 model: haiku
@@ -38,7 +39,7 @@ cargo bench --bench throughput            # Pipeline throughput
 cargo bench --bench stages                # Per-algorithm scaling
 cargo bench -- fse                        # Filter to specific algorithm
 cargo bench -- compress                   # All compression benchmarks
-cargo bench --features webgpu             # Include GPU benchmarks
+cargo bench                               # Includes GPU benchmarks (webgpu is default)
 cargo bench --no-default-features         # CPU-only
 ```
 **Output:** Median time, throughput, statistical analysis, comparison to baseline
@@ -98,63 +99,13 @@ When reporting benchmark results:
 - [Next steps, if any]
 ```
 
-### Example Output
-```markdown
-## Benchmark Results: LZ77 Cooperative Kernel Performance
-
-**Configuration:**
-- Test: `cargo bench --bench stages -- lz77 --features webgpu`
-- Hardware: GPU (AMD RX 9070 XT)
-- Data: 256KB, 1MB, 4MB random data
-
-**Key Findings:**
-- Cooperative kernel is 1.8x faster than brute-force at 256KB
-- Match quality is 94% of brute-force (acceptable trade-off)
-- Speedup increases with input size (2.1x at 4MB)
-
-**Detailed Results:**
-| Size   | Brute-Force | Cooperative | Speedup |
-|--------|-------------|-------------|---------|
-| 256KB  | 45.2 ms     | 25.1 ms     | 1.8x    |
-| 1MB    | 182.4 ms    | 92.3 ms     | 2.0x    |
-| 4MB    | 731.8 ms    | 348.6 ms    | 2.1x    |
-
-**Analysis:**
-- Performance scales well with input size
-- Trade-off: 6% quality loss for 1.8-2.1x speedup
-- GPU overhead less significant at larger sizes
-
-**Recommendations:**
-- Use cooperative kernel for inputs >256KB
-- Consider auto-switching based on input size
-- Profile to verify GPU launch overhead at 256KB boundary
-```
-
 ## Comparison Strategies
 
-### Before/After Comparison
-1. Checkout baseline commit: `git checkout <baseline-commit>`
-2. Run benchmark, save output: `cargo bench -- <filter> | tee baseline.txt`
-3. Checkout new commit: `git checkout <new-commit>`
-4. Run same benchmark: `cargo bench -- <filter> | tee new.txt`
-5. Compare and report differences
+- **Before/After**: Checkout baseline, run bench, checkout new, run again, compare
+- **CPU vs GPU**: Run with `--no-default-features` vs default features
+- **Pipeline comparison**: `./scripts/bench.sh -p deflate,lza,lzf <files>`
 
-### Feature Flag Comparison
-```bash
-# CPU-only
-cargo bench --bench throughput --no-default-features -- lz77 > cpu.txt
-
-# With GPU
-cargo bench --bench throughput --features webgpu -- lz77 > gpu.txt
-
-# Compare results
-```
-
-### Pipeline Comparison
-```bash
-./scripts/bench.sh -p deflate,lza,lzf samples/canterbury/alice29.txt
-```
-Shows compression ratio and speed for each pipeline on same data
+Use `--save-baseline <name>` with criterion to save results for later comparison.
 
 ## Interpreting Results
 
@@ -174,34 +125,6 @@ Shows compression ratio and speed for each pipeline on same data
 - 5-10%: Noticeable, worth investigating
 - >10%: Significant, definitely actionable
 - >50%: Major change, verify correctness first
-
-## Common Benchmark Scenarios
-
-### Regression Check
-```bash
-# Run on baseline
-git checkout main
-cargo bench --bench throughput > baseline.txt
-
-# Run on feature branch
-git checkout feature-branch
-cargo bench --bench throughput > feature.txt
-
-# Report differences
-```
-
-### GPU vs CPU
-```bash
-cargo bench --no-default-features -- lz77 > cpu.txt
-cargo bench --features webgpu -- lz77 > gpu.txt
-# Compare throughput at different sizes
-```
-
-### Pipeline Selection
-```bash
-./scripts/bench.sh -p deflate,lza,lzf,bwt samples/canterbury/*
-# Report best pipeline per file type
-```
 
 ## Important Notes
 
@@ -225,9 +148,6 @@ cargo bench --features webgpu -- lz77 > gpu.txt
 
 ## Presenting Results
 
-- **Lead with conclusions** — Don't bury the lede in raw data
-- **Use tables** — For side-by-side comparisons
-- **Highlight changes** — Make regressions/improvements obvious
-- **Round appropriately** — 45.234 ms → 45.2 ms, 1834 MB/s → 1.8 GB/s
-- **Include units** — Always specify ms, MB/s, %, etc.
-- **Context first** — What was tested before showing raw numbers
+- Lead with conclusions, not raw data
+- Use tables for comparisons, round appropriately (45.234 ms -> 45.2 ms)
+- Always include units (ms, MB/s, %) and test context (what was tested, on what)

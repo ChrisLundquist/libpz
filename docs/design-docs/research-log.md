@@ -287,26 +287,7 @@ Lazy kernel code retained (#[allow(dead_code)]) for A/B benchmarking.
 **Commit:** `4390d90` (2026-02-13)  
 **Title:** "Use ring-buffered streaming for batched LZ77 match finding"
 
-Replaced per-block buffer allocation in `find_matches_batched` with pre-allocated ring slots (double/triple-buffered):
-
-```
-Overhead identified in profiling:
-  Buffer alloc/map overhead: 35% of total time
-
-Results after ring-buffering:
-  - Batched 16-block (4MB): 82 ms → 70 ms (17% faster, 57 MB/s)
-  - Full deflate pipeline: 96 ms → 89 ms (7% faster)
-  - Full lzfi pipeline: 101 ms → 90 ms (11% faster)
-
-Design:
-  - Pre-allocated ring slots (double/triple-buffered)
-  - Eliminates per-block GPU alloc/map cycles
-  - Backpressure-aware: respects GPU queue depth
-
-Additional improvement:
-  - Consolidated all wait_indefinitely calls through poll_wait()
-  - Consistency across WebGPU backend
-```
+Replaced per-block buffer allocation in `find_matches_batched` with pre-allocated ring slots (double/triple-buffered). Eliminated 35% alloc/map overhead, achieving 17% faster batched compression. See `gpu-batching.md` for architecture details and full benchmark numbers.
 
 **Files changed:** `src/webgpu/bwt.rs`, `src/webgpu/lz77.rs` (128 +/- lines), `src/webgpu/mod.rs` (23 +/- lines)
 
