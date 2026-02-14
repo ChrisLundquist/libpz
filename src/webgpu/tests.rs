@@ -1947,3 +1947,123 @@ fn test_rans_decode_blocks_various_scale_bits() {
         assert_eq!(decoded, input, "failed at scale_bits={scale_bits}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// LZ77 GPU Decompression tests
+// ---------------------------------------------------------------------------
+
+/// Helper: compress input into blocks and return (block_data, block_meta).
+/// block_meta entries are (match_data_offset, num_matches, decompressed_size).
+fn lz77_compress_blocks(
+    input: &[u8],
+    block_size: usize,
+) -> (Vec<u8>, Vec<(usize, usize, usize)>) {
+    let mut block_data = Vec::new();
+    let mut block_meta = Vec::new();
+
+    for chunk in input.chunks(block_size) {
+        let compressed = crate::lz77::compress_lazy(chunk).unwrap();
+        let data_offset = block_data.len();
+        let num_matches = compressed.len() / crate::lz77::Match::SERIALIZED_SIZE;
+        block_meta.push((data_offset, num_matches, chunk.len()));
+        block_data.extend_from_slice(&compressed);
+    }
+
+    (block_data, block_meta)
+}
+
+#[test]
+fn test_lz77_decompress_blocks_small() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Small repetitive input — fits in one block
+    let input = b"abcabcabcabcabcabcabcabc";
+    let (block_data, block_meta) = lz77_compress_blocks(input, 1024);
+
+    let gpu_result = engine
+        .lz77_decompress_blocks(&block_data, &block_meta)
+        .unwrap();
+    assert_eq!(gpu_result, input);
+}
+
+#[test]
+fn test_lz77_decompress_blocks_multiblock() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Larger input split into multiple 4KB blocks
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::new();
+    for _ in 0..400 {
+        input.extend_from_slice(pattern);
+    }
+
+    let (block_data, block_meta) = lz77_compress_blocks(&input, 4096);
+    assert!(block_meta.len() > 1, "should have multiple blocks");
+
+    let gpu_result = engine
+        .lz77_decompress_blocks(&block_data, &block_meta)
+        .unwrap();
+    assert_eq!(gpu_result, input);
+}
+
+#[test]
+fn test_lz77_decompress_blocks_vs_cpu() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Test that GPU decompression matches CPU decompression exactly
+    let pattern = b"hello world compression test data ";
+    let mut input = Vec::new();
+    for _ in 0..200 {
+        input.extend_from_slice(pattern);
+    }
+
+    let (block_data, block_meta) = lz77_compress_blocks(&input, 2048);
+
+    // CPU decompress each block independently
+    let mut cpu_result = Vec::new();
+    for &(data_offset, num_matches, _decompressed_size) in &block_meta {
+        let block_bytes =
+            &block_data[data_offset..data_offset + num_matches * crate::lz77::Match::SERIALIZED_SIZE];
+        let decoded = crate::lz77::decompress(block_bytes).unwrap();
+        cpu_result.extend_from_slice(&decoded);
+    }
+    assert_eq!(cpu_result, input, "CPU decompress sanity check");
+
+    // GPU decompress
+    let gpu_result = engine
+        .lz77_decompress_blocks(&block_data, &block_meta)
+        .unwrap();
+    assert_eq!(gpu_result, cpu_result, "GPU vs CPU mismatch");
+}
+
+#[test]
+fn test_lz77_decompress_blocks_overlapping_backref() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Create input with overlapping back-references (offset < length)
+    // "aaaa..." repeated pattern triggers offset=1, length=N
+    let input: Vec<u8> = vec![b'a'; 200];
+
+    let (block_data, block_meta) = lz77_compress_blocks(&input, 1024);
+
+    let gpu_result = engine
+        .lz77_decompress_blocks(&block_data, &block_meta)
+        .unwrap();
+    assert_eq!(gpu_result, input);
+}

@@ -80,6 +80,9 @@ const RANS_DECODE_KERNEL_SOURCE: &str = include_str!("../../kernels/rans_decode.
 const RANS_DECODE_BLOCKS_KERNEL_SOURCE: &str =
     include_str!("../../kernels/rans_decode_blocks.wgsl");
 
+/// Embedded WGSL kernel source: GPU LZ77 block-parallel decompression.
+const LZ77_DECODE_KERNEL_SOURCE: &str = include_str!("../../kernels/lz77_decode.wgsl");
+
 /// Number of candidates per position in the top-K kernel (must match K in lz77_topk.wgsl).
 const TOPK_K: usize = 4;
 
@@ -244,6 +247,11 @@ struct RansDecodeBlocksPipelines {
     decode_blocks: wgpu::ComputePipeline,
 }
 
+/// LZ77 block-parallel decode pipeline (1 pipeline from lz77_decode.wgsl).
+struct Lz77DecodePipelines {
+    decode: wgpu::ComputePipeline,
+}
+
 /// WebGPU compute engine.
 ///
 /// Manages the wgpu device, queue, and lazily-compiled compute pipelines.
@@ -265,6 +273,7 @@ pub struct WebGpuEngine {
     fse_encode: OnceLock<FseEncodePipelines>,
     rans_decode: OnceLock<RansDecodePipelines>,
     rans_decode_blocks: OnceLock<RansDecodeBlocksPipelines>,
+    lz77_decode: OnceLock<Lz77DecodePipelines>,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum compute workgroup size.
@@ -406,6 +415,7 @@ impl WebGpuEngine {
             fse_encode: OnceLock::new(),
             rans_decode: OnceLock::new(),
             rans_decode_blocks: OnceLock::new(),
+            lz77_decode: OnceLock::new(),
             device_name,
             max_work_group_size,
             max_workgroups_per_dim,
@@ -1086,6 +1096,27 @@ impl WebGpuEngine {
                 group
             })
             .decode_blocks
+    }
+
+    fn pipeline_lz77_decode(&self) -> &wgpu::ComputePipeline {
+        &self
+            .lz77_decode
+            .get_or_init(|| {
+                let t0 = std::time::Instant::now();
+                let group = Lz77DecodePipelines {
+                    decode: self.make_pipeline(
+                        "lz77_decode",
+                        LZ77_DECODE_KERNEL_SOURCE,
+                        "lz77_decode",
+                    ),
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile lz77_decode.wgsl: {ms:.3} ms");
+                }
+                group
+            })
+            .decode
     }
 
     fn pipeline_fse_encode(&self) -> &wgpu::ComputePipeline {
