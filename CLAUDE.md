@@ -9,13 +9,13 @@ This is called automatically by `bench.sh` and other scripts, so manual extracti
 
 ## Build & test commands
 ```bash
-cargo build                    # compile
-cargo test                     # run all tests
-cargo test fse                 # run tests for a specific module
-cargo fmt                      # format code (must match CI)
-cargo clippy --all-targets     # lint (must pass with zero warnings)
-cargo build --features webgpu  # compile with GPU support
-cargo test --features webgpu   # run all tests including GPU (skips gracefully if no device)
+cargo build                          # compile (WebGPU enabled by default)
+cargo test                           # run all tests (includes GPU tests, skips if no device)
+cargo test fse                       # run tests for a specific module
+cargo fmt                            # format code (must match CI)
+cargo clippy --all-targets           # lint (must pass with zero warnings)
+cargo build --no-default-features    # compile CPU-only (no GPU)
+cargo test --no-default-features     # run tests without GPU features
 ```
 
 ## Git hooks setup
@@ -43,12 +43,12 @@ Before every commit, **always** run (the pre-commit hook handles 1 and 2 automat
 
 ### Criterion microbenchmarks
 ```bash
-cargo bench                        # all benchmarks (~10 min)
-cargo bench --bench throughput     # end-to-end pipeline throughput only
-cargo bench --bench stages         # per-algorithm stage benchmarks only
-cargo bench -- fse                 # filter to specific algorithm
-cargo bench -- compress            # filter to compress group
-cargo bench --features webgpu      # include GPU benchmarks
+cargo bench                             # all benchmarks including GPU (~10 min)
+cargo bench --bench throughput          # end-to-end pipeline throughput only
+cargo bench --bench stages              # per-algorithm stage benchmarks only
+cargo bench -- fse                      # filter to specific algorithm
+cargo bench -- compress                 # filter to compress group
+cargo bench --no-default-features       # CPU-only benchmarks (no GPU)
 ```
 
 ### Profiling with samply
@@ -96,6 +96,7 @@ samply load profiling/a1b2c3d/lz77_encode_256KB.json.gz     # view saved profile
 - `scripts/profile.sh` — samply profiling wrapper (headless by default, `--web` for browser)
 - `profiling/` — saved profiles, organized as `<7-char-sha>/<description>.json.gz` (e.g. `a1b2c3d-dirty/`)
 - `examples/profile.rs` — profiling harness (pipeline or individual stage loops)
+- `.claude/agents/` — custom Claude Code subagents (e.g., `historian.md` for project history research)
 
 ## Conventions
 - Public API: `encode()` / `decode()` returning `PzResult<T>`
@@ -106,8 +107,9 @@ samply load profiling/a1b2c3d/lz77_encode_256KB.json.gz     # view saved profile
 - Tests go in `#[cfg(test)] mod tests` at the bottom of each module file
 
 ## Feature flags
-- **Default (no features):** Pure CPU build. All tests pass everywhere.
-- **`webgpu`:** GPU acceleration via wgpu (Vulkan/Metal/DX12). Tests gracefully skip if no device. Always compile-check GPU changes: `cargo build --features webgpu`
+- **Default:** WebGPU GPU acceleration is enabled by default via wgpu (Vulkan/Metal/DX12). Tests gracefully skip if no GPU device available.
+- **`--no-default-features`:** Pure CPU build (disables WebGPU). Useful for minimal builds or platforms without GPU support.
+- **`webgpu`:** GPU acceleration feature (enabled by default). Always compile-check GPU changes: `cargo build --features webgpu`
 - GPU is **not faster for small inputs** — LZ77 breaks even ~256KB, Huffman ~128KB. Don't optimize GPU paths for small data.
 
 ## Understanding GPU resource usage
@@ -120,7 +122,7 @@ samply load profiling/a1b2c3d/lz77_encode_256KB.json.gz     # view saved profile
 - Adding a new LZ-based pipeline only requires an entry in `demuxer_for_pipeline()` and the `entropy_encode()`/`entropy_decode()` dispatch in `blocks.rs` — no new block function needed.
 
 ## Common pitfalls
-1. **Forgetting `--features webgpu` when modifying GPU code** — CPU-only build won't catch GPU compile errors.
+1. **Using `--no-default-features` unintentionally** — This disables WebGPU. If GPU tests/benchmarks aren't running, verify you haven't disabled the default features.
 2. **Multi-stream format changes are subtle** — LZ-based pipelines demux into independent streams (LZ77: 3 streams for offsets/lengths/literals, LZSS: 4, LZ78: 1). The per-block multistream container header is `[num_streams: u8][pre_entropy_len: u32][meta_len: u16][meta]`. Don't change without understanding round-trip implications.
 3. **Pre-commit hook auto-reformats and re-stages files** — `cargo fmt` runs automatically and modifies files in-place. If a commit fails on clippy, fix the warning and make a new commit (don't amend).
 4. **Use dedicated tools instead of shell pipelines** — Prefer Grep/Glob tools over `grep | cut | sort | uniq` shell pipelines. Dedicated tools are faster, don't need permission approval, and produce better-structured output.
