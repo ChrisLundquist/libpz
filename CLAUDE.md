@@ -96,7 +96,10 @@ samply load profiling/a1b2c3d/lz77_encode_256KB.json.gz     # view saved profile
 - `scripts/profile.sh` — samply profiling wrapper (headless by default, `--web` for browser)
 - `profiling/` — saved profiles, organized as `<7-char-sha>/<description>.json.gz` (e.g. `a1b2c3d-dirty/`)
 - `examples/profile.rs` — profiling harness (pipeline or individual stage loops)
-- `.claude/agents/` — custom Claude Code subagents (e.g., `historian.md` for project history research)
+- `.claude/agents/` — custom Claude Code subagents:
+  - `historian.md` — research project history and git archaeology (Haiku)
+  - `tooling.md` — build scripts to minimize context usage and streamline workflows (Sonnet)
+  - `benchmarker.md` — run benchmarks and generate detailed performance reports (Haiku)
 - `.claude/friction/` — friction reports documenting workflow impediments and tool limitations
 
 ## Conventions
