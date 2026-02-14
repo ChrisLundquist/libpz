@@ -33,20 +33,6 @@ jobs:
       - run: cargo clippy -- -D warnings
       - run: cargo fmt -- --check
 
-  test-opencl:
-    name: Test (OpenCL compile check)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install OpenCL headers and ICD loader
-        run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev opencl-headers
-      - name: Build with opencl feature
-        run: cargo build --features opencl
-      - name: Run tests with opencl feature
-        run: cargo test --features opencl
-        # GPU-dependent tests gracefully skip when no device is available
-
   bench:
     name: Benchmark (compile check)
     runs-on: ubuntu-latest

@@ -1,8 +1,8 @@
-//! Shared abstractions for GPU backends (OpenCL, WebGPU).
+//! Shared abstractions for GPU backends (WebGPU).
 //!
-//! Types in this module are used by both `opencl` and `webgpu` feature-gated
-//! backends. The module itself is always compiled (types are generic) so that
-//! either backend can import from a single canonical location.
+//! Types in this module are used by the `webgpu` feature-gated backend.
+//! The module itself is always compiled (types are generic) so that
+//! the backend can import from a single canonical location.
 
 /// Round-robin ring of pre-allocated buffer slots for streaming GPU work.
 ///

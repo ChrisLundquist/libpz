@@ -42,7 +42,6 @@ pub enum PzPipeline {
 /// Device information returned by pz_query_devices.
 #[repr(C)]
 pub struct PzDeviceInfo {
-    pub opencl_devices: i32,
     pub webgpu_devices: i32,
     pub cpu_threads: i32,
 }
@@ -51,15 +50,9 @@ pub struct PzDeviceInfo {
 pub struct PzContext {
     /// Placeholder for future state (cached kernels, etc.)
     _initialized: bool,
-    /// OpenCL GPU engine, if available. Wrapped in Arc for sharing
-    /// with pipeline CompressOptions.
-    #[cfg(feature = "opencl")]
-    opencl_engine: Option<std::sync::Arc<crate::opencl::OpenClEngine>>,
     /// WebGPU engine, if available.
     #[cfg(feature = "webgpu")]
     webgpu_engine: Option<std::sync::Arc<crate::webgpu::WebGpuEngine>>,
-    /// Cached count of OpenCL devices found during init.
-    opencl_device_count: i32,
     /// Cached count of WebGPU devices found during init.
     webgpu_device_count: i32,
 }
@@ -73,18 +66,6 @@ pub struct PzContext {
 /// Returns a pointer to a new context, or null on failure.
 #[no_mangle]
 pub extern "C" fn pz_init() -> *mut PzContext {
-    #[cfg(feature = "opencl")]
-    let (opencl_engine, opencl_device_count) = {
-        let count = crate::opencl::device_count() as i32;
-        let engine = crate::opencl::OpenClEngine::new()
-            .ok()
-            .map(std::sync::Arc::new);
-        (engine, count)
-    };
-
-    #[cfg(not(feature = "opencl"))]
-    let opencl_device_count = 0i32;
-
     #[cfg(feature = "webgpu")]
     let (webgpu_engine, webgpu_device_count) = {
         let count = crate::webgpu::device_count() as i32;
@@ -99,11 +80,8 @@ pub extern "C" fn pz_init() -> *mut PzContext {
 
     let ctx = Box::new(PzContext {
         _initialized: true,
-        #[cfg(feature = "opencl")]
-        opencl_engine,
         #[cfg(feature = "webgpu")]
         webgpu_engine,
-        opencl_device_count,
         webgpu_device_count,
     });
     Box::into_raw(ctx)
@@ -139,7 +117,6 @@ pub unsafe extern "C" fn pz_query_devices(ctx: *const PzContext, info: *mut PzDe
 
     let ctx = &*ctx;
     let info = &mut *info;
-    info.opencl_devices = ctx.opencl_device_count;
     info.webgpu_devices = ctx.webgpu_device_count;
     info.cpu_threads = std::thread::available_parallelism()
         .map(|n| n.get() as i32)
@@ -151,8 +128,8 @@ pub unsafe extern "C" fn pz_query_devices(ctx: *const PzContext, info: *mut PzDe
 /// Build compression options from context, selecting GPU when appropriate.
 ///
 /// Uses the GPU backend when:
-/// 1. The `opencl` feature is enabled
-/// 2. An OpenCL engine was successfully created at init time
+/// 1. The `webgpu` feature is enabled
+/// 2. A WebGPU engine was successfully created at init time
 /// 3. The input is large enough to benefit from GPU acceleration
 ///
 /// `threads`: 0 = auto, 1 = single-threaded, N = use N threads.
@@ -161,20 +138,6 @@ fn build_compress_options(
     _input_len: usize,
     threads: usize,
 ) -> pipeline::CompressOptions {
-    #[cfg(feature = "opencl")]
-    {
-        if let Some(ref engine) = ctx.opencl_engine {
-            if _input_len >= crate::opencl::MIN_GPU_INPUT_SIZE {
-                return pipeline::CompressOptions {
-                    backend: pipeline::Backend::OpenCl,
-                    threads,
-                    opencl_engine: Some(engine.clone()),
-                    ..Default::default()
-                };
-            }
-        }
-    }
-
     #[cfg(feature = "webgpu")]
     {
         if let Some(ref engine) = ctx.webgpu_engine {
@@ -182,8 +145,6 @@ fn build_compress_options(
                 return pipeline::CompressOptions {
                     backend: pipeline::Backend::WebGpu,
                     threads,
-                    #[cfg(feature = "opencl")]
-                    opencl_engine: None,
                     webgpu_engine: Some(engine.clone()),
                     ..Default::default()
                 };
@@ -191,7 +152,7 @@ fn build_compress_options(
         }
     }
 
-    #[cfg(not(any(feature = "opencl", feature = "webgpu")))]
+    #[cfg(not(feature = "webgpu"))]
     let _ = ctx;
 
     pipeline::CompressOptions {
@@ -557,13 +518,11 @@ mod tests {
         unsafe {
             let ctx = pz_init();
             let mut info = PzDeviceInfo {
-                opencl_devices: -1,
                 webgpu_devices: -1,
                 cpu_threads: -1,
             };
             let result = pz_query_devices(ctx, &mut info);
             assert_eq!(result, PZ_OK);
-            assert!(info.opencl_devices >= 0);
             assert!(info.cpu_threads >= 1);
             pz_destroy(ctx);
         }
