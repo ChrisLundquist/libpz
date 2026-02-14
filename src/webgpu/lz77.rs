@@ -1042,4 +1042,112 @@ impl WebGpuEngine {
         let gpu_matches: Vec<GpuMatch> = bytemuck::cast_slice(&raw).to_vec();
         Ok(dedupe_gpu_matches(&gpu_matches, input))
     }
+
+    /// GPU-accelerated LZ77 block-parallel decompression.
+    ///
+    /// Decompresses multiple independently-compressed LZ77 blocks in a single
+    /// GPU dispatch. Each workgroup (64 threads) handles one block using a
+    /// leader-follower pattern: thread 0 parses matches sequentially while
+    /// all threads cooperate on back-reference copying.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_data` - Concatenated serialized LZ77 match data for all blocks.
+    /// * `block_meta` - Per-block metadata: `(match_data_offset, num_matches, decompressed_size)`.
+    ///
+    /// Returns the concatenated decompressed data from all blocks.
+    pub fn lz77_decompress_blocks(
+        &self,
+        block_data: &[u8],
+        block_meta: &[(usize, usize, usize)],
+    ) -> PzResult<Vec<u8>> {
+        if block_data.is_empty() || block_meta.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let num_blocks = block_meta.len();
+
+        // Compute output offsets via prefix sum of decompressed sizes
+        let mut gpu_meta = Vec::with_capacity(num_blocks * 3);
+        let mut output_offset = 0usize;
+        for &(data_offset, num_matches, decompressed_size) in block_meta {
+            gpu_meta.push(data_offset as u32);
+            gpu_meta.push(num_matches as u32);
+            gpu_meta.push(output_offset as u32);
+            output_offset += decompressed_size;
+        }
+        let total_output_len = output_offset;
+
+        if total_output_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Pad match data to u32-aligned for WGSL byte reading
+        let mut padded_data = block_data.to_vec();
+        while !padded_data.len().is_multiple_of(4) {
+            padded_data.push(0);
+        }
+
+        // Create GPU buffers
+        let match_data_buf = self.create_buffer_init(
+            "lz77_dec_match_data",
+            &padded_data,
+            wgpu::BufferUsages::STORAGE,
+        );
+
+        let meta_buf = self.create_buffer_init(
+            "lz77_dec_meta",
+            bytemuck::cast_slice(&gpu_meta),
+            wgpu::BufferUsages::STORAGE,
+        );
+
+        let output_u32_count = total_output_len.div_ceil(4);
+        let output_buf = self.create_buffer_init(
+            "lz77_dec_output",
+            &vec![0u8; output_u32_count * 4],
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        let params = [num_blocks as u32, total_output_len as u32, 0u32, 0u32];
+        let params_buf = self.create_buffer_init(
+            "lz77_dec_params",
+            bytemuck::cast_slice(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
+        let bg_layout = self.pipeline_lz77_decode().get_bind_group_layout(0);
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lz77_dec_bg"),
+            layout: &bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: match_data_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: meta_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        self.dispatch(
+            self.pipeline_lz77_decode(),
+            &bg,
+            num_blocks as u32,
+            "lz77_decode",
+        )?;
+
+        // Read output
+        let raw_output = self.read_buffer(&output_buf, (output_u32_count * 4) as u64);
+        Ok(raw_output[..total_output_len].to_vec())
+    }
 }

@@ -69,6 +69,9 @@ const FSE_DECODE_KERNEL_SOURCE: &str = include_str!("../../kernels/fse_decode.wg
 /// Embedded WGSL kernel source: GPU FSE encode.
 const FSE_ENCODE_KERNEL_SOURCE: &str = include_str!("../../kernels/fse_encode.wgsl");
 
+/// Embedded WGSL kernel source: GPU LZ77 block-parallel decompression.
+const LZ77_DECODE_KERNEL_SOURCE: &str = include_str!("../../kernels/lz77_decode.wgsl");
+
 /// Number of candidates per position in the top-K kernel (must match K in lz77_topk.wgsl).
 const TOPK_K: usize = 4;
 
@@ -199,11 +202,13 @@ struct BwtRadixPipelines {
     scatter: wgpu::ComputePipeline,
 }
 
-/// Huffman encoding pipelines (3 pipelines from huffman_encode.wgsl).
+/// Huffman encoding pipelines (5 pipelines from huffman_encode.wgsl).
 struct HuffmanPipelines {
     byte_histogram: wgpu::ComputePipeline,
     compute_bit_lengths: wgpu::ComputePipeline,
     write_codes: wgpu::ComputePipeline,
+    prefix_sum_block: wgpu::ComputePipeline,
+    prefix_sum_apply: wgpu::ComputePipeline,
 }
 
 /// FSE decode pipeline (1 pipeline from fse_decode.wgsl).
@@ -214,6 +219,11 @@ struct FseDecodePipelines {
 /// FSE encode pipeline (1 pipeline from fse_encode.wgsl).
 struct FseEncodePipelines {
     encode: wgpu::ComputePipeline,
+}
+
+/// LZ77 block-parallel decode pipeline (1 pipeline from lz77_decode.wgsl).
+struct Lz77DecodePipelines {
+    decode: wgpu::ComputePipeline,
 }
 
 /// WebGPU compute engine.
@@ -234,6 +244,7 @@ pub struct WebGpuEngine {
     huffman: OnceLock<HuffmanPipelines>,
     fse_decode: OnceLock<FseDecodePipelines>,
     fse_encode: OnceLock<FseEncodePipelines>,
+    lz77_decode: OnceLock<Lz77DecodePipelines>,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum compute workgroup size.
@@ -372,6 +383,7 @@ impl WebGpuEngine {
             huffman: OnceLock::new(),
             fse_decode: OnceLock::new(),
             fse_encode: OnceLock::new(),
+            lz77_decode: OnceLock::new(),
             device_name,
             max_work_group_size,
             max_workgroups_per_dim,
@@ -939,6 +951,8 @@ impl WebGpuEngine {
                 byte_histogram: make("byte_histogram", "byte_histogram"),
                 compute_bit_lengths: make("compute_bit_lengths", "compute_bit_lengths"),
                 write_codes: make("write_codes", "write_codes"),
+                prefix_sum_block: make("prefix_sum_block", "prefix_sum_block"),
+                prefix_sum_apply: make("prefix_sum_apply", "prefix_sum_apply"),
             };
             if self.profiling {
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -960,6 +974,14 @@ impl WebGpuEngine {
         &self.huffman_pipelines().write_codes
     }
 
+    fn pipeline_prefix_sum_block(&self) -> &wgpu::ComputePipeline {
+        &self.huffman_pipelines().prefix_sum_block
+    }
+
+    fn pipeline_prefix_sum_apply(&self) -> &wgpu::ComputePipeline {
+        &self.huffman_pipelines().prefix_sum_apply
+    }
+
     fn pipeline_fse_decode(&self) -> &wgpu::ComputePipeline {
         &self
             .fse_decode
@@ -975,6 +997,27 @@ impl WebGpuEngine {
                 if self.profiling {
                     let ms = t0.elapsed().as_secs_f64() * 1000.0;
                     eprintln!("[pz-gpu] compile fse_decode.wgsl: {ms:.3} ms");
+                }
+                group
+            })
+            .decode
+    }
+
+    fn pipeline_lz77_decode(&self) -> &wgpu::ComputePipeline {
+        &self
+            .lz77_decode
+            .get_or_init(|| {
+                let t0 = std::time::Instant::now();
+                let group = Lz77DecodePipelines {
+                    decode: self.make_pipeline(
+                        "lz77_decode",
+                        LZ77_DECODE_KERNEL_SOURCE,
+                        "lz77_decode",
+                    ),
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile lz77_decode.wgsl: {ms:.3} ms");
                 }
                 group
             })

@@ -1492,3 +1492,288 @@ fn test_gpu_lazy_quality_fields_c() {
         "fields.c: too few GPU matched bytes ({gpu_matched} < 7000)"
     );
 }
+
+// --- GPU prefix sum tests ---
+
+#[test]
+fn test_prefix_sum_small() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let data: Vec<u32> = vec![1, 2, 3, 4, 5];
+    let n = data.len();
+    let buf = engine.create_buffer_init(
+        "ps_test",
+        bytemuck::cast_slice(&data),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    );
+
+    engine.prefix_sum_gpu(&buf, n).unwrap();
+
+    let raw = engine.read_buffer(&buf, (n * 4) as u64);
+    let result: &[u32] = bytemuck::cast_slice(&raw);
+    // Exclusive prefix sum of [1,2,3,4,5] = [0,1,3,6,10]
+    assert_eq!(&result[..n], &[0, 1, 3, 6, 10]);
+}
+
+#[test]
+fn test_prefix_sum_exact_block_size() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Exact block size = 512 (256 * 2)
+    let n = 512;
+    let data: Vec<u32> = (0..n as u32).map(|_| 1).collect();
+    let buf = engine.create_buffer_init(
+        "ps_test_512",
+        bytemuck::cast_slice(&data),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    );
+
+    engine.prefix_sum_gpu(&buf, n).unwrap();
+
+    let raw = engine.read_buffer(&buf, (n * 4) as u64);
+    let result: &[u32] = bytemuck::cast_slice(&raw);
+    // Exclusive prefix sum of all-ones = [0, 1, 2, ..., 511]
+    for (i, &val) in result[..n].iter().enumerate() {
+        assert_eq!(val, i as u32, "mismatch at index {i}");
+    }
+}
+
+#[test]
+fn test_prefix_sum_multi_level() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // 2000 elements requires multi-level (> 512)
+    let n = 2000;
+    let data: Vec<u32> = (0..n as u32).map(|i| (i % 7) + 1).collect();
+    let buf = engine.create_buffer_init(
+        "ps_test_multi",
+        bytemuck::cast_slice(&data),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    );
+
+    engine.prefix_sum_gpu(&buf, n).unwrap();
+
+    let raw = engine.read_buffer(&buf, (n * 4) as u64);
+    let result: &[u32] = bytemuck::cast_slice(&raw);
+
+    // Verify against CPU prefix sum
+    let mut expected = vec![0u32; n];
+    let mut sum = 0u32;
+    for (i, slot) in expected.iter_mut().enumerate() {
+        *slot = sum;
+        sum += (i as u32 % 7) + 1;
+    }
+    assert_eq!(&result[..n], &expected[..]);
+}
+
+#[test]
+fn test_prefix_sum_single_element() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let data: Vec<u32> = vec![42];
+    let buf = engine.create_buffer_init(
+        "ps_test_single",
+        bytemuck::cast_slice(&data),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    );
+
+    engine.prefix_sum_gpu(&buf, 1).unwrap();
+
+    let raw = engine.read_buffer(&buf, 4);
+    let result: &[u32] = bytemuck::cast_slice(&raw);
+    assert_eq!(result[0], 0);
+}
+
+// --- huffman_encode_fully_on_device tests ---
+
+#[test]
+fn test_huffman_encode_fully_on_device_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input = b"hello world hello world hello world!";
+    let tree = crate::huffman::HuffmanTree::from_data(input).unwrap();
+
+    let mut code_lut = [0u32; 256];
+    for byte in 0..=255u8 {
+        let (codeword, bits) = tree.get_code(byte);
+        code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+    }
+
+    let device_input = DeviceBuf::from_host(&engine, input).unwrap();
+    let (gpu_encoded, gpu_bits) = engine
+        .huffman_encode_fully_on_device(&device_input, &code_lut)
+        .unwrap();
+    let (cpu_encoded, cpu_bits) = tree.encode(input).unwrap();
+
+    assert_eq!(gpu_bits, cpu_bits, "bit counts differ");
+    assert_eq!(gpu_encoded, cpu_encoded, "encoded data differs");
+
+    let decoded = tree.decode(&gpu_encoded, gpu_bits).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_huffman_encode_fully_on_device_larger() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+
+    let tree = crate::huffman::HuffmanTree::from_data(&input).unwrap();
+    let mut code_lut = [0u32; 256];
+    for byte in 0..=255u8 {
+        let (codeword, bits) = tree.get_code(byte);
+        code_lut[byte as usize] = ((bits as u32) << 24) | codeword;
+    }
+
+    let device_input = DeviceBuf::from_host(&engine, &input).unwrap();
+    let (gpu_encoded, gpu_bits) = engine
+        .huffman_encode_fully_on_device(&device_input, &code_lut)
+        .unwrap();
+    let decoded = tree.decode(&gpu_encoded, gpu_bits).unwrap();
+    assert_eq!(decoded, input);
+}
+
+// ---------------------------------------------------------------------------
+// LZ77 GPU Decompression tests
+// ---------------------------------------------------------------------------
+
+/// Helper: compress input into blocks and return (block_data, block_meta).
+/// block_meta entries are (match_data_offset, num_matches, decompressed_size).
+fn lz77_compress_blocks(input: &[u8], block_size: usize) -> (Vec<u8>, Vec<(usize, usize, usize)>) {
+    let mut block_data = Vec::new();
+    let mut block_meta = Vec::new();
+
+    for chunk in input.chunks(block_size) {
+        let compressed = crate::lz77::compress_lazy(chunk).unwrap();
+        let data_offset = block_data.len();
+        let num_matches = compressed.len() / crate::lz77::Match::SERIALIZED_SIZE;
+        block_meta.push((data_offset, num_matches, chunk.len()));
+        block_data.extend_from_slice(&compressed);
+    }
+
+    (block_data, block_meta)
+}
+
+#[test]
+fn test_lz77_decompress_blocks_small() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Small repetitive input — fits in one block
+    let input = b"abcabcabcabcabcabcabcabc";
+    let (block_data, block_meta) = lz77_compress_blocks(input, 1024);
+
+    let gpu_result = engine
+        .lz77_decompress_blocks(&block_data, &block_meta)
+        .unwrap();
+    assert_eq!(gpu_result, input);
+}
+
+#[test]
+fn test_lz77_decompress_blocks_multiblock() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Larger input split into multiple 4KB blocks
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::new();
+    for _ in 0..400 {
+        input.extend_from_slice(pattern);
+    }
+
+    let (block_data, block_meta) = lz77_compress_blocks(&input, 4096);
+    assert!(block_meta.len() > 1, "should have multiple blocks");
+
+    let gpu_result = engine
+        .lz77_decompress_blocks(&block_data, &block_meta)
+        .unwrap();
+    assert_eq!(gpu_result, input);
+}
+
+#[test]
+fn test_lz77_decompress_blocks_vs_cpu() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Test that GPU decompression matches CPU decompression exactly
+    let pattern = b"hello world compression test data ";
+    let mut input = Vec::new();
+    for _ in 0..200 {
+        input.extend_from_slice(pattern);
+    }
+
+    let (block_data, block_meta) = lz77_compress_blocks(&input, 2048);
+
+    // CPU decompress each block independently
+    let mut cpu_result = Vec::new();
+    for &(data_offset, num_matches, _decompressed_size) in &block_meta {
+        let block_bytes = &block_data
+            [data_offset..data_offset + num_matches * crate::lz77::Match::SERIALIZED_SIZE];
+        let decoded = crate::lz77::decompress(block_bytes).unwrap();
+        cpu_result.extend_from_slice(&decoded);
+    }
+    assert_eq!(cpu_result, input, "CPU decompress sanity check");
+
+    // GPU decompress
+    let gpu_result = engine
+        .lz77_decompress_blocks(&block_data, &block_meta)
+        .unwrap();
+    assert_eq!(gpu_result, cpu_result, "GPU vs CPU mismatch");
+}
+
+#[test]
+fn test_lz77_decompress_blocks_overlapping_backref() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Create input with overlapping back-references (offset < length)
+    // "aaaa..." repeated pattern triggers offset=1, length=N
+    let input: Vec<u8> = vec![b'a'; 200];
+
+    let (block_data, block_meta) = lz77_compress_blocks(&input, 1024);
+
+    let gpu_result = engine
+        .lz77_decompress_blocks(&block_data, &block_meta)
+        .unwrap();
+    assert_eq!(gpu_result, input);
+}
