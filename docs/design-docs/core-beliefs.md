@@ -28,26 +28,11 @@ cargo test --features webgpu
 
 ### 3. GPU Is Not Faster for Small Inputs
 
-**Don't optimize GPU paths for inputs <128KB.** GPU acceleration breaks even around:
-- LZ77: ~256KB
-- Huffman: ~128KB
-- BWT: ~512KB
-
-Below these thresholds, CPU is faster due to kernel launch overhead and data transfer costs.
-
-**Why:** GPU optimization effort should focus on large-block batched workloads where it actually provides speedup.
+**Don't optimize GPU paths for inputs <128KB.** See `docs/DESIGN.md` "GPU Break-Even Points" for specific thresholds per algorithm. CPU is faster below these due to kernel launch overhead and data transfer costs.
 
 ### 4. Buffer Allocations Are the Source of Truth
 
-**Never trust memory estimates in comments or plans.** The only source of truth for GPU memory usage is the actual `Buffer::create()` / `create_buffer()` calls in `src/webgpu/*.rs`.
-
-When analyzing GPU memory:
-1. Grep for `create_buffer` in the specific file
-2. Parse the size expressions (e.g., `input.len() * 4`)
-3. Account for staging buffers and padding
-4. Update @pz_cost annotations to match
-
-**Why:** Buffer sizes are computed at runtime from input length. Estimates drift as code evolves. Only the Rust allocation code is accurate.
+**Never trust memory estimates in comments or plans.** The only source of truth for GPU memory usage is the actual `Buffer::create()` / `create_buffer()` calls in `src/webgpu/*.rs`. Use `scripts/gpu-meminfo.sh` to analyze actual allocations.
 
 ### 5. Commit at Every Logical Completion Point
 
@@ -80,27 +65,11 @@ Grep with pattern="encode" path="src/" output_mode="files_with_matches"
 
 ### 7. Algorithms Must Be Composable
 
-**New algorithms must work both standalone and in pipelines.** Every algorithm should:
-- Have `encode()` / `decode()` public API
-- Provide `_to_buf` variants for caller-allocated buffers
-- Return `PzResult<T>` (never panic on bad input)
-- Include round-trip tests in `#[cfg(test)] mod tests`
-- Document format and limitations
-
-**Why:** libpz's value comes from flexible composition. Standalone algorithms can be tested, benchmarked, and reused in multiple pipelines.
+**New algorithms must work both standalone and in pipelines.** See `docs/DESIGN.md` for the full API pattern (encode/decode, `_to_buf` variants, `PzResult<T>`).
 
 ### 8. Correctness First, Then Performance
 
-**Always verify correctness before optimizing.** The validation priority is:
-1. Unit tests pass
-2. Round-trip tests pass (encode → decode → original)
-3. Cross-decompression tests pass (GPU encode → CPU decode, vice versa)
-4. Validation corpus tests pass (Canterbury, enwik8)
-5. Benchmarks show improvement
-
-Never skip steps 1-4 to chase benchmark numbers.
-
-**Why:** Compression is easy to get wrong. Bugs can be silent (produce valid output with worse compression) or catastrophic (data corruption).
+**Always verify correctness before optimizing.** Follow the validation hierarchy in `docs/DESIGN.md` "Correctness First, Then Performance" — never skip unit/round-trip/cross-decompression tests to chase benchmark numbers.
 
 ### 9. GPU and CPU Paths Must Produce Bit-Identical Output
 
@@ -123,37 +92,11 @@ When they diverge, the bug is almost always in:
 
 ### 11. Tests Must Skip Gracefully on Missing GPU
 
-**GPU tests must check `is_gpu_available()` and skip if no device is present.** Never fail tests due to missing GPU hardware.
-
-```rust
-#[test]
-fn test_lz77_gpu() {
-    if !crate::webgpu::is_gpu_available() {
-        eprintln!("Skipping GPU test (no device available)");
-        return;
-    }
-    // ... test logic
-}
-```
-
-**Why:** CI runs on machines without GPUs. Tests should be robust to hardware availability.
+**GPU tests must check `is_gpu_available()` and skip if no device is present.** See `docs/DESIGN.md` "Graceful GPU Fallback" for the pattern. CI runs on machines without GPUs.
 
 ### 12. Error Messages Must Include Context
 
-**When returning errors, include expected vs actual values.** Bad:
-```rust
-Err(PzError::InvalidInput("buffer too small"))
-```
-
-Good:
-```rust
-Err(PzError::BufferTooSmall {
-    required: compressed_size,
-    provided: output.len(),
-})
-```
-
-**Why:** Context-rich errors enable faster debugging. Agents and humans can understand what went wrong without adding debug prints.
+**When returning errors, include expected vs actual values.** See `docs/DESIGN.md` "Error Handling Philosophy" for the `PzError` variants and code examples.
 
 ### 13. In a Worktree, Run Git From the Worktree Directory
 

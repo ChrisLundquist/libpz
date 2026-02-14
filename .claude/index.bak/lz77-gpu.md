@@ -137,17 +137,61 @@ Simple backward scan with two-tier window:
 
 ### 3. Hash-Table Kernel (REMOVED)
 
-**Status:** Abandoned in commit `ef067d0` (2026-02-13). Quality collapsed on repetitive data due to non-deterministic GPU atomic insertion order. See `experiments.md` "Hash-Table LZ77 Kernel" for full analysis.
+**Status:** Abandoned in commit `ef067d0` (2026-02-13)
+
+**Why it failed:**
+- Parallel atomic insertion filled fixed-size buckets with arbitrary positions
+- GPU thread scheduling randomizes insertion order
+- Ring buffers don't help — quality collapsed on repetitive data
+- Example: 99.61% CPU quality → 6.25% GPU quality on 1MB repetitive data
+
+**Lesson learned:** Hash tables require deterministic insertion order (most-recent positions). GPU atomics don't guarantee this.
 
 ## Ring-Buffered Streaming
 
 **Introduced:** Commit `4390d90` (2026-02-13)
 
-The multi-block batched path uses pre-allocated ring buffers instead of per-block allocation, eliminating 35% overhead and enabling overlapped GPU/CPU execution. See `gpu-batching.md` for the `Lz77BufferSlot` struct, buffer allocation formula, and performance benchmarks.
+The multi-block batched path uses pre-allocated ring buffers instead of per-block allocation:
+
+**Buffer structure:**
+
+```rust
+pub struct Lz77BufferSlot {
+    pub input_buf: wgpu::Buffer,
+    pub params_buf: wgpu::Buffer,
+    pub raw_match_buf: wgpu::Buffer,
+    pub resolved_buf: wgpu::Buffer,
+    pub staging_buf: wgpu::Buffer,
+    pub capacity: usize,
+}
+```
+
+**Benefits:**
+- Eliminates per-block GPU alloc/map overhead (35% of time)
+- Enables overlapped GPU/CPU execution
+- Backpressure-aware (respects GPU queue depth)
+
+**Performance impact:**
+```
+16-block batch (4MB): 82 ms → 70 ms (17% faster)
+Full deflate pipeline: 96 ms → 89 ms (7% faster)
+Full lzfi pipeline: 101 ms → 90 ms (11% faster)
+```
 
 ## Data Flow Through Pipeline
 
-See `pipeline-architecture.md` for the full data flow from `compress_block()` through demux and entropy coding. The key integration points for LZ77 GPU are `submit_lz77_to_slot()` (async dispatch) and `complete_find_matches_coop()` (result retrieval via backpressure loop).
+To understand how LZ77 GPU results flow through compression:
+
+1. **Block entry:** `compress_block()` in `src/pipeline/blocks.rs`
+2. **GPU submission:** `submit_lz77_to_slot()` dispatches async work
+3. **GPU wait point:** `poll_wait()` in backpressure loop
+4. **Result retrieval:** `complete_find_matches_coop()` reads staging buffer
+5. **Stage demux:** `stage_demux_compress()` splits matches into streams
+6. **Entropy coding:** GPU or CPU based on pipeline (handles streams independently)
+
+**Key handoff:** `StageBlock.streams` field:
+- `None` before demux
+- `Some(Vec<Vec<u8>>)` after demux (entropy encoders consume these)
 
 ## Known Bottlenecks & Optimization Opportunities
 
