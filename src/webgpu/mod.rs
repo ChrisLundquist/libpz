@@ -183,6 +183,8 @@ struct Lz77HashPipelines {
 }
 
 /// LZ77 lazy-matching pipelines (2 pipelines from lz77_lazy.wgsl).
+/// Retained for A/B benchmarking against the coop kernel.
+#[allow(dead_code)]
 struct Lz77LazyPipelines {
     find: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
@@ -246,6 +248,7 @@ pub struct WebGpuEngine {
     // Lazily-compiled pipeline groups (one OnceLock per WGSL shader module).
     lz77_topk: OnceLock<Lz77TopkPipelines>,
     lz77_hash: OnceLock<Lz77HashPipelines>,
+    #[allow(dead_code)]
     lz77_lazy: OnceLock<Lz77LazyPipelines>,
     lz77_coop: OnceLock<Lz77CoopPipelines>,
     bwt_rank: OnceLock<BwtRankPipelines>,
@@ -539,7 +542,7 @@ impl WebGpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        self.poll_wait();
         rx.recv()
             .unwrap()
             .map_err(|_| PzError::Unsupported)
@@ -573,7 +576,7 @@ impl WebGpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        self.poll_wait();
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();
@@ -647,19 +650,53 @@ impl WebGpuEngine {
         }
     }
 
+    /// Emit a no-op profiler query to burn the first query slot.
+    ///
+    /// Workaround for AMD Vulkan drivers (RDNA 4 confirmed) that return
+    /// zero timestamps for query pair index 0 in a query set. Call once
+    /// at the start of a profiled frame before any real dispatches.
+    pub fn profiler_warmup(&self) {
+        if let Some(p) = &self.profiler {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("profiler_warmup"),
+                });
+            let mut profiler = p.lock().unwrap();
+            let query = profiler.begin_pass_query("_warmup", &mut encoder);
+            // Empty compute pass so the timestamp writes are valid.
+            {
+                let _pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("_warmup"),
+                    timestamp_writes: query.compute_pass_timestamp_writes(),
+                });
+            }
+            profiler.end_query(&mut encoder, query);
+            profiler.resolve_queries(&mut encoder);
+            drop(profiler);
+            self.queue.submit(Some(encoder.finish()));
+        }
+    }
+
     /// End the current profiler frame and collect timing results.
     ///
     /// Call after all GPU work for the frame has been submitted.
     /// Returns `None` if profiling is disabled or no results are ready.
+    /// Filters out internal `_warmup` queries automatically.
     pub fn profiler_end_frame(&self) -> Option<Vec<wgpu_profiler::GpuTimerQueryResult>> {
         let p = self.profiler.as_ref()?;
-        {
-            p.lock().unwrap().end_frame().ok()?;
-        }
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-        p.lock()
+        p.lock().unwrap().end_frame().ok()?;
+        self.poll_wait();
+        let results = p
+            .lock()
             .unwrap()
-            .process_finished_frame(self.queue.get_timestamp_period())
+            .process_finished_frame(self.queue.get_timestamp_period());
+        // Filter out internal warmup queries
+        results.map(|v| {
+            v.into_iter()
+                .filter(|r| !r.label.starts_with('_'))
+                .collect()
+        })
     }
 
     /// Write collected profiler results to a Chrome trace file.
@@ -694,7 +731,7 @@ impl WebGpuEngine {
         self.queue.submit(Some(encoder.finish()));
         // Wall-clock fallback when profiler is not available
         if self.profiling && self.profiler.is_none() {
-            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            self.poll_wait();
             let ms = t0.unwrap().elapsed().as_secs_f64() * 1000.0;
             eprintln!("[pz-gpu] {label}: {ms:.3} ms");
         }
@@ -792,6 +829,7 @@ impl WebGpuEngine {
         &self.lz77_hash_pipelines().find
     }
 
+    #[allow(dead_code)]
     fn lz77_lazy_pipelines(&self) -> &Lz77LazyPipelines {
         self.lz77_lazy.get_or_init(|| {
             let t0 = std::time::Instant::now();
@@ -824,10 +862,12 @@ impl WebGpuEngine {
         })
     }
 
+    #[allow(dead_code)]
     fn pipeline_lz77_lazy_find(&self) -> &wgpu::ComputePipeline {
         &self.lz77_lazy_pipelines().find
     }
 
+    #[allow(dead_code)]
     fn pipeline_lz77_lazy_resolve(&self) -> &wgpu::ComputePipeline {
         &self.lz77_lazy_pipelines().resolve
     }

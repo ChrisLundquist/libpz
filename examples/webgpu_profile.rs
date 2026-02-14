@@ -504,6 +504,10 @@ fn run() {
         }
     );
 
+    // Warmup query to burn the first (buggy) query slot on AMD RDNA 4.
+    // AMD Vulkan driver returns zero timestamps for query pair index 0.
+    profile_engine.profiler_warmup();
+
     // Run key GPU operations once for the trace
     let _ = profile_engine.find_matches(&data).unwrap();
     let _ = profile_engine.byte_histogram(&data).unwrap();
@@ -519,6 +523,13 @@ fn run() {
         WebGpuEngine::profiler_write_trace(&trace_path, &results).unwrap();
         eprintln!("Chrome trace written to {}", trace_path.display());
         eprintln!("View at chrome://tracing or https://ui.perfetto.dev/");
+        // Print per-kernel GPU timing
+        for r in &results {
+            if let Some(ref time) = r.time {
+                let dur_us = (time.end - time.start) * 1_000_000.0;
+                eprintln!("  {}: {:.1} us", r.label, dur_us);
+            }
+        }
     } else {
         eprintln!("GPU timestamps not available (profiler returned no results)");
     }
