@@ -159,7 +159,7 @@ fn run() {
     }
 
     // Also test with real file data if available
-    let sample_path = "samples/canterbury/alice29.txt";
+    let sample_path = "samples/cantrbry/alice29.txt";
     if let Ok(data) = std::fs::read(sample_path) {
         println!("\n--- alice29.txt ({} bytes) ---", data.len());
 
@@ -209,6 +209,218 @@ fn run() {
         let gpu_decoded = lz77::decompress(&gpu_compressed).unwrap();
         assert_eq!(gpu_decoded, data, "GPU round-trip FAILED!");
         println!("GPU round-trip: OK");
+    }
+
+    // Offset distribution analysis: how much quality is lost from 1024-byte window?
+    println!("\n--- CPU Match Offset Distribution (what GPU misses) ---");
+    println!(
+        "{:<12} {:>8} {:>8} {:>8} {:>8} {:>8} | {:>8} {:>8}",
+        "Data", "<=256", "257-1K", "1K-4K", "4K-32K", ">1K tot", "Near %", "Far %"
+    );
+    println!("{}", "-".repeat(90));
+
+    for &(label, make_data) in &[
+        ("text 256K", make_text_data as fn(usize) -> Vec<u8>),
+        ("binary 256K", make_binary_data as fn(usize) -> Vec<u8>),
+    ] {
+        let data = make_data(256 * 1024);
+        let cpu_matches = lz77::compress_lazy_to_matches(&data).unwrap();
+
+        let mut near_256 = 0usize;
+        let mut near_1k = 0usize;
+        let mut far_4k = 0usize;
+        let mut far_32k = 0usize;
+
+        let mut near_bytes = 0usize;
+        let mut far_bytes = 0usize;
+        let mut total_match_bytes = 0usize;
+
+        for m in &cpu_matches {
+            if m.length == 0 {
+                continue;
+            }
+            let bytes = m.length as usize;
+            total_match_bytes += bytes;
+            match m.offset {
+                0 => {} // literal
+                1..=256 => {
+                    near_256 += 1;
+                    near_bytes += bytes;
+                }
+                257..=1024 => {
+                    near_1k += 1;
+                    near_bytes += bytes;
+                }
+                1025..=4096 => {
+                    far_4k += 1;
+                    far_bytes += bytes;
+                }
+                _ => {
+                    far_32k += 1;
+                    far_bytes += bytes;
+                }
+            }
+        }
+
+        let near_pct = if total_match_bytes > 0 {
+            near_bytes as f64 / total_match_bytes as f64 * 100.0
+        } else {
+            0.0
+        };
+        let far_pct = if total_match_bytes > 0 {
+            far_bytes as f64 / total_match_bytes as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        println!(
+            "{:<12} {:>8} {:>8} {:>8} {:>8} {:>8} | {:>7.1}% {:>6.1}%",
+            label,
+            near_256,
+            near_1k,
+            far_4k,
+            far_32k,
+            far_4k + far_32k,
+            near_pct,
+            far_pct,
+        );
+    }
+
+    // Also check real file data
+    for path in &[
+        "samples/cantrbry/alice29.txt",
+        "samples/cantrbry/asyoulik.txt",
+        "samples/cantrbry/cp.html",
+        "samples/cantrbry/kennedy.xls",
+    ] {
+        if let Ok(data) = std::fs::read(path) {
+            let cpu_matches = lz77::compress_lazy_to_matches(&data).unwrap();
+
+            let mut near_256 = 0usize;
+            let mut near_1k = 0usize;
+            let mut far_4k = 0usize;
+            let mut far_32k = 0usize;
+
+            let mut near_bytes = 0usize;
+            let mut far_bytes = 0usize;
+            let mut total_match_bytes = 0usize;
+
+            for m in &cpu_matches {
+                if m.length == 0 {
+                    continue;
+                }
+                let bytes = m.length as usize;
+                total_match_bytes += bytes;
+                match m.offset {
+                    0 => {}
+                    1..=256 => {
+                        near_256 += 1;
+                        near_bytes += bytes;
+                    }
+                    257..=1024 => {
+                        near_1k += 1;
+                        near_bytes += bytes;
+                    }
+                    1025..=4096 => {
+                        far_4k += 1;
+                        far_bytes += bytes;
+                    }
+                    _ => {
+                        far_32k += 1;
+                        far_bytes += bytes;
+                    }
+                }
+            }
+
+            let near_pct = if total_match_bytes > 0 {
+                near_bytes as f64 / total_match_bytes as f64 * 100.0
+            } else {
+                0.0
+            };
+            let far_pct = if total_match_bytes > 0 {
+                far_bytes as f64 / total_match_bytes as f64 * 100.0
+            } else {
+                0.0
+            };
+
+            let name = std::path::Path::new(path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            println!(
+                "{:<12} {:>8} {:>8} {:>8} {:>8} {:>8} | {:>7.1}% {:>6.1}%",
+                name,
+                near_256,
+                near_1k,
+                far_4k,
+                far_32k,
+                far_4k + far_32k,
+                near_pct,
+                far_pct,
+            );
+        }
+    }
+
+    // Detailed offset CDF: what NEAR_WINDOW would we need?
+    println!("\n--- CPU Match Offset CDF (cumulative % of match bytes by offset) ---");
+    println!(
+        "{:<12} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "Data", "<=256", "<=512", "<=1K", "<=2K", "<=4K", "<=8K", "<=16K"
+    );
+    println!("{}", "-".repeat(80));
+
+    for path in &[
+        "samples/cantrbry/alice29.txt",
+        "samples/cantrbry/asyoulik.txt",
+        "samples/cantrbry/cp.html",
+        "samples/cantrbry/kennedy.xls",
+        "samples/cantrbry/lcet10.txt",
+        "samples/cantrbry/plrabn12.txt",
+    ] {
+        if let Ok(data) = std::fs::read(path) {
+            let cpu_matches = lz77::compress_lazy_to_matches(&data).unwrap();
+            let thresholds = [256, 512, 1024, 2048, 4096, 8192, 16384];
+            let mut bucket_bytes = [0usize; 7];
+            let mut total_bytes = 0usize;
+
+            for m in &cpu_matches {
+                if m.length == 0 || m.offset == 0 {
+                    continue;
+                }
+                let bytes = m.length as usize;
+                total_bytes += bytes;
+                for (i, &t) in thresholds.iter().enumerate() {
+                    if m.offset <= t {
+                        bucket_bytes[i] += bytes;
+                        break;
+                    }
+                }
+            }
+
+            // Compute cumulative
+            let mut cum = [0usize; 7];
+            cum[0] = bucket_bytes[0];
+            for i in 1..7 {
+                cum[i] = cum[i - 1] + bucket_bytes[i];
+            }
+
+            let name = std::path::Path::new(path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            print!("{:<12}", name);
+            for c in &cum {
+                let pct = if total_bytes > 0 {
+                    *c as f64 / total_bytes as f64 * 100.0
+                } else {
+                    0.0
+                };
+                print!(" {:>7.1}%", pct);
+            }
+            println!();
+        }
     }
 
     // Profiling data
