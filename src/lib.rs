@@ -24,9 +24,6 @@ mod gpu_cost;
 #[allow(dead_code)]
 mod gpu_common;
 
-#[cfg(feature = "opencl")]
-pub mod opencl;
-
 #[cfg(feature = "webgpu")]
 pub mod webgpu;
 

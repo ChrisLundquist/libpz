@@ -946,7 +946,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Generate test input large enough to trigger GPU dispatch (≥64KB).
-    #[cfg(any(feature = "opencl", feature = "webgpu"))]
+    #[cfg(feature = "webgpu")]
     fn gpu_test_input() -> Vec<u8> {
         let pattern = b"The quick brown fox jumps over the lazy dog. ";
         let target_size = 80 * 1024; // 80KB, above MIN_GPU_INPUT_SIZE (64KB)
@@ -956,67 +956,6 @@ mod tests {
         }
         input.truncate(target_size);
         input
-    }
-
-    #[test]
-    #[cfg(feature = "opencl")]
-    fn opencl_compress_cpu_decompress_deflate() {
-        use crate::pipeline::{Backend, CompressOptions};
-        let engine = match crate::opencl::OpenClEngine::new() {
-            Ok(e) => std::sync::Arc::new(e),
-            Err(crate::PzError::Unsupported) => return,
-            Err(e) => panic!("unexpected error: {:?}", e),
-        };
-        let input = gpu_test_input();
-        let options = CompressOptions {
-            backend: Backend::OpenCl,
-            opencl_engine: Some(engine),
-            ..Default::default()
-        };
-        let compressed =
-            pipeline::compress_with_options(&input, Pipeline::Deflate, &options).unwrap();
-        let decompressed = pipeline::decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input, "OpenCL Deflate GPU→CPU round-trip");
-    }
-
-    #[test]
-    #[cfg(feature = "opencl")]
-    fn opencl_compress_cpu_decompress_lzr() {
-        use crate::pipeline::{Backend, CompressOptions};
-        let engine = match crate::opencl::OpenClEngine::new() {
-            Ok(e) => std::sync::Arc::new(e),
-            Err(crate::PzError::Unsupported) => return,
-            Err(e) => panic!("unexpected error: {:?}", e),
-        };
-        let input = gpu_test_input();
-        let options = CompressOptions {
-            backend: Backend::OpenCl,
-            opencl_engine: Some(engine),
-            ..Default::default()
-        };
-        let compressed = pipeline::compress_with_options(&input, Pipeline::Lzr, &options).unwrap();
-        let decompressed = pipeline::decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input, "OpenCL Lzr GPU→CPU round-trip");
-    }
-
-    #[test]
-    #[cfg(feature = "opencl")]
-    fn opencl_compress_cpu_decompress_lzf() {
-        use crate::pipeline::{Backend, CompressOptions};
-        let engine = match crate::opencl::OpenClEngine::new() {
-            Ok(e) => std::sync::Arc::new(e),
-            Err(crate::PzError::Unsupported) => return,
-            Err(e) => panic!("unexpected error: {:?}", e),
-        };
-        let input = gpu_test_input();
-        let options = CompressOptions {
-            backend: Backend::OpenCl,
-            opencl_engine: Some(engine),
-            ..Default::default()
-        };
-        let compressed = pipeline::compress_with_options(&input, Pipeline::Lzf, &options).unwrap();
-        let decompressed = pipeline::decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input, "OpenCL Lzf GPU→CPU round-trip");
     }
 
     #[test]

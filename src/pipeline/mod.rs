@@ -52,9 +52,6 @@ pub enum Backend {
     /// Single-threaded CPU reference implementation (always available).
     #[default]
     Cpu,
-    /// OpenCL GPU backend (requires `opencl` feature and a GPU device).
-    #[cfg(feature = "opencl")]
-    OpenCl,
     /// WebGPU backend via wgpu (requires `webgpu` feature).
     #[cfg(feature = "webgpu")]
     WebGpu,
@@ -108,9 +105,6 @@ pub struct CompressOptions {
     /// Larger limits allow longer matches on repetitive data without
     /// penalizing short-match performance (SIMD short-circuits).
     pub max_match_len: Option<u16>,
-    /// OpenCL engine handle, required when `backend` is `Backend::OpenCl`.
-    #[cfg(feature = "opencl")]
-    pub opencl_engine: Option<std::sync::Arc<crate::opencl::OpenClEngine>>,
     /// WebGPU engine handle, required when `backend` is `Backend::WebGpu`.
     #[cfg(feature = "webgpu")]
     pub webgpu_engine: Option<std::sync::Arc<crate::webgpu::WebGpuEngine>>,
@@ -124,8 +118,6 @@ impl Default for CompressOptions {
             block_size: DEFAULT_BLOCK_SIZE,
             parse_strategy: ParseStrategy::Auto,
             max_match_len: None,
-            #[cfg(feature = "opencl")]
-            opencl_engine: None,
             #[cfg(feature = "webgpu")]
             webgpu_engine: None,
         }
@@ -142,9 +134,6 @@ pub struct DecompressOptions {
     pub backend: Backend,
     /// Number of threads to use. 0 = auto, 1 = single-threaded.
     pub threads: usize,
-    /// OpenCL engine handle, required when `backend` is `Backend::OpenCl`.
-    #[cfg(feature = "opencl")]
-    pub opencl_engine: Option<std::sync::Arc<crate::opencl::OpenClEngine>>,
     /// WebGPU engine handle, required when `backend` is `Backend::WebGpu`.
     #[cfg(feature = "webgpu")]
     pub webgpu_engine: Option<std::sync::Arc<crate::webgpu::WebGpuEngine>>,
@@ -155,8 +144,6 @@ impl Default for DecompressOptions {
         DecompressOptions {
             backend: Backend::Cpu,
             threads: 0,
-            #[cfg(feature = "opencl")]
-            opencl_engine: None,
             #[cfg(feature = "webgpu")]
             webgpu_engine: None,
         }
@@ -254,7 +241,7 @@ pub fn compress(input: &[u8], pipeline: Pipeline) -> PzResult<Vec<u8>> {
 /// The output always uses the multi-block container format (V2) with a
 /// block table, even for single-block streams.
 ///
-/// When `options.backend` is `Backend::OpenCl` and an engine is provided,
+/// When `options.backend` is `Backend::WebGpu` and an engine is provided,
 /// GPU-amenable stages (e.g., LZ77 match finding) run on the GPU.
 /// Other stages and decompression always use the CPU.
 pub fn compress_with_options(
@@ -327,9 +314,9 @@ pub fn decompress_with_threads(input: &[u8], threads: usize) -> PzResult<Vec<u8>
 
 /// Decompress data with full options including GPU backend selection.
 ///
-/// When `options.backend` is `Backend::OpenCl` or `Backend::WebGpu` with
-/// an engine, GPU-amenable decode stages (e.g., interleaved FSE for Lzfi)
-/// run on the GPU. Other stages and pipelines use the CPU.
+/// When `options.backend` is `Backend::WebGpu` with an engine,
+/// GPU-amenable decode stages (e.g., interleaved FSE for Lzfi) run on the
+/// GPU. Other stages and pipelines use the CPU.
 pub fn decompress_with_options(input: &[u8], options: &DecompressOptions) -> PzResult<Vec<u8>> {
     if input.is_empty() {
         return Ok(Vec::new());
@@ -524,10 +511,6 @@ fn gpu_adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> Compre
         if matches!(options.backend, Backend::WebGpu) {
             gpu = true;
         }
-        #[cfg(feature = "opencl")]
-        if matches!(options.backend, Backend::OpenCl) {
-            gpu = true;
-        }
         gpu
     };
 
@@ -615,24 +598,6 @@ fn decompress_framed(
 /// - `Optimal` on CPU: CPU match table → CPU backward DP
 /// - GPU backend falls back to CPU when input < MIN_GPU_INPUT_SIZE
 fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    #[cfg(feature = "opencl")]
-    {
-        if let Backend::OpenCl = options.backend {
-            if let Some(ref engine) = options.opencl_engine {
-                if input.len() >= crate::opencl::MIN_GPU_INPUT_SIZE {
-                    if options.parse_strategy == ParseStrategy::Optimal {
-                        // GPU top-K match table + CPU optimal parse DP
-                        let table = engine.find_topk_matches(input)?;
-                        return crate::optimal::compress_optimal_with_table(input, &table);
-                    }
-                    // GPU hash-table kernel for Auto/Greedy/Lazy
-                    return engine.lz77_compress(input, crate::opencl::KernelVariant::HashTable);
-                }
-                // Input too small for GPU — fall through to CPU paths
-            }
-        }
-    }
-
     #[cfg(feature = "webgpu")]
     {
         if let Backend::WebGpu = options.backend {
@@ -663,19 +628,6 @@ fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResu
 
 /// Run BWT encoding using the configured backend.
 fn bwt_encode_with_backend(input: &[u8], options: &CompressOptions) -> PzResult<bwt::BwtResult> {
-    #[cfg(feature = "opencl")]
-    {
-        if let Backend::OpenCl = options.backend {
-            if let Some(ref engine) = options.opencl_engine {
-                // Skip GPU BWT on CPU OpenCL devices — bitonic sort is O(log^2 n)
-                // kernel launches which is much slower than CPU's O(n) SA-IS.
-                if !engine.is_cpu_device() && input.len() >= crate::opencl::MIN_GPU_BWT_SIZE {
-                    return engine.bwt_encode(input);
-                }
-            }
-        }
-    }
-
     #[cfg(feature = "webgpu")]
     {
         if let Backend::WebGpu = options.backend {
@@ -690,7 +642,7 @@ fn bwt_encode_with_backend(input: &[u8], options: &CompressOptions) -> PzResult<
         }
     }
 
-    #[cfg(not(any(feature = "opencl", feature = "webgpu")))]
+    #[cfg(not(feature = "webgpu"))]
     let _ = options;
 
     bwt::encode(input).ok_or(PzError::InvalidInput)

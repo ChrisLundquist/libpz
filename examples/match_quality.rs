@@ -263,31 +263,6 @@ fn main() {
                 }
             }
         }
-
-        // --- OpenCL ---
-        #[cfg(feature = "opencl")]
-        {
-            use pz::opencl::{KernelVariant, OpenClEngine};
-            match OpenClEngine::new() {
-                Ok(engine) => {
-                    if size >= pz::opencl::MIN_GPU_INPUT_SIZE {
-                        let gpu_compressed = engine
-                            .lz77_compress(&data, KernelVariant::HashTable)
-                            .unwrap();
-                        // Parse matches back
-                        let mut gpu_matches = Vec::new();
-                        for chunk in gpu_compressed.chunks_exact(5) {
-                            let buf: &[u8; 5] = chunk.try_into().unwrap();
-                            gpu_matches.push(pz::lz77::Match::from_bytes(buf));
-                        }
-                        all_stats.push(analyze_matches("OpenCL hash", &gpu_matches, size));
-                    }
-                }
-                Err(e) => {
-                    eprintln!("OpenCL unavailable: {:?}", e);
-                }
-            }
-        }
     }
 
     print_stats(&all_stats);

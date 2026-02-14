@@ -110,7 +110,7 @@ impl KernelCost {
     }
 }
 
-/// Strip leading `//` or `///` comment prefix (for both .cl and .wgsl files).
+/// Strip leading `//` or `///` comment prefix (for .wgsl files).
 fn strip_comment_prefix(line: &str) -> &str {
     let trimmed = line.trim_start();
     if let Some(rest) = trimmed.strip_prefix("///") {

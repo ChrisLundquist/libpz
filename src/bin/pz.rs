@@ -35,10 +35,8 @@ fn usage() {
     eprintln!("  -a, --auto         Auto-select best pipeline based on data analysis");
     eprintln!("  --trial            Auto-select by trial compression (slower, more accurate)");
     eprintln!("  -t, --threads N    Number of threads (0=auto, 1=single-threaded)");
-    #[cfg(feature = "opencl")]
-    eprintln!("  -g, --gpu          Use GPU (OpenCL) for compression and decompression");
     #[cfg(feature = "webgpu")]
-    eprintln!("  --webgpu           Use GPU (WebGPU/wgpu) for compression and decompression");
+    eprintln!("  -g, --gpu          Use GPU (WebGPU/wgpu) for compression and decompression");
     eprintln!("  -O, --optimal      Use optimal parsing (best compression, slowest)");
     eprintln!("  --lazy             Use lazy matching (good compression, default)");
     eprintln!("  --greedy           Use greedy matching (fastest, least compression)");
@@ -87,7 +85,6 @@ struct Opts {
     verbose: bool,
     quiet: bool,
     gpu: bool,
-    webgpu: bool,
     auto_select: bool,
     trial_mode: bool,
     parse_strategy: ParseStrategy,
@@ -107,7 +104,6 @@ fn parse_args() -> Opts {
         verbose: false,
         quiet: false,
         gpu: false,
-        webgpu: false,
         auto_select: false,
         trial_mode: false,
         parse_strategy: ParseStrategy::Auto,
@@ -127,8 +123,7 @@ fn parse_args() -> Opts {
             "-l" | "--list" => opts.list = true,
             "-v" | "--verbose" => opts.verbose = true,
             "-q" | "--quiet" => opts.quiet = true,
-            "-g" | "--gpu" | "--opencl" => opts.gpu = true,
-            "--webgpu" => opts.webgpu = true,
+            "-g" | "--gpu" | "--webgpu" => opts.gpu = true,
             "-a" | "--auto" => opts.auto_select = true,
             "--trial" => {
                 opts.auto_select = true;
@@ -251,59 +246,15 @@ fn decompress_output_path(input: &str) -> Option<PathBuf> {
 /// Resolved GPU backend state shared between compress and decompress options.
 struct GpuState {
     backend: pipeline::Backend,
-    #[cfg(feature = "opencl")]
-    opencl_engine: Option<std::sync::Arc<pz::opencl::OpenClEngine>>,
     #[cfg(feature = "webgpu")]
     webgpu_engine: Option<std::sync::Arc<pz::webgpu::WebGpuEngine>>,
 }
 
 /// Initialize GPU engine based on CLI flags.
 fn init_gpu(opts: &Opts) -> GpuState {
-    #[cfg(feature = "opencl")]
-    {
-        if opts.gpu {
-            let result = if opts.verbose {
-                pz::opencl::OpenClEngine::with_profiling(true)
-            } else {
-                pz::opencl::OpenClEngine::new()
-            };
-            match result {
-                Ok(engine) => {
-                    if opts.verbose {
-                        eprintln!("pz: using GPU device: {}", engine.device_name());
-                    }
-                    return GpuState {
-                        backend: pipeline::Backend::OpenCl,
-                        opencl_engine: Some(std::sync::Arc::new(engine)),
-                        #[cfg(feature = "webgpu")]
-                        webgpu_engine: None,
-                    };
-                }
-                Err(_) => {
-                    if !opts.quiet {
-                        eprintln!(
-                            "pz: warning: GPU requested but OpenCL not available, \
-                             falling back to CPU"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg(not(feature = "opencl"))]
-    {
-        if opts.gpu && !opts.quiet {
-            eprintln!(
-                "pz: warning: --gpu requires the opencl feature \
-                 (build with --features opencl)"
-            );
-        }
-    }
-
     #[cfg(feature = "webgpu")]
     {
-        if opts.webgpu {
+        if opts.gpu {
             let result = if opts.verbose {
                 pz::webgpu::WebGpuEngine::with_profiling(true)
             } else {
@@ -316,15 +267,13 @@ fn init_gpu(opts: &Opts) -> GpuState {
                     }
                     return GpuState {
                         backend: pipeline::Backend::WebGpu,
-                        #[cfg(feature = "opencl")]
-                        opencl_engine: None,
                         webgpu_engine: Some(std::sync::Arc::new(engine)),
                     };
                 }
                 Err(_) => {
                     if !opts.quiet {
                         eprintln!(
-                            "pz: warning: --webgpu requested but no WebGPU device available, \
+                            "pz: warning: GPU requested but no WebGPU device available, \
                              falling back to CPU"
                         );
                     }
@@ -335,9 +284,9 @@ fn init_gpu(opts: &Opts) -> GpuState {
 
     #[cfg(not(feature = "webgpu"))]
     {
-        if opts.webgpu && !opts.quiet {
+        if opts.gpu && !opts.quiet {
             eprintln!(
-                "pz: warning: --webgpu requires the webgpu feature \
+                "pz: warning: --gpu requires the webgpu feature \
                  (build with --features webgpu)"
             );
         }
@@ -345,8 +294,6 @@ fn init_gpu(opts: &Opts) -> GpuState {
 
     GpuState {
         backend: pipeline::Backend::Cpu,
-        #[cfg(feature = "opencl")]
-        opencl_engine: None,
         #[cfg(feature = "webgpu")]
         webgpu_engine: None,
     }
@@ -360,8 +307,6 @@ fn build_cli_options(opts: &Opts) -> (CompressOptions, DecompressOptions) {
         backend: gpu.backend,
         threads: opts.threads,
         parse_strategy: opts.parse_strategy,
-        #[cfg(feature = "opencl")]
-        opencl_engine: gpu.opencl_engine.clone(),
         #[cfg(feature = "webgpu")]
         webgpu_engine: gpu.webgpu_engine.clone(),
         ..Default::default()
@@ -370,8 +315,6 @@ fn build_cli_options(opts: &Opts) -> (CompressOptions, DecompressOptions) {
     let decompress_options = DecompressOptions {
         backend: gpu.backend,
         threads: opts.threads,
-        #[cfg(feature = "opencl")]
-        opencl_engine: gpu.opencl_engine,
         #[cfg(feature = "webgpu")]
         webgpu_engine: gpu.webgpu_engine,
     };

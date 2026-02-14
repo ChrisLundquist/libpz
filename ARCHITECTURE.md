@@ -11,14 +11,13 @@ For day-to-day development instructions, see `CLAUDE.md`.
 - **Optimal parsing:** GPU top-K match table → CPU backward DP (4-6% better compression)
 - **Multi-threading:** Block-parallel and pipeline-parallel via V2 container format; within-block parallel LZ77 match finding (`compress_lazy_parallel`)
 - **GPU kernels:** LZ77 hash-table (fast), LZ77 batch/per-position (legacy), LZ77 top-K, BWT radix sort + parallel rank assignment, Huffman encode (two-pass with Blelloch prefix sum), GPU Deflate chaining (LZ77→Huffman on device)
-- **Tooling:** CLI (`pz` with `-a`/`--auto` and `--trial` flags), C FFI, Criterion benchmarks, CI (3 OS + OpenCL)
+- **Tooling:** CLI (`pz` with `-a`/`--auto` and `--trial` flags), C FFI, Criterion benchmarks, CI (3 OS)
 
 ### Not started
 - M5.3: Fuzz testing (`cargo-fuzz`)
 
 ### Partially complete
 - **rANS SIMD decode paths** — N-way interleaved rANS decode in `src/simd.rs` (SSE2 4-way, AVX2 8-way). The scalar interleaved encoder/decoder is implemented; SIMD intrinsics for the hot decode loop are not yet wired.
-- **rANS OpenCL kernels** — GPU rANS encode/decode kernels (~200 lines). The CPU implementation and pipeline integration are done; GPU kernels are not yet written.
 - **rANS reciprocal multiplication** — Replace division in the encode loop with precomputed reciprocal multiply-shift for GPU/SIMD (avoids data-dependent division). Documented as future optimization due to u32 overflow edge cases with small frequencies.
 
 ## BWT implementation
@@ -149,18 +148,13 @@ is shared conceptually with `src/fse.rs` (both operate on power-of-2 tables).
    multiply-shift with packed 32×32→64 multiplies (`_mm_mul_epu32` /
    `_mm256_mul_epu32`).
 
-2. **OpenCL kernels** (~200 lines in `kernels/rans.cl`): GPU rANS encode and
-   decode. The interleaved format maps directly to GPU work-items (one state
-   per thread, 32–256 threads). Frequency tables fit in `__local` memory
-   (2 KB for 256×u16 + 256×u16 cumulative).
-
-3. **Reciprocal multiplication trick**: Replace `x / freq` and `x % freq` in
+2. **Reciprocal multiplication trick**: Replace `x / freq` and `x % freq` in
    the encode loop with precomputed `ceil(2^(32+shift) / freq)` reciprocals.
    This eliminates data-dependent divisions (critical for GPU throughput).
    Not yet implemented due to u32 overflow edge cases when `freq` is small;
    needs u64 intermediate arithmetic or per-frequency shift selection.
 
-4. **Benchmark integration**: Add rANS and Lzr pipeline to
+3. **Benchmark integration**: Add rANS and Lzr pipeline to
    `benches/throughput.rs` and `benches/stages.rs` for head-to-head comparison
    with Huffman and FSE.
 
@@ -187,7 +181,7 @@ The Deflate GPU path chains LZ77 → Huffman on the GPU with minimized transfers
 
 The `ByteHistogram` kernel eliminates the need to scan LZ77 data on CPU for frequency counting — only 1KB of histogram data is transferred instead of the full LZ77 stream.
 
-This is activated automatically when `Backend::OpenCl` is selected and input ≥ `MIN_GPU_INPUT_SIZE`.
+This is activated automatically when a GPU backend is selected and input ≥ `MIN_GPU_INPUT_SIZE`.
 
 ## Parallel LZ77
 `compress_lazy_parallel(input, num_threads)` pre-computes matches in parallel (each thread builds its own hash chain), then serializes sequentially with lazy evaluation. Thresholds:
@@ -258,22 +252,15 @@ GPU BWT radix sort is 7-14x faster than the old bitonic sort. Still slower than 
 
 ## Next steps
 
-### Priority 0: rANS SIMD + GPU completion
-Three pieces remain to complete the rANS integration (~350 lines total):
+### Priority 0: rANS SIMD completion
+Two pieces remain to complete the rANS integration:
 
 1. **SIMD decode paths** (~150 lines in `src/simd.rs`): SSE2 4-way and AVX2 8-way
    intrinsics for the interleaved rANS decode hot loop. The scalar N-way interleave
    is implemented; SIMD replaces per-state multiply-shift with packed `_mm_mul_epu32` /
    `_mm256_mul_epu32`. Expected 3-4x decode throughput improvement.
 
-2. **OpenCL rANS kernels** (~200 lines in `kernels/rans_decode.cl`): GPU decode
-   kernel mapping one rANS state per work-item. Frequency + cumulative tables in
-   `__local` memory (2 KB). The interleaved format maps directly: each work-item
-   independently decodes its symbol stream, then results are scattered to output
-   positions. Encode kernel is lower priority (CPU encode + GPU decode is the
-   typical asymmetric pattern).
-
-3. **Reciprocal multiplication trick**: Replace `x / freq` and `x % freq` with
+2. **Reciprocal multiplication trick**: Replace `x / freq` and `x % freq` with
    precomputed `ceil(2^(32+shift) / freq)` reciprocals to eliminate data-dependent
    division in encode. Needs u64 intermediate arithmetic or per-frequency adaptive
    shift to handle overflow when `freq` is small. Critical for GPU encode throughput.

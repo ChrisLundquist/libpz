@@ -15,8 +15,7 @@
 #   ./scripts/profile.sh --web                         # open browser UI after recording
 #
 # Feature flags:
-#   ./scripts/profile.sh --features opencl             # build with opencl (instead of default webgpu)
-#   ./scripts/profile.sh --features opencl,webgpu      # build with both
+#   ./scripts/profile.sh --features webgpu             # build with webgpu
 #   ./scripts/profile.sh --no-default-features         # disable default features (pure CPU)
 #
 # Extra samply arguments:
@@ -68,9 +67,6 @@ EXAMPLES:
 
     # Override output path
     ./scripts/profile.sh -o custom.json.gz --stage lz77
-
-    # Profile with OpenCL GPU backend
-    ./scripts/profile.sh --features opencl --pipeline lzf
 
     # Pure CPU build (no GPU features)
     ./scripts/profile.sh --no-default-features --pipeline lzf

@@ -9,7 +9,6 @@
 ///
 /// Usage:
 ///   cargo run --example block_size_experiment --release --features webgpu
-///   cargo run --example block_size_experiment --release --features opencl
 ///   cargo run --example block_size_experiment --release  # CPU-only baseline
 use std::path::Path;
 use std::time::Instant;
@@ -269,8 +268,6 @@ fn main() {
                                 threads: 0,
                                 block_size,
                                 webgpu_engine: Some(engine.clone()),
-                                #[cfg(feature = "opencl")]
-                                opencl_engine: None,
                                 ..Default::default()
                             };
                             let r = run_trial(&data, pipeline, &options, "WebGPU");
@@ -290,54 +287,6 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("WebGPU unavailable: {:?}", e);
-            }
-        }
-    }
-
-    // --- OpenCL ---
-    #[cfg(feature = "opencl")]
-    {
-        use pz::opencl::OpenClEngine;
-        match OpenClEngine::new() {
-            Ok(engine) => {
-                let engine = std::sync::Arc::new(engine);
-                println!(
-                    "Running OpenCL trials (device: {})...",
-                    engine.device_name()
-                );
-                for &input_size in INPUT_SIZES {
-                    let data = load_data(input_size);
-                    for &pipeline in PIPELINES {
-                        for &block_size in BLOCK_SIZES {
-                            if block_size > input_size * 2 {
-                                continue;
-                            }
-                            let options = CompressOptions {
-                                backend: pipeline::Backend::OpenCl,
-                                threads: 0,
-                                block_size,
-                                opencl_engine: Some(engine.clone()),
-                                #[cfg(feature = "webgpu")]
-                                webgpu_engine: None,
-                                ..Default::default()
-                            };
-                            let r = run_trial(&data, pipeline, &options, "OpenCL");
-                            eprint!(
-                                "  {:?} {} blk={} => {:.1} MB/s ratio={:.4}\r",
-                                pipeline,
-                                format_size(input_size),
-                                format_size(block_size),
-                                r.throughput_mbs,
-                                r.ratio,
-                            );
-                            all_results.push(r);
-                        }
-                    }
-                }
-                eprintln!();
-            }
-            Err(e) => {
-                eprintln!("OpenCL unavailable: {:?}", e);
             }
         }
     }

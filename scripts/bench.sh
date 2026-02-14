@@ -27,9 +27,8 @@ Options:
   -p, --pipelines LIST   Comma-separated list of pipelines to benchmark
                          (default: deflate,lzr,lzf)
   --all                  Benchmark all available pipelines
-  --opencl               Build with OpenCL feature and pass --gpu to pz
-  --webgpu               Build with WebGPU feature and pass --webgpu to pz
-  --features FEAT        Cargo features to enable (e.g. opencl,webgpu)
+  --webgpu               Build with WebGPU feature and pass --gpu to pz
+  --features FEAT        Cargo features to enable (e.g. webgpu)
   -h, --help             Show this help
 
 If no FILEs are given, benchmarks all files in samples/cantrbry and samples/large.
@@ -39,7 +38,6 @@ Examples:
   ./scripts/bench.sh myfile.bin                   # specific file
   ./scripts/bench.sh -p deflate,lzf               # subset of pipelines
   ./scripts/bench.sh -n 10                        # more iterations
-  ./scripts/bench.sh --opencl -p deflate           # GPU-accelerated via OpenCL
   ./scripts/bench.sh --webgpu -p bw,bbw           # GPU-accelerated via WebGPU
   ./scripts/bench.sh --all                         # benchmark every pipeline
   ./scripts/bench.sh -n 1 -p deflate,lzf file.txt # combine options
@@ -73,24 +71,14 @@ while [[ $# -gt 0 ]]; do
             PIPELINES=(deflate bw bbw lzr lzf lzfi)
             shift
             ;;
-        --opencl)
-            # Shorthand: enable opencl feature and pass --gpu to pz
-            if [[ -z "$FEATURES" ]]; then
-                FEATURES="opencl"
-            else
-                FEATURES="$FEATURES,opencl"
-            fi
-            GPU_FLAG="--gpu"
-            shift
-            ;;
         --webgpu)
-            # Shorthand: enable webgpu feature and pass --webgpu to pz
+            # Shorthand: enable webgpu feature and pass --gpu to pz
             if [[ -z "$FEATURES" ]]; then
                 FEATURES="webgpu"
             else
                 FEATURES="$FEATURES,webgpu"
             fi
-            GPU_FLAG="--webgpu"
+            GPU_FLAG="--gpu"
             shift
             ;;
         --features)

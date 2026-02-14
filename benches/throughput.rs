@@ -124,51 +124,6 @@ fn bench_decompress(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(feature = "opencl")]
-fn bench_compress_gpu(c: &mut Criterion) {
-    use pz::opencl::OpenClEngine;
-    use pz::pipeline::{Backend, CompressOptions};
-
-    let engine = match OpenClEngine::new() {
-        Ok(e) => std::sync::Arc::new(e),
-        Err(_) => {
-            eprintln!("throughput: no OpenCL device, skipping GPU benchmarks");
-            return;
-        }
-    };
-
-    eprintln!("throughput: GPU device: {}", engine.device_name());
-
-    let data = get_test_data();
-    let mut group = c.benchmark_group("compress_gpu");
-    cap(&mut group);
-    group.throughput(Throughput::Bytes(data.len() as u64));
-
-    let options = CompressOptions {
-        backend: Backend::OpenCl,
-        threads: 1,
-        block_size: 0,
-        parse_strategy: pz::pipeline::ParseStrategy::Auto,
-        opencl_engine: Some(engine),
-        #[cfg(feature = "webgpu")]
-        webgpu_engine: None,
-        ..Default::default()
-    };
-
-    for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
-        let opts = options.clone();
-        group.bench_with_input(
-            BenchmarkId::new("pz_gpu", format!("{:?}", pipe)),
-            &data,
-            move |b, data| {
-                b.iter(|| pipeline::compress_with_options(data, pipe, &opts).unwrap());
-            },
-        );
-    }
-
-    group.finish();
-}
-
 fn bench_compress_parallel(c: &mut Criterion) {
     use pz::pipeline::CompressOptions;
 
@@ -201,9 +156,6 @@ fn bench_compress_parallel(c: &mut Criterion) {
 
     group.finish();
 }
-
-#[cfg(not(feature = "opencl"))]
-fn bench_compress_gpu(_c: &mut Criterion) {}
 
 /// End-to-end pipeline throughput at 4MB and 16MB (CPU).
 fn bench_compress_large(c: &mut Criterion) {
@@ -246,50 +198,6 @@ fn bench_decompress_large(c: &mut Criterion) {
     group.finish();
 }
 
-/// End-to-end GPU pipeline throughput at 4MB and 16MB.
-#[cfg(feature = "opencl")]
-fn bench_compress_gpu_large(c: &mut Criterion) {
-    use pz::opencl::OpenClEngine;
-    use pz::pipeline::{Backend, CompressOptions};
-
-    let engine = match OpenClEngine::new() {
-        Ok(e) => std::sync::Arc::new(e),
-        Err(_) => {
-            eprintln!("throughput: no OpenCL device, skipping large GPU benchmarks");
-            return;
-        }
-    };
-
-    let mut group = c.benchmark_group("compress_gpu_large");
-    cap(&mut group);
-
-    for &size in &[4_194_304usize, 16_777_216] {
-        let data = get_test_data_sized(size);
-        group.throughput(Throughput::Bytes(size as u64));
-
-        let options = CompressOptions {
-            backend: Backend::OpenCl,
-            opencl_engine: Some(engine.clone()),
-            ..CompressOptions::default()
-        };
-
-        for &pipe in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
-            let opts = options.clone();
-            group.bench_with_input(
-                BenchmarkId::new(format!("{:?}_gpu", pipe), size),
-                &data,
-                move |b, data| {
-                    b.iter(|| pipeline::compress_with_options(data, pipe, &opts).unwrap());
-                },
-            );
-        }
-    }
-    group.finish();
-}
-
-#[cfg(not(feature = "opencl"))]
-fn bench_compress_gpu_large(_c: &mut Criterion) {}
-
 #[cfg(feature = "webgpu")]
 fn bench_compress_webgpu(c: &mut Criterion) {
     use pz::pipeline::{Backend, CompressOptions};
@@ -315,8 +223,6 @@ fn bench_compress_webgpu(c: &mut Criterion) {
         threads: 1,
         block_size: 0,
         parse_strategy: pz::pipeline::ParseStrategy::Auto,
-        #[cfg(feature = "opencl")]
-        opencl_engine: None,
         webgpu_engine: Some(engine),
         ..Default::default()
     };
@@ -389,8 +295,6 @@ criterion_group!(
     bench_compress_parallel,
     bench_compress_large,
     bench_decompress_large,
-    bench_compress_gpu,
-    bench_compress_gpu_large,
     bench_compress_webgpu,
     bench_compress_webgpu_large
 );
