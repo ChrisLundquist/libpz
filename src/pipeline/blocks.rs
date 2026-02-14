@@ -14,7 +14,7 @@ use crate::{PzError, PzResult};
 
 use super::demux::{demuxer_for_pipeline, LzDemuxer};
 use super::stages::*;
-#[cfg(any(feature = "opencl", feature = "webgpu"))]
+#[cfg(feature = "webgpu")]
 use super::Backend;
 use super::{resolve_max_match_len, CompressOptions, DecompressOptions, Pipeline};
 
@@ -132,25 +132,11 @@ fn entropy_encode(
 ) -> PzResult<StageBlock> {
     match pipeline {
         Pipeline::Deflate => {
-            // GPU Huffman when available, otherwise CPU Huffman.
-            #[cfg(feature = "opencl")]
-            {
-                if let Backend::OpenCl = options.backend {
-                    if let Some(ref engine) = options.opencl_engine {
-                        return stage_huffman_encode_gpu(block, engine);
-                    }
-                }
-            }
-
             // Note: WebGPU Huffman is intentionally NOT used here.
             // Profiling shows CPU Huffman (~0.5ms/256KB) is faster than the
             // WebGPU path (~2ms) due to CPU↔GPU round-trips for bit-length
             // computation and prefix-sum. The GPU LZ77 path provides the
             // parallelism win; entropy encoding is faster on the CPU.
-            #[cfg(feature = "webgpu")]
-            let _ = &options;
-
-            // Suppress unused variable warning when no GPU features are enabled
             let _ = (input_len, options);
             stage_huffman_encode(block)
         }
@@ -163,14 +149,6 @@ fn entropy_encode(
             stage_fse_encode(block)
         }
         Pipeline::Lzfi => {
-            #[cfg(feature = "opencl")]
-            {
-                if let Backend::OpenCl = options.backend {
-                    if let Some(ref engine) = options.opencl_engine {
-                        return stage_fse_interleaved_encode_gpu(block, engine);
-                    }
-                }
-            }
             #[cfg(feature = "webgpu")]
             {
                 if let Backend::WebGpu = options.backend {
@@ -199,14 +177,6 @@ fn entropy_decode(
         Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R => stage_rans_decode(block),
         Pipeline::Lzf => stage_fse_decode(block),
         Pipeline::Lzfi => {
-            #[cfg(feature = "opencl")]
-            {
-                if let Backend::OpenCl = options.backend {
-                    if let Some(ref engine) = options.opencl_engine {
-                        return stage_fse_interleaved_decode_gpu(block, engine);
-                    }
-                }
-            }
             #[cfg(feature = "webgpu")]
             {
                 if let Backend::WebGpu = options.backend {

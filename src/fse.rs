@@ -357,7 +357,7 @@ fn build_encode_tables(
 ///
 /// Absent symbols (frequency == 0) have all-zero entries (never accessed
 /// during encoding because no input byte maps to them).
-#[allow(dead_code)] // Used by GPU FSE encode (opencl + webgpu features)
+#[allow(dead_code)] // Used by GPU FSE encode (webgpu feature)
 pub(crate) fn build_gpu_encode_table(norm: &NormalizedFreqs) -> Vec<u32> {
     let table_size = 1usize << norm.accuracy_log;
     let spread = spread_symbols(norm);

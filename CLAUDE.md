@@ -14,8 +14,8 @@ cargo test                     # run all tests
 cargo test fse                 # run tests for a specific module
 cargo fmt                      # format code (must match CI)
 cargo clippy --all-targets     # lint (must pass with zero warnings)
-cargo build --features opencl  # compile with GPU support
-cargo test --features opencl   # run all tests including GPU (skips gracefully if no device)
+cargo build --features webgpu  # compile with GPU support
+cargo test --features webgpu   # run all tests including GPU (skips gracefully if no device)
 ```
 
 ## Git hooks setup
@@ -48,7 +48,7 @@ cargo bench --bench throughput     # end-to-end pipeline throughput only
 cargo bench --bench stages         # per-algorithm stage benchmarks only
 cargo bench -- fse                 # filter to specific algorithm
 cargo bench -- compress            # filter to compress group
-cargo bench --features opencl      # include GPU benchmarks
+cargo bench --features webgpu      # include GPU benchmarks
 ```
 
 ### Profiling with samply
@@ -60,7 +60,7 @@ cargo install samply                                        # one-time setup
 ./scripts/profile.sh --stage fse --size 1048576             # 1MB input
 ./scripts/profile.sh --web --pipeline lzf                   # open browser UI
 ./scripts/profile.sh --no-default-features --pipeline lzf   # pure CPU (no GPU)
-./scripts/profile.sh --features opencl --pipeline lzf       # OpenCL GPU backend
+./scripts/profile.sh --features webgpu --pipeline lzf       # WebGPU GPU backend
 samply load profiling/a1b2c3d/lz77_encode_256KB.json.gz     # view saved profile later
 ```
 
@@ -85,14 +85,9 @@ samply load profiling/a1b2c3d/lz77_encode_256KB.json.gz     # view saved profile
   - `parallel.rs` — block-parallel, pipeline-parallel, and GPU-batched multi-block paths
 - `src/frequency.rs` — shared frequency table used by entropy coders (SIMD-accelerated counting)
 - `src/simd.rs` — SIMD-accelerated primitives (SSE2/AVX2 for x86_64, NEON stubs for aarch64)
-- `src/opencl/` — OpenCL GPU backend (feature-gated behind `opencl`)
-  - `mod.rs` — engine init, `DeviceBuf` type, kernel compilation
-  - `lz77.rs` — GPU LZ77 match finding (hash, per-position, batch, top-K variants)
-  - `huffman.rs` — GPU Huffman encode, `byte_histogram_on_device`, `huffman_encode_on_device`
 - `src/webgpu/` — WebGPU backend (feature-gated behind `webgpu`)
 - `src/ffi.rs` — C FFI bindings
 - `src/validation.rs` — cross-module integration tests (including GPU↔CPU cross-decompression)
-- `kernels/*.cl` — OpenCL kernel source
 - `kernels/*.wgsl` — WebGPU kernel source
 - `benches/throughput.rs` — end-to-end pipeline benchmarks
 - `benches/stages.rs` — per-algorithm scaling benchmarks
@@ -101,7 +96,6 @@ samply load profiling/a1b2c3d/lz77_encode_256KB.json.gz     # view saved profile
 - `scripts/profile.sh` — samply profiling wrapper (headless by default, `--web` for browser)
 - `profiling/` — saved profiles, organized as `<7-char-sha>/<description>.json.gz` (e.g. `a1b2c3d-dirty/`)
 - `examples/profile.rs` — profiling harness (pipeline or individual stage loops)
-- `examples/gpu_compare.rs` — GPU backend comparison benchmark
 
 ## Conventions
 - Public API: `encode()` / `decode()` returning `PzResult<T>`
@@ -113,8 +107,7 @@ samply load profiling/a1b2c3d/lz77_encode_256KB.json.gz     # view saved profile
 
 ## Feature flags
 - **Default (no features):** Pure CPU build. All tests pass everywhere.
-- **`opencl`:** GPU acceleration via OpenCL. Requires OpenCL SDK + GPU device. Tests gracefully skip if no device. Always compile-check GPU changes: `cargo build --features opencl`
-- **`webgpu`:** GPU acceleration via wgpu (Vulkan/Metal/DX12). Same graceful-skip behavior.
+- **`webgpu`:** GPU acceleration via wgpu (Vulkan/Metal/DX12). Tests gracefully skip if no device. Always compile-check GPU changes: `cargo build --features webgpu`
 - GPU is **not faster for small inputs** — LZ77 breaks even ~256KB, Huffman ~128KB. Don't optimize GPU paths for small data.
 
 ## Understanding GPU resource usage
@@ -127,7 +120,7 @@ samply load profiling/a1b2c3d/lz77_encode_256KB.json.gz     # view saved profile
 - Adding a new LZ-based pipeline only requires an entry in `demuxer_for_pipeline()` and the `entropy_encode()`/`entropy_decode()` dispatch in `blocks.rs` — no new block function needed.
 
 ## Common pitfalls
-1. **Forgetting `--features opencl` when modifying GPU code** — CPU-only build won't catch GPU compile errors.
+1. **Forgetting `--features webgpu` when modifying GPU code** — CPU-only build won't catch GPU compile errors.
 2. **Multi-stream format changes are subtle** — LZ-based pipelines demux into independent streams (LZ77: 3 streams for offsets/lengths/literals, LZSS: 4, LZ78: 1). The per-block multistream container header is `[num_streams: u8][pre_entropy_len: u32][meta_len: u16][meta]`. Don't change without understanding round-trip implications.
 3. **Pre-commit hook auto-reformats and re-stages files** — `cargo fmt` runs automatically and modifies files in-place. If a commit fails on clippy, fix the warning and make a new commit (don't amend).
 4. **Use dedicated tools instead of shell pipelines** — Prefer Grep/Glob tools over `grep | cut | sort | uniq` shell pipelines. Dedicated tools are faster, don't need permission approval, and produce better-structured output.
@@ -147,6 +140,6 @@ samply load profiling/a1b2c3d/lz77_encode_256KB.json.gz     # view saved profile
 - If a task has multiple independent parts, commit each part separately rather than one giant commit at the end.
 
 ## Project status
-11 of 12 milestones complete. All core algorithms, pipelines, GPU kernels (OpenCL + WebGPU), auto-selection, optimal parsing, multi-threading, and tooling are implemented. Not started: fuzz testing (M5.3).
+11 of 12 milestones complete. All core algorithms, pipelines, GPU kernels (WebGPU), auto-selection, optimal parsing, multi-threading, and tooling are implemented. Not started: fuzz testing (M5.3).
 
 For detailed GPU benchmarks, architecture notes, and roadmap see `ARCHITECTURE.md`.

@@ -26,8 +26,6 @@ struct Result {
 /// Holds optional GPU engine handles.
 #[allow(dead_code)]
 struct GpuEngines {
-    #[cfg(feature = "opencl")]
-    opencl: Option<std::sync::Arc<pz::opencl::OpenClEngine>>,
     #[cfg(feature = "webgpu")]
     webgpu: Option<std::sync::Arc<pz::webgpu::WebGpuEngine>>,
 }
@@ -73,8 +71,6 @@ fn measure_pz(
 ) -> Option<Result> {
     let backend_tag = match backend {
         Backend::Cpu => "",
-        #[cfg(feature = "opencl")]
-        Backend::OpenCl => "/OpenCL",
         #[cfg(feature = "webgpu")]
         Backend::WebGpu => "/WebGPU",
     };
@@ -94,8 +90,6 @@ fn measure_pz(
         parse_strategy: strategy,
         threads,
         backend,
-        #[cfg(feature = "opencl")]
-        opencl_engine: _engines.opencl.clone(),
         #[cfg(feature = "webgpu")]
         webgpu_engine: _engines.webgpu.clone(),
         ..Default::default()
@@ -246,25 +240,10 @@ fn should_skip_for_large(pipe: Pipeline, strategy: ParseStrategy, data_len: usiz
 
 fn main() {
     // Initialize GPU engines (if feature-enabled and hardware available)
-    #[cfg(feature = "opencl")]
-    let has_opencl;
     #[cfg(feature = "webgpu")]
     let has_webgpu;
 
     let engines = GpuEngines {
-        #[cfg(feature = "opencl")]
-        opencl: match pz::opencl::OpenClEngine::new() {
-            Ok(e) => {
-                eprintln!("OpenCL engine initialized: {}", e.device_name());
-                has_opencl = true;
-                Some(std::sync::Arc::new(e))
-            }
-            Err(e) => {
-                eprintln!("OpenCL not available: {}", e);
-                has_opencl = false;
-                None
-            }
-        },
         #[cfg(feature = "webgpu")]
         webgpu: match pz::webgpu::WebGpuEngine::new() {
             Ok(e) => {
@@ -346,16 +325,6 @@ fn main() {
         (Pipeline::Lz78R, ParseStrategy::Auto, 0, Backend::Cpu),
     ];
 
-    // OpenCL GPU variants (if available)
-    #[cfg(feature = "opencl")]
-    if has_opencl {
-        pz_configs.extend([
-            (Pipeline::Deflate, ParseStrategy::Auto, 1, Backend::OpenCl),
-            (Pipeline::Lzf, ParseStrategy::Auto, 1, Backend::OpenCl),
-            (Pipeline::Bw, ParseStrategy::Auto, 1, Backend::OpenCl),
-        ]);
-    }
-
     // WebGPU GPU variants (if available)
     #[cfg(feature = "webgpu")]
     if has_webgpu {
@@ -390,8 +359,6 @@ fn main() {
             }
             let backend_tag = match backend {
                 Backend::Cpu => "",
-                #[cfg(feature = "opencl")]
-                Backend::OpenCl => "/OpenCL",
                 #[cfg(feature = "webgpu")]
                 Backend::WebGpu => "/WebGPU",
             };

@@ -316,7 +316,7 @@ pub(crate) fn compress_optimal_with_limit(input: &[u8], max_match_len: u16) -> P
 /// Compress input using optimal parsing with a pre-built match table.
 ///
 /// This variant is used when the match table comes from the GPU
-/// (via `OpenClEngine::find_topk_matches`).
+/// (via GPU top-K match finding).
 pub fn compress_optimal_with_table(input: &[u8], table: &MatchTable) -> PzResult<Vec<u8>> {
     if input.is_empty() {
         return Ok(Vec::new());
