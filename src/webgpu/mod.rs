@@ -650,28 +650,52 @@ impl WebGpuEngine {
         }
     }
 
+    /// Emit a no-op profiler query to burn the first query slot.
+    ///
+    /// Workaround for AMD Vulkan drivers (RDNA 4 confirmed) that return
+    /// zero timestamps for query pair index 0 in a query set. Call once
+    /// at the start of a profiled frame before any real dispatches.
+    pub fn profiler_warmup(&self) {
+        if let Some(p) = &self.profiler {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("profiler_warmup"),
+                });
+            // Issue a dummy query pair — no actual compute pass needed.
+            let query = p.lock().unwrap().begin_pass_query("_warmup", &mut encoder);
+            // Create an empty compute pass so the timestamp writes are valid.
+            {
+                let _pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("_warmup"),
+                    timestamp_writes: query.compute_pass_timestamp_writes(),
+                });
+            }
+            p.lock().unwrap().end_query(&mut encoder, query);
+            p.lock().unwrap().resolve_queries(&mut encoder);
+            self.queue.submit(Some(encoder.finish()));
+        }
+    }
+
     /// End the current profiler frame and collect timing results.
     ///
     /// Call after all GPU work for the frame has been submitted.
     /// Returns `None` if profiling is disabled or no results are ready.
+    /// Filters out internal `_warmup` queries automatically.
     pub fn profiler_end_frame(&self) -> Option<Vec<wgpu_profiler::GpuTimerQueryResult>> {
         let p = self.profiler.as_ref()?;
-        {
-            let result = p.lock().unwrap().end_frame();
-            if let Err(ref e) = result {
-                eprintln!("[pz-gpu] profiler end_frame error: {e:?}");
-            }
-            result.ok()?;
-        }
+        p.lock().unwrap().end_frame().ok()?;
         self.poll_wait();
         let results = p
             .lock()
             .unwrap()
             .process_finished_frame(self.queue.get_timestamp_period());
-        if results.is_none() {
-            eprintln!("[pz-gpu] profiler process_finished_frame returned None");
-        }
-        results
+        // Filter out internal warmup queries
+        results.map(|v| {
+            v.into_iter()
+                .filter(|r| !r.label.starts_with('_'))
+                .collect()
+        })
     }
 
     /// Write collected profiler results to a Chrome trace file.

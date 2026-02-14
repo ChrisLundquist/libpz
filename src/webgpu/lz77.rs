@@ -153,31 +153,56 @@ impl WebGpuEngine {
             ],
         });
 
-        // Encode 2 compute passes + staging copy in one command buffer
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("lz77_coop_submit"),
-            });
-        self.record_dispatch(
-            &mut encoder,
-            self.pipeline_lz77_coop_find(),
-            &find_bg,
-            workgroups,
-            "lz77_coop_find",
-        )?;
-        self.record_dispatch(
-            &mut encoder,
-            self.pipeline_lz77_coop_resolve(),
-            &resolve_bg,
-            workgroups,
-            "lz77_coop_resolve",
-        )?;
-        // Copy resolved matches to staging buffer (in same command buffer)
-        encoder.copy_buffer_to_buffer(&resolved_buf, 0, &staging_buf, 0, match_buf_size);
-
-        self.profiler_resolve(&mut encoder);
-        self.queue.submit(Some(encoder.finish()));
+        if self.profiler.is_some() {
+            // When profiling, use separate encoders per dispatch so each gets
+            // its own resolve_query_set. AMD Vulkan drivers (RDNA 4 confirmed)
+            // return zero timestamps for the 2nd dispatch in a multi-pass encoder.
+            self.dispatch(
+                self.pipeline_lz77_coop_find(),
+                &find_bg,
+                workgroups,
+                "lz77_coop_find",
+            )?;
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("lz77_coop_resolve"),
+                });
+            self.record_dispatch(
+                &mut encoder,
+                self.pipeline_lz77_coop_resolve(),
+                &resolve_bg,
+                workgroups,
+                "lz77_coop_resolve",
+            )?;
+            encoder.copy_buffer_to_buffer(&resolved_buf, 0, &staging_buf, 0, match_buf_size);
+            self.profiler_resolve(&mut encoder);
+            self.queue.submit(Some(encoder.finish()));
+        } else {
+            // Non-profiling: single encoder for both passes + staging copy (less overhead).
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("lz77_coop_submit"),
+                });
+            self.record_dispatch(
+                &mut encoder,
+                self.pipeline_lz77_coop_find(),
+                &find_bg,
+                workgroups,
+                "lz77_coop_find",
+            )?;
+            self.record_dispatch(
+                &mut encoder,
+                self.pipeline_lz77_coop_resolve(),
+                &resolve_bg,
+                workgroups,
+                "lz77_coop_resolve",
+            )?;
+            encoder.copy_buffer_to_buffer(&resolved_buf, 0, &staging_buf, 0, match_buf_size);
+            self.profiler_resolve(&mut encoder);
+            self.queue.submit(Some(encoder.finish()));
+        }
 
         Ok(PendingLz77 {
             staging_buf,

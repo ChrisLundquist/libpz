@@ -427,9 +427,10 @@ fn run() {
     println!("\n--- GPU Profiling (256KB text) ---");
     let engine = WebGpuEngine::with_profiling(true).unwrap();
     let data = make_text_data(256 * 1024);
-    // warmup
+    // warmup (actual GPU work — pipeline compilation etc.)
     let _ = engine.find_matches(&data);
-    // profiled run
+    // profiled run with warmup query to burn AMD's buggy first slot
+    engine.profiler_warmup();
     let _ = engine.find_matches(&data);
     if let Some(results) = engine.profiler_end_frame() {
         let path = std::path::Path::new("/tmp/pz_webgpu_lz77_trace.json");
