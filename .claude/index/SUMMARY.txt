@@ -1,0 +1,206 @@
+================================================================================
+libpz Historical Documentation Index — Summary
+================================================================================
+
+CREATED: 2026-02-14
+PURPOSE: Comprehensive research documentation of GPU optimization journey, 
+         architectural decisions, and algorithmic trade-offs
+
+================================================================================
+DOCUMENTATION CREATED
+================================================================================
+
+1. README.md (329 lines, 12 KB)
+   - Navigation guide for all documents
+   - Quick-start scenarios for different research questions
+   - File references and related documentation
+   - Maintenance guidelines
+
+2. research-log.md (438 lines, 16 KB)
+   - Chronological GPU optimization journey
+   - Four major phases: OpenCL → Hash Table → Brute-Force → Cooperative-Stitch
+   - 80+ commits with SHAs, dates, and impact metrics
+   - Why hash-table kernel failed (6.25% quality on repetitive data)
+   - Ring-buffered streaming evolution
+   - Backend architecture transition (OpenCL → WebGPU)
+
+3. experiments.md (330 lines, 12 KB)
+   - Successful experiments (6 total, with metrics)
+   - Failed experiments (3 total, with failure analysis)
+   - Unresolved questions and future opportunities
+   - Benchmarking best practices learned
+
+4. lz77-gpu.md (274 lines, 9.4 KB)
+   - Current cooperative-stitch kernel details
+   - Algorithm explanation with 2-pass design
+   - Coverage analysis (1788 probes vs 4896 for brute-force)
+   - Quality metrics by data type (94% on natural text)
+   - Kernel variants and their status
+   - Configuration parameters and tuning space
+
+5. gpu-batching.md (254 lines, 7.1 KB)
+   - Ring-buffered streaming architecture
+   - Buffer allocation formula (36×N + overhead)
+   - Backpressure synchronization patterns
+   - GPU memory constraints and safe limits
+   - Performance impact analysis (17% gain on 4MB batch)
+
+6. pipeline-architecture.md (344 lines, 10 KB)
+   - Multi-stage pipeline design (Deflate, Lzf, Lzr)
+   - V2 container format specification
+   - Stream demuxing for entropy coding
+   - Block parallelism strategies (3 patterns)
+   - Data flow through compression/decompression
+   - StageBlock semantics (critical for debugging)
+   - Known pitfalls and debugging strategies
+
+================================================================================
+STATISTICS
+================================================================================
+
+Total lines of documentation: 1,969
+Total file size: ~56 KB
+Coverage period: Initial GPU work → 2026-02-14
+Commits referenced: 80+
+Algorithms covered: LZ77, Huffman, FSE, rANS, BWT
+GPU backends mentioned: OpenCL (removed), WebGPU (current)
+
+================================================================================
+KEY METRICS DOCUMENTED
+================================================================================
+
+GPU Performance:
+  - Hash-table kernel: 2x faster at 1MB (but 6.25% quality on repetitive data)
+  - Cooperative kernel: 1.8x faster with 94% quality
+  - Ring-buffered batching: 17% faster on 4MB batch (eliminated 35% overhead)
+  - FAR_STEP tuning: 37% speedup (82ms → 52ms for 256KB)
+
+Memory Usage:
+  - Per-block (256KB): ~9.3 MB (36×N + buffers)
+  - Ring buffer (3 slots): ~27.9 MB
+  - Safe allocation: ≤25% of device VRAM
+
+Quality Trade-offs:
+  - Cooperative kernel: 6% loss on text for 1.8x speedup
+  - Two-tier scanning: recovered 55% of missed far-window matches
+  - Hash-table: catastrophic loss (99.61% → 6.25% on repetitive)
+
+================================================================================
+COMMIT HIGHLIGHTS
+================================================================================
+
+Most Important Commits Referenced:
+
+Cooperative-Stitch Era:
+  - 7457360: Cooperative kernel becomes default
+  - 1fce493: Cooperative kernel introduced
+  - b06cfb4: Kernel tuning (N=1024, S=512, W=512)
+  - a6ae499: FAR_STEP optimization (37% speedup)
+
+Ring-Buffered Streaming:
+  - 4390d90: Ring buffer implementation (17% gain)
+  - 008d8ba: GPU profiling timestamp fixes
+
+Brute-Force Evolution:
+  - 9395204: Two-tier far window scanning
+  - ef067d0: Hash-table removal (quality collapse explanation)
+  - 27bdf12: Shared memory tiling optimization
+
+Backend Infrastructure:
+  - 6504641: OpenCL removal, WebGPU consolidation
+  - 22fe18a: wgpu upgrade (24 → 27)
+  - 9e24938: GPU profiler integration
+
+================================================================================
+RESEARCH AREAS COVERED
+================================================================================
+
+GPU Kernel Development:
+  ✓ Algorithm design (cooperative-stitch)
+  ✓ Performance tuning (FAR_STEP, parameters)
+  ✓ Quality analysis (trade-offs by data type)
+  ✓ Failed approaches (hash tables, why)
+  ✓ Alternative strategies (two-tier scanning, shared memory tiling)
+
+Pipeline Architecture:
+  ✓ Multi-stage processing (Deflate, Lzf, Lzr)
+  ✓ Stream demuxing for entropy coding
+  ✓ Data flow through compression blocks
+  ✓ Container format details (V2)
+  ✓ Block parallelism patterns
+
+GPU Memory & Batching:
+  ✓ Ring-buffered streaming
+  ✓ Buffer allocation patterns
+  ✓ Backpressure synchronization
+  ✓ Cost-model-driven scheduling
+  ✓ Memory constraints and safe limits
+
+Experiments & Learning:
+  ✓ 6 successful experiments with metrics
+  ✓ 3 failed experiments with analysis
+  ✓ Benchmarking best practices
+  ✓ Unresolved questions for future work
+
+================================================================================
+QUICK REFERENCE
+================================================================================
+
+For GPU Optimization Questions:
+  → research-log.md (chronological timeline with commits)
+  → experiments.md (what worked/failed and why)
+  → lz77-gpu.md (current kernel details)
+
+For Pipeline Architecture Questions:
+  → pipeline-architecture.md (design and data flow)
+  → gpu-batching.md (memory and batching strategies)
+
+For Performance Debugging:
+  → research-log.md (baseline metrics)
+  → lz77-gpu.md (bottlenecks section)
+  → experiments.md (benchmarking practices)
+
+For Understanding Failures:
+  → experiments.md (hash-table, Blelloch, WHT)
+  → research-log.md (Phase 2: Hash Table Experiment)
+
+================================================================================
+RELATED DOCUMENTATION IN REPOSITORY
+================================================================================
+
+Core Project Files:
+  - ARCHITECTURE.md — Design notes, GPU benchmarks, roadmap
+  - CLAUDE.md — Build commands, profiling instructions
+  - src/webgpu/lz77.rs — Current GPU LZ77 implementation
+  - kernels/lz77_coop.wgsl — Cooperative-stitch kernel source
+  - src/pipeline/blocks.rs — Block processing, stage dispatch
+
+Diagnostic Tools:
+  - examples/coop_test.rs — A/B benchmark (coop vs lazy)
+  - examples/webgpu_diag.rs — GPU vs CPU quality comparison
+  - src/validation.rs — Cross-decompression tests
+  - scripts/profile.sh — GPU and CPU profiling
+  - scripts/bench.sh — End-to-end throughput comparison
+
+Friction Reports:
+  - .claude/friction/2026-02-14-lz77-gpu-research-friction.md
+  - .claude/friction/2026-02-14-heredoc-commit-permission-prompts.md
+
+================================================================================
+MAINTENANCE & UPDATES
+================================================================================
+
+This documentation should be updated:
+  1. After completing major GPU optimization work
+  2. When adding new kernel variants
+  3. When abandoning approaches (document failure analysis)
+  4. When discovering new bottlenecks or constraints
+  5. Quarterly review to ensure metrics remain current
+
+Update process:
+  1. Add entry to research-log.md (chronological)
+  2. Summarize learnings in experiments.md if significant
+  3. Update relevant algorithm-specific doc (lz77-gpu.md, etc.)
+  4. File friction report if workflow impediments encountered
+
+================================================================================

@@ -72,6 +72,28 @@ samply load profiling/a1b2c3d/lz77_encode_256KB.json.gz     # view saved profile
 5. **Re-measure** — `cargo bench -- <stage>` for precise before/after
 6. **Confirm** — `./scripts/bench.sh` to verify end-to-end improvement
 
+### GPU memory analysis
+```bash
+./scripts/gpu-meminfo.sh                    # overview table for standard block sizes
+./scripts/gpu-meminfo.sh -b 262144          # detailed breakdown for 256KB blocks
+./scripts/gpu-meminfo.sh -b 1048576 --explain  # 1MB blocks with formulas and sources
+```
+Shows per-block GPU memory costs and recommended batch sizes for different GPU memory budgets. Parses actual buffer allocations from `src/webgpu/lz77.rs` to compute ring buffer depth (2-3) or fallback to per-block allocation.
+
+### Pipeline flow tracing
+```bash
+./scripts/trace-pipeline.sh                 # deflate pipeline (text format)
+./scripts/trace-pipeline.sh -p bw           # BWT pipeline
+./scripts/trace-pipeline.sh -p lzfi --format mermaid  # FSE interleaved (mermaid)
+```
+Generates visual flow diagrams showing:
+- Call path from `compress_block()` through each stage
+- File locations (file:line) for each function
+- Data transformations (`StageBlock.data` vs `StageBlock.streams`)
+- Stream counts and demuxer types
+
+Use `--format mermaid` for diagrams you can paste into [mermaid.live](https://mermaid.live) or GitHub.
+
 ## Project layout
 - `src/lib.rs` — crate root, module declarations
 - `src/{algorithm}.rs` — one file per composable algorithm (bwt, deflate, fse, huffman, lz77, mtf, rans, rle)
@@ -94,6 +116,8 @@ samply load profiling/a1b2c3d/lz77_encode_256KB.json.gz     # view saved profile
 - `scripts/setup.sh` — extract sample archives (idempotent, called automatically by other scripts)
 - `scripts/bench.sh` — pz vs gzip comparison (ratio, throughput, all pipelines)
 - `scripts/profile.sh` — samply profiling wrapper (headless by default, `--web` for browser)
+- `scripts/gpu-meminfo.sh` — GPU memory cost calculator and batch size recommender
+- `scripts/trace-pipeline.sh` — pipeline flow diagram generator (text or mermaid format)
 - `profiling/` — saved profiles, organized as `<7-char-sha>/<description>.json.gz` (e.g. `a1b2c3d-dirty/`)
 - `examples/profile.rs` — profiling harness (pipeline or individual stage loops)
 - `.claude/agents/` — custom Claude Code subagents:

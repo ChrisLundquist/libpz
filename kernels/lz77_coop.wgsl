@@ -26,8 +26,9 @@
 // @pz_cost {
 //   threads_per_element: 1
 //   passes: 2
-//   buffers: input=N, raw_matches=N*12, resolved=N*12, staging=N*12
+//   buffers: input=N+7, params=16, raw_matches=N*12, resolved=N*12, staging=N*12
 //   local_mem: 1024
+//   note: input padded to 4-byte boundary + 4, params is uniform buffer (4×u32)
 // }
 
 struct Lz77Match {
