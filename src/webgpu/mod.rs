@@ -179,9 +179,8 @@ struct Lz77HashPipelines {
     find: wgpu::ComputePipeline,
 }
 
-/// LZ77 lazy-matching pipelines (3 pipelines from lz77_lazy.wgsl).
+/// LZ77 lazy-matching pipelines (2 pipelines from lz77_lazy.wgsl).
 struct Lz77LazyPipelines {
-    build: wgpu::ComputePipeline,
     find: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
 }
@@ -803,7 +802,6 @@ impl WebGpuEngine {
                     })
             };
             let group = Lz77LazyPipelines {
-                build: make("lz77_lazy_build", "build_hash_table"),
                 find: make("lz77_lazy_find", "find_matches"),
                 resolve: make("lz77_lazy_resolve", "resolve_lazy"),
             };
@@ -813,10 +811,6 @@ impl WebGpuEngine {
             }
             group
         })
-    }
-
-    fn pipeline_lz77_lazy_build(&self) -> &wgpu::ComputePipeline {
-        &self.lz77_lazy_pipelines().build
     }
 
     fn pipeline_lz77_lazy_find(&self) -> &wgpu::ComputePipeline {

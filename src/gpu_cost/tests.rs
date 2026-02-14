@@ -519,7 +519,7 @@ fn count_entry_points_cl() {
 #[test]
 fn count_entry_points_wgsl() {
     let src = include_str!("../../kernels/lz77_lazy.wgsl");
-    assert_eq!(count_entry_points(src, true), 3); // build, find, resolve
+    assert_eq!(count_entry_points(src, true), 2); // find, resolve
 }
 
 // ---------------------------------------------------------------------------
@@ -623,24 +623,7 @@ fn cross_validate_lz77_lazy_wgsl() {
     let src = include_str!("../../kernels/lz77_lazy.wgsl");
     let cost = KernelCost::parse(src).expect("parse lz77_lazy.wgsl");
 
-    let hash_size = extract_constant(src, "HASH_SIZE").expect("HASH_SIZE in lz77_lazy.wgsl");
-    let bucket_cap = extract_constant(src, "BUCKET_CAP").expect("BUCKET_CAP in lz77_lazy.wgsl");
-
-    let expected_hash_counts = hash_size * 4;
-    assert_eq!(
-        find_buffer(&cost, "hash_counts"),
-        Some(&BufferFormula::Fixed(expected_hash_counts)),
-        "lz77_lazy.wgsl: hash_counts mismatch"
-    );
-
-    let expected_hash_table = hash_size * bucket_cap * 4;
-    assert_eq!(
-        find_buffer(&cost, "hash_table"),
-        Some(&BufferFormula::Fixed(expected_hash_table)),
-        "lz77_lazy.wgsl: hash_table mismatch"
-    );
-
-    // Lazy kernel has three match buffers, all N*12
+    // Near brute-force kernel has no hash table — only match buffers (N*12 each)
     for buf_name in &["raw_matches", "resolved", "staging"] {
         assert_eq!(
             find_buffer(&cost, buf_name),
