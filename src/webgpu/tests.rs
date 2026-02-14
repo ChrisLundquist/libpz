@@ -1777,3 +1777,64 @@ fn test_lz77_decompress_blocks_overlapping_backref() {
         .unwrap();
     assert_eq!(gpu_result, input);
 }
+
+// --- Cooperative-stitch kernel tests ---
+
+#[test]
+fn test_lz77_coop_round_trip_repeats() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input = b"abcabcabcabcabcabc";
+    let matches = engine.find_matches_coop(input).unwrap();
+    let mut compressed = Vec::new();
+    for m in &matches {
+        compressed.extend_from_slice(&m.to_bytes());
+    }
+    let decompressed = crate::lz77::decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input.to_vec());
+}
+
+#[test]
+fn test_lz77_coop_round_trip_all_same() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input = vec![b'x'; 500];
+    let matches = engine.find_matches_coop(&input).unwrap();
+    let mut compressed = Vec::new();
+    for m in &matches {
+        compressed.extend_from_slice(&m.to_bytes());
+    }
+    let decompressed = crate::lz77::decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_lz77_coop_round_trip_large() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::with_capacity(256 * 1024);
+    while input.len() < 256 * 1024 {
+        let chunk = (256 * 1024 - input.len()).min(pattern.len());
+        input.extend_from_slice(&pattern[..chunk]);
+    }
+    let matches = engine.find_matches_coop(&input).unwrap();
+    let mut compressed = Vec::new();
+    for m in &matches {
+        compressed.extend_from_slice(&m.to_bytes());
+    }
+    let decompressed = crate::lz77::decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}

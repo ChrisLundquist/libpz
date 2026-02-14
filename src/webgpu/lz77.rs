@@ -39,6 +39,148 @@ impl WebGpuEngine {
         self.find_matches_lazy(input)
     }
 
+    /// Find LZ77 matches using the cooperative-stitch kernel.
+    ///
+    /// Uses a cooperative search strategy: each thread in a 64-thread workgroup
+    /// searches a distinct offset band, shares top-K discoveries via shared
+    /// memory, then all threads re-test all discovered offsets from their own
+    /// positions. Covers [1, 4288] effective lookback with only 572 probes
+    /// per thread (vs 4896 for brute-force scan of the same range).
+    pub fn find_matches_coop(&self, input: &[u8]) -> PzResult<Vec<Match>> {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let input_len = input.len();
+        let padded = Self::pad_input_bytes(input);
+        let match_buf_size = (input_len * std::mem::size_of::<GpuMatch>()) as u64;
+
+        let input_buf =
+            self.create_buffer_init("lz77_coop_input", &padded, wgpu::BufferUsages::STORAGE);
+
+        let workgroups = (input_len as u32).div_ceil(64);
+        let params = [input_len as u32, 0, 0, self.dispatch_width(workgroups, 64)];
+        let params_buf = self.create_buffer_init(
+            "lz77_coop_params",
+            bytemuck::cast_slice(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
+        let raw_match_buf = self.create_buffer(
+            "coop_raw_matches",
+            match_buf_size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        let resolved_buf = self.create_buffer(
+            "coop_resolved",
+            match_buf_size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        let staging_buf = self.create_buffer(
+            "lz77_coop_staging",
+            match_buf_size,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
+
+        // Pass 1: cooperative match finding
+        let find_bg_layout = self.pipeline_lz77_coop_find().get_bind_group_layout(0);
+        let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lz77_coop_find_bg"),
+            layout: &find_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: raw_match_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Pass 2: resolve_lazy
+        let resolve_bg_layout = self.pipeline_lz77_coop_resolve().get_bind_group_layout(0);
+        let resolve_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lz77_coop_resolve_bg"),
+            layout: &resolve_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: resolved_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: raw_match_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Encode 2 compute passes + staging copy
+        let t0 = if self.profiling {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("lz77_coop"),
+            });
+        self.record_dispatch(
+            &mut encoder,
+            self.pipeline_lz77_coop_find(),
+            &find_bg,
+            workgroups,
+            "lz77_coop_find",
+        )?;
+        self.record_dispatch(
+            &mut encoder,
+            self.pipeline_lz77_coop_resolve(),
+            &resolve_bg,
+            workgroups,
+            "lz77_coop_resolve",
+        )?;
+        encoder.copy_buffer_to_buffer(&resolved_buf, 0, &staging_buf, 0, match_buf_size);
+        self.profiler_resolve(&mut encoder);
+        self.queue.submit(Some(encoder.finish()));
+
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        if let Some(t0) = t0 {
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[pz-gpu] lz77_coop (find+resolve): {ms:.3} ms");
+        }
+
+        // Read back and deduplicate
+        let slice = staging_buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().unwrap().map_err(|_| PzError::Unsupported)?;
+
+        let raw = slice.get_mapped_range().to_vec();
+        staging_buf.unmap();
+        let gpu_matches: Vec<GpuMatch> = bytemuck::cast_slice(&raw).to_vec();
+
+        Ok(dedupe_gpu_matches(&gpu_matches, input))
+    }
+
     /// Find LZ77 matches using the original greedy hash-table kernel (no lazy).
     pub fn find_matches_greedy(&self, input: &[u8]) -> PzResult<Vec<Match>> {
         if input.is_empty() {
