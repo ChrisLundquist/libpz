@@ -183,6 +183,8 @@ struct Lz77HashPipelines {
 }
 
 /// LZ77 lazy-matching pipelines (2 pipelines from lz77_lazy.wgsl).
+/// Retained for A/B benchmarking against the coop kernel.
+#[allow(dead_code)]
 struct Lz77LazyPipelines {
     find: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
@@ -246,6 +248,7 @@ pub struct WebGpuEngine {
     // Lazily-compiled pipeline groups (one OnceLock per WGSL shader module).
     lz77_topk: OnceLock<Lz77TopkPipelines>,
     lz77_hash: OnceLock<Lz77HashPipelines>,
+    #[allow(dead_code)]
     lz77_lazy: OnceLock<Lz77LazyPipelines>,
     lz77_coop: OnceLock<Lz77CoopPipelines>,
     bwt_rank: OnceLock<BwtRankPipelines>,
@@ -792,6 +795,7 @@ impl WebGpuEngine {
         &self.lz77_hash_pipelines().find
     }
 
+    #[allow(dead_code)]
     fn lz77_lazy_pipelines(&self) -> &Lz77LazyPipelines {
         self.lz77_lazy.get_or_init(|| {
             let t0 = std::time::Instant::now();
@@ -824,10 +828,12 @@ impl WebGpuEngine {
         })
     }
 
+    #[allow(dead_code)]
     fn pipeline_lz77_lazy_find(&self) -> &wgpu::ComputePipeline {
         &self.lz77_lazy_pipelines().find
     }
 
+    #[allow(dead_code)]
     fn pipeline_lz77_lazy_resolve(&self) -> &wgpu::ComputePipeline {
         &self.lz77_lazy_pipelines().resolve
     }
