@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# setup.sh — Extract sample data archives (idempotent, skips if already done).
+# setup.sh — One-time project setup (idempotent, safe to re-run).
 #
 # Usage:
-#   ./scripts/setup.sh           # extract all sample archives
+#   ./scripts/setup.sh           # run all setup steps
 #
-# Called automatically by bench.sh and other scripts that need sample data.
+# Called automatically by test.sh, bench.sh, and other scripts.
 
 set -euo pipefail
 
@@ -12,6 +12,32 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SAMPLES_DIR="$PROJECT_DIR/samples"
 
+# ── Git hooks (worktree-aware) ──
+ensure_hooks() {
+    local want=".githooks"
+    local git_dir
+    git_dir="$(git rev-parse --git-dir 2>/dev/null)" || return 0
+
+    # Detect worktree: git-dir for a linked worktree lives under .git/worktrees/<name>
+    if [[ "$git_dir" == *"/worktrees/"* ]]; then
+        # Per-worktree config so hooks don't bleed into other worktrees
+        git config extensions.worktreeConfig true 2>/dev/null || true
+        local current
+        current="$(git config --worktree --get core.hooksPath 2>/dev/null)" || true
+        if [[ "$current" != "$want" ]]; then
+            git config --worktree core.hooksPath "$want"
+        fi
+    else
+        local current
+        current="$(git config --get core.hooksPath 2>/dev/null)" || true
+        if [[ "$current" != "$want" ]]; then
+            git config core.hooksPath "$want"
+        fi
+    fi
+}
+ensure_hooks
+
+# ── Sample data archives ──
 # extract_archive ARCHIVE DEST_DIR
 #   Extracts ARCHIVE into DEST_DIR if DEST_DIR is empty or missing.
 #   Uses the archive's mtime as a stamp — re-extracts if the archive is newer.
@@ -19,7 +45,6 @@ extract_archive() {
     local archive="$1" dest="$2"
 
     if [[ ! -f "$archive" ]]; then
-        echo "WARNING: $archive not found, skipping." >&2
         return 1
     fi
 
@@ -40,7 +65,7 @@ ok=0
 extract_archive "$SAMPLES_DIR/cantrbry.tar.gz" "$SAMPLES_DIR/cantrbry" && ok=$((ok + 1))
 extract_archive "$SAMPLES_DIR/large.tar.gz"    "$SAMPLES_DIR/large"    && ok=$((ok + 1))
 
-if [[ $ok -eq 0 ]]; then
-    echo "ERROR: No sample archives found in $SAMPLES_DIR" >&2
-    exit 1
+# Sample archives are optional — only error when invoked directly
+if [[ $ok -eq 0 ]] && [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    echo "WARNING: No sample archives found in $SAMPLES_DIR" >&2
 fi

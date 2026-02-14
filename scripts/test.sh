@@ -15,6 +15,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
 
+# ── Project setup (hooks, sample data) ──
+source "$SCRIPT_DIR/setup.sh"
+
 # Parse arguments
 FEATURES=()
 QUICK=false
