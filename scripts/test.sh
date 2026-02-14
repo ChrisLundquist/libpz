@@ -6,8 +6,8 @@
 #   ./scripts/test.sh --quick      # Skip compilation-only checks, just lint+test
 #   ./scripts/test.sh --fix        # Auto-fix fmt + clippy before checking
 #   ./scripts/test.sh --webgpu     # Include WebGPU backend
-#   ./scripts/test.sh --opencl     # Include OpenCL backend
 #   ./scripts/test.sh --all        # All feature combinations
+#   ./scripts/test.sh --hook       # Pre-commit mode: --fix + --quick + re-stage
 
 set -euo pipefail
 
@@ -23,14 +23,15 @@ FEATURES=()
 QUICK=false
 ALL=false
 FIX=false
+HOOK=false
 
 for arg in "$@"; do
     case "$arg" in
         --webgpu)  FEATURES+=(webgpu) ;;
-        --opencl)  FEATURES+=(opencl) ;;
         --all)     ALL=true ;;
         --quick)   QUICK=true ;;
         --fix)     FIX=true ;;
+        --hook)    FIX=true; QUICK=true; HOOK=true ;;
         -h|--help)
             sed -n '2,10p' "$0" | sed 's/^# \?//'
             exit 0
@@ -86,6 +87,10 @@ run_step() {
 if [ "$FIX" = true ]; then
     run_step "cargo fmt (autofix)" cargo fmt
     run_step "clippy --fix (autofix)" cargo clippy --fix --allow-dirty --allow-staged --all-targets -- -D warnings
+    # Re-stage any files modified by autofix (for pre-commit hook)
+    if [ "$HOOK" = true ]; then
+        git diff --name-only --diff-filter=M | grep '\.rs$' | xargs -r git add 2>/dev/null || true
+    fi
 fi
 
 # ── Formatting ──
@@ -104,7 +109,7 @@ run_step "test (default)" cargo test
 
 # ── Feature-gated checks ──
 if [ "$ALL" = true ]; then
-    FEATURES=(webgpu opencl)
+    FEATURES=(webgpu)
 fi
 
 if [ "${#FEATURES[@]}" -gt 0 ]; then
