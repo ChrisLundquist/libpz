@@ -97,6 +97,7 @@ samply load profiling/a1b2c3d/lz77_encode_256KB.json.gz     # view saved profile
 - `profiling/` — saved profiles, organized as `<7-char-sha>/<description>.json.gz` (e.g. `a1b2c3d-dirty/`)
 - `examples/profile.rs` — profiling harness (pipeline or individual stage loops)
 - `.claude/agents/` — custom Claude Code subagents (e.g., `historian.md` for project history research)
+- `.claude/friction/` — friction reports documenting workflow impediments and tool limitations
 
 ## Conventions
 - Public API: `encode()` / `decode()` returning `PzResult<T>`
@@ -140,6 +141,47 @@ samply load profiling/a1b2c3d/lz77_encode_256KB.json.gz     # view saved profile
 - A "logical completion point" is any self-contained change: a bug fix, a new feature, a refactor, a test addition, a docs update, etc.
 - Run the pre-commit checklist (`fmt`, `clippy`, `test`) before each commit.
 - If a task has multiple independent parts, commit each part separately rather than one giant commit at the end.
+
+## Documenting friction points
+When you encounter obstacles, bugs, or workflow impediments during development, document them in `.claude/friction/`:
+
+**What to document:**
+- Permission prompts that shouldn't require approval (e.g., patterns not matching in settings.json)
+- Tool limitations or unexpected behavior (e.g., pattern matching edge cases)
+- Bugs in dependencies or external tools
+- Confusing error messages that needed investigation
+- Workarounds required for common tasks
+- Missing features that would improve the workflow
+
+**Format:**
+Create a new file named `YYYY-MM-DD-short-description.md` with:
+```markdown
+# Short Description of Issue
+
+**Date:** YYYY-MM-DD
+**Agent/User:** (who encountered this)
+**Severity:** Low | Medium | High
+
+## Problem
+Clear description of the friction point and how it impeded work.
+
+## Steps to Reproduce
+1. Step-by-step reproduction if applicable
+
+## Workaround
+What was done to work around the issue (if any).
+
+## Suggested Fix
+Ideas for permanently resolving the issue.
+```
+
+**When to document:**
+- After completing a task where you hit an obstacle
+- When you notice a pattern of repeated friction across sessions
+- When a workaround feels hacky or unsatisfying
+- When you spend >5 minutes debugging a tool or permission issue
+
+These reports help identify patterns and prioritize tooling improvements.
 
 ## Project status
 11 of 12 milestones complete. All core algorithms, pipelines, GPU kernels (WebGPU), auto-selection, optimal parsing, multi-threading, and tooling are implemented. Not started: fuzz testing (M5.3).
