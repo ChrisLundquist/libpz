@@ -14,6 +14,7 @@ PIPELINES=()
 FILES=()
 FEATURES=""
 GPU_FLAG=""
+VERBOSE=false
 
 usage() {
     cat <<'EOF'
@@ -29,6 +30,7 @@ Options:
   --all                  Benchmark all available pipelines
   --webgpu               Build with WebGPU feature and pass --gpu to pz
   --features FEAT        Cargo features to enable (e.g. webgpu)
+  -v, --verbose          Show detailed output (default: quiet, summary only)
   -h, --help             Show this help
 
 If no FILEs are given, benchmarks all files in samples/cantrbry and samples/large.
@@ -41,6 +43,7 @@ Examples:
   ./scripts/bench.sh --webgpu -p bw,bbw           # GPU-accelerated via WebGPU
   ./scripts/bench.sh --all                         # benchmark every pipeline
   ./scripts/bench.sh -n 1 -p deflate,lzf file.txt # combine options
+  ./scripts/bench.sh -v                           # verbose output with full tables
 EOF
 }
 
@@ -50,6 +53,10 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             usage
             exit 0
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
             ;;
         -n|--iters)
             if [[ $# -lt 2 ]]; then
@@ -113,7 +120,10 @@ fi
 # Collect input files from corpus if none given on command line
 if [[ ${#FILES[@]} -eq 0 ]]; then
     # Auto-extract sample archives if needed
-    "$SCRIPT_DIR/setup.sh"
+    if ! "$SCRIPT_DIR/setup.sh" 2>&1; then
+        echo "ERROR: Failed to extract sample archives" >&2
+        exit 1
+    fi
 
     for f in "$PROJECT_DIR"/samples/cantrbry/* "$PROJECT_DIR"/samples/large/*; do
         # Skip archives and compressed leftovers — only benchmark raw sample files
@@ -122,7 +132,7 @@ if [[ ${#FILES[@]} -eq 0 ]]; then
         FILES+=("$f")
     done
     if [[ ${#FILES[@]} -eq 0 ]]; then
-        echo "ERROR: No sample files found even after extraction." >&2
+        echo "ERROR: No sample files found even after extraction" >&2
         exit 1
     fi
 fi
@@ -131,12 +141,25 @@ fi
 CARGO_FEATURES_ARG=()
 if [[ -n "$FEATURES" ]]; then
     CARGO_FEATURES_ARG=(--features "$FEATURES")
-    echo "Building pz (release, features: $FEATURES)..."
-else
-    echo "Building pz (release)..."
 fi
-cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml" ${CARGO_FEATURES_ARG[@]+"${CARGO_FEATURES_ARG[@]}"} --quiet 2>/dev/null || \
-    cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml" ${CARGO_FEATURES_ARG[@]+"${CARGO_FEATURES_ARG[@]}"}
+
+# Build quietly unless verbose or build fails
+BUILD_OUTPUT=$(mktemp)
+if cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml" ${CARGO_FEATURES_ARG[@]+"${CARGO_FEATURES_ARG[@]}"} >"$BUILD_OUTPUT" 2>&1; then
+    if [[ "$VERBOSE" == true ]]; then
+        if [[ -n "$FEATURES" ]]; then
+            echo "Built pz (release, features: $FEATURES)"
+        else
+            echo "Built pz (release)"
+        fi
+    fi
+else
+    echo "ERROR: Build failed" >&2
+    cat "$BUILD_OUTPUT" >&2
+    rm -f "$BUILD_OUTPUT"
+    exit 1
+fi
+rm -f "$BUILD_OUTPUT"
 
 if [[ ! -x "$PZ" ]]; then
     echo "ERROR: $PZ not found after build" >&2
@@ -148,8 +171,8 @@ if ! command -v gzip &>/dev/null; then
     exit 1
 fi
 
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+BENCH_TMPDIR=$(mktemp -d)
+trap 'rm -rf "$BENCH_TMPDIR"' EXIT
 
 # time_ns CMD ARGS... → prints wall-clock nanoseconds
 # macOS `date` lacks %N, so use perl for portable sub-ms precision
@@ -170,6 +193,19 @@ avg_ns() {
     echo $(( total / ITERATIONS ))
 }
 
+fmt_bytes() {
+    local bytes=$1
+    if (( bytes >= 1073741824 )); then
+        awk "BEGIN { printf \"%.2f GB\", $bytes / 1073741824.0; exit }" < /dev/null
+    elif (( bytes >= 1048576 )); then
+        awk "BEGIN { printf \"%.2f MB\", $bytes / 1048576.0; exit }" < /dev/null
+    elif (( bytes >= 1024 )); then
+        awk "BEGIN { printf \"%.2f KB\", $bytes / 1024.0; exit }" < /dev/null
+    else
+        echo "${bytes} B"
+    fi
+}
+
 fmt_ms() {
     awk "BEGIN { printf \"%.1f\", $1 / 1000000.0; exit }" < /dev/null
 }
@@ -187,12 +223,14 @@ fmt_ratio() {
     awk "BEGIN { printf \"%.1f%%\", ($1/$2)*100; exit }" < /dev/null
 }
 
-echo "Averaging over $ITERATIONS iterations per operation."
-echo "Pipelines: ${PIPELINES[*]}"
-if [[ -n "$GPU_FLAG" ]]; then
-    echo "GPU: $GPU_FLAG"
+if [[ "$VERBOSE" == true ]]; then
+    echo "Averaging over $ITERATIONS iterations per operation."
+    echo "Pipelines: ${PIPELINES[*]}"
+    if [[ -n "$GPU_FLAG" ]]; then
+        echo "GPU: $GPU_FLAG"
+    fi
+    echo ""
 fi
-echo ""
 
 # Build dynamic column header
 hdr_file=$(printf "%-20s %8s" "FILE" "ORIG")
@@ -204,10 +242,12 @@ for p in "${PIPELINES[@]}"; do
 done
 
 # === COMPRESSION ===
-echo "=== COMPRESSION ==="
-echo "$hdr_file"
-col_width=${#hdr_file}
-printf '%*s\n' "$col_width" '' | tr ' ' '-'
+if [[ "$VERBOSE" == true ]]; then
+    echo "=== COMPRESSION ==="
+    echo "$hdr_file"
+    col_width=${#hdr_file}
+    printf '%*s\n' "$col_width" '' | tr ' ' '-'
+fi
 
 # Accumulators: gzip
 t_orig=0; t_gz=0; t_gz_ns=0
@@ -223,10 +263,10 @@ for file in "${FILES[@]}"; do
     orig_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
 
     # --- gzip compress ---
-    cp "$file" "$TMPDIR/$name"
-    gz_comp_ns=$(avg_ns gzip -k -f "$TMPDIR/$name")
-    gz_size=$(stat -c%s "$TMPDIR/$name.gz" 2>/dev/null || stat -f%z "$TMPDIR/$name.gz" 2>/dev/null)
-    rm -f "$TMPDIR/$name" "$TMPDIR/$name.gz"
+    cp "$file" "$BENCH_TMPDIR/$name"
+    gz_comp_ns=$(avg_ns gzip -k -f "$BENCH_TMPDIR/$name")
+    gz_size=$(stat -c%s "$BENCH_TMPDIR/$name.gz" 2>/dev/null || stat -f%z "$BENCH_TMPDIR/$name.gz" 2>/dev/null)
+    rm -f "$BENCH_TMPDIR/$name" "$BENCH_TMPDIR/$name.gz"
 
     row=$(printf "%-20s %8d" "$name" "$orig_size")
     row+=$(printf " | %8d %6s %7s %8s" \
@@ -240,10 +280,10 @@ for file in "${FILES[@]}"; do
     # --- pz pipelines ---
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
-        cp "$file" "$TMPDIR/$name"
-        pz_comp_ns=$(avg_ns "$PZ" -k -f -p "$p" $GPU_FLAG "$TMPDIR/$name")
-        pz_size=$(stat -c%s "$TMPDIR/$name.pz" 2>/dev/null || stat -f%z "$TMPDIR/$name.pz" 2>/dev/null)
-        rm -f "$TMPDIR/$name" "$TMPDIR/$name.pz"
+        cp "$file" "$BENCH_TMPDIR/$name"
+        pz_comp_ns=$(avg_ns "$PZ" -k -f -p "$p" $GPU_FLAG "$BENCH_TMPDIR/$name")
+        pz_size=$(stat -c%s "$BENCH_TMPDIR/$name.pz" 2>/dev/null || stat -f%z "$BENCH_TMPDIR/$name.pz" 2>/dev/null)
+        rm -f "$BENCH_TMPDIR/$name" "$BENCH_TMPDIR/$name.pz"
 
         row+=$(printf " | %8d %6s %7s %8s" \
             "$pz_size" "$(fmt_ratio $pz_size $orig_size)" \
@@ -253,11 +293,15 @@ for file in "${FILES[@]}"; do
         t_pz_ns[$pi]=$(( ${t_pz_ns[$pi]} + pz_comp_ns ))
     done
 
-    echo "$row"
+    if [[ "$VERBOSE" == true ]]; then
+        echo "$row"
+    fi
 done
 
 # Totals row
-printf '%*s\n' "$col_width" '' | tr ' ' '-'
+if [[ "$VERBOSE" == true ]]; then
+    printf '%*s\n' "$col_width" '' | tr ' ' '-'
+fi
 total_row=$(printf "%-20s %8d" "TOTAL" "$t_orig")
 total_row+=$(printf " | %8d %6s %7s %8s" \
     "$t_gz" "$(fmt_ratio $t_gz $t_orig)" \
@@ -267,21 +311,24 @@ for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         "${t_pz_size[$pi]}" "$(fmt_ratio ${t_pz_size[$pi]} $t_orig)" \
         "$(fmt_ms ${t_pz_ns[$pi]})" "$(fmt_throughput $t_orig ${t_pz_ns[$pi]})")
 done
-echo "$total_row"
-
-echo ""
+if [[ "$VERBOSE" == true ]]; then
+    echo "$total_row"
+    echo ""
+fi
 
 # === DECOMPRESSION ===
-echo "=== DECOMPRESSION ==="
-dhdr=$(printf "%-20s %8s" "FILE" "ORIG")
-dhdr+=$(printf " | %7s %8s" "GZIP-ms" "MB/s")
-for p in "${PIPELINES[@]}"; do
-    tag=$(echo "$p" | tr '[:lower:]' '[:upper:]')
-    dhdr+=$(printf " | %7s %8s" "PZ-${tag:0:3}" "MB/s")
-done
-echo "$dhdr"
-dcol_width=${#dhdr}
-printf '%*s\n' "$dcol_width" '' | tr ' ' '-'
+if [[ "$VERBOSE" == true ]]; then
+    echo "=== DECOMPRESSION ==="
+    dhdr=$(printf "%-20s %8s" "FILE" "ORIG")
+    dhdr+=$(printf " | %7s %8s" "GZIP-ms" "MB/s")
+    for p in "${PIPELINES[@]}"; do
+        tag=$(echo "$p" | tr '[:lower:]' '[:upper:]')
+        dhdr+=$(printf " | %7s %8s" "PZ-${tag:0:3}" "MB/s")
+    done
+    echo "$dhdr"
+    dcol_width=${#dhdr}
+    printf '%*s\n' "$dcol_width" '' | tr ' ' '-'
+fi
 
 dt_orig=0; dt_gz_ns=0
 declare -a dt_pz_ns
@@ -294,22 +341,22 @@ for file in "${FILES[@]}"; do
     orig_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
 
     # Prepare compressed versions
-    cp "$file" "$TMPDIR/$name.src"
+    cp "$file" "$BENCH_TMPDIR/$name.src"
 
     # gzip
-    cp "$TMPDIR/$name.src" "$TMPDIR/$name"
-    gzip -f "$TMPDIR/$name"
+    cp "$BENCH_TMPDIR/$name.src" "$BENCH_TMPDIR/$name"
+    gzip -f "$BENCH_TMPDIR/$name"
 
     # pz pipelines
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
-        cp "$TMPDIR/$name.src" "$TMPDIR/$name"
-        "$PZ" -k -f -p "$p" $GPU_FLAG "$TMPDIR/$name"
-        mv "$TMPDIR/$name.pz" "$TMPDIR/$name.$p.pz"
+        cp "$BENCH_TMPDIR/$name.src" "$BENCH_TMPDIR/$name"
+        "$PZ" -k -f -p "$p" $GPU_FLAG "$BENCH_TMPDIR/$name"
+        mv "$BENCH_TMPDIR/$name.pz" "$BENCH_TMPDIR/$name.$p.pz"
     done
 
     # Time decompressions
-    gz_dec_ns=$(avg_ns gzip -d -k -f "$TMPDIR/$name.gz")
+    gz_dec_ns=$(avg_ns gzip -d -k -f "$BENCH_TMPDIR/$name.gz")
 
     drow=$(printf "%-20s %8d" "$name" "$orig_size")
     drow+=$(printf " | %7s %8s" \
@@ -320,22 +367,26 @@ for file in "${FILES[@]}"; do
 
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
-        pz_dec_ns=$(avg_ns "$PZ" -d -k -f $GPU_FLAG "$TMPDIR/$name.$p.pz")
+        pz_dec_ns=$(avg_ns "$PZ" -d -k -f $GPU_FLAG "$BENCH_TMPDIR/$name.$p.pz")
         drow+=$(printf " | %7s %8s" \
             "$(fmt_ms $pz_dec_ns)" "$(fmt_throughput $orig_size $pz_dec_ns)")
         dt_pz_ns[$pi]=$(( ${dt_pz_ns[$pi]} + pz_dec_ns ))
     done
 
-    echo "$drow"
+    if [[ "$VERBOSE" == true ]]; then
+        echo "$drow"
+    fi
 
     # Cleanup
-    rm -f "$TMPDIR/$name.src" "$TMPDIR/$name.gz" "$TMPDIR/$name"
+    rm -f "$BENCH_TMPDIR/$name.src" "$BENCH_TMPDIR/$name.gz" "$BENCH_TMPDIR/$name"
     for p in "${PIPELINES[@]}"; do
-        rm -f "$TMPDIR/$name.$p.pz" "$TMPDIR/$name.$p"
+        rm -f "$BENCH_TMPDIR/$name.$p.pz" "$BENCH_TMPDIR/$name.$p"
     done
 done
 
-printf '%*s\n' "$dcol_width" '' | tr ' ' '-'
+if [[ "$VERBOSE" == true ]]; then
+    printf '%*s\n' "$dcol_width" '' | tr ' ' '-'
+fi
 dtotal=$(printf "%-20s %8d" "TOTAL" "$dt_orig")
 dtotal+=$(printf " | %7s %8s" \
     "$(fmt_ms $dt_gz_ns)" "$(fmt_throughput $dt_orig $dt_gz_ns)")
@@ -343,4 +394,50 @@ for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
     dtotal+=$(printf " | %7s %8s" \
         "$(fmt_ms ${dt_pz_ns[$pi]})" "$(fmt_throughput $dt_orig ${dt_pz_ns[$pi]})")
 done
-echo "$dtotal"
+if [[ "$VERBOSE" == true ]]; then
+    echo "$dtotal"
+    echo ""
+fi
+
+# === SUMMARY (always shown) ===
+if [[ "$VERBOSE" == false ]]; then
+    echo "=== BENCHMARK SUMMARY ==="
+    echo ""
+    echo "Configuration:"
+    echo "  Files:      ${#FILES[@]} files ($(fmt_bytes $t_orig) total)"
+    echo "  Iterations: $ITERATIONS per operation"
+    echo "  Pipelines:  ${PIPELINES[*]}"
+    if [[ -n "$GPU_FLAG" ]]; then
+        echo "  GPU:        enabled"
+    fi
+    echo ""
+
+    echo "Compression Results:"
+    printf "  %-10s %12s %8s %10s %10s\n" "Pipeline" "Size" "Ratio" "Time" "Throughput"
+    printf "  %s\n" "────────────────────────────────────────────────────────────"
+    printf "  %-10s %12s %8s %10s %10s\n" "gzip" "$(fmt_bytes $t_gz)" \
+        "$(fmt_ratio $t_gz $t_orig)" "$(fmt_ms $t_gz_ns) ms" "$(fmt_throughput $t_orig $t_gz_ns) MB/s"
+
+    for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
+        p="${PIPELINES[$pi]}"
+        tag=$(echo "$p" | tr '[:lower:]' '[:upper:]')
+        printf "  %-10s %12s %8s %10s %10s\n" "pz-$p" "$(fmt_bytes ${t_pz_size[$pi]})" \
+            "$(fmt_ratio ${t_pz_size[$pi]} $t_orig)" "$(fmt_ms ${t_pz_ns[$pi]}) ms" \
+            "$(fmt_throughput $t_orig ${t_pz_ns[$pi]}) MB/s"
+    done
+
+    echo ""
+    echo "Decompression Results:"
+    printf "  %-10s %10s %10s\n" "Pipeline" "Time" "Throughput"
+    printf "  %s\n" "────────────────────────────────────"
+    printf "  %-10s %10s %10s\n" "gzip" "$(fmt_ms $dt_gz_ns) ms" "$(fmt_throughput $dt_orig $dt_gz_ns) MB/s"
+
+    for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
+        p="${PIPELINES[$pi]}"
+        printf "  %-10s %10s %10s\n" "pz-$p" "$(fmt_ms ${dt_pz_ns[$pi]}) ms" \
+            "$(fmt_throughput $dt_orig ${dt_pz_ns[$pi]}) MB/s"
+    done
+
+    echo ""
+    echo "Run with --verbose for per-file breakdown"
+fi

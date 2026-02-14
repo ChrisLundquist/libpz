@@ -56,10 +56,11 @@ Or manually (the pre-commit hook handles 1 and 2 automatically):
 
 ### Quick comparison vs gzip (end-to-end, real files)
 ```bash
-./scripts/bench.sh                              # all Canterbury + large corpus
+./scripts/bench.sh                              # all Canterbury + large corpus (quiet, summary only)
 ./scripts/bench.sh myfile.bin                   # specific files
-./scripts/bench.sh -p deflate,lza               # subset of pipelines
+./scripts/bench.sh -p deflate,lzf               # subset of pipelines
 ./scripts/bench.sh -n 10                        # more iterations
+./scripts/bench.sh -v                           # verbose mode (per-file breakdown)
 ./scripts/bench.sh --help                       # full usage info
 ```
 
@@ -155,7 +156,7 @@ Use `--format mermaid` for diagrams you can paste into [mermaid.live](https://me
   - `tooling.md` — build scripts to minimize context usage and streamline workflows (Sonnet)
   - `benchmarker.md` — run benchmarks and generate detailed performance reports (Haiku)
   - `tester.md` — run tests with programmatic autofixes, diagnose remaining errors (Haiku)
-- `.claude/friction/` — friction reports documenting workflow impediments and tool limitations
+- `.claude/friction/` — friction backlog for the tooling agent (other agents file reports here; the tooling agent consumes them)
 
 ## Key Conventions
 
