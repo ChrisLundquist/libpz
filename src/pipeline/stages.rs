@@ -336,6 +336,9 @@ pub(crate) fn stage_rans_encode_with_options(
                         options.rans_interleaved_states,
                         rans::DEFAULT_SCALE_BITS,
                     );
+                    if data.len() >= (1usize << 31) {
+                        return Err(PzError::InvalidInput);
+                    }
                     let len = (data.len() as u32) | RANS_INTERLEAVED_FLAG;
                     (data, len)
                 } else {

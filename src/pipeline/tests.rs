@@ -950,6 +950,26 @@ fn test_lzr_pipeline_parallel() {
 }
 
 #[test]
+fn test_lzr_unified_scheduler_multiblock_round_trip() {
+    let pattern = b"Lzr unified scheduler multiblock round-trip test. ";
+    let mut input = Vec::new();
+    for _ in 0..400 {
+        input.extend_from_slice(pattern);
+    }
+
+    let opts = CompressOptions {
+        threads: 4,
+        block_size: 512,
+        unified_scheduler: true,
+        ..CompressOptions::default()
+    };
+    let compressed = compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
+    assert_eq!(compressed[2], VERSION, "expected V2 multi-block container");
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
 fn test_lzr_trial_selection_candidate() {
     // Verify Lzr is included in trial selection
     let pattern = b"Trial selection test data for rANS pipeline. ";

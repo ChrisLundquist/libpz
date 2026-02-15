@@ -215,6 +215,9 @@ fn compress_parallel_unified_lz_rans(
                                     .expect("stage0 slot poisoned") = Some(stage0_block);
                                 let mut guard = queue_ref.lock().expect("unified queue poisoned");
                                 guard.queue.push_back(UnifiedTask::Stage1(block_idx));
+                                // pending_tasks counts total outstanding work units
+                                // (queued + currently executing). A successful Stage0
+                                // completion creates one new outstanding Stage1 task.
                                 guard.pending_tasks += 1;
                                 cv_ref.notify_one();
                             }
@@ -237,6 +240,10 @@ fn compress_parallel_unified_lz_rans(
                 }
 
                 let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                // Every popped task completes exactly once here, regardless of
+                // success or failure. Stage0 success may have already incremented
+                // pending_tasks to account for the newly-enqueued Stage1 follow-up.
+                debug_assert!(guard.pending_tasks > 0);
                 guard.pending_tasks -= 1;
                 if guard.pending_tasks == 0 {
                     guard.closed = true;
