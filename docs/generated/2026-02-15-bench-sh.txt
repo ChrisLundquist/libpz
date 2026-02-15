@@ -1,0 +1,25 @@
+Provenance: 9c5d6b8-dirty
+=== BENCHMARK SUMMARY ===
+
+Configuration:
+  Files:      14 files (13.32 MB total)
+  Iterations: 5 per operation
+  Pipelines:  deflate lzr lzf
+
+Compression Results:
+  Pipeline           Size    Ratio       Time Throughput
+  ────────────────────────────────────────────────────────────
+  gzip            3.81 MB    28.6%  2269.1 ms   5.9 MB/s
+  pz-deflate      5.54 MB    41.6%   664.9 ms  20.0 MB/s
+  pz-lzr          5.41 MB    40.6%   567.1 ms  23.5 MB/s
+  pz-lzf          5.55 MB    41.7%   628.3 ms  21.2 MB/s
+
+Decompression Results:
+  Pipeline         Time Throughput
+  ────────────────────────────────────
+  gzip         396.6 ms  33.6 MB/s
+  pz-deflate   519.9 ms  25.6 MB/s
+  pz-lzr       503.3 ms  26.5 MB/s
+  pz-lzf       539.2 ms  24.7 MB/s
+
+Run with --verbose for per-file breakdown

@@ -1,0 +1,6 @@
+Provenance: 9c5d6b8-dirty
+Building profile binary...
+    Blocking waiting for file lock on artifact directory
+    Finished `profiling` profile [optimized + debuginfo] target(s) in 3.43s
+Launching samply...
+Encountered an error during profiling: Unknown(1100)

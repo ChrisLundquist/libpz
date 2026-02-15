@@ -1,0 +1,72 @@
+   Compiling pz v0.1.0 (/Users/clundquist/code/libpz)
+    Finished `bench` profile [optimized] target(s) in 6.09s
+     Running benches/stages_lz77.rs (target/release/deps/stages_lz77-bf4072bfea81e660)
+Gnuplot not found, using plotters backend
+Benchmarking lz77/compress_lazy/8192
+Benchmarking lz77/compress_lazy/8192: Warming up for 2.0000 s
+Benchmarking lz77/compress_lazy/8192: Collecting 10 samples in estimated 5.0003 s (45k iterations)
+Benchmarking lz77/compress_lazy/8192: Analyzing
+lz77/compress_lazy/8192 time:   [108.57 µs 109.35 µs 110.01 µs]
+                        thrpt:  [71.014 MiB/s 71.443 MiB/s 71.961 MiB/s]
+                 change:
+                        time:   [+3.5278% +4.8354% +6.0283%] (p = 0.00 < 0.05)
+                        thrpt:  [-5.6856% -4.6123% -3.4075%]
+                        Performance has regressed.
+Benchmarking lz77/decompress/8192
+Benchmarking lz77/decompress/8192: Warming up for 2.0000 s
+Benchmarking lz77/decompress/8192: Collecting 10 samples in estimated 5.0010 s (280k iterations)
+Benchmarking lz77/decompress/8192: Analyzing
+lz77/decompress/8192    time:   [16.995 µs 17.050 µs 17.095 µs]
+                        thrpt:  [456.99 MiB/s 458.21 MiB/s 459.70 MiB/s]
+                 change:
+                        time:   [+0.6518% +1.5535% +2.2871%] (p = 0.00 < 0.05)
+                        thrpt:  [-2.2359% -1.5298% -0.6476%]
+                        Change within noise threshold.
+Benchmarking lz77/compress_lazy/65536
+Benchmarking lz77/compress_lazy/65536: Warming up for 2.0000 s
+Benchmarking lz77/compress_lazy/65536: Collecting 10 samples in estimated 5.0093 s (5555 iterations)
+Benchmarking lz77/compress_lazy/65536: Analyzing
+lz77/compress_lazy/65536
+                        time:   [903.34 µs 919.41 µs 954.16 µs]
+                        thrpt:  [65.502 MiB/s 67.979 MiB/s 69.187 MiB/s]
+                 change:
+                        time:   [+7.2678% +11.960% +16.409%] (p = 0.00 < 0.05)
+                        thrpt:  [-14.096% -10.682% -6.7753%]
+                        Performance has regressed.
+Benchmarking lz77/decompress/65536
+Benchmarking lz77/decompress/65536: Warming up for 2.0000 s
+Benchmarking lz77/decompress/65536: Collecting 10 samples in estimated 5.0058 s (33k iterations)
+Benchmarking lz77/decompress/65536: Analyzing
+lz77/decompress/65536   time:   [144.70 µs 147.90 µs 151.97 µs]
+                        thrpt:  [411.27 MiB/s 422.58 MiB/s 431.92 MiB/s]
+                 change:
+                        time:   [+1.9415% +3.9474% +6.3180%] (p = 0.00 < 0.05)
+                        thrpt:  [-5.9425% -3.7975% -1.9045%]
+                        Performance has regressed.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking lz77/compress_lazy/4194304
+Benchmarking lz77/compress_lazy/4194304: Warming up for 2.0000 s
+Benchmarking lz77/compress_lazy/4194304: Collecting 10 samples in estimated 8.7832 s (110 iterations)
+Benchmarking lz77/compress_lazy/4194304: Analyzing
+lz77/compress_lazy/4194304
+                        time:   [80.367 ms 82.108 ms 83.264 ms]
+                        thrpt:  [48.040 MiB/s 48.717 MiB/s 49.772 MiB/s]
+                 change:
+                        time:   [+12.059% +14.064% +16.146%] (p = 0.00 < 0.05)
+                        thrpt:  [-13.901% -12.330% -10.761%]
+                        Performance has regressed.
+Benchmarking lz77/decompress/4194304
+Benchmarking lz77/decompress/4194304: Warming up for 2.0000 s
+Benchmarking lz77/decompress/4194304: Collecting 10 samples in estimated 5.0076 s (825 iterations)
+Benchmarking lz77/decompress/4194304: Analyzing
+lz77/decompress/4194304 time:   [6.0145 ms 6.1626 ms 6.3605 ms]
+                        thrpt:  [628.88 MiB/s 649.08 MiB/s 665.06 MiB/s]
+                 change:
+                        time:   [-6.5491% -5.1241% -3.1351%] (p = 0.00 < 0.05)
+                        thrpt:  [+3.2366% +5.4009% +7.0080%]
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+
+stages: no WebGPU device, skipping batched LZ77 benchmarks

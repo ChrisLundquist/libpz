@@ -1,0 +1,5 @@
+   Compiling pz v0.1.0 (/Users/clundquist/code/libpz)
+    Finished `profiling` profile [optimized + debuginfo] target(s) in 7.53s
+     Running `target/profiling/examples/profile --stage lz77 --iterations 200 --size 262144`
+profiling stage lz77 encode: 262144 bytes, 200 iterations
+done: 0.8s, 63.6 MB/s

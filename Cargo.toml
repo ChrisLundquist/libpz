@@ -113,6 +113,12 @@ harness = false
 inherits = "release"
 debug = true
 
+[profile.bench]
+inherits = "release"
+debug = true
+split-debuginfo = "unpacked"
+strip = "none"
+
 [features]
 default = ["webgpu"]
 webgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:wgpu-profiler"]

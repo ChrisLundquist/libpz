@@ -290,6 +290,22 @@ pub fn compress_optimal(input: &[u8]) -> PzResult<Vec<u8>> {
 
 /// Like `compress_optimal` but with a caller-specified max match length.
 pub(crate) fn compress_optimal_with_limit(input: &[u8], max_match_len: u16) -> PzResult<Vec<u8>> {
+    let matches = optimal_matches_with_limit(input, max_match_len)?;
+
+    // Step 4: Serialize to the standard Match byte format
+    let mut output = Vec::with_capacity(matches.len() * Match::SERIALIZED_SIZE);
+    for m in &matches {
+        output.extend_from_slice(&m.to_bytes());
+    }
+
+    Ok(output)
+}
+
+/// Build and return the optimal match sequence without serializing.
+///
+/// This is used by pipeline internals that already operate on `Vec<Match>`
+/// (e.g., demux fast paths) to avoid serialize-then-parse overhead.
+pub(crate) fn optimal_matches_with_limit(input: &[u8], max_match_len: u16) -> PzResult<Vec<Match>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
@@ -302,15 +318,7 @@ pub(crate) fn compress_optimal_with_limit(input: &[u8], max_match_len: u16) -> P
     let table = build_match_table_cpu_with_limit(input, K, max_match_len);
 
     // Step 3: Run backward DP
-    let matches = optimal_parse(input, &table, &cost_model);
-
-    // Step 4: Serialize to the standard Match byte format
-    let mut output = Vec::with_capacity(matches.len() * Match::SERIALIZED_SIZE);
-    for m in &matches {
-        output.extend_from_slice(&m.to_bytes());
-    }
-
-    Ok(output)
+    Ok(optimal_parse(input, &table, &cost_model))
 }
 
 /// Compress input using optimal parsing with a pre-built match table.

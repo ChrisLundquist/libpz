@@ -1,0 +1,50 @@
+Provenance: e5b3290-dirty
+lz77/compress_lazy/8192 time:   [100.82 µs 102.53 µs 105.40 µs]
+                        thrpt:  [74.124 MiB/s 76.196 MiB/s 77.487 MiB/s]
+                 change:
+                        time:   [-5.2434% -3.5766% -1.4501%] (p = 0.00 < 0.05)
+                        thrpt:  [+1.4715% +3.7093% +5.5336%]
+                        Performance has improved.
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high mild
+lz77/decompress/8192    time:   [17.147 µs 17.417 µs 17.815 µs]
+                        thrpt:  [438.55 MiB/s 448.56 MiB/s 455.61 MiB/s]
+                 change:
+                        time:   [-6.4311% -2.9658% +0.6821%] (p = 0.15 > 0.05)
+                        thrpt:  [-0.6774% +3.0565% +6.8731%]
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+lz77/compress_lazy/65536
+                        time:   [816.79 µs 819.29 µs 822.47 µs]
+                        thrpt:  [75.990 MiB/s 76.286 MiB/s 76.519 MiB/s]
+                 change:
+                        time:   [-11.277% -10.709% -10.163%] (p = 0.00 < 0.05)
+                        thrpt:  [+11.313% +11.994% +12.710%]
+                        Performance has improved.
+lz77/decompress/65536   time:   [143.17 µs 143.66 µs 144.67 µs]
+                        thrpt:  [432.01 MiB/s 435.06 MiB/s 436.56 MiB/s]
+                 change:
+                        time:   [-1.7080% +0.7998% +4.5267%] (p = 0.71 > 0.05)
+                        thrpt:  [-4.3307% -0.7935% +1.7377%]
+                        No change in performance detected.
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high severe
+lz77/compress_lazy/4194304
+                        time:   [50.174 ms 50.773 ms 51.725 ms]
+                        thrpt:  [77.332 MiB/s 78.783 MiB/s 79.723 MiB/s]
+                 change:
+                        time:   [-29.914% -28.550% -27.041%] (p = 0.00 < 0.05)
+                        thrpt:  [+37.063% +39.957% +42.681%]
+                        Performance has improved.
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high severe
+lz77/decompress/4194304 time:   [6.0663 ms 6.2021 ms 6.3699 ms]
+                        thrpt:  [627.95 MiB/s 644.94 MiB/s 659.38 MiB/s]
+                 change:
+                        time:   [-6.9325% -5.6728% -3.8280%] (p = 0.00 < 0.05)
+                        thrpt:  [+3.9803% +6.0139% +7.4489%]
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+

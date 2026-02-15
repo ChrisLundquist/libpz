@@ -1,0 +1,74 @@
+    Finished `bench` profile [optimized] target(s) in 0.10s
+     Running benches/stages_rans.rs (target/release/deps/stages_rans-d9956c2bdaa3cd94)
+Gnuplot not found, using plotters backend
+Benchmarking rans/encode/8192
+Benchmarking rans/encode/8192: Warming up for 2.0000 s
+Benchmarking rans/encode/8192: Collecting 10 samples in estimated 5.0001 s (138k iterations)
+Benchmarking rans/encode/8192: Analyzing
+rans/encode/8192        time:   [34.405 µs 34.595 µs 34.858 µs]
+                        thrpt:  [224.13 MiB/s 225.83 MiB/s 227.08 MiB/s]
+                 change:
+                        time:   [-29.941% -28.153% -26.042%] (p = 0.00 < 0.05)
+                        thrpt:  [+35.212% +39.185% +42.736%]
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking rans/decode/8192
+Benchmarking rans/decode/8192: Warming up for 2.0000 s
+Benchmarking rans/decode/8192: Collecting 10 samples in estimated 5.0012 s (120k iterations)
+Benchmarking rans/decode/8192: Analyzing
+rans/decode/8192        time:   [39.567 µs 39.754 µs 39.973 µs]
+                        thrpt:  [195.45 MiB/s 196.52 MiB/s 197.45 MiB/s]
+                 change:
+                        time:   [-26.723% -24.587% -21.822%] (p = 0.00 < 0.05)
+                        thrpt:  [+27.913% +32.603% +36.468%]
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+Benchmarking rans/encode/65536
+Benchmarking rans/encode/65536: Warming up for 2.0000 s
+Benchmarking rans/encode/65536: Collecting 10 samples in estimated 5.0128 s (17k iterations)
+Benchmarking rans/encode/65536: Analyzing
+rans/encode/65536       time:   [294.54 µs 295.92 µs 297.63 µs]
+                        thrpt:  [209.99 MiB/s 211.20 MiB/s 212.20 MiB/s]
+                 change:
+                        time:   [-32.544% -31.462% -30.040%] (p = 0.00 < 0.05)
+                        thrpt:  [+42.939% +45.904% +48.245%]
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking rans/decode/65536
+Benchmarking rans/decode/65536: Warming up for 2.0000 s
+Benchmarking rans/decode/65536: Collecting 10 samples in estimated 5.0159 s (14k iterations)
+Benchmarking rans/decode/65536: Analyzing
+rans/decode/65536       time:   [346.83 µs 348.37 µs 349.51 µs]
+                        thrpt:  [178.82 MiB/s 179.40 MiB/s 180.20 MiB/s]
+                 change:
+                        time:   [-38.468% -33.369% -28.047%] (p = 0.00 < 0.05)
+                        thrpt:  [+38.980% +50.081% +62.516%]
+                        Performance has improved.
+Benchmarking rans/encode/4194304
+Benchmarking rans/encode/4194304: Warming up for 2.0000 s
+Benchmarking rans/encode/4194304: Collecting 10 samples in estimated 5.5262 s (275 iterations)
+Benchmarking rans/encode/4194304: Analyzing
+rans/encode/4194304     time:   [20.144 ms 20.332 ms 20.487 ms]
+                        thrpt:  [195.25 MiB/s 196.73 MiB/s 198.57 MiB/s]
+                 change:
+                        time:   [-62.282% -55.963% -50.591%] (p = 0.00 < 0.05)
+                        thrpt:  [+102.39% +127.08% +165.13%]
+                        Performance has improved.
+Benchmarking rans/decode/4194304
+Benchmarking rans/decode/4194304: Warming up for 2.0000 s
+Benchmarking rans/decode/4194304: Collecting 10 samples in estimated 5.8488 s (275 iterations)
+Benchmarking rans/decode/4194304: Analyzing
+rans/decode/4194304     time:   [20.957 ms 21.089 ms 21.235 ms]
+                        thrpt:  [188.37 MiB/s 189.67 MiB/s 190.87 MiB/s]
+                 change:
+                        time:   [-43.305% -40.848% -38.597%] (p = 0.00 < 0.05)
+                        thrpt:  [+62.860% +69.055% +76.381%]
+                        Performance has improved.
+Found 3 outliers among 10 measurements (30.00%)
+  1 (10.00%) low severe
+  1 (10.00%) high mild
+  1 (10.00%) high severe
+

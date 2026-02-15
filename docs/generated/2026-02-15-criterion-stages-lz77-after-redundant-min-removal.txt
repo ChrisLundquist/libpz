@@ -1,0 +1,83 @@
+   Compiling pz v0.1.0 (/Users/clundquist/code/libpz)
+    Finished `bench` profile [optimized] target(s) in 6.64s
+     Running benches/stages_lz77.rs (target/release/deps/stages_lz77-bf4072bfea81e660)
+Gnuplot not found, using plotters backend
+Benchmarking lz77/compress_lazy/8192
+Benchmarking lz77/compress_lazy/8192: Warming up for 2.0000 s
+Benchmarking lz77/compress_lazy/8192: Collecting 10 samples in estimated 5.0064 s (39k iterations)
+Benchmarking lz77/compress_lazy/8192: Analyzing
+lz77/compress_lazy/8192 time:   [112.48 µs 113.05 µs 113.83 µs]
+                        thrpt:  [68.633 MiB/s 69.107 MiB/s 69.456 MiB/s]
+                 change:
+                        time:   [-36.308% -34.842% -33.275%] (p = 0.00 < 0.05)
+                        thrpt:  [+49.869% +53.473% +57.005%]
+                        Performance has improved.
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high severe
+Benchmarking lz77/decompress/8192
+Benchmarking lz77/decompress/8192: Warming up for 2.0000 s
+Benchmarking lz77/decompress/8192: Collecting 10 samples in estimated 5.0003 s (267k iterations)
+Benchmarking lz77/decompress/8192: Analyzing
+lz77/decompress/8192    time:   [18.392 µs 21.424 µs 25.527 µs]
+                        thrpt:  [306.05 MiB/s 364.65 MiB/s 424.79 MiB/s]
+                 change:
+                        time:   [-25.256% -19.564% -10.393%] (p = 0.00 < 0.05)
+                        thrpt:  [+11.598% +24.322% +33.789%]
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+Benchmarking lz77/compress_lazy/65536
+Benchmarking lz77/compress_lazy/65536: Warming up for 2.0000 s
+Benchmarking lz77/compress_lazy/65536: Collecting 10 samples in estimated 5.0435 s (5060 iterations)
+Benchmarking lz77/compress_lazy/65536: Analyzing
+lz77/compress_lazy/65536
+                        time:   [938.37 µs 945.07 µs 952.73 µs]
+                        thrpt:  [65.601 MiB/s 66.133 MiB/s 66.605 MiB/s]
+                 change:
+                        time:   [-40.577% -39.864% -39.097%] (p = 0.00 < 0.05)
+                        thrpt:  [+64.197% +66.288% +68.285%]
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
+Benchmarking lz77/decompress/65536
+Benchmarking lz77/decompress/65536: Warming up for 2.0000 s
+Benchmarking lz77/decompress/65536: Collecting 10 samples in estimated 5.0072 s (31k iterations)
+Benchmarking lz77/decompress/65536: Analyzing
+lz77/decompress/65536   time:   [194.51 µs 196.10 µs 198.21 µs]
+                        thrpt:  [315.32 MiB/s 318.71 MiB/s 321.32 MiB/s]
+                 change:
+                        time:   [-48.127% -44.623% -40.617%] (p = 0.00 < 0.05)
+                        thrpt:  [+68.398% +80.580% +92.780%]
+                        Performance has improved.
+Found 3 outliers among 10 measurements (30.00%)
+  1 (10.00%) low severe
+  1 (10.00%) high mild
+  1 (10.00%) high severe
+Benchmarking lz77/compress_lazy/4194304
+Benchmarking lz77/compress_lazy/4194304: Warming up for 2.0000 s
+
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 6.6s or enable flat sampling.
+Benchmarking lz77/compress_lazy/4194304: Collecting 10 samples in estimated 6.6364 s (55 iterations)
+Benchmarking lz77/compress_lazy/4194304: Analyzing
+lz77/compress_lazy/4194304
+                        time:   [88.211 ms 88.517 ms 88.666 ms]
+                        thrpt:  [45.113 MiB/s 45.189 MiB/s 45.346 MiB/s]
+                 change:
+                        time:   [-61.657% -60.333% -59.034%] (p = 0.00 < 0.05)
+                        thrpt:  [+144.10% +152.10% +160.81%]
+                        Performance has improved.
+Found 3 outliers among 10 measurements (30.00%)
+  2 (20.00%) low mild
+  1 (10.00%) high severe
+Benchmarking lz77/decompress/4194304
+Benchmarking lz77/decompress/4194304: Warming up for 2.0000 s
+Benchmarking lz77/decompress/4194304: Collecting 10 samples in estimated 5.3024 s (605 iterations)
+Benchmarking lz77/decompress/4194304: Analyzing
+lz77/decompress/4194304 time:   [8.9718 ms 9.3795 ms 9.7572 ms]
+                        thrpt:  [409.95 MiB/s 426.46 MiB/s 445.84 MiB/s]
+                 change:
+                        time:   [-8.7643% -5.0746% -1.2250%] (p = 0.02 < 0.05)
+                        thrpt:  [+1.2402% +5.3458% +9.6062%]
+                        Performance has improved.
+
+stages: no WebGPU device, skipping batched LZ77 benchmarks

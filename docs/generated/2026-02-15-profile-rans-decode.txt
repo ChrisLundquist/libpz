@@ -1,0 +1,6 @@
+Provenance: 9c5d6b8-dirty
+Building profile binary...
+   Compiling pz v0.1.0 (/Users/clundquist/code/libpz)
+    Finished `profiling` profile [optimized + debuginfo] target(s) in 3.41s
+Launching samply...
+Encountered an error during profiling: Unknown(1100)

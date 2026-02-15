@@ -1,0 +1,22 @@
+Provenance: e5b3290-dirty
+=== BENCHMARK SUMMARY ===
+
+Configuration:
+  Files:      14 files (13.32 MB total)
+  Iterations: 3 per operation
+  Pipelines:  lzr
+  Threads:    0
+
+Compression Results:
+  Pipeline           Size    Ratio       Time Throughput
+  ────────────────────────────────────────────────────────────
+  gzip            3.81 MB    28.6%  1431.8 ms   9.3 MB/s
+  pz-lzr          5.41 MB    40.6%   498.9 ms  26.7 MB/s
+
+Decompression Results:
+  Pipeline         Time Throughput
+  ────────────────────────────────────
+  gzip         309.1 ms  43.1 MB/s
+  pz-lzr       366.4 ms  36.4 MB/s
+
+Run with --verbose for per-file breakdown

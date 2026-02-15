@@ -1,0 +1,58 @@
+   Compiling pz v0.1.0 (/Users/clundquist/code/libpz)
+    Finished `bench` profile [optimized] target(s) in 6.59s
+     Running benches/stages_lz77.rs (target/release/deps/stages_lz77-bf4072bfea81e660)
+Gnuplot not found, using plotters backend
+Benchmarking lz77/compress_lazy/8192
+Benchmarking lz77/compress_lazy/8192: Warming up for 2.0000 s
+Benchmarking lz77/compress_lazy/8192: Collecting 10 samples in estimated 5.0021 s (45k iterations)
+Benchmarking lz77/compress_lazy/8192: Analyzing
+lz77/compress_lazy/8192 time:   [148.51 µs 160.07 µs 172.83 µs]
+                        thrpt:  [45.204 MiB/s 48.806 MiB/s 52.607 MiB/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+Benchmarking lz77/decompress/8192
+Benchmarking lz77/decompress/8192: Warming up for 2.0000 s
+Benchmarking lz77/decompress/8192: Collecting 10 samples in estimated 5.0005 s (193k iterations)
+Benchmarking lz77/decompress/8192: Analyzing
+lz77/decompress/8192    time:   [22.642 µs 25.252 µs 30.381 µs]
+                        thrpt:  [257.15 MiB/s 309.38 MiB/s 345.04 MiB/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+Benchmarking lz77/compress_lazy/65536
+Benchmarking lz77/compress_lazy/65536: Warming up for 2.0000 s
+Benchmarking lz77/compress_lazy/65536: Collecting 10 samples in estimated 5.0502 s (3905 iterations)
+Benchmarking lz77/compress_lazy/65536: Analyzing
+lz77/compress_lazy/65536
+                        time:   [1.3075 ms 1.5231 ms 1.7851 ms]
+                        thrpt:  [35.013 MiB/s 41.034 MiB/s 47.802 MiB/s]
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high severe
+Benchmarking lz77/decompress/65536
+Benchmarking lz77/decompress/65536: Warming up for 2.0000 s
+Benchmarking lz77/decompress/65536: Collecting 10 samples in estimated 5.0102 s (20k iterations)
+Benchmarking lz77/decompress/65536: Analyzing
+lz77/decompress/65536   time:   [313.39 µs 353.54 µs 431.10 µs]
+                        thrpt:  [144.98 MiB/s 176.79 MiB/s 199.43 MiB/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+Benchmarking lz77/compress_lazy/4194304
+Benchmarking lz77/compress_lazy/4194304: Warming up for 2.0000 s
+
+Warning: Unable to complete 10 samples in 5.0s. You may wish to increase target time to 9.4s or enable flat sampling.
+Benchmarking lz77/compress_lazy/4194304: Collecting 10 samples in estimated 9.4033 s (55 iterations)
+Benchmarking lz77/compress_lazy/4194304: Analyzing
+lz77/compress_lazy/4194304
+                        time:   [158.48 ms 180.93 ms 225.30 ms]
+                        thrpt:  [17.754 MiB/s 22.108 MiB/s 25.240 MiB/s]
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high severe
+Benchmarking lz77/decompress/4194304
+Benchmarking lz77/decompress/4194304: Warming up for 2.0000 s
+Benchmarking lz77/decompress/4194304: Collecting 10 samples in estimated 5.7111 s (440 iterations)
+Benchmarking lz77/decompress/4194304: Analyzing
+lz77/decompress/4194304 time:   [9.5757 ms 10.297 ms 11.264 ms]
+                        thrpt:  [355.12 MiB/s 388.46 MiB/s 417.73 MiB/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+
+stages: no WebGPU device, skipping batched LZ77 benchmarks

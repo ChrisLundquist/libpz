@@ -1,0 +1,74 @@
+Provenance: 9c5d6b8-dirty
+   Compiling pz v0.1.0 (/Users/clundquist/code/libpz)
+    Finished `bench` profile [optimized] target(s) in 14.30s
+     Running benches/stages.rs (target/release/deps/stages-f32789ef65b08e13)
+Gnuplot not found, using plotters backend
+Benchmarking rans/encode/8192
+Benchmarking rans/encode/8192: Warming up for 2.0000 s
+Benchmarking rans/encode/8192: Collecting 10 samples in estimated 5.0008 s (86k iterations)
+Benchmarking rans/encode/8192: Analyzing
+rans/encode/8192        time:   [58.583 µs 59.170 µs 60.085 µs]
+                        thrpt:  [130.02 MiB/s 132.04 MiB/s 133.36 MiB/s]
+                 change:
+                        time:   [+3.7564% +4.8111% +5.7588%] (p = 0.00 < 0.05)
+                        thrpt:  [-5.4452% -4.5903% -3.6204%]
+                        Performance has regressed.
+Benchmarking rans/decode/8192
+Benchmarking rans/decode/8192: Warming up for 2.0000 s
+Benchmarking rans/decode/8192: Collecting 10 samples in estimated 5.0024 s (74k iterations)
+Benchmarking rans/decode/8192: Analyzing
+rans/decode/8192        time:   [66.204 µs 66.284 µs 66.329 µs]
+                        thrpt:  [117.78 MiB/s 117.86 MiB/s 118.01 MiB/s]
+                 change:
+                        time:   [+1.3467% +1.6075% +1.8314%] (p = 0.00 < 0.05)
+                        thrpt:  [-1.7984% -1.5821% -1.3288%]
+                        Performance has regressed.
+Benchmarking rans/encode/65536
+Benchmarking rans/encode/65536: Warming up for 2.0000 s
+Benchmarking rans/encode/65536: Collecting 10 samples in estimated 5.0068 s (9735 iterations)
+Benchmarking rans/encode/65536: Analyzing
+rans/encode/65536       time:   [516.52 µs 518.64 µs 522.61 µs]
+                        thrpt:  [119.59 MiB/s 120.51 MiB/s 121.00 MiB/s]
+                 change:
+                        time:   [+7.7338% +8.4446% +9.1489%] (p = 0.00 < 0.05)
+                        thrpt:  [-8.3820% -7.7870% -7.1786%]
+                        Performance has regressed.
+Benchmarking rans/decode/65536
+Benchmarking rans/decode/65536: Warming up for 2.0000 s
+Benchmarking rans/decode/65536: Collecting 10 samples in estimated 5.0090 s (8635 iterations)
+Benchmarking rans/decode/65536: Analyzing
+rans/decode/65536       time:   [577.68 µs 578.96 µs 580.91 µs]
+                        thrpt:  [107.59 MiB/s 107.95 MiB/s 108.19 MiB/s]
+                 change:
+                        time:   [-0.4579% +0.6593% +1.6218%] (p = 0.27 > 0.05)
+                        thrpt:  [-1.5960% -0.6550% +0.4600%]
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+Benchmarking rans/encode/4194304
+Benchmarking rans/encode/4194304: Warming up for 2.0000 s
+Benchmarking rans/encode/4194304: Collecting 10 samples in estimated 5.0610 s (165 iterations)
+Benchmarking rans/encode/4194304: Analyzing
+rans/encode/4194304     time:   [30.664 ms 33.121 ms 36.705 ms]
+                        thrpt:  [108.98 MiB/s 120.77 MiB/s 130.44 MiB/s]
+                 change:
+                        time:   [-4.8355% -1.5840% +4.2955%] (p = 0.67 > 0.05)
+                        thrpt:  [-4.1186% +1.6095% +5.0812%]
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+Benchmarking rans/decode/4194304
+Benchmarking rans/decode/4194304: Warming up for 2.0000 s
+Benchmarking rans/decode/4194304: Collecting 10 samples in estimated 6.0999 s (165 iterations)
+Benchmarking rans/decode/4194304: Analyzing
+rans/decode/4194304     time:   [37.311 ms 38.502 ms 39.486 ms]
+                        thrpt:  [101.30 MiB/s 103.89 MiB/s 107.21 MiB/s]
+                 change:
+                        time:   [+5.1887% +7.7606% +11.164%] (p = 0.00 < 0.05)
+                        thrpt:  [-10.043% -7.2017% -4.9328%]
+                        Performance has regressed.
+
+stages: no WebGPU device, skipping WebGPU BWT benchmarks
+stages: no WebGPU device, skipping batched LZ77 benchmarks
+stages: no WebGPU device, skipping WebGPU Huffman benchmarks
+stages: no WebGPU device, skipping WebGPU Deflate chained benchmarks

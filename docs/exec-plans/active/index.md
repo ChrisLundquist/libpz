@@ -1,6 +1,6 @@
 # Active Execution Plans
 
-**Last Updated:** 2026-02-14
+**Last Updated:** 2026-02-15
 
 ## Active Plans
 
@@ -9,6 +9,9 @@
 
 ### [TODO-huffman-sync-decode.md](TODO-huffman-sync-decode.md)
 **Status:** Planned | **Priority:** P2
+
+### [PLAN-competitive-roadmap.md](PLAN-competitive-roadmap.md)
+**Status:** Planned | **Priority:** P0
 
 ## Completed Plans (in ../completed/)
 

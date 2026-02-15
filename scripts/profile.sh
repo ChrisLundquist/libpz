@@ -26,6 +26,10 @@
 
 set -euo pipefail
 
+# Normalize locale for predictable CLI behavior.
+export LC_ALL=C
+export LANG=C
+
 usage() {
     cat <<'EOF'
 profile.sh — Profile pz pipelines and stages with samply
@@ -207,10 +211,17 @@ cargo build --profile profiling --example profile \
 BINARY="$PROJECT_DIR/target/profiling/examples/profile"
 
 echo "Launching samply..."
-"$SAMPLY" record "${SAMPLY_ARGS[@]+"${SAMPLY_ARGS[@]}"}" \
-    "$BINARY" "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}"
+if ! "$SAMPLY" record "${SAMPLY_ARGS[@]+"${SAMPLY_ARGS[@]}"}" \
+    "$BINARY" "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}"; then
+    echo "samply record failed."
+    echo "Hint: on macOS this may require running outside sandboxed execution contexts."
+    exit 1
+fi
 
 if [[ "$SAVE_ONLY" == true ]]; then
     echo "Profile saved to $OUTPUT"
     echo "View with: samply load $OUTPUT"
+    echo "Note: save-only JSON may remain unsymbolicated (meta.symbolicated=false)."
+    echo "Browser symbolization via 'samply load' does not rewrite the saved JSON file."
+    echo "Hotspot helper: ./scripts/samply-top-symbols.sh --profile $OUTPUT --binary $BINARY"
 fi

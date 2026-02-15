@@ -1,0 +1,4 @@
+    Finished `profiling` profile [optimized + debuginfo] target(s) in 0.10s
+     Running `target/profiling/examples/profile --pipeline lzr --iterations 200 --size 262144`
+profiling Lzr compress: 262144 bytes, 200 iterations
+done: 1.0s, 47.8 MB/s

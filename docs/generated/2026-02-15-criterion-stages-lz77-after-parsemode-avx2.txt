@@ -1,0 +1,47 @@
+Provenance: e5b3290-dirty
+lz77/compress_lazy/8192 time:   [104.26 µs 105.53 µs 107.33 µs]
+                        thrpt:  [72.792 MiB/s 74.031 MiB/s 74.934 MiB/s]
+                 change:
+                        time:   [+3.4210% +4.5809% +5.8918%] (p = 0.00 < 0.05)
+                        thrpt:  [-5.5640% -4.3802% -3.3079%]
+                        Performance has regressed.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+lz77/decompress/8192    time:   [14.927 µs 14.978 µs 15.050 µs]
+                        thrpt:  [519.09 MiB/s 521.60 MiB/s 523.38 MiB/s]
+                 change:
+                        time:   [-12.287% -11.219% -10.217%] (p = 0.00 < 0.05)
+                        thrpt:  [+11.379% +12.637% +14.008%]
+                        Performance has improved.
+lz77/compress_lazy/65536
+                        time:   [830.62 µs 834.14 µs 837.16 µs]
+                        thrpt:  [74.657 MiB/s 74.928 MiB/s 75.245 MiB/s]
+                 change:
+                        time:   [+3.2732% +3.9937% +4.7025%] (p = 0.00 < 0.05)
+                        thrpt:  [-4.4913% -3.8403% -3.1694%]
+                        Performance has regressed.
+lz77/decompress/65536   time:   [126.72 µs 127.54 µs 128.41 µs]
+                        thrpt:  [486.72 MiB/s 490.03 MiB/s 493.23 MiB/s]
+                 change:
+                        time:   [-15.345% -13.361% -11.600%] (p = 0.00 < 0.05)
+                        thrpt:  [+13.122% +15.422% +18.127%]
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+lz77/compress_lazy/4194304
+                        time:   [49.819 ms 50.433 ms 50.943 ms]
+                        thrpt:  [78.519 MiB/s 79.314 MiB/s 80.291 MiB/s]
+                 change:
+                        time:   [+5.4845% +6.2308% +7.1031%] (p = 0.00 < 0.05)
+                        thrpt:  [-6.6320% -5.8653% -5.1994%]
+                        Performance has regressed.
+lz77/decompress/4194304 time:   [5.1952 ms 5.2226 ms 5.2712 ms]
+                        thrpt:  [758.84 MiB/s 765.90 MiB/s 769.94 MiB/s]
+                 change:
+                        time:   [-14.183% -12.845% -10.890%] (p = 0.00 < 0.05)
+                        thrpt:  [+12.221% +14.738% +16.527%]
+                        Performance has improved.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) low mild
+  1 (10.00%) high severe
+
