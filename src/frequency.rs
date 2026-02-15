@@ -3,6 +3,8 @@
 //! Counts the occurrence of each byte value (0-255) in an input buffer
 //! and computes Shannon entropy.
 
+use std::sync::OnceLock;
+
 /// A frequency table that tracks byte occurrence counts.
 #[derive(Debug, Clone)]
 pub struct FrequencyTable {
@@ -32,11 +34,18 @@ impl FrequencyTable {
     /// Uses SIMD-accelerated counting when available (AVX2 on x86_64
     /// with 4-bank histogramming, SSE2 with unrolled scalar).
     pub fn count(&mut self, input: &[u8]) {
-        let d = crate::simd::Dispatcher::new();
+        static DISPATCHER: OnceLock<crate::simd::Dispatcher> = OnceLock::new();
+        let d = DISPATCHER.get_or_init(crate::simd::Dispatcher::new);
         self.byte = d.byte_frequencies(input);
 
-        self.total = self.byte.iter().map(|&c| c as u64).sum();
-        self.used = self.byte.iter().filter(|&&c| c > 0).count() as u32;
+        let mut total = 0u64;
+        let mut used = 0u32;
+        for &c in &self.byte {
+            total += c as u64;
+            used += (c > 0) as u32;
+        }
+        self.total = total;
+        self.used = used;
     }
 
     /// Compute the Shannon entropy of the distribution (in bits per symbol).
