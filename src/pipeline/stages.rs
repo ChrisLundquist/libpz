@@ -101,6 +101,8 @@ pub(crate) fn stage_demux_decompress(
 
 /// Multi-stream header size: num_streams(1) + pre_entropy_len(4) + meta_len(2) = 7
 const MULTISTREAM_HEADER_SIZE: usize = 7;
+/// High-bit flag on per-stream compressed length signaling interleaved rANS payload.
+const RANS_INTERLEAVED_FLAG: u32 = 1 << 31;
 
 /// Encode N streams into a multi-stream container.
 ///
@@ -309,10 +311,13 @@ pub(crate) fn stage_huffman_decode(mut block: StageBlock) -> PzResult<StageBlock
 // Entropy stage functions — rANS
 // ---------------------------------------------------------------------------
 
-/// rANS encoding stage: encode each stream independently with rANS.
+/// rANS encoding stage with policy options.
 ///
-/// Per-stream framing: [orig_len: u32] [compressed_len: u32] [rans_data]
-pub(crate) fn stage_rans_encode(mut block: StageBlock) -> PzResult<StageBlock> {
+/// Per-stream framing: [orig_len: u32] [compressed_len: u32 with optional interleaved flag] [rans_data]
+pub(crate) fn stage_rans_encode_with_options(
+    mut block: StageBlock,
+    options: &CompressOptions,
+) -> PzResult<StageBlock> {
     let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
     let pre_entropy_len = block
         .metadata
@@ -324,9 +329,22 @@ pub(crate) fn stage_rans_encode(mut block: StageBlock) -> PzResult<StageBlock> {
         pre_entropy_len,
         &block.metadata.demux_meta,
         |stream, output| {
-            let rans_data = rans::encode(stream);
+            let (rans_data, flagged_len) =
+                if options.rans_interleaved && stream.len() >= options.rans_interleaved_min_bytes {
+                    let data = rans::encode_interleaved_n(
+                        stream,
+                        options.rans_interleaved_states,
+                        rans::DEFAULT_SCALE_BITS,
+                    );
+                    let len = (data.len() as u32) | RANS_INTERLEAVED_FLAG;
+                    (data, len)
+                } else {
+                    let data = rans::encode(stream);
+                    let len = data.len() as u32;
+                    (data, len)
+                };
             output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
-            output.extend_from_slice(&(rans_data.len() as u32).to_le_bytes());
+            output.extend_from_slice(&flagged_len.to_le_bytes());
             output.extend_from_slice(&rans_data);
             Ok(())
         },
@@ -344,11 +362,18 @@ pub(crate) fn stage_rans_decode(mut block: StageBlock) -> PzResult<StageBlock> {
             return Err(PzError::InvalidInput);
         }
         let orig_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        let comp_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        let comp_field = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let is_interleaved = (comp_field & RANS_INTERLEAVED_FLAG) != 0;
+        let comp_len = (comp_field & !RANS_INTERLEAVED_FLAG) as usize;
         if 8 + comp_len > data.len() {
             return Err(PzError::InvalidInput);
         }
-        let decoded = rans::decode(&data[8..8 + comp_len], orig_len)?;
+        let payload = &data[8..8 + comp_len];
+        let decoded = if is_interleaved {
+            rans::decode_interleaved(payload, orig_len)?
+        } else {
+            rans::decode(payload, orig_len)?
+        };
         Ok((decoded, 8 + comp_len))
     })?;
 
@@ -772,7 +797,7 @@ pub(crate) fn run_compress_stage(
         (Pipeline::Bbw, 2) => stage_rle_encode(block),
         (Pipeline::Bbw, 3) => stage_fse_encode_bbw(block),
         (Pipeline::Lzr, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
-        (Pipeline::Lzr, 1) => stage_rans_encode(block),
+        (Pipeline::Lzr, 1) => stage_rans_encode_with_options(block, options),
         (Pipeline::Lzf, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
         (Pipeline::Lzf, 1) => stage_fse_encode(block),
         (Pipeline::Lzfi, 0) => stage_demux_compress(block, &LzDemuxer::Lzss, options),
@@ -788,9 +813,9 @@ pub(crate) fn run_compress_stage(
             stage_fse_interleaved_encode(block)
         }
         (Pipeline::LzssR, 0) => stage_demux_compress(block, &LzDemuxer::Lzss, options),
-        (Pipeline::LzssR, 1) => stage_rans_encode(block),
+        (Pipeline::LzssR, 1) => stage_rans_encode_with_options(block, options),
         (Pipeline::Lz78R, 0) => stage_demux_compress(block, &LzDemuxer::Lz78, options),
-        (Pipeline::Lz78R, 1) => stage_rans_encode(block),
+        (Pipeline::Lz78R, 1) => stage_rans_encode_with_options(block, options),
         _ => Err(PzError::Unsupported),
     }
 }

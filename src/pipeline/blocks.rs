@@ -142,7 +142,7 @@ fn entropy_encode(
         }
         Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R => {
             let _ = (input_len, options);
-            stage_rans_encode(block)
+            stage_rans_encode_with_options(block, options)
         }
         Pipeline::Lzf => {
             let _ = (input_len, options);

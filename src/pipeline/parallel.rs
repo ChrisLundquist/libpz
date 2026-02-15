@@ -189,7 +189,7 @@ fn compress_parallel_gpu_batched(
                 handles.push((
                     block_idx,
                     scope.spawn(move || {
-                        entropy_encode_lz77_block(&matches, block_input.len(), pipeline)
+                        entropy_encode_lz77_block(&matches, block_input.len(), pipeline, options)
                     }),
                 ));
             }
@@ -257,7 +257,8 @@ fn compress_streaming_gpu(
             let rtx = result_tx.clone();
             scope.spawn(move || {
                 while let Ok((block_idx, matches, original_len)) = rx.recv() {
-                    let result = entropy_encode_lz77_block(&matches, original_len, pipeline);
+                    let result =
+                        entropy_encode_lz77_block(&matches, original_len, pipeline, options);
                     let _ = rtx.send((block_idx, result));
                 }
             });
@@ -427,9 +428,11 @@ fn entropy_encode_lz77_block(
     matches: &[crate::lz77::Match],
     original_len: usize,
     pipeline: Pipeline,
+    options: &CompressOptions,
 ) -> PzResult<Vec<u8>> {
     use super::stages::{
-        stage_fse_encode, stage_fse_interleaved_encode, stage_huffman_encode, stage_rans_encode,
+        stage_fse_encode, stage_fse_interleaved_encode, stage_huffman_encode,
+        stage_rans_encode_with_options,
     };
     use crate::lz77;
 
@@ -533,7 +536,7 @@ fn entropy_encode_lz77_block(
 
         let block = match pipeline {
             Pipeline::Lzfi => stage_fse_interleaved_encode(block)?,
-            Pipeline::LzssR => stage_rans_encode(block)?,
+            Pipeline::LzssR => stage_rans_encode_with_options(block, options)?,
             _ => unreachable!(),
         };
         Ok(block.data)
@@ -568,7 +571,7 @@ fn entropy_encode_lz77_block(
 
         let block = match pipeline {
             Pipeline::Deflate => stage_huffman_encode(block)?,
-            Pipeline::Lzr => stage_rans_encode(block)?,
+            Pipeline::Lzr => stage_rans_encode_with_options(block, options)?,
             Pipeline::Lzf => stage_fse_encode(block)?,
             _ => return Err(PzError::Unsupported),
         };
