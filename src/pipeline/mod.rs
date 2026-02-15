@@ -117,6 +117,11 @@ pub struct CompressOptions {
     pub rans_interleaved_min_bytes: usize,
     /// Number of interleaved rANS states when interleaved mode is active.
     pub rans_interleaved_states: usize,
+    /// Prototype unified task scheduler for compatible two-stage pipelines.
+    ///
+    /// When enabled, the same worker pool executes both stage-0 transform
+    /// tasks and stage-1 entropy tasks from a shared work queue.
+    pub unified_scheduler: bool,
 }
 
 impl Default for CompressOptions {
@@ -132,6 +137,7 @@ impl Default for CompressOptions {
             rans_interleaved: false,
             rans_interleaved_min_bytes: 64 * 1024,
             rans_interleaved_states: crate::rans::DEFAULT_INTERLEAVE,
+            unified_scheduler: false,
         }
     }
 }

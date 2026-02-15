@@ -48,6 +48,7 @@ fn usage() {
         "  --rans-interleaved-states N     Number of interleaved rANS states (default: {})",
         pz::rans::DEFAULT_INTERLEAVE
     );
+    eprintln!("  --unified-scheduler  Prototype mixed-task scheduler for compatible pipelines");
     eprintln!("  -q, --quiet        Suppress warnings");
     eprintln!("  -v, --verbose      Verbose output");
     eprintln!("  -h, --help         Show this help");
@@ -100,6 +101,7 @@ struct Opts {
     rans_interleaved: bool,
     rans_interleaved_min_bytes: usize,
     rans_interleaved_states: usize,
+    unified_scheduler: bool,
     pipeline: Pipeline,
     files: Vec<String>,
 }
@@ -122,6 +124,7 @@ fn parse_args() -> Opts {
         rans_interleaved: false,
         rans_interleaved_min_bytes: 64 * 1024,
         rans_interleaved_states: pz::rans::DEFAULT_INTERLEAVE,
+        unified_scheduler: false,
         pipeline: Pipeline::Deflate,
         files: Vec::new(),
     };
@@ -181,6 +184,7 @@ fn parse_args() -> Opts {
                     }
                 };
             }
+            "--unified-scheduler" => opts.unified_scheduler = true,
             "--list-pipelines" => {
                 list_pipelines();
                 process::exit(0);
@@ -359,6 +363,7 @@ fn build_cli_options(opts: &Opts) -> (CompressOptions, DecompressOptions) {
         rans_interleaved: opts.rans_interleaved,
         rans_interleaved_min_bytes: opts.rans_interleaved_min_bytes,
         rans_interleaved_states: opts.rans_interleaved_states,
+        unified_scheduler: opts.unified_scheduler,
         #[cfg(feature = "webgpu")]
         webgpu_engine: gpu.webgpu_engine.clone(),
         ..Default::default()

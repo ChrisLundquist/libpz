@@ -32,6 +32,7 @@ fn usage() {
         "  --rans-interleaved-min-bytes  Min stream bytes for interleaved rANS (default: 65536)"
     );
     eprintln!("  --rans-interleaved-states N   Interleaved rANS state count (default: 4)");
+    eprintln!("  --unified-scheduler           Enable prototype mixed-task scheduler");
     eprintln!("  --help          Show this help");
 }
 
@@ -249,6 +250,7 @@ fn main() {
     let mut rans_interleaved = false;
     let mut rans_interleaved_min_bytes = 65_536usize;
     let mut rans_interleaved_states = 4usize;
+    let mut unified_scheduler = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -282,6 +284,7 @@ fn main() {
                 rans_interleaved_states =
                     args[i].parse().expect("invalid --rans-interleaved-states");
             }
+            "--unified-scheduler" => unified_scheduler = true,
             "--help" | "-h" => {
                 usage();
                 return;
@@ -327,6 +330,7 @@ fn main() {
             rans_interleaved,
             rans_interleaved_min_bytes,
             rans_interleaved_states,
+            unified_scheduler,
             ..CompressOptions::default()
         };
         let _ = pipeline::compress_with_options(&data, pipe, &opts).unwrap();

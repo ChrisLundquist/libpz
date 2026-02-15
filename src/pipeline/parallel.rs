@@ -5,6 +5,8 @@
 //! - **Pipeline-parallel**: one thread per stage, blocks flow through channels.
 
 use crate::{PzError, PzResult};
+use std::collections::VecDeque;
+use std::sync::{Condvar, Mutex};
 
 use super::blocks::compress_block;
 use super::stages::{
@@ -70,6 +72,15 @@ pub(crate) fn compress_parallel(
     let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
     let num_blocks = blocks.len();
 
+    // Prototype unified scheduler: a single worker pool executes both
+    // stage-0 transform and stage-1 entropy tasks from one shared queue.
+    if options.unified_scheduler
+        && num_blocks > 1
+        && matches!(pipeline, Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R)
+    {
+        return compress_parallel_unified_lz_rans(input, pipeline, options, num_threads, &blocks);
+    }
+
     // Compress blocks in parallel using scoped threads
     let compressed_blocks: Vec<PzResult<Vec<u8>>> = std::thread::scope(|scope| {
         // Launch threads in batches to cap concurrency
@@ -122,6 +133,141 @@ pub(crate) fn compress_parallel(
         output.extend_from_slice(compressed);
     }
 
+    Ok(output)
+}
+
+#[derive(Copy, Clone)]
+enum UnifiedTask {
+    Stage0(usize),
+    Stage1(usize),
+}
+
+#[derive(Default)]
+struct UnifiedQueueState {
+    queue: VecDeque<UnifiedTask>,
+    pending_tasks: usize,
+    closed: bool,
+}
+
+fn compress_parallel_unified_lz_rans(
+    input: &[u8],
+    pipeline: Pipeline,
+    options: &CompressOptions,
+    num_threads: usize,
+    blocks: &[&[u8]],
+) -> PzResult<Vec<u8>> {
+    let num_blocks = blocks.len();
+    let worker_count = num_threads.min(num_blocks).max(1);
+
+    let mut resolved_options = options.clone();
+    if resolved_options.max_match_len.is_none() {
+        resolved_options.max_match_len = Some(super::resolve_max_match_len(pipeline, options));
+    }
+
+    let stage0_slots: Vec<Mutex<Option<StageBlock>>> =
+        (0..num_blocks).map(|_| Mutex::new(None)).collect();
+    let results: Vec<Mutex<Option<PzResult<Vec<u8>>>>> =
+        (0..num_blocks).map(|_| Mutex::new(None)).collect();
+
+    let queue = Mutex::new(UnifiedQueueState {
+        queue: (0..num_blocks).map(UnifiedTask::Stage0).collect(),
+        pending_tasks: num_blocks,
+        closed: false,
+    });
+    let queue_cv = Condvar::new();
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let queue_ref = &queue;
+            let cv_ref = &queue_cv;
+            let stage0_slots_ref = &stage0_slots;
+            let results_ref = &results;
+            let opts = resolved_options.clone();
+
+            scope.spawn(move || loop {
+                let task = {
+                    let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                    loop {
+                        if let Some(task) = guard.queue.pop_front() {
+                            break task;
+                        }
+                        if guard.closed {
+                            return;
+                        }
+                        guard = cv_ref.wait(guard).expect("unified queue wait poisoned");
+                    }
+                };
+
+                match task {
+                    UnifiedTask::Stage0(block_idx) => {
+                        let block = StageBlock {
+                            block_index: block_idx,
+                            original_len: blocks[block_idx].len(),
+                            data: blocks[block_idx].to_vec(),
+                            streams: None,
+                            metadata: StageMetadata::default(),
+                        };
+                        let result = run_compress_stage(pipeline, 0, block, &opts);
+                        match result {
+                            Ok(stage0_block) => {
+                                *stage0_slots_ref[block_idx]
+                                    .lock()
+                                    .expect("stage0 slot poisoned") = Some(stage0_block);
+                                let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                                guard.queue.push_back(UnifiedTask::Stage1(block_idx));
+                                guard.pending_tasks += 1;
+                                cv_ref.notify_one();
+                            }
+                            Err(e) => {
+                                *results_ref[block_idx].lock().expect("result slot poisoned") =
+                                    Some(Err(e));
+                            }
+                        }
+                    }
+                    UnifiedTask::Stage1(block_idx) => {
+                        let stage0 = stage0_slots_ref[block_idx]
+                            .lock()
+                            .expect("stage0 slot poisoned")
+                            .take()
+                            .expect("stage0 result missing");
+                        let result = run_compress_stage(pipeline, 1, stage0, &opts).map(|b| b.data);
+                        *results_ref[block_idx].lock().expect("result slot poisoned") =
+                            Some(result);
+                    }
+                }
+
+                let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                guard.pending_tasks -= 1;
+                if guard.pending_tasks == 0 {
+                    guard.closed = true;
+                    cv_ref.notify_all();
+                    return;
+                }
+            });
+        }
+    });
+
+    let mut block_data_vec = Vec::with_capacity(num_blocks);
+    for slot in results {
+        let result = slot
+            .into_inner()
+            .expect("result slot poisoned")
+            .unwrap_or(Err(PzError::InvalidInput))?;
+        block_data_vec.push(result);
+    }
+
+    let mut output = Vec::new();
+    write_header(&mut output, pipeline, input.len());
+    output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+    for (i, compressed) in block_data_vec.iter().enumerate() {
+        let orig_block_len = blocks[i].len() as u32;
+        let comp_block_len = compressed.len() as u32;
+        output.extend_from_slice(&comp_block_len.to_le_bytes());
+        output.extend_from_slice(&orig_block_len.to_le_bytes());
+    }
+    for compressed in &block_data_vec {
+        output.extend_from_slice(compressed);
+    }
     Ok(output)
 }
 
