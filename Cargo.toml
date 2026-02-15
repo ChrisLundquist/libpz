@@ -3,6 +3,7 @@ name = "pz"
 version = "0.1.0"
 edition = "2021"
 description = "Lossless data compression library with GPU acceleration"
+autobenches = false
 
 [lib]
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -21,11 +22,91 @@ path = "src/bin/pz.rs"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
-name = "throughput"
+name = "throughput_deflate"
 harness = false
 
 [[bench]]
-name = "stages"
+name = "throughput_bw"
+harness = false
+
+[[bench]]
+name = "throughput_bbw"
+harness = false
+
+[[bench]]
+name = "throughput_lzr"
+harness = false
+
+[[bench]]
+name = "throughput_lzf"
+harness = false
+
+[[bench]]
+name = "throughput_lzfi"
+harness = false
+
+[[bench]]
+name = "stages_bwt"
+harness = false
+
+[[bench]]
+name = "stages_bbwt"
+harness = false
+
+[[bench]]
+name = "stages_lz77"
+harness = false
+
+[[bench]]
+name = "stages_lzss"
+harness = false
+
+[[bench]]
+name = "stages_lz78"
+harness = false
+
+[[bench]]
+name = "stages_lz_comparison"
+harness = false
+
+[[bench]]
+name = "stages_lz_plus_fse"
+harness = false
+
+[[bench]]
+name = "stages_huffman"
+harness = false
+
+[[bench]]
+name = "stages_mtf"
+harness = false
+
+[[bench]]
+name = "stages_rle"
+harness = false
+
+[[bench]]
+name = "stages_fse"
+harness = false
+
+[[bench]]
+name = "stages_rans"
+harness = false
+
+[[bench]]
+name = "stages_simd"
+harness = false
+
+[[bench]]
+name = "stages_analysis"
+harness = false
+
+[[bench]]
+name = "stages_auto_select"
+harness = false
+
+[[bench]]
+name = "stages_deflate_webgpu_chained"
 harness = false
 
 [profile.profiling]
