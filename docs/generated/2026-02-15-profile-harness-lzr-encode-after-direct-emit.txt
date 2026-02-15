@@ -1,0 +1,6 @@
+Provenance: 9c5d6b8-dirty
+    Blocking waiting for file lock on artifact directory
+    Finished `profiling` profile [optimized + debuginfo] target(s) in 8.78s
+     Running `target/profiling/examples/profile --pipeline lzr --iterations 200 --size 262144`
+profiling Lzr compress: 262144 bytes, 200 iterations
+done: 1.1s, 46.3 MB/s

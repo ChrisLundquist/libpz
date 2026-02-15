@@ -1,0 +1,22 @@
+Provenance: 9c5d6b8-dirty
+=== BENCHMARK SUMMARY ===
+
+Configuration:
+  Files:      14 files (13.32 MB total)
+  Iterations: 3 per operation
+  Pipelines:  lzr
+  Threads:    1
+
+Compression Results:
+  Pipeline           Size    Ratio       Time Throughput
+  ────────────────────────────────────────────────────────────
+  gzip            3.81 MB    28.6%  1774.5 ms   7.5 MB/s
+  pz-lzr          5.41 MB    40.6%  1927.2 ms   6.9 MB/s
+
+Decompression Results:
+  Pipeline         Time Throughput
+  ────────────────────────────────────
+  gzip         296.8 ms  44.9 MB/s
+  pz-lzr       449.3 ms  29.7 MB/s
+
+Run with --verbose for per-file breakdown

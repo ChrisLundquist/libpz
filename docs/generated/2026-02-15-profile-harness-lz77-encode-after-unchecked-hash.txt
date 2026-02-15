@@ -1,0 +1,15 @@
+Provenance: 9c5d6b8-dirty
+   Compiling pz v0.1.0 (/Users/clundquist/code/libpz)
+warning: function `hash3` is never used
+   --> src/lz77.rs:163:15
+    |
+163 | pub(crate) fn hash3(data: &[u8], pos: usize) -> usize {
+    |               ^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `pz` (lib) generated 1 warning
+    Finished `profiling` profile [optimized + debuginfo] target(s) in 7.07s
+     Running `target/profiling/examples/profile --stage lz77 --iterations 200 --size 262144`
+profiling stage lz77 encode: 262144 bytes, 200 iterations
+done: 0.7s, 73.7 MB/s

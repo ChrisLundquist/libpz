@@ -1,0 +1,5 @@
+Provenance: 9c5d6b8-dirty
+    Finished `profiling` profile [optimized + debuginfo] target(s) in 0.15s
+     Running `target/profiling/examples/profile --stage lz77 --iterations 200 --size 262144`
+profiling stage lz77 encode: 262144 bytes, 200 iterations
+done: 0.7s, 67.1 MB/s

@@ -1,0 +1,6 @@
+Provenance: 9c5d6b8-dirty
+    Blocking waiting for file lock on artifact directory
+    Finished `profiling` profile [optimized + debuginfo] target(s) in 44.57s
+     Running `target/profiling/examples/profile --stage rans --decompress --iterations 400 --size 262144`
+profiling stage rans decode: 262144 bytes, 400 iterations
+done: 0.6s, 157.8 MB/s

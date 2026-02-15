@@ -168,18 +168,6 @@ pub(crate) fn hash3(data: &[u8], pos: usize) -> usize {
     h & HASH_MASK
 }
 
-/// Unchecked hash for the hot path where caller guarantees `pos + 2 < data.len()`.
-///
-/// # Safety
-/// Caller must ensure `pos + 2 < data.len()`.
-#[inline(always)]
-unsafe fn hash3_unchecked(data: &[u8], pos: usize) -> usize {
-    let h = (*data.get_unchecked(pos) as usize) << 10
-        ^ (*data.get_unchecked(pos + 1) as usize) << 5
-        ^ (*data.get_unchecked(pos + 2) as usize);
-    h & HASH_MASK
-}
-
 /// Maximum hash insertion count per match (longer matches cap insertion
 /// to avoid spending time on positions that will soon leave the window).
 const MAX_INSERT_LEN: usize = 128;
@@ -301,8 +289,7 @@ impl HashChainFinder {
         if pos + 2 >= input.len() {
             return;
         }
-        // SAFETY: bounds check above guarantees pos + 2 < input.len()
-        let h = unsafe { hash3_unchecked(input, pos) };
+        let h = hash3(input, pos);
         self.prev[pos % MAX_WINDOW] = self.head[h];
         self.head[h] = pos as u32;
     }

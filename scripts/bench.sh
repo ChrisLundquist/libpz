@@ -14,6 +14,7 @@ PIPELINES=()
 FILES=()
 FEATURES=""
 GPU_FLAG=""
+THREADS=""
 VERBOSE=false
 
 usage() {
@@ -27,6 +28,7 @@ Options:
   -n, --iters N          Number of iterations per operation (default: 3)
   -p, --pipelines LIST   Comma-separated list of pipelines to benchmark
                          (default: deflate,lzr,lzf)
+  -t, --threads N        Pass thread count to pz (-t N; 0=auto, 1=single-threaded)
   --all                  Benchmark all available pipelines
   --webgpu               Build with WebGPU feature and pass --gpu to pz
   --features FEAT        Cargo features to enable (e.g. webgpu)
@@ -39,6 +41,7 @@ Examples:
   ./scripts/bench.sh                              # all corpus, all pipelines
   ./scripts/bench.sh myfile.bin                   # specific file
   ./scripts/bench.sh -p deflate,lzf               # subset of pipelines
+  ./scripts/bench.sh -t 1 -p lzr                  # force single-threaded pz
   ./scripts/bench.sh -n 10                        # more iterations
   ./scripts/bench.sh --webgpu -p bw,bbw           # GPU-accelerated via WebGPU
   ./scripts/bench.sh --all                         # benchmark every pipeline
@@ -72,6 +75,18 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             IFS=',' read -ra PIPELINES <<< "$2"
+            shift 2
+            ;;
+        -t|--threads)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --threads requires an argument" >&2
+                exit 1
+            fi
+            THREADS="$2"
+            if ! [[ "$THREADS" =~ ^[0-9]+$ ]]; then
+                echo "ERROR: --threads must be a non-negative integer" >&2
+                exit 1
+            fi
             shift 2
             ;;
         --all)
@@ -226,6 +241,9 @@ fmt_ratio() {
 if [[ "$VERBOSE" == true ]]; then
     echo "Averaging over $ITERATIONS iterations per operation."
     echo "Pipelines: ${PIPELINES[*]}"
+    if [[ -n "$THREADS" ]]; then
+        echo "Threads: $THREADS"
+    fi
     if [[ -n "$GPU_FLAG" ]]; then
         echo "GPU: $GPU_FLAG"
     fi
@@ -281,7 +299,7 @@ for file in "${FILES[@]}"; do
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
         cp "$file" "$BENCH_TMPDIR/$name"
-        pz_comp_ns=$(avg_ns "$PZ" -k -f -p "$p" $GPU_FLAG "$BENCH_TMPDIR/$name")
+        pz_comp_ns=$(avg_ns "$PZ" -k -f -p "$p" ${THREADS:+-t "$THREADS"} $GPU_FLAG "$BENCH_TMPDIR/$name")
         pz_size=$(stat -c%s "$BENCH_TMPDIR/$name.pz" 2>/dev/null || stat -f%z "$BENCH_TMPDIR/$name.pz" 2>/dev/null)
         rm -f "$BENCH_TMPDIR/$name" "$BENCH_TMPDIR/$name.pz"
 
@@ -344,14 +362,14 @@ for file in "${FILES[@]}"; do
     cp "$file" "$BENCH_TMPDIR/$name.src"
 
     # gzip
-    cp "$BENCH_TMPDIR/$name.src" "$BENCH_TMPDIR/$name"
+    cp -f "$BENCH_TMPDIR/$name.src" "$BENCH_TMPDIR/$name"
     gzip -f "$BENCH_TMPDIR/$name"
 
     # pz pipelines
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
-        cp "$BENCH_TMPDIR/$name.src" "$BENCH_TMPDIR/$name"
-        "$PZ" -k -f -p "$p" $GPU_FLAG "$BENCH_TMPDIR/$name"
+        cp -f "$BENCH_TMPDIR/$name.src" "$BENCH_TMPDIR/$name"
+        "$PZ" -k -f -p "$p" ${THREADS:+-t "$THREADS"} $GPU_FLAG "$BENCH_TMPDIR/$name"
         mv "$BENCH_TMPDIR/$name.pz" "$BENCH_TMPDIR/$name.$p.pz"
     done
 
@@ -367,7 +385,7 @@ for file in "${FILES[@]}"; do
 
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
-        pz_dec_ns=$(avg_ns "$PZ" -d -k -f $GPU_FLAG "$BENCH_TMPDIR/$name.$p.pz")
+        pz_dec_ns=$(avg_ns "$PZ" -d -k -f ${THREADS:+-t "$THREADS"} $GPU_FLAG "$BENCH_TMPDIR/$name.$p.pz")
         drow+=$(printf " | %7s %8s" \
             "$(fmt_ms $pz_dec_ns)" "$(fmt_throughput $orig_size $pz_dec_ns)")
         dt_pz_ns[$pi]=$(( ${dt_pz_ns[$pi]} + pz_dec_ns ))
@@ -407,6 +425,9 @@ if [[ "$VERBOSE" == false ]]; then
     echo "  Files:      ${#FILES[@]} files ($(fmt_bytes $t_orig) total)"
     echo "  Iterations: $ITERATIONS per operation"
     echo "  Pipelines:  ${PIPELINES[*]}"
+    if [[ -n "$THREADS" ]]; then
+        echo "  Threads:    $THREADS"
+    fi
     if [[ -n "$GPU_FLAG" ]]; then
         echo "  GPU:        enabled"
     fi

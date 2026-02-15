@@ -1,0 +1,72 @@
+Provenance: 9c5d6b8-dirty
+   Compiling num-traits v0.2.19
+   Compiling serde_derive v1.0.228
+   Compiling half v2.7.1
+   Compiling plotters v0.3.7
+   Compiling serde v1.0.228
+   Compiling naga v27.0.3
+   Compiling ciborium-ll v0.2.2
+   Compiling tinytemplate v1.2.1
+   Compiling ciborium v0.2.2
+   Compiling criterion v0.5.1
+   Compiling wgpu-hal v27.0.4
+   Compiling wgpu-core-deps-apple v27.0.0
+   Compiling wgpu-core v27.0.3
+   Compiling wgpu v27.0.1
+   Compiling wgpu-profiler v0.25.0
+   Compiling pz v0.1.0 (/Users/clundquist/code/libpz)
+    Finished `bench` profile [optimized] target(s) in 55.76s
+     Running benches/stages.rs (target/release/deps/stages-f32789ef65b08e13)
+Gnuplot not found, using plotters backend
+Benchmarking rans/encode/8192
+Benchmarking rans/encode/8192: Warming up for 2.0000 s
+Benchmarking rans/encode/8192: Collecting 10 samples in estimated 5.0005 s (89k iterations)
+Benchmarking rans/encode/8192: Analyzing
+rans/encode/8192        time:   [56.176 µs 56.514 µs 57.049 µs]
+                        thrpt:  [136.94 MiB/s 138.24 MiB/s 139.07 MiB/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+Benchmarking rans/decode/8192
+Benchmarking rans/decode/8192: Warming up for 2.0000 s
+Benchmarking rans/decode/8192: Collecting 10 samples in estimated 5.0007 s (77k iterations)
+Benchmarking rans/decode/8192: Analyzing
+rans/decode/8192        time:   [65.088 µs 65.191 µs 65.249 µs]
+                        thrpt:  [119.73 MiB/s 119.84 MiB/s 120.03 MiB/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking rans/encode/65536
+Benchmarking rans/encode/65536: Warming up for 2.0000 s
+Benchmarking rans/encode/65536: Collecting 10 samples in estimated 5.0079 s (10k iterations)
+Benchmarking rans/encode/65536: Analyzing
+rans/encode/65536       time:   [480.23 µs 480.66 µs 480.97 µs]
+                        thrpt:  [129.95 MiB/s 130.03 MiB/s 130.15 MiB/s]
+Benchmarking rans/decode/65536
+Benchmarking rans/decode/65536: Warming up for 2.0000 s
+Benchmarking rans/decode/65536: Collecting 10 samples in estimated 5.0178 s (8745 iterations)
+Benchmarking rans/decode/65536: Analyzing
+rans/decode/65536       time:   [573.10 µs 574.25 µs 576.04 µs]
+                        thrpt:  [108.50 MiB/s 108.84 MiB/s 109.06 MiB/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+Benchmarking rans/encode/4194304
+Benchmarking rans/encode/4194304: Warming up for 2.0000 s
+Benchmarking rans/encode/4194304: Collecting 10 samples in estimated 5.3133 s (165 iterations)
+Benchmarking rans/encode/4194304: Analyzing
+rans/encode/4194304     time:   [32.030 ms 32.108 ms 32.267 ms]
+                        thrpt:  [123.97 MiB/s 124.58 MiB/s 124.88 MiB/s]
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) high mild
+  1 (10.00%) high severe
+Benchmarking rans/decode/4194304
+Benchmarking rans/decode/4194304: Warming up for 2.0000 s
+Benchmarking rans/decode/4194304: Collecting 10 samples in estimated 5.7510 s (165 iterations)
+Benchmarking rans/decode/4194304: Analyzing
+rans/decode/4194304     time:   [34.778 ms 34.798 ms 34.820 ms]
+                        thrpt:  [114.88 MiB/s 114.95 MiB/s 115.02 MiB/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+
+stages: no WebGPU device, skipping WebGPU BWT benchmarks
+stages: no WebGPU device, skipping batched LZ77 benchmarks
+stages: no WebGPU device, skipping WebGPU Huffman benchmarks
+stages: no WebGPU device, skipping WebGPU Deflate chained benchmarks

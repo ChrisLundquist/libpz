@@ -1,0 +1,6 @@
+Provenance: 9c5d6b8-dirty
+   Compiling pz v0.1.0 (/Users/clundquist/code/libpz)
+    Finished `profiling` profile [optimized + debuginfo] target(s) in 6.29s
+     Running `target/profiling/examples/profile --pipeline lzr --iterations 200 --size 262144`
+profiling Lzr compress: 262144 bytes, 200 iterations
+done: 1.0s, 51.1 MB/s

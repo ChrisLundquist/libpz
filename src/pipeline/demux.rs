@@ -6,7 +6,7 @@ use crate::lz78;
 use crate::lzss;
 use crate::{PzError, PzResult};
 
-use super::CompressOptions;
+use super::{Backend, CompressOptions, ParseStrategy};
 
 /// Output from a demuxer's compress-and-split operation.
 pub(crate) struct DemuxOutput {
@@ -72,23 +72,50 @@ impl StreamDemuxer for LzDemuxer {
     fn compress_and_demux(&self, input: &[u8], options: &CompressOptions) -> PzResult<DemuxOutput> {
         match self {
             LzDemuxer::Lz77 => {
-                let lz_data = super::lz77_compress_with_backend(input, options)?;
-                let lz_len = lz_data.len();
-                let match_size = lz77::Match::SERIALIZED_SIZE; // 5
-                let num_matches = lz_len / match_size;
+                // Fast path: CPU lazy/auto can demux directly from Match structs,
+                // avoiding an intermediate serialized LZ byte buffer.
+                let (offsets, lengths, literals, lz_len) = if options.backend == Backend::Cpu
+                    && matches!(
+                        options.parse_strategy,
+                        ParseStrategy::Auto | ParseStrategy::Lazy
+                    ) {
+                    let max_match = options.max_match_len.unwrap_or(lz77::DEFLATE_MAX_MATCH);
+                    let matches = lz77::compress_lazy_to_matches_with_limit(input, max_match)?;
+                    let num_matches = matches.len();
+                    let mut offsets = Vec::with_capacity(num_matches * 2);
+                    let mut lengths = Vec::with_capacity(num_matches * 2);
+                    let mut literals = Vec::with_capacity(num_matches);
+                    for m in matches {
+                        offsets.extend_from_slice(&m.offset.to_le_bytes());
+                        lengths.extend_from_slice(&m.length.to_le_bytes());
+                        literals.push(m.next);
+                    }
+                    (
+                        offsets,
+                        lengths,
+                        literals,
+                        num_matches * lz77::Match::SERIALIZED_SIZE,
+                    )
+                } else {
+                    let lz_data = super::lz77_compress_with_backend(input, options)?;
+                    let lz_len = lz_data.len();
+                    let match_size = lz77::Match::SERIALIZED_SIZE; // 5
+                    let num_matches = lz_len / match_size;
 
-                let mut offsets = Vec::with_capacity(num_matches * 2);
-                let mut lengths = Vec::with_capacity(num_matches * 2);
-                let mut literals = Vec::with_capacity(num_matches);
+                    let mut offsets = Vec::with_capacity(num_matches * 2);
+                    let mut lengths = Vec::with_capacity(num_matches * 2);
+                    let mut literals = Vec::with_capacity(num_matches);
 
-                for i in 0..num_matches {
-                    let base = i * match_size;
-                    offsets.push(lz_data[base]);
-                    offsets.push(lz_data[base + 1]);
-                    lengths.push(lz_data[base + 2]);
-                    lengths.push(lz_data[base + 3]);
-                    literals.push(lz_data[base + 4]);
-                }
+                    for i in 0..num_matches {
+                        let base = i * match_size;
+                        offsets.push(lz_data[base]);
+                        offsets.push(lz_data[base + 1]);
+                        lengths.push(lz_data[base + 2]);
+                        lengths.push(lz_data[base + 3]);
+                        literals.push(lz_data[base + 4]);
+                    }
+                    (offsets, lengths, literals, lz_len)
+                };
 
                 Ok(DemuxOutput {
                     streams: vec![offsets, lengths, literals],
