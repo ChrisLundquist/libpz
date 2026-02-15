@@ -113,27 +113,38 @@ pub(crate) fn compress_parallel(
         block_data_vec.push(result?);
     }
 
-    // Build output: V2 header + num_blocks + block_table + block_data
+    let orig_block_lens: Vec<usize> = blocks.iter().map(|b| b.len()).collect();
+    let block_slices: Vec<&[u8]> = block_data_vec.iter().map(|v| v.as_slice()).collect();
+    Ok(assemble_multiblock_container(
+        pipeline,
+        input.len(),
+        &orig_block_lens,
+        &block_slices,
+    ))
+}
+
+fn assemble_multiblock_container(
+    pipeline: Pipeline,
+    original_len: usize,
+    orig_block_lens: &[usize],
+    block_data: &[&[u8]],
+) -> Vec<u8> {
+    let num_blocks = block_data.len();
+    debug_assert_eq!(orig_block_lens.len(), num_blocks);
+
     let mut output = Vec::new();
-    write_header(&mut output, pipeline, input.len());
-
-    // num_blocks
+    write_header(&mut output, pipeline, original_len);
     output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
-
-    // Block table
-    for (i, compressed) in block_data_vec.iter().enumerate() {
-        let orig_block_len = blocks[i].len() as u32;
+    for (i, compressed) in block_data.iter().enumerate() {
+        let orig_block_len = orig_block_lens[i] as u32;
         let comp_block_len = compressed.len() as u32;
         output.extend_from_slice(&comp_block_len.to_le_bytes());
         output.extend_from_slice(&orig_block_len.to_le_bytes());
     }
-
-    // Block data
-    for compressed in &block_data_vec {
+    for compressed in block_data {
         output.extend_from_slice(compressed);
     }
-
-    Ok(output)
+    output
 }
 
 #[derive(Copy, Clone)]
@@ -147,6 +158,7 @@ struct UnifiedQueueState {
     queue: VecDeque<UnifiedTask>,
     pending_tasks: usize,
     closed: bool,
+    failed: bool,
 }
 
 fn compress_parallel_unified_lz_rans(
@@ -173,6 +185,7 @@ fn compress_parallel_unified_lz_rans(
         queue: (0..num_blocks).map(UnifiedTask::Stage0).collect(),
         pending_tasks: num_blocks,
         closed: false,
+        failed: false,
     });
     let queue_cv = Condvar::new();
 
@@ -191,7 +204,7 @@ fn compress_parallel_unified_lz_rans(
                         if let Some(task) = guard.queue.pop_front() {
                             break task;
                         }
-                        if guard.closed {
+                        if guard.closed || (guard.failed && guard.queue.is_empty()) {
                             return;
                         }
                         guard = cv_ref.wait(guard).expect("unified queue wait poisoned");
@@ -214,16 +227,32 @@ fn compress_parallel_unified_lz_rans(
                                     .lock()
                                     .expect("stage0 slot poisoned") = Some(stage0_block);
                                 let mut guard = queue_ref.lock().expect("unified queue poisoned");
-                                guard.queue.push_back(UnifiedTask::Stage1(block_idx));
-                                // pending_tasks counts total outstanding work units
-                                // (queued + currently executing). A successful Stage0
-                                // completion creates one new outstanding Stage1 task.
-                                guard.pending_tasks += 1;
-                                cv_ref.notify_one();
+                                if !guard.failed {
+                                    guard.queue.push_back(UnifiedTask::Stage1(block_idx));
+                                    // pending_tasks counts total outstanding work units
+                                    // (queued + currently executing). A successful Stage0
+                                    // completion creates one new outstanding Stage1 task.
+                                    guard.pending_tasks += 1;
+                                    cv_ref.notify_one();
+                                } else {
+                                    *results_ref[block_idx].lock().expect("result slot poisoned") =
+                                        Some(Err(PzError::InvalidInput));
+                                }
                             }
                             Err(e) => {
                                 *results_ref[block_idx].lock().expect("result slot poisoned") =
                                     Some(Err(e));
+                                let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                                if !guard.failed {
+                                    guard.failed = true;
+                                    // Cancel not-yet-started tasks and account for them
+                                    // in pending_tasks since no worker will decrement them.
+                                    let dropped = guard.queue.len();
+                                    guard.queue.clear();
+                                    guard.pending_tasks =
+                                        guard.pending_tasks.saturating_sub(dropped);
+                                    cv_ref.notify_all();
+                                }
                             }
                         }
                     }
@@ -234,8 +263,19 @@ fn compress_parallel_unified_lz_rans(
                             .take()
                             .expect("stage0 result missing");
                         let result = run_compress_stage(pipeline, 1, stage0, &opts).map(|b| b.data);
+                        let is_err = result.is_err();
                         *results_ref[block_idx].lock().expect("result slot poisoned") =
                             Some(result);
+                        if is_err {
+                            let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                            if !guard.failed {
+                                guard.failed = true;
+                                let dropped = guard.queue.len();
+                                guard.queue.clear();
+                                guard.pending_tasks = guard.pending_tasks.saturating_sub(dropped);
+                                cv_ref.notify_all();
+                            }
+                        }
                     }
                 }
 
@@ -263,19 +303,14 @@ fn compress_parallel_unified_lz_rans(
         block_data_vec.push(result);
     }
 
-    let mut output = Vec::new();
-    write_header(&mut output, pipeline, input.len());
-    output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
-    for (i, compressed) in block_data_vec.iter().enumerate() {
-        let orig_block_len = blocks[i].len() as u32;
-        let comp_block_len = compressed.len() as u32;
-        output.extend_from_slice(&comp_block_len.to_le_bytes());
-        output.extend_from_slice(&orig_block_len.to_le_bytes());
-    }
-    for compressed in &block_data_vec {
-        output.extend_from_slice(compressed);
-    }
-    Ok(output)
+    let orig_block_lens: Vec<usize> = blocks.iter().map(|b| b.len()).collect();
+    let block_slices: Vec<&[u8]> = block_data_vec.iter().map(|v| v.as_slice()).collect();
+    Ok(assemble_multiblock_container(
+        pipeline,
+        input.len(),
+        &orig_block_lens,
+        &block_slices,
+    ))
 }
 
 /// Batched GPU LZ77 compression for multi-block inputs.
@@ -555,20 +590,14 @@ fn assemble_multiblock_output(
         }
     }
 
-    let mut output = Vec::new();
-    write_header(&mut output, pipeline, input.len());
-    output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
-    for (i, compressed) in block_data_vec.iter().enumerate() {
-        let orig_block_len = blocks[i].len() as u32;
-        let comp_block_len = compressed.len() as u32;
-        output.extend_from_slice(&comp_block_len.to_le_bytes());
-        output.extend_from_slice(&orig_block_len.to_le_bytes());
-    }
-    for compressed in &block_data_vec {
-        output.extend_from_slice(compressed);
-    }
-
-    Ok(output)
+    let orig_block_lens: Vec<usize> = blocks.iter().map(|b| b.len()).collect();
+    let block_slices: Vec<&[u8]> = block_data_vec.iter().map(|v| v.as_slice()).collect();
+    Ok(assemble_multiblock_container(
+        pipeline,
+        input.len(),
+        &orig_block_lens,
+        &block_slices,
+    ))
 }
 
 /// Demux LZ77 matches and apply the appropriate entropy encoder for the given pipeline.

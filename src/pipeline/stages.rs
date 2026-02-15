@@ -343,6 +343,9 @@ pub(crate) fn stage_rans_encode_with_options(
                     (data, len)
                 } else {
                     let data = rans::encode(stream);
+                    if data.len() >= (1usize << 31) {
+                        return Err(PzError::InvalidInput);
+                    }
                     let len = data.len() as u32;
                     (data, len)
                 };
