@@ -16,9 +16,19 @@ The current GPU pipeline hands LZ77 matches back to CPU for entropy encoding, le
 3. Unified scheduler extended with a `GpuBatch` task type for full on-device pipelines.
 4. Automatic CPU/GPU partitioning policy based on device occupancy and input characteristics.
 
-## Key Insight
+## Key Insights
 
-If the GPU owns all stages on device (LZ77 → demux → rANS), a "GPU block" is just another synchronous task from the scheduler's perspective: one worker submits a batch, blocks on device fence, gets back compressed output. The existing `Mutex<VecDeque>` + `Condvar` task model survives — it just needs a `GpuBatch(Range<usize>)` variant alongside the current `Stage0`/`Stage1` CPU variants.
+**Scheduler compatibility.** If the GPU owns all stages on device (LZ77 → demux → rANS), a "GPU block" is just another synchronous task from the scheduler's perspective: one worker submits a batch, blocks on device fence, gets back compressed output. The existing `Mutex<VecDeque>` + `Condvar` task model survives — it just needs a `GpuBatch(Range<usize>)` variant alongside the current `Stage0`/`Stage1` CPU variants.
+
+**GPU occupancy requires chunk-level parallelism.** Sequential entropy coding (rANS, FSE) on GPU gives one thread per lane. Even with N=32 interleaved lanes × 3 semantic streams × 10 batched blocks = 960 threads — far below the ~8K-16K needed for GPU saturation. The existing GPU FSE kernels (`fse_encode.wgsl`, `fse_decode.wgsl`) use `@workgroup_size(1)` with one thread per lane for the same reason — entropy is inherently sequential per-state. This is tolerable today because GPU value comes from LZ77, not entropy. For rANS to be the primary GPU entropy path at high throughput, streams must be chunked into small independent segments (4-16KB each), each encoded separately, giving chunk × lane × stream × block parallelism:
+
+| Chunk size | Chunks/300KB stream | × 4 lanes | × 3 streams | × 10 blocks | Total threads |
+|------------|---------------------|-----------|-------------|-------------|---------------|
+| 16KB | 19 | 76 | 228 | 2,280 | marginal |
+| 4KB | 75 | 300 | 900 | 9,000 | good |
+| 1KB | 300 | 1,200 | 3,600 | 36,000 | saturated |
+
+The tradeoff: smaller chunks = more parallelism but more framing overhead (per-chunk final states, potential per-chunk frequency tables). The wire format must include chunk boundaries from the start — retrofitting chunking into a flat interleaved format is a format break. PLAN-interleaved-rans.md Phase C anticipates this with `entropy_chunk_bytes` as a tunable.
 
 ## Scope
 
@@ -53,27 +63,47 @@ If the GPU owns all stages on device (LZ77 → demux → rANS), a "GPU block" is
 
 ## Implementation Phases
 
-### Phase 1: GPU rANS Kernels
+### Phase 1: Chunked GPU rANS Kernels
 
-**Goal:** Byte-identical GPU rANS encode/decode matching CPU interleaved format.
+**Goal:** GPU rANS encode/decode with chunk-level parallelism and CPU decode compatibility.
+
+The critical design decision is chunking granularity. A naive one-thread-per-lane kernel (like the existing FSE kernels) will not saturate the GPU. Streams must be split into independent chunks, each encoded with its own rANS state(s), to achieve sufficient thread count.
 
 Tasks:
 
-1. Implement `rans_encode.wgsl` — per-lane interleaved rANS encode.
-   - Each GPU thread processes one lane (one rANS state).
-   - Output format must match CPU `encode_interleaved_n`: `[scale_bits][freq_table][num_states][final_states][word_counts][lane_words...]`.
-   - Backward-pass dependency within a lane is sequential per-thread; parallelism comes from N independent lanes.
-2. Implement `rans_decode.wgsl` — per-lane interleaved rANS decode.
+1. **Design chunked rANS wire format.** Extend the interleaved rANS framing with chunk boundaries:
+   ```
+   [scale_bits: u8]
+   [freq_table: 256 × u16]        ← shared across all chunks (one table per stream)
+   [num_chunks: u16]
+   [chunk_original_lens: num_chunks × u16]
+   per chunk:
+     [num_states: u8]
+     [final_states: N × u32]
+     [word_counts: N × u32]
+     [lane_words...]
+   ```
+   Frequency table is shared (computed from the full stream) to avoid per-chunk ratio loss. Each chunk carries only its own final states and word data.
+2. **CPU chunked encode/decode.** Add `rans::encode_chunked` and `rans::decode_chunked` to `src/rans.rs` before writing GPU kernels. This gives a CPU reference implementation for equivalence testing and allows the format to be validated end-to-end without GPU hardware.
+3. **Implement `rans_encode.wgsl`** — one workgroup per chunk, one thread per lane within chunk.
+   - Backward-pass dependency within a lane is sequential per-thread; parallelism comes from chunk × lane independence.
+   - Frequency table loaded once into workgroup shared memory.
+   - Dispatch: `num_chunks × num_lanes` threads total (e.g., 75 chunks × 4 lanes = 300 threads per stream).
+4. **Implement `rans_decode.wgsl`** — same dispatch structure.
    - Decode hot path is multiply-add (GPU-friendly, no division via reciprocal table).
    - Word-aligned I/O (16-bit) suits GPU memory access patterns.
-3. Add `WebGpuEngine` methods: `rans_encode_interleaved`, `rans_decode_interleaved`.
-4. CPU/GPU equivalence tests: encode on GPU → decode on CPU, encode on CPU → decode on GPU, bit-exact both directions.
+5. **Add `WebGpuEngine` methods:** `rans_encode_chunked`, `rans_decode_chunked`.
+6. **CPU/GPU equivalence tests:** encode on GPU → decode on CPU, encode on CPU → decode on GPU, bit-exact both directions. Include edge cases: single-chunk streams (below chunk threshold), empty chunks, maximum chunk count.
+7. **Chunk size tuning sweep.** Benchmark 1KB, 4KB, 8KB, 16KB chunk sizes on 256KB and 1MB inputs. Find the Pareto frontier of GPU occupancy vs framing overhead (ratio loss).
 
 Acceptance:
 
-1. Round-trip parity with CPU interleaved rANS for all tested inputs.
+1. Round-trip parity between CPU chunked rANS and GPU chunked rANS for all tested inputs.
 2. GPU rANS decode throughput >= 2x CPU single-stream decode on 1MB+ data.
-3. No new WGSL compilation warnings.
+3. Compression ratio within 0.5% of unchunked interleaved rANS at chosen default chunk size.
+4. No new WGSL compilation warnings.
+
+**Design note:** The unchunked interleaved format from PR #91 remains valid for CPU-only paths where GPU occupancy is irrelevant. The chunked format is a superset — a stream with `num_chunks=1` is equivalent to the unchunked format. The `RANS_INTERLEAVED_FLAG` in the per-stream compressed length field can be extended with a second flag bit (`RANS_CHUNKED_FLAG = 1 << 30`) to signal chunked payloads, preserving backward compatibility with existing single-stream and unchunked-interleaved decoders.
 
 ### Phase 2: GPU Demux Kernel
 
@@ -164,7 +194,8 @@ Acceptance:
 
 ## Risks
 
-1. **rANS encode backward-pass is hard to parallelize within a single lane.** Mitigation: interleaved format already partitions into N independent lanes; each lane is a separate GPU thread. Parallelism comes from inter-lane independence, not intra-lane parallelism.
+1. **rANS encode backward-pass is hard to parallelize within a single lane.** Mitigation: chunking splits streams into many independent segments; parallelism comes from chunk × lane count, not from parallelizing the sequential state machine within a single lane.
+5. **Chunk size is a ratio/throughput tradeoff.** Smaller chunks = more GPU threads but more framing overhead and potentially worse ratio (less context for frequency estimation, though shared freq table mitigates this). Mitigation: shared frequency table across chunks; benchmark sweep in Phase 1 to find the Pareto frontier; make chunk size a tunable with conservative default.
 2. **Demux kernel memory amplification.** Splitting one match stream into 3-4 output streams requires scatter writes with unpredictable output sizes. Mitigation: two-pass approach (count pass for offsets, then write pass), matching the existing GPU Huffman encode pattern.
 3. **Partitioning heuristic is workload-dependent.** Wrong split wastes one device. Mitigation: conservative defaults (CPU-only unless input is large), user override via policy flag, benchmark-driven threshold tuning.
 4. **Command buffer chaining complexity.** Buffer lifetime and synchronization across stages in a single submission. Mitigation: Phase 5 is last; validate correctness in Phases 1-4 with separate submissions first.
@@ -176,7 +207,8 @@ Acceptance:
 
 ## Immediate Next Actions
 
-1. Prototype `rans_encode.wgsl` for single-lane rANS encode; validate against CPU `rans::encode` output.
-2. Extend to N-lane interleaved encode matching `encode_interleaved_n` output format.
-3. Add `WebGpuEngine::rans_encode` method and CPU↔GPU equivalence test.
-4. Benchmark GPU rANS encode throughput vs CPU baseline on 256KB and 1MB inputs.
+1. Design chunked rANS wire format and get agreement on flag bit allocation (`RANS_CHUNKED_FLAG`).
+2. Implement CPU `rans::encode_chunked` / `rans::decode_chunked` in `src/rans.rs` as reference implementation.
+3. Add round-trip tests for chunked format at various chunk sizes (1KB, 4KB, 16KB).
+4. Prototype `rans_encode.wgsl` for chunk-parallel encode; validate against CPU `rans::decode_chunked`.
+5. Benchmark chunk size sweep: ratio impact and GPU thread count at 256KB and 1MB input sizes.
