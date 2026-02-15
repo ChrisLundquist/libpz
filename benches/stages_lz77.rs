@@ -2,7 +2,9 @@
 mod stages_common;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use stages_common::{cap, get_test_data, SIZES_ALL};
+use stages_common::{cap, get_test_data};
+
+const SIZES_ALL: &[usize] = &[8192, 65536, 4_194_304];
 
 fn bench_lz77(c: &mut Criterion) {
     let mut group = c.benchmark_group("lz77");

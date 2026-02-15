@@ -1,13 +1,7 @@
-#![allow(dead_code)]
-
 use criterion::measurement::WallTime;
 use criterion::BenchmarkGroup;
 use std::path::Path;
 use std::time::Duration;
-
-pub const SIZES_SMALL: &[usize] = &[8192, 65536];
-pub const SIZES_ALL: &[usize] = &[8192, 65536, 4_194_304];
-pub const SIZES_LARGE: &[usize] = &[262_144, 4_194_304];
 
 pub fn cap(group: &mut BenchmarkGroup<'_, WallTime>) {
     group.warm_up_time(Duration::from_secs(2));

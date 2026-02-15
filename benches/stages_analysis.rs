@@ -2,10 +2,11 @@
 mod stages_common;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use stages_common::get_test_data;
+use stages_common::{cap, get_test_data};
 
 fn bench_analysis(c: &mut Criterion) {
     let mut group = c.benchmark_group("analysis");
+    cap(&mut group);
     for &size in &[8192, 65536] {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
