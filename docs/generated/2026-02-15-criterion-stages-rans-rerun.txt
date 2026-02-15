@@ -1,0 +1,75 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling pz v0.1.0 (/Users/clundquist/code/libpz)
+    Finished `bench` profile [optimized] target(s) in 8.10s
+     Running benches/stages_rans.rs (target/release/deps/stages_rans-d9956c2bdaa3cd94)
+Gnuplot not found, using plotters backend
+Benchmarking rans/encode/8192
+Benchmarking rans/encode/8192: Warming up for 2.0000 s
+Benchmarking rans/encode/8192: Collecting 10 samples in estimated 5.0021 s (125k iterations)
+Benchmarking rans/encode/8192: Analyzing
+rans/encode/8192        time:   [48.715 µs 49.427 µs 50.516 µs]
+                        thrpt:  [154.65 MiB/s 158.06 MiB/s 160.37 MiB/s]
+                 change:
+                        time:   [-59.479% -53.923% -45.303%] (p = 0.00 < 0.05)
+                        thrpt:  [+82.825% +117.03% +146.79%]
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+Benchmarking rans/decode/8192
+Benchmarking rans/decode/8192: Warming up for 2.0000 s
+Benchmarking rans/decode/8192: Collecting 10 samples in estimated 5.0005 s (80k iterations)
+Benchmarking rans/decode/8192: Analyzing
+rans/decode/8192        time:   [50.618 µs 51.695 µs 53.818 µs]
+                        thrpt:  [145.17 MiB/s 151.13 MiB/s 154.34 MiB/s]
+                 change:
+                        time:   [-21.818% -19.874% -18.178%] (p = 0.00 < 0.05)
+                        thrpt:  [+22.216% +24.803% +27.906%]
+                        Performance has improved.
+Benchmarking rans/encode/65536
+Benchmarking rans/encode/65536: Warming up for 2.0000 s
+Benchmarking rans/encode/65536: Collecting 10 samples in estimated 5.0036 s (11k iterations)
+Benchmarking rans/encode/65536: Analyzing
+rans/encode/65536       time:   [435.23 µs 437.81 µs 440.34 µs]
+                        thrpt:  [141.93 MiB/s 142.76 MiB/s 143.60 MiB/s]
+                 change:
+                        time:   [+28.733% +31.892% +35.191%] (p = 0.00 < 0.05)
+                        thrpt:  [-26.030% -24.180% -22.320%]
+                        Performance has regressed.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) low severe
+  1 (10.00%) low mild
+Benchmarking rans/decode/65536
+Benchmarking rans/decode/65536: Warming up for 2.0000 s
+Benchmarking rans/decode/65536: Collecting 10 samples in estimated 5.0064 s (8470 iterations)
+Benchmarking rans/decode/65536: Analyzing
+rans/decode/65536       time:   [483.03 µs 565.66 µs 607.48 µs]
+                        thrpt:  [102.88 MiB/s 110.49 MiB/s 129.39 MiB/s]
+                 change:
+                        time:   [-24.575% -5.6117% +22.733%] (p = 0.66 > 0.05)
+                        thrpt:  [-18.522% +5.9454% +32.582%]
+                        No change in performance detected.
+Benchmarking rans/encode/4194304
+Benchmarking rans/encode/4194304: Warming up for 2.0000 s
+Benchmarking rans/encode/4194304: Collecting 10 samples in estimated 7.4509 s (165 iterations)
+Benchmarking rans/encode/4194304: Analyzing
+rans/encode/4194304     time:   [39.830 ms 43.522 ms 51.890 ms]
+                        thrpt:  [77.086 MiB/s 91.908 MiB/s 100.43 MiB/s]
+                 change:
+                        time:   [-26.551% -2.3210% +33.456%] (p = 0.88 > 0.05)
+                        thrpt:  [-25.069% +2.3761% +36.150%]
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+Benchmarking rans/decode/4194304
+Benchmarking rans/decode/4194304: Warming up for 2.0000 s
+Benchmarking rans/decode/4194304: Collecting 10 samples in estimated 5.9946 s (165 iterations)
+Benchmarking rans/decode/4194304: Analyzing
+rans/decode/4194304     time:   [34.330 ms 36.231 ms 38.773 ms]
+                        thrpt:  [103.16 MiB/s 110.40 MiB/s 116.52 MiB/s]
+                 change:
+                        time:   [+61.701% +67.741% +75.078%] (p = 0.00 < 0.05)
+                        thrpt:  [-42.883% -40.384% -38.158%]
+                        Performance has regressed.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+

@@ -1,0 +1,47 @@
+Provenance: e5b3290-dirty
+lz77/compress_lazy/8192 time:   [107.04 µs 107.75 µs 108.37 µs]
+                        thrpt:  [72.093 MiB/s 72.507 MiB/s 72.989 MiB/s]
+                 change:
+                        time:   [+0.8992% +2.1196% +3.1352%] (p = 0.00 < 0.05)
+                        thrpt:  [-3.0399% -2.0756% -0.8911%]
+                        Change within noise threshold.
+lz77/decompress/8192    time:   [17.067 µs 17.654 µs 18.094 µs]
+                        thrpt:  [431.77 MiB/s 442.52 MiB/s 457.75 MiB/s]
+                 change:
+                        time:   [+14.898% +18.996% +23.632%] (p = 0.00 < 0.05)
+                        thrpt:  [-19.115% -15.963% -12.967%]
+                        Performance has regressed.
+lz77/compress_lazy/65536
+                        time:   [916.03 µs 922.73 µs 929.99 µs]
+                        thrpt:  [67.205 MiB/s 67.734 MiB/s 68.229 MiB/s]
+                 change:
+                        time:   [+9.2865% +10.082% +10.830%] (p = 0.00 < 0.05)
+                        thrpt:  [-9.7714% -9.1584% -8.4974%]
+                        Performance has regressed.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) low severe
+  1 (10.00%) high severe
+lz77/decompress/65536   time:   [146.09 µs 146.35 µs 146.52 µs]
+                        thrpt:  [426.57 MiB/s 427.04 MiB/s 427.81 MiB/s]
+                 change:
+                        time:   [+14.390% +14.982% +15.456%] (p = 0.00 < 0.05)
+                        thrpt:  [-13.387% -13.030% -12.580%]
+                        Performance has regressed.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
+lz77/compress_lazy/4194304
+                        time:   [69.802 ms 71.656 ms 72.853 ms]
+                        thrpt:  [54.905 MiB/s 55.823 MiB/s 57.305 MiB/s]
+                 change:
+                        time:   [+39.227% +41.434% +44.154%] (p = 0.00 < 0.05)
+                        thrpt:  [-30.630% -29.295% -28.175%]
+                        Performance has regressed.
+lz77/decompress/4194304 time:   [6.4726 ms 6.4996 ms 6.5300 ms]
+                        thrpt:  [612.55 MiB/s 615.42 MiB/s 617.99 MiB/s]
+                 change:
+                        time:   [+20.784% +23.646% +25.735%] (p = 0.00 < 0.05)
+                        thrpt:  [-20.468% -19.124% -17.207%]
+                        Performance has regressed.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+

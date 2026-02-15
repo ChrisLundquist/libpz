@@ -3,6 +3,11 @@
 
 set -euo pipefail
 
+# Normalize locale for portable tool behavior (notably perl Time::HiRes).
+# Some hosts do not have C.UTF-8 installed and emit noisy warnings.
+export LC_ALL=C
+export LANG=C
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 

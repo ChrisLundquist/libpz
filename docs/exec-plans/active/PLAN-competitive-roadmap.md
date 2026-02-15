@@ -248,3 +248,38 @@ Acceptance criteria:
       - `lzr` encode: 54.8 → 50.5 MB/s
       - `bench.sh -n 3 -p lzr -t 0`: compression 26.4 → 24.7 MB/s, decompression 37.1 → 37.9 MB/s
     - Decision: keep safe code path and continue with non-unsafe optimization work.
+16. New Samply-driven LZ77 hotspot pass:
+    - Captured fresh profile: `profiling/e5b3290-dirty/lz77_encode_1MB.json.gz`.
+    - Although saved JSON remained unsymbolicated, frame addresses were mapped to symbols via `nm -n target/profiling/examples/profile`.
+    - Dominant hotspots identified: `pz::simd::compare_bytes_avx2` and `pz::lz77::HashChainFinder::find_match`.
+17. Implemented hotspot-targeted safe optimizations in `src/lz77.rs`:
+    - Added best-length probe prefilter in `find_match` to skip futile SIMD compares.
+    - Added early chain-exit when no longer possible to improve useful match length.
+    - Replaced `% MAX_WINDOW` with `& WINDOW_MASK` ring indexing in hot loops.
+18. Validation and measurements after patch:
+    - `cargo test lz77` passed.
+    - `cargo test lzr` passed.
+    - `cargo bench --bench stages_lz77` showed statistically significant throughput improvements across all tested sizes.
+    - `./scripts/bench.sh -n 3 -p lzr -t 0` summary:
+      - `pz-lzr` compression: 26.1 MB/s
+      - `pz-lzr` decompression: 37.3 MB/s
+19. Executed Objective 3 (parse-mode chain-depth tuning on CPU):
+    - Added parse-mode-aware chain limit selection in `src/lz77.rs`:
+      - `Auto` on large inputs uses reduced chain depth (`MAX_CHAIN_AUTO=48`).
+      - `Lazy` keeps full chain depth (`MAX_CHAIN=64`).
+    - Wired through CPU LZ77 backend and demux fast path via new helper in `src/pipeline/mod.rs`.
+20. Executed Objective 4 (compare-loop overhead reduction):
+    - Added `Dispatcher::compare_bytes_ptr` in `src/simd.rs`.
+    - Updated `HashChainFinder::find_match` and `find_top_k` to use precomputed pointers and compare limit, removing per-candidate slice/min setup overhead.
+21. Attempts and outcome notes:
+    - Two intermediate safe optimizations (short AVX2 branch path and hash-collision triple-byte gate) were benchmarked and showed regressions; both were removed.
+    - Kept only the pointer-compare optimization for Objective 4.
+22. Validation and benchmarks:
+    - Tests: `cargo test lz77`, `cargo test lzr` passed.
+    - `cargo bench --bench stages_lz77` (pointer-compare run):
+      - `compress_lazy` improved across tested sizes (notably 64KB and 4MB).
+      - `decompress` mostly neutral to improved depending on size.
+    - `./scripts/bench.sh -n 3 -p lzr -t 0` after Objective 3+4:
+      - `pz-lzr` compression: 26.7 MB/s
+      - `pz-lzr` decompression: 36.4 MB/s
+      - ratio unchanged at 40.6% (Canterbury set in script).

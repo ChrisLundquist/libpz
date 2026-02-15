@@ -77,10 +77,9 @@ impl StreamDemuxer for LzDemuxer {
                 let (offsets, lengths, literals, lz_len) = if options.backend == Backend::Cpu
                     && matches!(
                         options.parse_strategy,
-                        ParseStrategy::Auto | ParseStrategy::Lazy
+                        ParseStrategy::Auto | ParseStrategy::Lazy | ParseStrategy::Optimal
                     ) {
-                    let max_match = options.max_match_len.unwrap_or(lz77::DEFLATE_MAX_MATCH);
-                    let matches = lz77::compress_lazy_to_matches_with_limit(input, max_match)?;
+                    let matches = super::lz77_matches_with_backend(input, options)?;
                     let num_matches = matches.len();
                     let mut offsets = Vec::with_capacity(num_matches * 2);
                     let mut lengths = Vec::with_capacity(num_matches * 2);
@@ -201,20 +200,34 @@ impl StreamDemuxer for LzDemuxer {
                     return Err(PzError::InvalidInput);
                 }
                 let num_matches = literals.len();
-                let match_size = lz77::Match::SERIALIZED_SIZE;
-                let mut lz_data = Vec::with_capacity(num_matches * match_size);
+                let mut output = vec![0u8; original_len];
+                let mut out_pos = 0usize;
 
                 for i in 0..num_matches {
-                    lz_data.push(offsets[i * 2]);
-                    lz_data.push(offsets[i * 2 + 1]);
-                    lz_data.push(lengths[i * 2]);
-                    lz_data.push(lengths[i * 2 + 1]);
-                    lz_data.push(literals[i]);
+                    let offset = u16::from_le_bytes([offsets[i * 2], offsets[i * 2 + 1]]) as usize;
+                    let length = u16::from_le_bytes([lengths[i * 2], lengths[i * 2 + 1]]) as usize;
+                    let next = literals[i];
+
+                    if out_pos + length + 1 > output.len() {
+                        return Err(PzError::BufferTooSmall);
+                    }
+
+                    if length > 0 {
+                        if offset > out_pos {
+                            return Err(PzError::InvalidInput);
+                        }
+                        for _ in 0..length {
+                            let src = out_pos - offset;
+                            output[out_pos] = output[src];
+                            out_pos += 1;
+                        }
+                    }
+
+                    output[out_pos] = next;
+                    out_pos += 1;
                 }
 
-                let mut output = vec![0u8; original_len];
-                let out_len = lz77::decompress_to_buf(&lz_data, &mut output)?;
-                if out_len != original_len {
+                if out_pos != original_len {
                     return Err(PzError::InvalidInput);
                 }
                 Ok(output)

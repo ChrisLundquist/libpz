@@ -9,6 +9,7 @@ For detailed documentation, see `docs/DESIGN.md`, `docs/QUALITY.md`, `docs/desig
 ./scripts/test.sh --quick      # Skip build step, just lint + test
 ./scripts/test.sh --fix        # Auto-fix fmt + clippy before checking
 ./scripts/test.sh --all        # Test all feature combinations
+./scripts/test-targets.sh ...  # Run multiple cargo test targets sequentially
 ```
 
 The pre-commit hook (auto-configured by `scripts/setup.sh`) runs fmt, clippy, and tests before every commit. Use `--no-default-features` for CPU-only builds/tests. Prefer delegating test runs to the **tester** agent to keep your context clean.
@@ -18,6 +19,7 @@ The pre-commit hook (auto-configured by `scripts/setup.sh`) runs fmt, clippy, an
 ```bash
 ./scripts/bench.sh             # pz vs gzip comparison (all pipelines, quiet)
 ./scripts/profile.sh           # samply profiling (see --help for options)
+./scripts/samply-top-symbols.sh --profile ... --binary ...  # hotspot mapping for unsymbolicated save-only JSON
 ./scripts/gpu-meminfo.sh       # GPU memory cost calculator
 ./scripts/trace-pipeline.sh    # pipeline flow diagrams (text or mermaid)
 ./scripts/webgpu_profile.sh   # GPU vs CPU per-stage timing comparisons

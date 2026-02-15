@@ -16,6 +16,7 @@ use crate::{PzError, PzResult};
 /// 32KB matches the gzip standard and provides much better compression
 /// than the previous 4KB window, especially on repetitive data.
 pub(crate) const MAX_WINDOW: usize = 32768;
+const WINDOW_MASK: usize = MAX_WINDOW - 1;
 
 /// Minimum match length to consider (shorter matches aren't worth encoding).
 pub(crate) const MIN_MATCH: u16 = 3;
@@ -26,6 +27,8 @@ pub(crate) const HASH_MASK: usize = HASH_SIZE - 1;
 
 /// Maximum number of chain links to follow per position.
 pub(crate) const MAX_CHAIN: usize = 64;
+/// Reduced chain depth used by auto/speed-biased parsing on large inputs.
+const MAX_CHAIN_AUTO: usize = 48;
 
 /// Maximum match length for DEFLATE-compatible pipelines (RFC 1951).
 pub const DEFLATE_MAX_MATCH: u16 = 258;
@@ -191,6 +194,8 @@ pub(crate) struct HashChainFinder {
     /// other pipelines can use larger values (up to u16::MAX) for better
     /// compression on repetitive data.
     max_match_len: usize,
+    /// Maximum number of chain links to walk for each match search.
+    max_chain: usize,
 }
 
 impl HashChainFinder {
@@ -201,11 +206,17 @@ impl HashChainFinder {
 
     /// Create a match finder with a caller-specified max match length.
     pub(crate) fn with_max_match_len(max_match_len: u16) -> Self {
+        Self::with_tuning(max_match_len, MAX_CHAIN)
+    }
+
+    /// Create a match finder with explicit chain-depth tuning.
+    pub(crate) fn with_tuning(max_match_len: u16, max_chain: usize) -> Self {
         Self {
             head: vec![0; HASH_SIZE],
             prev: vec![0; MAX_WINDOW],
             dispatcher: crate::simd::Dispatcher::new(),
             max_match_len: max_match_len as usize,
+            max_chain: max_chain.clamp(1, MAX_CHAIN),
         }
     }
 
@@ -228,31 +239,52 @@ impl HashChainFinder {
         let mut chain_pos = self.head[h] as usize;
         let mut best_offset: u32 = 0;
         let mut best_length: u32 = 0;
+        let mut best_probe_byte: u8 = 0;
         let min_pos = pos.saturating_sub(MAX_WINDOW);
         let mut chain_count = 0;
+        let pos_suffix = &input[pos..];
+        let cmp_limit = remaining.min(self.max_match_len);
 
-        while chain_pos >= min_pos && chain_pos < pos && chain_count < MAX_CHAIN {
+        while chain_pos >= min_pos && chain_pos < pos && chain_count < self.max_chain {
+            // If a candidate differs at the current best-length probe point,
+            // it cannot beat the current best match. Skip the SIMD compare.
+            if best_length >= MIN_MATCH as u32 {
+                let probe = best_length as usize;
+                debug_assert!(probe < remaining);
+                if input[chain_pos + probe] != best_probe_byte {
+                    let prev_pos = self.prev[chain_pos & WINDOW_MASK] as usize;
+                    if prev_pos >= chain_pos || prev_pos < min_pos {
+                        break;
+                    }
+                    chain_pos = prev_pos;
+                    chain_count += 1;
+                    continue;
+                }
+            }
+
             // SIMD-accelerated byte comparison.
             // max_len is capped only by remaining bytes (not by offset distance),
             // allowing overlapping matches where length > offset. This enables
             // efficient encoding of repeated-byte runs (e.g., offset=1, length=999
             // for 1000 identical bytes). The decompressor's byte-by-byte copy loop
             // already handles the overlap correctly.
-            let max_len = remaining;
-            let match_len = self.dispatcher.compare_bytes(
-                &input[chain_pos..],
-                &input[pos..],
-                self.max_match_len,
-            ) as u32;
-            let match_len = match_len.min(max_len as u32);
+            let match_len =
+                self.dispatcher
+                    .compare_bytes(&input[chain_pos..], pos_suffix, cmp_limit)
+                    as u32;
 
             if match_len > best_length && match_len >= MIN_MATCH as u32 {
                 best_length = match_len;
                 best_offset = (pos - chain_pos) as u32;
+                // Can't do better while still leaving room for the required literal.
+                if best_length as usize + 1 >= remaining {
+                    break;
+                }
+                best_probe_byte = input[pos + best_length as usize];
             }
 
             // Follow chain
-            let prev_pos = self.prev[chain_pos % MAX_WINDOW] as usize;
+            let prev_pos = self.prev[chain_pos & WINDOW_MASK] as usize;
             if prev_pos >= chain_pos || prev_pos < min_pos {
                 break;
             }
@@ -290,7 +322,7 @@ impl HashChainFinder {
             return;
         }
         let h = hash3(input, pos);
-        self.prev[pos % MAX_WINDOW] = self.head[h];
+        self.prev[pos & WINDOW_MASK] = self.head[h];
         self.head[h] = pos as u32;
     }
 
@@ -316,15 +348,13 @@ impl HashChainFinder {
         // Use a simple vec of (length, offset) pairs; K is small.
         let mut found: Vec<(u16, u16)> = Vec::new();
 
-        while chain_pos >= min_pos && chain_pos < pos && chain_count < MAX_CHAIN {
+        while chain_pos >= min_pos && chain_pos < pos && chain_count < self.max_chain {
             // Allow overlapping matches (length > offset) for run compression.
-            let max_len = remaining;
             let match_len = self.dispatcher.compare_bytes(
                 &input[chain_pos..],
                 &input[pos..],
                 self.max_match_len,
             ) as u32;
-            let match_len = match_len.min(max_len as u32);
 
             if match_len >= MIN_MATCH as u32 {
                 let offset = (pos - chain_pos) as u16;
@@ -346,7 +376,7 @@ impl HashChainFinder {
             }
 
             // Follow chain
-            let prev_pos = self.prev[chain_pos % MAX_WINDOW] as usize;
+            let prev_pos = self.prev[chain_pos & WINDOW_MASK] as usize;
             if prev_pos >= chain_pos || prev_pos < min_pos {
                 break;
             }
@@ -383,12 +413,22 @@ pub(crate) fn compress_lazy_to_matches_with_limit(
     input: &[u8],
     max_match_len: u16,
 ) -> PzResult<Vec<Match>> {
+    compress_lazy_to_matches_with_limit_and_chain(input, max_match_len, MAX_CHAIN)
+}
+
+/// Like `compress_lazy_to_matches_with_limit`, but with caller-controlled
+/// chain depth for speed/ratio tuning.
+pub(crate) fn compress_lazy_to_matches_with_limit_and_chain(
+    input: &[u8],
+    max_match_len: u16,
+    max_chain: usize,
+) -> PzResult<Vec<Match>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut matches = Vec::with_capacity(input.len() / 4);
-    let mut finder = HashChainFinder::with_max_match_len(max_match_len);
+    let mut finder = HashChainFinder::with_tuning(max_match_len, max_chain);
     let mut pos: usize = 0;
 
     while pos < input.len() {
@@ -454,6 +494,26 @@ pub(crate) fn compress_lazy_with_limit(input: &[u8], max_match_len: u16) -> PzRe
         output.extend_from_slice(&m.to_bytes());
     }
     Ok(output)
+}
+
+/// Parse-mode-aware chain-depth heuristic.
+///
+/// `prefer_speed = true` is used for auto/default CPU mode on large blocks.
+pub(crate) fn select_chain_depth(input_len: usize, prefer_speed: bool) -> usize {
+    if !prefer_speed {
+        return MAX_CHAIN;
+    }
+    // Keep full search on small blocks. On larger inputs, progressively trim
+    // chain depth where CPU time grows super-linearly but ratio gains flatten.
+    if input_len >= 4 * 1024 * 1024 {
+        24
+    } else if input_len >= 1024 * 1024 {
+        32
+    } else if input_len >= 256 * 1024 {
+        MAX_CHAIN_AUTO
+    } else {
+        MAX_CHAIN
+    }
 }
 
 #[cfg(test)]
@@ -561,6 +621,15 @@ mod tests {
         let compressed = compress_lazy(input).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(&decompressed, &input[..]);
+    }
+
+    #[test]
+    fn test_chain_depth_selection_tiers() {
+        assert_eq!(select_chain_depth(128 * 1024, true), MAX_CHAIN);
+        assert_eq!(select_chain_depth(256 * 1024, true), MAX_CHAIN_AUTO);
+        assert_eq!(select_chain_depth(1024 * 1024, true), 32);
+        assert_eq!(select_chain_depth(4 * 1024 * 1024, true), 24);
+        assert_eq!(select_chain_depth(4 * 1024 * 1024, false), MAX_CHAIN);
     }
 
     #[test]

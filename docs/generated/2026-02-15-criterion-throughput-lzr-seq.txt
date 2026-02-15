@@ -1,0 +1,93 @@
+    Finished `bench` profile [optimized] target(s) in 0.10s
+     Running benches/throughput_lzr.rs (target/release/deps/throughput_lzr-d45a9500cfa444e8)
+Gnuplot not found, using plotters backend
+Benchmarking compress_lzr/pz/Lzr
+Benchmarking compress_lzr/pz/Lzr: Warming up for 2.0000 s
+Benchmarking compress_lzr/pz/Lzr: Collecting 10 samples in estimated 5.0474 s (385 iterations)
+Benchmarking compress_lzr/pz/Lzr: Analyzing
+compress_lzr/pz/Lzr     time:   [13.006 ms 13.216 ms 13.383 ms]
+                        thrpt:  [201.03 MiB/s 203.57 MiB/s 206.86 MiB/s]
+                 change:
+                        time:   [-20.401% -15.595% -10.856%] (p = 0.00 < 0.05)
+                        thrpt:  [+12.178% +18.476% +25.630%]
+                        Performance has improved.
+
+Benchmarking decompress_lzr/pz/Lzr
+Benchmarking decompress_lzr/pz/Lzr: Warming up for 2.0000 s
+Benchmarking decompress_lzr/pz/Lzr: Collecting 10 samples in estimated 5.1952 s (1045 iterations)
+Benchmarking decompress_lzr/pz/Lzr: Analyzing
+decompress_lzr/pz/Lzr   time:   [4.9841 ms 5.0262 ms 5.0770 ms]
+                        thrpt:  [529.92 MiB/s 535.28 MiB/s 539.80 MiB/s]
+                 change:
+                        time:   [-8.2438% -3.4602% +1.2819%] (p = 0.22 > 0.05)
+                        thrpt:  [-1.2657% +3.5843% +8.9844%]
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+
+Benchmarking compress_parallel_lzr/pz_mt/Lzr
+Benchmarking compress_parallel_lzr/pz_mt/Lzr: Warming up for 2.0000 s
+Benchmarking compress_parallel_lzr/pz_mt/Lzr: Collecting 10 samples in estimated 5.1058 s (385 iterations)
+Benchmarking compress_parallel_lzr/pz_mt/Lzr: Analyzing
+compress_parallel_lzr/pz_mt/Lzr
+                        time:   [13.395 ms 13.927 ms 14.225 ms]
+                        thrpt:  [189.13 MiB/s 193.18 MiB/s 200.86 MiB/s]
+                 change:
+                        time:   [-26.286% -19.915% -13.788%] (p = 0.00 < 0.05)
+                        thrpt:  [+15.993% +24.867% +35.659%]
+                        Performance has improved.
+
+Benchmarking compress_large_lzr/Lzr/4194304
+Benchmarking compress_large_lzr/Lzr/4194304: Warming up for 2.0000 s
+Benchmarking compress_large_lzr/Lzr/4194304: Collecting 10 samples in estimated 5.3627 s (275 iterations)
+Benchmarking compress_large_lzr/Lzr/4194304: Analyzing
+compress_large_lzr/Lzr/4194304
+                        time:   [19.917 ms 20.277 ms 20.608 ms]
+                        thrpt:  [194.10 MiB/s 197.27 MiB/s 200.84 MiB/s]
+                 change:
+                        time:   [-24.574% -19.502% -14.641%] (p = 0.00 < 0.05)
+                        thrpt:  [+17.153% +24.227% +32.581%]
+                        Performance has improved.
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high severe
+Benchmarking compress_large_lzr/Lzr/16777216
+Benchmarking compress_large_lzr/Lzr/16777216: Warming up for 2.0000 s
+Benchmarking compress_large_lzr/Lzr/16777216: Collecting 10 samples in estimated 7.2719 s (110 iterations)
+Benchmarking compress_large_lzr/Lzr/16777216: Analyzing
+compress_large_lzr/Lzr/16777216
+                        time:   [69.666 ms 70.139 ms 70.906 ms]
+                        thrpt:  [225.65 MiB/s 228.12 MiB/s 229.67 MiB/s]
+                 change:
+                        time:   [-15.080% -12.567% -9.7303%] (p = 0.00 < 0.05)
+                        thrpt:  [+10.779% +14.374% +17.758%]
+                        Performance has improved.
+
+Benchmarking decompress_large_lzr/Lzr/4194304
+Benchmarking decompress_large_lzr/Lzr/4194304: Warming up for 2.0000 s
+Benchmarking decompress_large_lzr/Lzr/4194304: Collecting 10 samples in estimated 5.2217 s (825 iterations)
+Benchmarking decompress_large_lzr/Lzr/4194304: Analyzing
+decompress_large_lzr/Lzr/4194304
+                        time:   [6.0839 ms 6.1461 ms 6.1953 ms]
+                        thrpt:  [645.66 MiB/s 650.82 MiB/s 657.48 MiB/s]
+                 change:
+                        time:   [-23.122% -15.969% -8.8908%] (p = 0.00 < 0.05)
+                        thrpt:  [+9.7584% +19.004% +30.076%]
+                        Performance has improved.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) low mild
+  1 (10.00%) high mild
+Benchmarking decompress_large_lzr/Lzr/16777216
+Benchmarking decompress_large_lzr/Lzr/16777216: Warming up for 2.0000 s
+Benchmarking decompress_large_lzr/Lzr/16777216: Collecting 10 samples in estimated 5.8400 s (220 iterations)
+Benchmarking decompress_large_lzr/Lzr/16777216: Analyzing
+decompress_large_lzr/Lzr/16777216
+                        time:   [26.601 ms 26.693 ms 26.834 ms]
+                        thrpt:  [596.25 MiB/s 599.41 MiB/s 601.49 MiB/s]
+                 change:
+                        time:   [-1.1033% +0.4632% +1.8291%] (p = 0.57 > 0.05)
+                        thrpt:  [-1.7962% -0.4611% +1.1156%]
+                        No change in performance detected.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) high mild
+  1 (10.00%) high severe
+

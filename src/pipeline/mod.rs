@@ -619,10 +619,34 @@ fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResu
     // Multi-threading happens at the pipeline block level, not inside LZ77.
     let max_match = options.max_match_len.unwrap_or(lz77::DEFLATE_MAX_MATCH);
     match options.parse_strategy {
-        ParseStrategy::Auto | ParseStrategy::Lazy => {
-            lz77::compress_lazy_with_limit(input, max_match)
+        ParseStrategy::Auto => {
+            let max_chain = lz77::select_chain_depth(input.len(), true);
+            let matches =
+                lz77::compress_lazy_to_matches_with_limit_and_chain(input, max_match, max_chain)?;
+            let mut out = Vec::with_capacity(matches.len() * lz77::Match::SERIALIZED_SIZE);
+            for m in &matches {
+                out.extend_from_slice(&m.to_bytes());
+            }
+            Ok(out)
         }
+        ParseStrategy::Lazy => lz77::compress_lazy_with_limit(input, max_match),
         ParseStrategy::Optimal => crate::optimal::compress_optimal_with_limit(input, max_match),
+    }
+}
+
+/// Demux helpers can use this for parse-mode-aware LZ77 match generation.
+pub(crate) fn lz77_matches_with_backend(
+    input: &[u8],
+    options: &CompressOptions,
+) -> PzResult<Vec<lz77::Match>> {
+    let max_match = options.max_match_len.unwrap_or(lz77::DEFLATE_MAX_MATCH);
+    match options.parse_strategy {
+        ParseStrategy::Auto => {
+            let max_chain = lz77::select_chain_depth(input.len(), true);
+            lz77::compress_lazy_to_matches_with_limit_and_chain(input, max_match, max_chain)
+        }
+        ParseStrategy::Lazy => lz77::compress_lazy_to_matches_with_limit(input, max_match),
+        ParseStrategy::Optimal => crate::optimal::optimal_matches_with_limit(input, max_match),
     }
 }
 
