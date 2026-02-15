@@ -138,11 +138,13 @@ pub struct DeviceInfo {
 /// Probe all available WebGPU devices without creating an engine.
 pub fn probe_devices() -> Vec<DeviceInfo> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::all(),
+        backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12,
+        flags: wgpu::InstanceFlags::from_env_or_default(),
         ..Default::default()
     });
 
-    let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+    let backends = wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12;
+    let adapters = instance.enumerate_adapters(backends);
     adapters
         .into_iter()
         .map(|adapter| {
@@ -311,7 +313,8 @@ impl WebGpuEngine {
 
     fn create(prefer_gpu: bool, profiling: bool) -> PzResult<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12,
+            flags: wgpu::InstanceFlags::from_env_or_default(),
             ..Default::default()
         });
 
