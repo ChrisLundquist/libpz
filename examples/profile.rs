@@ -25,6 +25,13 @@ fn usage() {
     eprintln!("  --decompress    Profile decompression instead of compression");
     eprintln!("  --iterations N  Number of iterations (default: 200)");
     eprintln!("  --size N        Input data size in bytes (default: 262144)");
+    eprintln!(
+        "  --rans-interleaved            Enable interleaved rANS for pipeline and rANS stage"
+    );
+    eprintln!(
+        "  --rans-interleaved-min-bytes  Min stream bytes for interleaved rANS (default: 65536)"
+    );
+    eprintln!("  --rans-interleaved-states N   Interleaved rANS state count (default: 4)");
     eprintln!("  --help          Show this help");
 }
 
@@ -56,9 +63,15 @@ fn load_data(size: usize) -> Vec<u8> {
     full[..size].to_vec()
 }
 
-fn profile_pipeline(data: &[u8], pipe: Pipeline, decompress: bool, iterations: usize) {
+fn profile_pipeline(
+    data: &[u8],
+    pipe: Pipeline,
+    decompress: bool,
+    iterations: usize,
+    opts: &CompressOptions,
+) {
     if decompress {
-        let compressed = pipeline::compress(data, pipe).unwrap();
+        let compressed = pipeline::compress_with_options(data, pipe, opts).unwrap();
         eprintln!(
             "profiling {:?} decompress: {} bytes compressed -> {} bytes, {} iterations",
             pipe,
@@ -83,7 +96,8 @@ fn profile_pipeline(data: &[u8], pipe: Pipeline, decompress: bool, iterations: u
         );
         let start = Instant::now();
         for _ in 0..iterations {
-            let _ = std::hint::black_box(pipeline::compress(data, pipe).unwrap());
+            let _ =
+                std::hint::black_box(pipeline::compress_with_options(data, pipe, opts).unwrap());
         }
         let elapsed = start.elapsed();
         let mbps =
@@ -92,7 +106,14 @@ fn profile_pipeline(data: &[u8], pipe: Pipeline, decompress: bool, iterations: u
     }
 }
 
-fn profile_stage(data: &[u8], stage: &str, decompress: bool, iterations: usize) {
+fn profile_stage(
+    data: &[u8],
+    stage: &str,
+    decompress: bool,
+    iterations: usize,
+    rans_interleaved: bool,
+    rans_interleaved_states: usize,
+) {
     eprintln!(
         "profiling stage {} {}: {} bytes, {} iterations",
         stage,
@@ -177,14 +198,34 @@ fn profile_stage(data: &[u8], stage: &str, decompress: bool, iterations: usize) 
         }
         ("rans", false) => {
             for _ in 0..iterations {
-                let _ = std::hint::black_box(pz::rans::encode(data));
+                if rans_interleaved {
+                    let _ = std::hint::black_box(pz::rans::encode_interleaved_n(
+                        data,
+                        rans_interleaved_states,
+                        pz::rans::DEFAULT_SCALE_BITS,
+                    ));
+                } else {
+                    let _ = std::hint::black_box(pz::rans::encode(data));
+                }
             }
         }
         ("rans", true) => {
-            let enc = pz::rans::encode(data);
+            let enc = if rans_interleaved {
+                pz::rans::encode_interleaved_n(
+                    data,
+                    rans_interleaved_states,
+                    pz::rans::DEFAULT_SCALE_BITS,
+                )
+            } else {
+                pz::rans::encode(data)
+            };
             let len = data.len();
             for _ in 0..iterations {
-                let _ = std::hint::black_box(pz::rans::decode(&enc, len).unwrap());
+                if rans_interleaved {
+                    let _ = std::hint::black_box(pz::rans::decode_interleaved(&enc, len).unwrap());
+                } else {
+                    let _ = std::hint::black_box(pz::rans::decode(&enc, len).unwrap());
+                }
             }
         }
         _ => {
@@ -205,6 +246,9 @@ fn main() {
     let mut decompress = false;
     let mut iterations = 200usize;
     let mut size = 262_144usize;
+    let mut rans_interleaved = false;
+    let mut rans_interleaved_min_bytes = 65_536usize;
+    let mut rans_interleaved_states = 4usize;
 
     let mut i = 0;
     while i < args.len() {
@@ -226,6 +270,18 @@ fn main() {
                 i += 1;
                 size = args[i].parse().expect("invalid size");
             }
+            "--rans-interleaved" => rans_interleaved = true,
+            "--rans-interleaved-min-bytes" => {
+                i += 1;
+                rans_interleaved_min_bytes = args[i]
+                    .parse()
+                    .expect("invalid --rans-interleaved-min-bytes");
+            }
+            "--rans-interleaved-states" => {
+                i += 1;
+                rans_interleaved_states =
+                    args[i].parse().expect("invalid --rans-interleaved-states");
+            }
             "--help" | "-h" => {
                 usage();
                 return;
@@ -242,7 +298,14 @@ fn main() {
     let data = load_data(size);
 
     if let Some(ref stage_name) = stage {
-        profile_stage(&data, stage_name, decompress, iterations);
+        profile_stage(
+            &data,
+            stage_name,
+            decompress,
+            iterations,
+            rans_interleaved,
+            rans_interleaved_states,
+        );
     } else {
         let pipe = match pipeline_name.as_str() {
             "deflate" => Pipeline::Deflate,
@@ -260,9 +323,14 @@ fn main() {
         };
 
         // Warm up once
-        let opts = CompressOptions::default();
+        let opts = CompressOptions {
+            rans_interleaved,
+            rans_interleaved_min_bytes,
+            rans_interleaved_states,
+            ..CompressOptions::default()
+        };
         let _ = pipeline::compress_with_options(&data, pipe, &opts).unwrap();
 
-        profile_pipeline(&data, pipe, decompress, iterations);
+        profile_pipeline(&data, pipe, decompress, iterations, &opts);
     }
 }
