@@ -1,0 +1,3 @@
+- Criterion baseline drift caused misleading "change" percentages across successive experiments; direct A/B stash-pop checks were required to avoid false positives.
+- CLI command composition with markdown-style backticks in shell arguments caused accidental command substitution when creating PR text.
+- Recovery/workaround used: explicit direct A/B benchmarking (`stash -> bench -> pop -> bench`) and plain-text PR body strings without backticks.
