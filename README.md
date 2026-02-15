@@ -77,11 +77,13 @@ Uses [criterion](https://github.com/bheisler/criterion.rs) for statistical bench
 ```
 cargo bench                         # CPU benchmarks
 cargo bench --features webgpu       # includes GPU benchmarks
+cargo bench --bench throughput_deflate
+cargo bench --bench stages_lz77
 ```
 
-Two benchmark suites:
-- `benches/throughput.rs` — end-to-end pipeline throughput (MB/s) with external tool comparison (gzip, pigz, zstd)
-- `benches/stages.rs` — per-algorithm scaling at 1KB / 10KB / 64KB
+Benchmark targets are split per pipeline/algorithm to keep runtime manageable:
+- `benches/throughput_<pipeline>.rs` — end-to-end pipeline throughput (MB/s)
+- `benches/stages_<algorithm>.rs` — per-algorithm stage scaling
 
 ## Linting
 
