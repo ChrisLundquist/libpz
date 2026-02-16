@@ -1,4 +1,5 @@
 use super::*;
+use crate::webgpu::rans::RansChunkedDecodeParams;
 
 #[test]
 fn test_gpu_match_struct_size() {
@@ -1865,4 +1866,49 @@ fn test_lz77_lazy_kernel_round_trip() {
     }
     let decompressed = crate::lz77::decompress(&compressed).unwrap();
     assert_eq!(decompressed, input, "lazy kernel round-trip failed");
+}
+
+#[test]
+fn test_rans_chunked_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    let (words, states, tables) = engine.rans_encode_chunked_gpu(&input, 4, 12, 1024).unwrap();
+    let decoded_buffer = engine
+        .rans_decode_chunked_gpu(
+            &words,
+            &states,
+            &tables,
+            input.len(),
+            RansChunkedDecodeParams {
+                num_lanes: 4,
+                scale_bits: 12,
+                chunk_size: 1024,
+            },
+        )
+        .unwrap();
+
+    let decoded_data = decoded_buffer.read_to_host(&engine).unwrap();
+
+    assert_eq!(decoded_data, input);
+}
+
+#[test]
+fn test_rans_interleaved_decode_gpu_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..8192).map(|i| ((i * 41 + 61) % 251) as u8).collect();
+    let encoded = crate::rans::encode_interleaved_n(&input, 4, crate::rans::DEFAULT_SCALE_BITS);
+    let decoded = engine
+        .rans_decode_interleaved_gpu(&encoded, input.len())
+        .unwrap();
+    assert_eq!(decoded, input);
 }

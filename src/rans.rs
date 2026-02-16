@@ -226,12 +226,12 @@ pub(crate) fn build_symbol_lookup(norm: &NormalizedFreqs) -> Vec<u8> {
 /// division can be approximated by `q = hi32(x * rcp)` with a single
 /// correction step. This is critical for GPU kernels where hardware
 /// division is 10-30x slower than multiply.
-struct ReciprocalTable {
-    rcp: [u32; NUM_SYMBOLS],
+pub struct ReciprocalTable {
+    pub rcp: [u32; NUM_SYMBOLS],
 }
 
 impl ReciprocalTable {
-    fn from_normalized(norm: &NormalizedFreqs) -> Self {
+    pub(crate) fn from_normalized(norm: &NormalizedFreqs) -> Self {
         let mut rcp = [0u32; NUM_SYMBOLS];
         for (i, &f) in norm.freq.iter().enumerate() {
             if f > 0 {
@@ -936,6 +936,212 @@ pub fn decode_interleaved_to_buf(
 }
 
 // ---------------------------------------------------------------------------
+// Public API — chunked N-way
+// ---------------------------------------------------------------------------
+
+/// Encode data using chunked N-way interleaved rANS.
+///
+/// This splits the input into chunks of `chunk_size` bytes, and encodes
+/// each chunk independently with N-way interleaved rANS. This allows for
+/// block-level parallelism on decode, which is critical for GPU saturation.
+///
+/// The format shares a single frequency table across all chunks.
+pub fn encode_chunked(
+    input: &[u8],
+    num_states: usize,
+    scale_bits: u8,
+    chunk_size: usize,
+) -> Vec<u8> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+
+    const MAX_CHUNKED_NUM_STATES: usize = u8::MAX as usize;
+    const MAX_CHUNKED_NUM_CHUNKS: usize = u16::MAX as usize;
+    const MAX_CHUNKED_CHUNK_LEN: usize = u16::MAX as usize;
+
+    let num_states = num_states.max(1);
+    assert!(
+        num_states <= MAX_CHUNKED_NUM_STATES,
+        "encode_chunked: num_states {} exceeds on-wire u8 limit {}",
+        num_states,
+        MAX_CHUNKED_NUM_STATES
+    );
+
+    let scale_bits = scale_bits.clamp(MIN_SCALE_BITS, MAX_SCALE_BITS);
+    let chunk_size = chunk_size.max(1);
+
+    // Global frequency table for the whole input.
+    let mut freq = FrequencyTable::new();
+    freq.count(input);
+
+    let mut sb = scale_bits;
+    while (1u32 << sb) < freq.used {
+        sb += 1;
+        if sb > MAX_SCALE_BITS {
+            break;
+        }
+    }
+    let norm = normalize_frequencies(&freq, sb).expect("valid non-empty input");
+
+    // Encode each chunk.
+    let chunks: Vec<_> = input.chunks(chunk_size).collect();
+    assert!(
+        chunks.len() <= MAX_CHUNKED_NUM_CHUNKS,
+        "encode_chunked: chunk count {} exceeds on-wire u16 limit {}",
+        chunks.len(),
+        MAX_CHUNKED_NUM_CHUNKS
+    );
+    for chunk in &chunks {
+        assert!(
+            chunk.len() <= MAX_CHUNKED_CHUNK_LEN,
+            "encode_chunked: chunk length {} exceeds on-wire u16 limit {}",
+            chunk.len(),
+            MAX_CHUNKED_CHUNK_LEN
+        );
+    }
+
+    let mut encoded_chunks = Vec::with_capacity(chunks.len());
+    for chunk in &chunks {
+        let (word_streams, final_states) = rans_encode_interleaved(chunk, &norm, num_states);
+        encoded_chunks.push((word_streams, final_states));
+    }
+
+    // Serialize chunked format:
+    // [scale_bits: u8] [freq_table: 512] [num_chunks: u16] [num_states: u8]
+    // [chunk_0_original_len: u16] [chunk_1_original_len: u16] ...
+    // per chunk:
+    //   [final_states: N × u32] [num_words: N × u32]
+    //   [stream_0_words] [stream_1_words] ...
+    let mut output = Vec::new();
+    output.push(sb);
+    serialize_freq_table(&norm, &mut output);
+    output.extend_from_slice(&(chunks.len() as u16).to_le_bytes());
+    output.push(num_states as u8);
+
+    for chunk in &chunks {
+        output.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+    }
+
+    for (word_streams, final_states) in &encoded_chunks {
+        for &state in final_states {
+            output.extend_from_slice(&state.to_le_bytes());
+        }
+        for stream in word_streams {
+            output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+        }
+        for stream in word_streams {
+            serialize_u16_le_bulk(stream, &mut output);
+        }
+    }
+
+    output
+}
+
+/// Decode chunked N-way interleaved rANS-encoded data.
+pub fn decode_chunked(input: &[u8]) -> PzResult<Vec<u8>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut cursor = 0;
+
+    // --- Global Header ---
+    // [scale_bits: u8]
+    if input.len() < cursor + 1 {
+        return Err(PzError::InvalidInput);
+    }
+    let scale_bits = input[cursor];
+    cursor += 1;
+    if !(MIN_SCALE_BITS..=MAX_SCALE_BITS).contains(&scale_bits) {
+        return Err(PzError::InvalidInput);
+    }
+
+    // [freq_table: 512]
+    if input.len() < cursor + NUM_SYMBOLS * 2 {
+        return Err(PzError::InvalidInput);
+    }
+    let norm = deserialize_freq_table(&input[cursor..], scale_bits)?;
+    let lookup = build_symbol_lookup(&norm);
+    cursor += NUM_SYMBOLS * 2;
+
+    // [num_chunks: u16] [num_states: u8]
+    if input.len() < cursor + 3 {
+        return Err(PzError::InvalidInput);
+    }
+    let num_chunks = u16::from_le_bytes([input[cursor], input[cursor + 1]]) as usize;
+    cursor += 2;
+    let num_states = input[cursor] as usize;
+    cursor += 1;
+    if num_states == 0 {
+        return Err(PzError::InvalidInput);
+    }
+
+    // [chunk_original_lens: num_chunks × u16]
+    if input.len() < cursor + num_chunks * 2 {
+        return Err(PzError::InvalidInput);
+    }
+    let mut chunk_original_lens = Vec::with_capacity(num_chunks);
+    for _ in 0..num_chunks {
+        chunk_original_lens.push(u16::from_le_bytes([input[cursor], input[cursor + 1]]) as usize);
+        cursor += 2;
+    }
+
+    // --- Per-Chunk Data ---
+    let mut decoded_output = Vec::new();
+
+    for &original_len in &chunk_original_lens {
+        // [final_states: N × u32]
+        if input.len() < cursor + num_states * 4 {
+            return Err(PzError::InvalidInput);
+        }
+        let mut initial_states = Vec::with_capacity(num_states);
+        for _ in 0..num_states {
+            initial_states.push(u32::from_le_bytes([
+                input[cursor],
+                input[cursor + 1],
+                input[cursor + 2],
+                input[cursor + 3],
+            ]));
+            cursor += 4;
+        }
+
+        // [num_words: N × u32]
+        if input.len() < cursor + num_states * 4 {
+            return Err(PzError::InvalidInput);
+        }
+        let mut word_counts = Vec::with_capacity(num_states);
+        for _ in 0..num_states {
+            word_counts.push(u32::from_le_bytes([
+                input[cursor],
+                input[cursor + 1],
+                input[cursor + 2],
+                input[cursor + 3],
+            ]) as usize);
+            cursor += 4;
+        }
+
+        // Word streams
+        let mut word_slices = Vec::with_capacity(num_states);
+        for &count in &word_counts {
+            if input.len() < cursor + count * 2 {
+                return Err(PzError::InvalidInput);
+            }
+            word_slices.push(bytes_as_u16_le(&input[cursor..], count));
+            cursor += count * 2;
+        }
+        let word_streams: Vec<&[u16]> = word_slices.iter().map(|ws| &**ws).collect();
+
+        // Decode this chunk
+        let decoded_chunk =
+            rans_decode_interleaved(&word_streams, &initial_states, &norm, &lookup, original_len)?;
+        decoded_output.extend(decoded_chunk);
+    }
+
+    Ok(decoded_output)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1356,5 +1562,126 @@ mod tests {
             encoded.len(),
             input.len()
         );
+    }
+
+    mod chunked_tests {
+        use super::*;
+
+        const NUM_STATES: usize = 4;
+        const SCALE_BITS: u8 = DEFAULT_SCALE_BITS;
+        const CHUNK_SIZE: usize = 1024;
+
+        #[test]
+        fn test_chunked_empty() {
+            let encoded = encode_chunked(&[], NUM_STATES, SCALE_BITS, CHUNK_SIZE);
+            assert_eq!(encoded, Vec::<u8>::new());
+            let decoded = decode_chunked(&encoded).unwrap();
+            assert_eq!(decoded, Vec::<u8>::new());
+        }
+
+        #[test]
+        fn test_chunked_single_byte() {
+            let input = &[42u8];
+            let encoded = encode_chunked(input, NUM_STATES, SCALE_BITS, CHUNK_SIZE);
+            let decoded = decode_chunked(&encoded).unwrap();
+            assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn test_chunked_small_input() {
+            // Input smaller than one chunk
+            let input = b"hello, world!";
+            let encoded = encode_chunked(input, NUM_STATES, SCALE_BITS, CHUNK_SIZE);
+            let decoded = decode_chunked(&encoded).unwrap();
+            assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn test_chunked_one_full_chunk() {
+            let input: Vec<u8> = (0..CHUNK_SIZE).map(|i| i as u8).collect();
+            let encoded = encode_chunked(&input, NUM_STATES, SCALE_BITS, CHUNK_SIZE);
+            let decoded = decode_chunked(&encoded).unwrap();
+            assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn test_chunked_multiple_chunks_exact() {
+            let mut input = Vec::new();
+            for i in 0..3 {
+                for j in 0..CHUNK_SIZE {
+                    input.push((i * CHUNK_SIZE + j) as u8);
+                }
+            }
+            let encoded = encode_chunked(&input, NUM_STATES, SCALE_BITS, CHUNK_SIZE);
+            let decoded = decode_chunked(&encoded).unwrap();
+            assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn test_chunked_multiple_chunks_partial() {
+            let input: Vec<u8> = (0..CHUNK_SIZE + 100).map(|i| i as u8).collect();
+            let encoded = encode_chunked(&input, NUM_STATES, SCALE_BITS, CHUNK_SIZE);
+            let decoded = decode_chunked(&encoded).unwrap();
+            assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn test_chunked_binary_data() {
+            let input: Vec<u8> = (0..5000).map(|i| ((i * 41 + 61) % 256) as u8).collect();
+            let encoded = encode_chunked(&input, NUM_STATES, SCALE_BITS, CHUNK_SIZE);
+            let decoded = decode_chunked(&encoded).unwrap();
+            assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn test_chunked_different_params() {
+            let input: Vec<u8> = (0..3000).map(|i| ((i * 41 + 61) % 256) as u8).collect();
+            let encoded = encode_chunked(&input, 8, 13, 512);
+            let decoded = decode_chunked(&encoded).unwrap();
+            assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn test_chunked_long_repeated() {
+            let input = vec![b'a'; 10_000];
+            let encoded = encode_chunked(&input, NUM_STATES, SCALE_BITS, CHUNK_SIZE);
+            let decoded = decode_chunked(&encoded).unwrap();
+            assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn test_chunked_decode_invalid_input() {
+            assert_eq!(decode_chunked(&[0; 10]), Err(PzError::InvalidInput));
+            // Valid header but truncated data
+            let input = b"some data";
+            let valid_encoded = encode_chunked(input, NUM_STATES, SCALE_BITS, CHUNK_SIZE);
+            assert_eq!(
+                decode_chunked(&valid_encoded[..valid_encoded.len() - 10]),
+                Err(PzError::InvalidInput)
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "num_states")]
+        fn test_chunked_num_states_overflow_panics() {
+            let input = vec![0u8; 1024];
+            let _ = encode_chunked(&input, 256, SCALE_BITS, CHUNK_SIZE);
+        }
+
+        #[test]
+        #[should_panic(expected = "chunk count")]
+        fn test_chunked_chunk_count_overflow_panics() {
+            // 65536 chunks (one byte each) exceeds u16 chunk-count header field.
+            let input = vec![0u8; (u16::MAX as usize) + 1];
+            let _ = encode_chunked(&input, NUM_STATES, SCALE_BITS, 1);
+        }
+
+        #[test]
+        #[should_panic(expected = "chunk length")]
+        fn test_chunked_chunk_len_overflow_panics() {
+            // Single chunk length exceeds u16 per-chunk-len header field.
+            let input = vec![0u8; (u16::MAX as usize) + 1];
+            let _ = encode_chunked(&input, NUM_STATES, SCALE_BITS, (u16::MAX as usize) + 1);
+        }
     }
 }
