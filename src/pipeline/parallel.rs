@@ -5,6 +5,8 @@
 //! - **Pipeline-parallel**: one thread per stage, blocks flow through channels.
 
 use crate::{PzError, PzResult};
+use std::collections::VecDeque;
+use std::sync::{Condvar, Mutex};
 
 use super::blocks::compress_block;
 use super::stages::{
@@ -70,6 +72,15 @@ pub(crate) fn compress_parallel(
     let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
     let num_blocks = blocks.len();
 
+    // Prototype unified scheduler: a single worker pool executes both
+    // stage-0 transform and stage-1 entropy tasks from one shared queue.
+    if options.unified_scheduler
+        && num_blocks > 1
+        && matches!(pipeline, Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R)
+    {
+        return compress_parallel_unified_lz_rans(input, pipeline, options, num_threads, &blocks);
+    }
+
     // Compress blocks in parallel using scoped threads
     let compressed_blocks: Vec<PzResult<Vec<u8>>> = std::thread::scope(|scope| {
         // Launch threads in batches to cap concurrency
@@ -102,27 +113,204 @@ pub(crate) fn compress_parallel(
         block_data_vec.push(result?);
     }
 
-    // Build output: V2 header + num_blocks + block_table + block_data
+    let orig_block_lens: Vec<usize> = blocks.iter().map(|b| b.len()).collect();
+    let block_slices: Vec<&[u8]> = block_data_vec.iter().map(|v| v.as_slice()).collect();
+    Ok(assemble_multiblock_container(
+        pipeline,
+        input.len(),
+        &orig_block_lens,
+        &block_slices,
+    ))
+}
+
+fn assemble_multiblock_container(
+    pipeline: Pipeline,
+    original_len: usize,
+    orig_block_lens: &[usize],
+    block_data: &[&[u8]],
+) -> Vec<u8> {
+    let num_blocks = block_data.len();
+    debug_assert_eq!(orig_block_lens.len(), num_blocks);
+
     let mut output = Vec::new();
-    write_header(&mut output, pipeline, input.len());
-
-    // num_blocks
+    write_header(&mut output, pipeline, original_len);
     output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
-
-    // Block table
-    for (i, compressed) in block_data_vec.iter().enumerate() {
-        let orig_block_len = blocks[i].len() as u32;
+    for (i, compressed) in block_data.iter().enumerate() {
+        let orig_block_len = orig_block_lens[i] as u32;
         let comp_block_len = compressed.len() as u32;
         output.extend_from_slice(&comp_block_len.to_le_bytes());
         output.extend_from_slice(&orig_block_len.to_le_bytes());
     }
-
-    // Block data
-    for compressed in &block_data_vec {
+    for compressed in block_data {
         output.extend_from_slice(compressed);
     }
+    output
+}
 
-    Ok(output)
+#[derive(Copy, Clone)]
+enum UnifiedTask {
+    Stage0(usize),
+    Stage1(usize),
+}
+
+#[derive(Default)]
+struct UnifiedQueueState {
+    queue: VecDeque<UnifiedTask>,
+    pending_tasks: usize,
+    closed: bool,
+    failed: bool,
+}
+
+fn compress_parallel_unified_lz_rans(
+    input: &[u8],
+    pipeline: Pipeline,
+    options: &CompressOptions,
+    num_threads: usize,
+    blocks: &[&[u8]],
+) -> PzResult<Vec<u8>> {
+    let num_blocks = blocks.len();
+    let worker_count = num_threads.min(num_blocks).max(1);
+
+    let mut resolved_options = options.clone();
+    if resolved_options.max_match_len.is_none() {
+        resolved_options.max_match_len = Some(super::resolve_max_match_len(pipeline, options));
+    }
+
+    let stage0_slots: Vec<Mutex<Option<StageBlock>>> =
+        (0..num_blocks).map(|_| Mutex::new(None)).collect();
+    let results: Vec<Mutex<Option<PzResult<Vec<u8>>>>> =
+        (0..num_blocks).map(|_| Mutex::new(None)).collect();
+
+    let queue = Mutex::new(UnifiedQueueState {
+        queue: (0..num_blocks).map(UnifiedTask::Stage0).collect(),
+        pending_tasks: num_blocks,
+        closed: false,
+        failed: false,
+    });
+    let queue_cv = Condvar::new();
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let queue_ref = &queue;
+            let cv_ref = &queue_cv;
+            let stage0_slots_ref = &stage0_slots;
+            let results_ref = &results;
+            let opts = resolved_options.clone();
+
+            scope.spawn(move || loop {
+                let task = {
+                    let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                    loop {
+                        if let Some(task) = guard.queue.pop_front() {
+                            break task;
+                        }
+                        if guard.closed || (guard.failed && guard.queue.is_empty()) {
+                            return;
+                        }
+                        guard = cv_ref.wait(guard).expect("unified queue wait poisoned");
+                    }
+                };
+
+                match task {
+                    UnifiedTask::Stage0(block_idx) => {
+                        let block = StageBlock {
+                            block_index: block_idx,
+                            original_len: blocks[block_idx].len(),
+                            data: blocks[block_idx].to_vec(),
+                            streams: None,
+                            metadata: StageMetadata::default(),
+                        };
+                        let result = run_compress_stage(pipeline, 0, block, &opts);
+                        match result {
+                            Ok(stage0_block) => {
+                                *stage0_slots_ref[block_idx]
+                                    .lock()
+                                    .expect("stage0 slot poisoned") = Some(stage0_block);
+                                let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                                if !guard.failed {
+                                    guard.queue.push_back(UnifiedTask::Stage1(block_idx));
+                                    // pending_tasks counts total outstanding work units
+                                    // (queued + currently executing). A successful Stage0
+                                    // completion creates one new outstanding Stage1 task.
+                                    guard.pending_tasks += 1;
+                                    cv_ref.notify_one();
+                                } else {
+                                    *results_ref[block_idx].lock().expect("result slot poisoned") =
+                                        Some(Err(PzError::InvalidInput));
+                                }
+                            }
+                            Err(e) => {
+                                *results_ref[block_idx].lock().expect("result slot poisoned") =
+                                    Some(Err(e));
+                                let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                                if !guard.failed {
+                                    guard.failed = true;
+                                    // Cancel not-yet-started tasks and account for them
+                                    // in pending_tasks since no worker will decrement them.
+                                    let dropped = guard.queue.len();
+                                    guard.queue.clear();
+                                    guard.pending_tasks =
+                                        guard.pending_tasks.saturating_sub(dropped);
+                                    cv_ref.notify_all();
+                                }
+                            }
+                        }
+                    }
+                    UnifiedTask::Stage1(block_idx) => {
+                        let stage0 = stage0_slots_ref[block_idx]
+                            .lock()
+                            .expect("stage0 slot poisoned")
+                            .take()
+                            .expect("stage0 result missing");
+                        let result = run_compress_stage(pipeline, 1, stage0, &opts).map(|b| b.data);
+                        let is_err = result.is_err();
+                        *results_ref[block_idx].lock().expect("result slot poisoned") =
+                            Some(result);
+                        if is_err {
+                            let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                            if !guard.failed {
+                                guard.failed = true;
+                                let dropped = guard.queue.len();
+                                guard.queue.clear();
+                                guard.pending_tasks = guard.pending_tasks.saturating_sub(dropped);
+                                cv_ref.notify_all();
+                            }
+                        }
+                    }
+                }
+
+                let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                // Every popped task completes exactly once here, regardless of
+                // success or failure. Stage0 success may have already incremented
+                // pending_tasks to account for the newly-enqueued Stage1 follow-up.
+                debug_assert!(guard.pending_tasks > 0);
+                guard.pending_tasks -= 1;
+                if guard.pending_tasks == 0 {
+                    guard.closed = true;
+                    cv_ref.notify_all();
+                    return;
+                }
+            });
+        }
+    });
+
+    let mut block_data_vec = Vec::with_capacity(num_blocks);
+    for slot in results {
+        let result = slot
+            .into_inner()
+            .expect("result slot poisoned")
+            .unwrap_or(Err(PzError::InvalidInput))?;
+        block_data_vec.push(result);
+    }
+
+    let orig_block_lens: Vec<usize> = blocks.iter().map(|b| b.len()).collect();
+    let block_slices: Vec<&[u8]> = block_data_vec.iter().map(|v| v.as_slice()).collect();
+    Ok(assemble_multiblock_container(
+        pipeline,
+        input.len(),
+        &orig_block_lens,
+        &block_slices,
+    ))
 }
 
 /// Batched GPU LZ77 compression for multi-block inputs.
@@ -189,7 +377,7 @@ fn compress_parallel_gpu_batched(
                 handles.push((
                     block_idx,
                     scope.spawn(move || {
-                        entropy_encode_lz77_block(&matches, block_input.len(), pipeline)
+                        entropy_encode_lz77_block(&matches, block_input.len(), pipeline, options)
                     }),
                 ));
             }
@@ -257,7 +445,8 @@ fn compress_streaming_gpu(
             let rtx = result_tx.clone();
             scope.spawn(move || {
                 while let Ok((block_idx, matches, original_len)) = rx.recv() {
-                    let result = entropy_encode_lz77_block(&matches, original_len, pipeline);
+                    let result =
+                        entropy_encode_lz77_block(&matches, original_len, pipeline, options);
                     let _ = rtx.send((block_idx, result));
                 }
             });
@@ -401,20 +590,14 @@ fn assemble_multiblock_output(
         }
     }
 
-    let mut output = Vec::new();
-    write_header(&mut output, pipeline, input.len());
-    output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
-    for (i, compressed) in block_data_vec.iter().enumerate() {
-        let orig_block_len = blocks[i].len() as u32;
-        let comp_block_len = compressed.len() as u32;
-        output.extend_from_slice(&comp_block_len.to_le_bytes());
-        output.extend_from_slice(&orig_block_len.to_le_bytes());
-    }
-    for compressed in &block_data_vec {
-        output.extend_from_slice(compressed);
-    }
-
-    Ok(output)
+    let orig_block_lens: Vec<usize> = blocks.iter().map(|b| b.len()).collect();
+    let block_slices: Vec<&[u8]> = block_data_vec.iter().map(|v| v.as_slice()).collect();
+    Ok(assemble_multiblock_container(
+        pipeline,
+        input.len(),
+        &orig_block_lens,
+        &block_slices,
+    ))
 }
 
 /// Demux LZ77 matches and apply the appropriate entropy encoder for the given pipeline.
@@ -427,9 +610,11 @@ fn entropy_encode_lz77_block(
     matches: &[crate::lz77::Match],
     original_len: usize,
     pipeline: Pipeline,
+    options: &CompressOptions,
 ) -> PzResult<Vec<u8>> {
     use super::stages::{
-        stage_fse_encode, stage_fse_interleaved_encode, stage_huffman_encode, stage_rans_encode,
+        stage_fse_encode, stage_fse_interleaved_encode, stage_huffman_encode,
+        stage_rans_encode_with_options,
     };
     use crate::lz77;
 
@@ -533,7 +718,7 @@ fn entropy_encode_lz77_block(
 
         let block = match pipeline {
             Pipeline::Lzfi => stage_fse_interleaved_encode(block)?,
-            Pipeline::LzssR => stage_rans_encode(block)?,
+            Pipeline::LzssR => stage_rans_encode_with_options(block, options)?,
             _ => unreachable!(),
         };
         Ok(block.data)
@@ -568,7 +753,7 @@ fn entropy_encode_lz77_block(
 
         let block = match pipeline {
             Pipeline::Deflate => stage_huffman_encode(block)?,
-            Pipeline::Lzr => stage_rans_encode(block)?,
+            Pipeline::Lzr => stage_rans_encode_with_options(block, options)?,
             Pipeline::Lzf => stage_fse_encode(block)?,
             _ => return Err(PzError::Unsupported),
         };

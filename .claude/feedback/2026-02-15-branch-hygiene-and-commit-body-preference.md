@@ -1,0 +1,3 @@
+- Add explicit default workflow reminder: create/switch feature branch before any commit to prevent accidental commits on `master`.
+- Preserve optimization findings in commit messages (body) when requested, and avoid duplicating them in generated markdown logs.
+- For performance work, always report both: (1) absolute throughput, (2) direct A/B in same session when Criterion history is noisy.

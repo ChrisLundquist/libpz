@@ -3,7 +3,7 @@ use demux::LzDemuxer;
 use stages::{
     self, pipeline_stage_count, stage_demux_compress, stage_demux_decompress, stage_fse_decode,
     stage_fse_encode, stage_huffman_decode, stage_huffman_encode, stage_rans_decode,
-    stage_rans_encode, StageBlock, StageMetadata,
+    stage_rans_encode_with_options, StageBlock, StageMetadata,
 };
 
 // --- Deflate pipeline tests ---
@@ -919,7 +919,7 @@ fn test_lzr_multistream_deinterleave_reinterleave() {
     assert_eq!(streams.len(), 3);
 
     // rANS encode → serializes streams into data
-    let block = stage_rans_encode(block).unwrap();
+    let block = stage_rans_encode_with_options(block, &CompressOptions::default()).unwrap();
     assert!(block.streams.is_none());
     assert!(!block.data.is_empty());
     // Verify multi-stream header: [num_streams: u8][pre_entropy_len: u32][meta_len: u16]
@@ -945,6 +945,26 @@ fn test_lzr_pipeline_parallel() {
         input.extend_from_slice(pattern);
     }
     let compressed = compress_mt(&input, Pipeline::Lzr, 4, 512).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_lzr_unified_scheduler_multiblock_round_trip() {
+    let pattern = b"Lzr unified scheduler multiblock round-trip test. ";
+    let mut input = Vec::new();
+    for _ in 0..400 {
+        input.extend_from_slice(pattern);
+    }
+
+    let opts = CompressOptions {
+        threads: 4,
+        block_size: 512,
+        unified_scheduler: true,
+        ..CompressOptions::default()
+    };
+    let compressed = compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
+    assert_eq!(compressed[2], VERSION, "expected V2 multi-block container");
     let decompressed = decompress(&compressed).unwrap();
     assert_eq!(decompressed, input);
 }
@@ -1326,6 +1346,42 @@ fn test_lzr_extended_match_length() {
         lzr_compressed.len(),
         deflate_compressed.len()
     );
+}
+
+#[test]
+fn test_lzr_rans_interleaved_round_trip() {
+    let mut input = Vec::new();
+    for _ in 0..2048 {
+        input.extend_from_slice(b"interleaved-rans-round-trip-");
+    }
+
+    let opts = CompressOptions {
+        rans_interleaved: true,
+        rans_interleaved_min_bytes: 0,
+        rans_interleaved_states: 4,
+        ..Default::default()
+    };
+    let compressed = compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_lzssr_rans_interleaved_round_trip() {
+    let mut input = Vec::new();
+    for _ in 0..1024 {
+        input.extend_from_slice(b"lzssr-interleaved-rans-round-trip-");
+    }
+
+    let opts = CompressOptions {
+        rans_interleaved: true,
+        rans_interleaved_min_bytes: 0,
+        rans_interleaved_states: 4,
+        ..Default::default()
+    };
+    let compressed = compress_with_options(&input, Pipeline::LzssR, &opts).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
 }
 
 /// Verify Lzf pipeline benefits from extended match lengths on repetitive data.

@@ -108,6 +108,20 @@ pub struct CompressOptions {
     /// WebGPU engine handle, required when `backend` is `Backend::WebGpu`.
     #[cfg(feature = "webgpu")]
     pub webgpu_engine: Option<std::sync::Arc<crate::webgpu::WebGpuEngine>>,
+    /// Enable interleaved rANS for rANS-based pipelines when stream size permits.
+    ///
+    /// When enabled, streams with length >= `rans_interleaved_min_bytes` are encoded
+    /// with `rans::encode_interleaved_n` using `rans_interleaved_states`.
+    pub rans_interleaved: bool,
+    /// Minimum stream size for interleaved rANS encode.
+    pub rans_interleaved_min_bytes: usize,
+    /// Number of interleaved rANS states when interleaved mode is active.
+    pub rans_interleaved_states: usize,
+    /// Prototype unified task scheduler for compatible two-stage pipelines.
+    ///
+    /// When enabled, the same worker pool executes both stage-0 transform
+    /// tasks and stage-1 entropy tasks from a shared work queue.
+    pub unified_scheduler: bool,
 }
 
 impl Default for CompressOptions {
@@ -120,6 +134,10 @@ impl Default for CompressOptions {
             max_match_len: None,
             #[cfg(feature = "webgpu")]
             webgpu_engine: None,
+            rans_interleaved: false,
+            rans_interleaved_min_bytes: 64 * 1024,
+            rans_interleaved_states: crate::rans::DEFAULT_INTERLEAVE,
+            unified_scheduler: false,
         }
     }
 }

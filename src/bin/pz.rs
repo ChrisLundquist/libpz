@@ -40,6 +40,15 @@ fn usage() {
     eprintln!("  -O, --optimal      Use optimal parsing (best compression, slowest)");
     eprintln!("  --lazy             Use lazy matching (good compression, default)");
     eprintln!("  --greedy           Use greedy matching (fastest, least compression)");
+    eprintln!("  --rans-interleaved Enable interleaved rANS on rANS pipelines");
+    eprintln!(
+        "  --rans-interleaved-min-bytes N  Min stream size for interleaved rANS (default: 65536)"
+    );
+    eprintln!(
+        "  --rans-interleaved-states N     Number of interleaved rANS states (default: {})",
+        pz::rans::DEFAULT_INTERLEAVE
+    );
+    eprintln!("  --unified-scheduler  Prototype mixed-task scheduler for compatible pipelines");
     eprintln!("  -q, --quiet        Suppress warnings");
     eprintln!("  -v, --verbose      Verbose output");
     eprintln!("  -h, --help         Show this help");
@@ -89,6 +98,10 @@ struct Opts {
     trial_mode: bool,
     parse_strategy: ParseStrategy,
     threads: usize,
+    rans_interleaved: bool,
+    rans_interleaved_min_bytes: usize,
+    rans_interleaved_states: usize,
+    unified_scheduler: bool,
     pipeline: Pipeline,
     files: Vec<String>,
 }
@@ -108,6 +121,10 @@ fn parse_args() -> Opts {
         trial_mode: false,
         parse_strategy: ParseStrategy::Auto,
         threads: 0,
+        rans_interleaved: false,
+        rans_interleaved_min_bytes: 64 * 1024,
+        rans_interleaved_states: pz::rans::DEFAULT_INTERLEAVE,
+        unified_scheduler: false,
         pipeline: Pipeline::Deflate,
         files: Vec::new(),
     };
@@ -132,6 +149,42 @@ fn parse_args() -> Opts {
             "-O" | "--optimal" => opts.parse_strategy = ParseStrategy::Optimal,
             "--lazy" => opts.parse_strategy = ParseStrategy::Lazy,
             "--greedy" => opts.parse_strategy = ParseStrategy::Lazy, // greedy removed; lazy is strictly better
+            "--rans-interleaved" => opts.rans_interleaved = true,
+            "--rans-interleaved-min-bytes" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("pz: missing argument for --rans-interleaved-min-bytes");
+                    process::exit(1);
+                }
+                opts.rans_interleaved_min_bytes = match args[i].parse::<usize>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        eprintln!(
+                            "pz: invalid value for --rans-interleaved-min-bytes '{}'",
+                            args[i]
+                        );
+                        process::exit(1);
+                    }
+                };
+            }
+            "--rans-interleaved-states" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("pz: missing argument for --rans-interleaved-states");
+                    process::exit(1);
+                }
+                opts.rans_interleaved_states = match args[i].parse::<usize>() {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        eprintln!(
+                            "pz: invalid value for --rans-interleaved-states '{}'",
+                            args[i]
+                        );
+                        process::exit(1);
+                    }
+                };
+            }
+            "--unified-scheduler" => opts.unified_scheduler = true,
             "--list-pipelines" => {
                 list_pipelines();
                 process::exit(0);
@@ -307,6 +360,10 @@ fn build_cli_options(opts: &Opts) -> (CompressOptions, DecompressOptions) {
         backend: gpu.backend,
         threads: opts.threads,
         parse_strategy: opts.parse_strategy,
+        rans_interleaved: opts.rans_interleaved,
+        rans_interleaved_min_bytes: opts.rans_interleaved_min_bytes,
+        rans_interleaved_states: opts.rans_interleaved_states,
+        unified_scheduler: opts.unified_scheduler,
         #[cfg(feature = "webgpu")]
         webgpu_engine: gpu.webgpu_engine.clone(),
         ..Default::default()

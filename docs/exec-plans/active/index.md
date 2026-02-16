@@ -13,6 +13,12 @@
 ### [PLAN-competitive-roadmap.md](PLAN-competitive-roadmap.md)
 **Status:** Planned | **Priority:** P0
 
+### [PLAN-interleaved-rans.md](PLAN-interleaved-rans.md)
+**Status:** Planned | **Priority:** P1
+
+### [PLAN-unified-scheduler-north-star.md](PLAN-unified-scheduler-north-star.md)
+**Status:** Planned | **Priority:** P1
+
 ## Completed Plans (in ../completed/)
 
 - `PLAN-gpu-backpressure-impl.md` — GPU ring buffer batching
