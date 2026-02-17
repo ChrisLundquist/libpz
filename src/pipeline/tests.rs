@@ -1535,6 +1535,30 @@ mod gpu_batched_tests {
     }
 
     #[test]
+    fn test_gpu_rans_interleaved_decode_round_trip() {
+        let mut opts = match make_webgpu_options() {
+            Some(o) => o,
+            None => return,
+        };
+        opts.rans_interleaved = true;
+        opts.rans_interleaved_min_bytes = 0;
+        opts.rans_interleaved_states = 4;
+
+        let input: Vec<u8> = (0..192 * 1024)
+            .map(|i| ((i * 13 + 97) % 251) as u8)
+            .collect();
+        let compressed = compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
+
+        let dec_opts = DecompressOptions {
+            backend: Backend::WebGpu,
+            webgpu_engine: opts.webgpu_engine.clone(),
+            threads: 0,
+        };
+        let decompressed = decompress_with_options(&compressed, &dec_opts).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
     fn test_gpu_batched_lzfi_round_trip() {
         let opts = match make_webgpu_options() {
             Some(o) => o,

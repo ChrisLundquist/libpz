@@ -40,6 +40,7 @@ mod bwt;
 mod fse;
 mod huffman;
 pub(crate) mod lz77;
+pub(crate) mod rans;
 
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -238,6 +239,11 @@ struct Lz77DecodePipelines {
     decode: wgpu::ComputePipeline,
 }
 
+struct RansPipelines {
+    encode: wgpu::ComputePipeline,
+    decode: wgpu::ComputePipeline,
+}
+
 /// WebGPU compute engine.
 ///
 /// Manages the wgpu device, queue, and lazily-compiled compute pipelines.
@@ -259,6 +265,7 @@ pub struct WebGpuEngine {
     fse_decode: OnceLock<FseDecodePipelines>,
     fse_encode: OnceLock<FseEncodePipelines>,
     lz77_decode: OnceLock<Lz77DecodePipelines>,
+    rans: OnceLock<RansPipelines>,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum compute workgroup size.
@@ -400,6 +407,7 @@ impl WebGpuEngine {
             fse_decode: OnceLock::new(),
             fse_encode: OnceLock::new(),
             lz77_decode: OnceLock::new(),
+            rans: OnceLock::new(),
             device_name,
             max_work_group_size,
             max_workgroups_per_dim,
@@ -1131,6 +1139,55 @@ impl WebGpuEngine {
                 group
             })
             .encode
+    }
+
+    fn rans_pipelines(&self) -> &RansPipelines {
+        self.rans.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let encode_module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("rans_encode"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../../kernels/rans_encode.wgsl").into(),
+                    ),
+                });
+            let decode_module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("rans_decode"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../../kernels/rans_decode.wgsl").into(),
+                    ),
+                });
+            let group = RansPipelines {
+                encode: self
+                    .device
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("rans_encode"),
+                        layout: None,
+                        module: &encode_module,
+                        entry_point: Some("rans_encode_chunk"),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    }),
+                decode: self
+                    .device
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("rans_decode"),
+                        layout: None,
+                        module: &decode_module,
+                        entry_point: Some("rans_decode_chunk"),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    }),
+            };
+            if self.profiling {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[pz-gpu] compile rans kernels: {ms:.3} ms");
+            }
+            group
+        })
     }
 }
 
