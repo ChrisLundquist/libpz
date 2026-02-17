@@ -76,6 +76,12 @@ const FSE_ENCODE_KERNEL_SOURCE: &str = include_str!("../../kernels/fse_encode.wg
 /// Embedded WGSL kernel source: GPU LZ77 block-parallel decompression.
 const LZ77_DECODE_KERNEL_SOURCE: &str = include_str!("../../kernels/lz77_decode.wgsl");
 
+/// Embedded WGSL kernel source: GPU chunked rANS decode.
+const RANS_DECODE_KERNEL_SOURCE: &str = include_str!("../../kernels/rans_decode.wgsl");
+
+/// Embedded WGSL kernel source: GPU chunked rANS encode.
+const RANS_ENCODE_KERNEL_SOURCE: &str = include_str!("../../kernels/rans_encode.wgsl");
+
 /// Number of candidates per position in the top-K kernel (must match K in lz77_topk.wgsl).
 const TOPK_K: usize = 4;
 
@@ -239,9 +245,14 @@ struct Lz77DecodePipelines {
     decode: wgpu::ComputePipeline,
 }
 
-struct RansPipelines {
-    encode: wgpu::ComputePipeline,
+/// rANS decode pipeline (1 pipeline from rans_decode.wgsl).
+struct RansDecodePipelines {
     decode: wgpu::ComputePipeline,
+}
+
+/// rANS encode pipeline (1 pipeline from rans_encode.wgsl).
+struct RansEncodePipelines {
+    encode: wgpu::ComputePipeline,
 }
 
 /// WebGPU compute engine.
@@ -265,7 +276,8 @@ pub struct WebGpuEngine {
     fse_decode: OnceLock<FseDecodePipelines>,
     fse_encode: OnceLock<FseEncodePipelines>,
     lz77_decode: OnceLock<Lz77DecodePipelines>,
-    rans: OnceLock<RansPipelines>,
+    rans_decode: OnceLock<RansDecodePipelines>,
+    rans_encode: OnceLock<RansEncodePipelines>,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum compute workgroup size.
@@ -278,6 +290,8 @@ pub struct WebGpuEngine {
     scan_workgroup_size: usize,
     /// Maximum storage buffer binding size in bytes (device limit).
     max_buffer_size: u32,
+    /// Maximum storage buffers per shader stage (device limit).
+    max_storage_buffers_per_shader_stage: u32,
     /// Parsed cost model for the LZ77 lazy kernel (used for batch scheduling).
     cost_lz77_lazy: KernelCost,
     /// Whether profiling is enabled (timestamp queries).
@@ -352,6 +366,15 @@ impl WebGpuEngine {
         let max_work_group_size = limits.max_compute_workgroup_size_x as usize;
         let max_workgroups_per_dim = limits.max_compute_workgroups_per_dimension;
         let max_buffer_size = limits.max_storage_buffer_binding_size;
+        let max_storage_buffers_per_shader_stage = limits.max_storage_buffers_per_shader_stage;
+
+        let mut required_limits = wgpu::Limits::downlevel_defaults();
+        // rANS kernels use 5 storage bindings. Keep conservative defaults while
+        // raising this single limit to what the adapter can support.
+        required_limits.max_storage_buffers_per_shader_stage = required_limits
+            .max_storage_buffers_per_shader_stage
+            .max(5)
+            .min(max_storage_buffers_per_shader_stage);
 
         // Request TIMESTAMP_QUERY when profiling is desired; fall back if unsupported.
         // profiling stays true regardless -- we'll use CPU-side wall-clock timing as fallback.
@@ -366,7 +389,7 @@ impl WebGpuEngine {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("libpz-webgpu"),
             required_features,
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            required_limits,
             memory_hints: wgpu::MemoryHints::Performance,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             trace: wgpu::Trace::Off,
@@ -407,13 +430,15 @@ impl WebGpuEngine {
             fse_decode: OnceLock::new(),
             fse_encode: OnceLock::new(),
             lz77_decode: OnceLock::new(),
-            rans: OnceLock::new(),
+            rans_decode: OnceLock::new(),
+            rans_encode: OnceLock::new(),
             device_name,
             max_work_group_size,
             max_workgroups_per_dim,
             is_cpu,
             scan_workgroup_size,
             max_buffer_size,
+            max_storage_buffers_per_shader_stage,
             cost_lz77_lazy,
             profiling,
             profiler,
@@ -433,6 +458,11 @@ impl WebGpuEngine {
     /// Return the maximum work-group size for the device.
     pub fn max_work_group_size(&self) -> usize {
         self.max_work_group_size
+    }
+
+    /// Return the max compute workgroups per dispatch dimension.
+    pub fn max_workgroups_per_dimension(&self) -> u32 {
+        self.max_workgroups_per_dim
     }
 
     /// Check if the selected device is a CPU (not a GPU or accelerator).
@@ -1141,53 +1171,46 @@ impl WebGpuEngine {
             .encode
     }
 
-    fn rans_pipelines(&self) -> &RansPipelines {
-        self.rans.get_or_init(|| {
-            let t0 = std::time::Instant::now();
-            let encode_module = self
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("rans_encode"),
-                    source: wgpu::ShaderSource::Wgsl(
-                        include_str!("../../kernels/rans_encode.wgsl").into(),
+    fn pipeline_rans_decode(&self) -> &wgpu::ComputePipeline {
+        &self
+            .rans_decode
+            .get_or_init(|| {
+                let t0 = std::time::Instant::now();
+                let group = RansDecodePipelines {
+                    decode: self.make_pipeline(
+                        "rans_decode",
+                        RANS_DECODE_KERNEL_SOURCE,
+                        "rans_decode_chunk",
                     ),
-                });
-            let decode_module = self
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("rans_decode"),
-                    source: wgpu::ShaderSource::Wgsl(
-                        include_str!("../../kernels/rans_decode.wgsl").into(),
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile rans_decode.wgsl: {ms:.3} ms");
+                }
+                group
+            })
+            .decode
+    }
+
+    fn pipeline_rans_encode(&self) -> &wgpu::ComputePipeline {
+        &self
+            .rans_encode
+            .get_or_init(|| {
+                let t0 = std::time::Instant::now();
+                let group = RansEncodePipelines {
+                    encode: self.make_pipeline(
+                        "rans_encode",
+                        RANS_ENCODE_KERNEL_SOURCE,
+                        "rans_encode_chunk",
                     ),
-                });
-            let group = RansPipelines {
-                encode: self
-                    .device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some("rans_encode"),
-                        layout: None,
-                        module: &encode_module,
-                        entry_point: Some("rans_encode_chunk"),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    }),
-                decode: self
-                    .device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some("rans_decode"),
-                        layout: None,
-                        module: &decode_module,
-                        entry_point: Some("rans_decode_chunk"),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    }),
-            };
-            if self.profiling {
-                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                eprintln!("[pz-gpu] compile rans kernels: {ms:.3} ms");
-            }
-            group
-        })
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile rans_encode.wgsl: {ms:.3} ms");
+                }
+                group
+            })
+            .encode
     }
 }
 

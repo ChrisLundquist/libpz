@@ -5,8 +5,12 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use stages_common::{cap, get_test_data};
 
 const SIZES_ALL: &[usize] = &[8192, 65536, 4_194_304];
+const DEFAULT_RANS_CHUNK_BYTES: usize = 8192;
 
 fn bench_rans(c: &mut Criterion) {
+    #[cfg(feature = "webgpu")]
+    let gpu_engine = pz::webgpu::WebGpuEngine::new().ok();
+
     let mut group = c.benchmark_group("rans");
     cap(&mut group);
     for &size in SIZES_ALL {
@@ -21,6 +25,73 @@ fn bench_rans(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("decode", size), &encoded, |b, enc| {
             b.iter(|| pz::rans::decode(enc, size).unwrap());
         });
+
+        let chunked_cpu = pz::rans::encode_chunked(
+            &data,
+            pz::rans::DEFAULT_INTERLEAVE,
+            pz::rans::DEFAULT_SCALE_BITS,
+            DEFAULT_RANS_CHUNK_BYTES,
+        );
+        group.bench_with_input(
+            BenchmarkId::new("encode_chunked_cpu", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    pz::rans::encode_chunked(
+                        data,
+                        pz::rans::DEFAULT_INTERLEAVE,
+                        pz::rans::DEFAULT_SCALE_BITS,
+                        DEFAULT_RANS_CHUNK_BYTES,
+                    )
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("decode_chunked_cpu", size),
+            &chunked_cpu,
+            |b, enc| {
+                b.iter(|| pz::rans::decode_chunked(enc).unwrap());
+            },
+        );
+
+        #[cfg(feature = "webgpu")]
+        if let Some(engine) = &gpu_engine {
+            let (gpu_encoded, used_chunked_gpu) = engine
+                .rans_encode_chunked_payload_gpu(
+                    &data,
+                    pz::rans::DEFAULT_INTERLEAVE,
+                    pz::rans::DEFAULT_SCALE_BITS,
+                    DEFAULT_RANS_CHUNK_BYTES,
+                )
+                .expect("gpu rans encode");
+            if used_chunked_gpu {
+                group.bench_with_input(
+                    BenchmarkId::new("encode_chunked_gpu", size),
+                    &data,
+                    |b, data| {
+                        b.iter(|| {
+                            engine
+                                .rans_encode_chunked_payload_gpu(
+                                    data,
+                                    pz::rans::DEFAULT_INTERLEAVE,
+                                    pz::rans::DEFAULT_SCALE_BITS,
+                                    DEFAULT_RANS_CHUNK_BYTES,
+                                )
+                                .unwrap()
+                        });
+                    },
+                );
+
+                group.bench_with_input(
+                    BenchmarkId::new("decode_chunked_gpu", size),
+                    &gpu_encoded,
+                    |b, enc| {
+                        b.iter(|| engine.rans_decode_chunked_payload_gpu(enc, size).unwrap());
+                    },
+                );
+            }
+        }
     }
     group.finish();
 }
