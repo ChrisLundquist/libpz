@@ -40,16 +40,17 @@ Current implementation status:
 
 1. Slice 0 completed: WebGPU rANS kernels/module scaffolding added and lazy pipeline registration wired.
 2. Slice 1 completed: GPU decode-first path implemented for CPU-compatible interleaved and chunked rANS payloads.
-3. Slice 2 completed: GPU chunked encode implemented and serialized into CPU chunked wire format (`rans::encode_chunked_n` compatible), plus fallback-compatible behavior for chunk metadata overflow.
+3. Slice 2 completed: GPU chunked encode implemented and serialized into CPU chunked wire format (`rans::encode_chunked` compatible), plus fallback-compatible behavior for chunk metadata overflow.
 4. Slice 3 completed: CPU/GPU parity matrix added in WebGPU tests (lanes 4/8, chunk sizes 1KB/4KB/8KB/16KB, repetitive/text/binary/small-edge patterns).
 5. Slice 4 measured (provisional): profiling harness now exercises WebGPU rANS stage path when available; current results do **not** show a stage-level gain vs CPU chunked reference.
 
 Latest stage numbers (1MB, 300 iterations):
 
-1. GPU chunked rANS (`--webgpu`, lanes=4, chunk=8192, `--rans-gpu-batch=2`): encode 38.7 MB/s, decode 70.2 MB/s.
+1. GPU chunked rANS (`--webgpu`, lanes=4, chunk=8192, `--rans-gpu-batch=2`): encode 35.1 MB/s, decode 91.7 MB/s (warm rerun on rebased commit `c4beafa`, 2026-02-17).
 2. CPU chunked interleaved rANS (`--no-default-features --rans-interleaved --rans-chunked --rans-interleaved-states 4 --rans-chunk-bytes 8192`): encode 75.5 MB/s, decode 191.7 MB/s.
-3. Relative: GPU is ~0.51x CPU on encode and ~0.37x CPU on decode for this host/device setup.
-4. Recent perf deltas: encode improved from ~24.3 MB/s to ~38.7 MB/s after host-side ring-buffered submit/completion, single-pass dual-buffer readback, and capping ring depth to active batch size; decode improved from ~54.5 MB/s (batch=1) to ~70.2 MB/s (batch=2) after adding ring-buffered batched GPU decode submission/completion.
+3. Relative: GPU is ~0.46x CPU on encode and ~0.48x CPU on decode for this host/device setup.
+4. Batch overlap sweep (1MB, 300 iterations): batch=1 encode/decode 25.4/55.9 MB/s, batch=2 35.1/91.7 MB/s, batch=3 39.4/75.3 MB/s, batch=4 34.9/71.2 MB/s.
+5. Recent perf deltas: encode improved from ~24.3 MB/s to ~35.1 MB/s after host-side ring-buffered submit/completion, single-pass dual-buffer readback, and capping ring depth to active batch size; decode improved from ~54.5 MB/s (batch=1) to ~91.7 MB/s (batch=2) after adding ring-buffered batched GPU decode submission/completion.
 
 Interim Go/No-Go:
 
@@ -59,7 +60,7 @@ Interim Go/No-Go:
 
 ## Existing Assets We Reuse
 
-1. CPU chunked rANS reference in `src/rans.rs` (`encode_chunked_n`, `decode_chunked`).
+1. CPU chunked rANS reference in `src/rans.rs` (`encode_chunked`, `decode_chunked`).
 2. Pipeline chunked framing support and flag bit in `src/pipeline/stages.rs` (`RANS_CHUNKED_FLAG`).
 3. Established WebGPU pipeline patterns in `src/webgpu/fse.rs` and `src/webgpu/lz77.rs`.
 4. Benchmark/profiling guardrails in `scripts/bench.sh` and `scripts/profile.sh`.
