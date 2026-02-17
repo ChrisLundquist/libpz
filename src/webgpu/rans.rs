@@ -966,6 +966,7 @@ impl WebGpuEngine {
     }
 
     fn rans_decode_pending_ring_depth(&self, inputs: &[(&[u8], usize)]) -> usize {
+        let max_depth = inputs.len().max(1);
         let max_payload = inputs
             .iter()
             .map(|(payload, _)| payload.len())
@@ -983,7 +984,7 @@ impl WebGpuEngine {
 
         // Mirror the LZ77 streaming policy: reserve headroom, clamp to 3 slots.
         let budget = (self.gpu_memory_budget() * 3) / 4;
-        (budget / per_slot).clamp(1, 3)
+        (budget / per_slot).clamp(1, 3).min(max_depth)
     }
 
     /// Batched GPU chunked rANS decode with ring-buffered submit/readback.
@@ -1069,6 +1070,7 @@ impl WebGpuEngine {
         num_lanes: usize,
         chunk_size: usize,
     ) -> usize {
+        let max_depth = inputs.len().max(1);
         let max_input = inputs.iter().map(|b| b.len()).max().unwrap_or(0);
         if max_input == 0 || chunk_size == 0 || num_lanes == 0 {
             return 1;
@@ -1096,7 +1098,7 @@ impl WebGpuEngine {
 
         // Mirror the LZ77 streaming policy: reserve headroom, clamp to 3 slots.
         let budget = (self.gpu_memory_budget() * 3) / 4;
-        (budget / per_slot).clamp(1, 3)
+        (budget / per_slot).clamp(1, 3).min(max_depth)
     }
 
     /// Batched GPU chunked rANS encode with ring-buffered submit/readback.
