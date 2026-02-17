@@ -384,11 +384,12 @@ impl WebGpuEngine {
         let states_u32: &[u32] = bytemuck::cast_slice(&states_raw);
 
         let num_chunks = chunk_lens.len();
-        let header_size = 1 + NUM_SYMBOLS * 2 + 2 + num_chunks * 2;
+        let header_size = 1 + NUM_SYMBOLS * 2 + 2 + 1 + num_chunks * 2;
         let mut output = Vec::with_capacity(header_size + input_len);
         output.push(norm.scale_bits);
         serialize_freq_table(&norm, &mut output);
         output.extend_from_slice(&(num_chunks as u16).to_le_bytes());
+        output.push(num_lanes as u8);
         for &chunk_len in &chunk_lens {
             output.extend_from_slice(&(chunk_len as u16).to_le_bytes());
         }
@@ -409,7 +410,6 @@ impl WebGpuEngine {
                 return Err(PzError::InvalidInput);
             }
 
-            output.push(num_lanes as u8);
             for lane in 0..num_lanes {
                 output.extend_from_slice(&states_u32[chunk_base + lane].to_le_bytes());
             }
@@ -768,6 +768,14 @@ impl WebGpuEngine {
         if num_chunks == 0 {
             return Err(PzError::InvalidInput);
         }
+        if input.len() < cursor + 1 {
+            return Err(PzError::InvalidInput);
+        }
+        let num_lanes = input[cursor] as usize;
+        cursor += 1;
+        if num_lanes == 0 || num_lanes > 64 {
+            return Err(PzError::Unsupported);
+        }
         if input.len() < cursor + num_chunks * 2 {
             return Err(PzError::InvalidInput);
         }
@@ -783,14 +791,6 @@ impl WebGpuEngine {
         }
         if total_chunk_len != original_len {
             return Err(PzError::InvalidInput);
-        }
-        if input.len() <= cursor {
-            return Err(PzError::InvalidInput);
-        }
-
-        let num_lanes = input[cursor] as usize;
-        if num_lanes == 0 || num_lanes > 64 {
-            return Err(PzError::Unsupported);
         }
         let chunk_size = chunk_lens[0].max(1);
         if !validate_chunk_grid(&chunk_lens, chunk_size, original_len) {
@@ -819,15 +819,6 @@ impl WebGpuEngine {
         let mut running_words_u16 = 0usize;
 
         for (chunk_idx, &chunk_len) in chunk_lens.iter().enumerate() {
-            if input.len() < cursor + 1 {
-                return Err(PzError::InvalidInput);
-            }
-            let lane_count = input[cursor] as usize;
-            cursor += 1;
-            if lane_count != num_lanes {
-                return Err(PzError::Unsupported);
-            }
-
             let chunk_base = chunk_idx * num_lanes * 2;
             for lane in 0..num_lanes {
                 state_words[chunk_base + lane] = read_u32_le(input, &mut cursor)?;
@@ -950,7 +941,7 @@ impl WebGpuEngine {
         pending.output_dev.read_to_host(self)
     }
 
-    /// Decode chunked interleaved rANS payload (`rans::encode_chunked_n`) on GPU.
+    /// Decode chunked interleaved rANS payload (`rans::encode_chunked`) on GPU.
     ///
     /// Preserves CPU wire compatibility and rejects malformed metadata.
     pub fn rans_decode_chunked_payload_gpu(
@@ -990,7 +981,7 @@ impl WebGpuEngine {
     /// Batched GPU chunked rANS decode with ring-buffered submit/readback.
     ///
     /// Inputs are `(payload, original_len)` tuples where `payload` is in
-    /// `rans::encode_chunked_n` wire format.
+    /// `rans::encode_chunked` wire format.
     pub fn rans_decode_chunked_payload_gpu_batched(
         &self,
         inputs: &[(&[u8], usize)],
@@ -1035,7 +1026,7 @@ impl WebGpuEngine {
     /// Encode chunked interleaved rANS payload on GPU using CPU wire format.
     ///
     /// Returns `(encoded, used_chunked)` with fallback behavior that mirrors
-    /// `rans::encode_chunked_n` metadata limits.
+    /// `rans::encode_chunked` metadata limits.
     pub fn rans_encode_chunked_payload_gpu(
         &self,
         input: &[u8],

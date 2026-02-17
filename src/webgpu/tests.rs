@@ -1896,7 +1896,7 @@ fn test_rans_chunked_encode_gpu_cpu_decode_round_trip() {
         .rans_encode_chunked_payload_gpu(&input, 4, crate::rans::DEFAULT_SCALE_BITS, 2048)
         .unwrap();
     assert!(used_chunked);
-    let decoded = crate::rans::decode_chunked(&encoded, input.len()).unwrap();
+    let decoded = crate::rans::decode_chunked(&encoded).unwrap();
     assert_eq!(decoded, input);
 }
 
@@ -1966,7 +1966,7 @@ fn test_rans_chunked_encode_gpu_batched_cpu_decode_round_trip() {
 
     for (i, (payload, used_chunked)) in encoded.iter().enumerate() {
         assert!(*used_chunked);
-        let decoded = crate::rans::decode_chunked(payload, inputs[i].len()).unwrap();
+        let decoded = crate::rans::decode_chunked(payload).unwrap();
         assert_eq!(decoded, inputs[i]);
     }
 }
@@ -1980,9 +1980,7 @@ fn test_rans_chunked_decode_gpu_round_trip() {
     };
 
     let input: Vec<u8> = (0..32768).map(|i| ((i * 19 + 7) % 256) as u8).collect();
-    let (encoded, used_chunked) =
-        crate::rans::encode_chunked_n(&input, 4, crate::rans::DEFAULT_SCALE_BITS, 2048);
-    assert!(used_chunked);
+    let encoded = crate::rans::encode_chunked(&input, 4, crate::rans::DEFAULT_SCALE_BITS, 2048);
 
     let decoded = engine
         .rans_decode_chunked_payload_gpu(&encoded, input.len())
@@ -2005,9 +2003,7 @@ fn test_rans_chunked_decode_gpu_batched_round_trip() {
     ];
     let mut payloads = Vec::with_capacity(inputs.len());
     for input in &inputs {
-        let (encoded, used_chunked) =
-            crate::rans::encode_chunked_n(input, 4, crate::rans::DEFAULT_SCALE_BITS, 2048);
-        assert!(used_chunked);
+        let encoded = crate::rans::encode_chunked(input, 4, crate::rans::DEFAULT_SCALE_BITS, 2048);
         payloads.push(encoded);
     }
 
@@ -2065,9 +2061,7 @@ fn test_rans_chunked_decode_gpu_rejects_chunk_len_mismatch() {
     };
 
     let input: Vec<u8> = (0..8192usize).map(|i| ((i * 23 + 3) % 256) as u8).collect();
-    let (mut encoded, used_chunked) =
-        crate::rans::encode_chunked_n(&input, 4, crate::rans::DEFAULT_SCALE_BITS, 1024);
-    assert!(used_chunked);
+    let mut encoded = crate::rans::encode_chunked(&input, 4, crate::rans::DEFAULT_SCALE_BITS, 1024);
 
     let first_chunk_len_offset = 1 + crate::rans::NUM_SYMBOLS * 2 + 2;
     encoded[first_chunk_len_offset] ^= 1;
@@ -2109,17 +2103,13 @@ fn test_rans_chunked_parity_matrix_gpu_cpu() {
         for &chunk_size in &[1024usize, 4096, 8192, 16_384] {
             for (label, input) in &patterns {
                 // 1) CPU encode -> CPU decode
-                let (cpu_encoded, used_cpu_chunked) = crate::rans::encode_chunked_n(
+                let cpu_encoded = crate::rans::encode_chunked(
                     input,
                     num_lanes,
                     crate::rans::DEFAULT_SCALE_BITS,
                     chunk_size,
                 );
-                assert!(
-                    used_cpu_chunked,
-                    "cpu chunked fallback for pattern={label}, lanes={num_lanes}, chunk={chunk_size}"
-                );
-                let cpu_decoded = crate::rans::decode_chunked(&cpu_encoded, input.len()).unwrap();
+                let cpu_decoded = crate::rans::decode_chunked(&cpu_encoded).unwrap();
                 assert_eq!(
                     cpu_decoded, *input,
                     "cpu->cpu mismatch pattern={label}, lanes={num_lanes}, chunk={chunk_size}"
@@ -2147,8 +2137,7 @@ fn test_rans_chunked_parity_matrix_gpu_cpu() {
                     used_gpu_chunked,
                     "gpu chunked fallback for pattern={label}, lanes={num_lanes}, chunk={chunk_size}"
                 );
-                let cpu_decoded_from_gpu =
-                    crate::rans::decode_chunked(&gpu_encoded, input.len()).unwrap();
+                let cpu_decoded_from_gpu = crate::rans::decode_chunked(&gpu_encoded).unwrap();
                 assert_eq!(
                     cpu_decoded_from_gpu, *input,
                     "gpu->cpu mismatch pattern={label}, lanes={num_lanes}, chunk={chunk_size}"

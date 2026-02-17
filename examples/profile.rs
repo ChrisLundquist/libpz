@@ -13,6 +13,8 @@ use std::time::Instant;
 
 use pz::pipeline::{self, CompressOptions, Pipeline};
 
+const DEFAULT_RANS_CHUNK_BYTES: usize = 8192;
+
 fn usage() {
     eprintln!("profile - run compression in a loop for profiling");
     eprintln!();
@@ -38,7 +40,7 @@ fn usage() {
     );
     eprintln!(
         "  --rans-chunk-bytes N          Chunk size for chunked interleaved rANS (default: {})",
-        pz::rans::DEFAULT_CHUNK_BYTES
+        DEFAULT_RANS_CHUNK_BYTES
     );
     eprintln!("  --rans-gpu-batch N            Batch size for GPU rANS profiling (default: 2)");
     eprintln!("  --unified-scheduler           Enable prototype mixed-task scheduler");
@@ -50,6 +52,7 @@ struct RansProfileOptions {
     interleaved: bool,
     interleaved_states: usize,
     chunked: bool,
+    chunked_min_bytes: usize,
     chunk_bytes: usize,
     #[cfg_attr(not(feature = "webgpu"), allow(dead_code))]
     gpu_batch: usize,
@@ -133,6 +136,7 @@ fn profile_stage(
     iterations: usize,
     rans: RansProfileOptions,
 ) {
+    let chunked_enabled = rans.chunked && data.len() >= rans.chunked_min_bytes;
     eprintln!(
         "profiling stage {} {}: {} bytes, {} iterations",
         stage,
@@ -218,16 +222,13 @@ fn profile_stage(
         ("rans", false) => {
             if !profile_rans_stage_gpu(data, false, iterations, rans) {
                 for _ in 0..iterations {
-                    if rans.chunked {
-                        let _ = std::hint::black_box(
-                            pz::rans::encode_chunked_n(
-                                data,
-                                rans.interleaved_states,
-                                pz::rans::DEFAULT_SCALE_BITS,
-                                rans.chunk_bytes,
-                            )
-                            .0,
-                        );
+                    if chunked_enabled {
+                        let _ = std::hint::black_box(pz::rans::encode_chunked(
+                            data,
+                            rans.interleaved_states,
+                            pz::rans::DEFAULT_SCALE_BITS,
+                            rans.chunk_bytes,
+                        ));
                     } else if rans.interleaved {
                         let _ = std::hint::black_box(pz::rans::encode_interleaved_n(
                             data,
@@ -242,12 +243,15 @@ fn profile_stage(
         }
         ("rans", true) => {
             if !profile_rans_stage_gpu(data, true, iterations, rans) {
-                let (enc, encoded_chunked) = if rans.chunked {
-                    pz::rans::encode_chunked_n(
-                        data,
-                        rans.interleaved_states,
-                        pz::rans::DEFAULT_SCALE_BITS,
-                        rans.chunk_bytes,
+                let (enc, encoded_chunked) = if chunked_enabled {
+                    (
+                        pz::rans::encode_chunked(
+                            data,
+                            rans.interleaved_states,
+                            pz::rans::DEFAULT_SCALE_BITS,
+                            rans.chunk_bytes,
+                        ),
+                        true,
                     )
                 } else if rans.interleaved {
                     (
@@ -264,7 +268,7 @@ fn profile_stage(
                 let len = data.len();
                 for _ in 0..iterations {
                     if encoded_chunked {
-                        let _ = std::hint::black_box(pz::rans::decode_chunked(&enc, len).unwrap());
+                        let _ = std::hint::black_box(pz::rans::decode_chunked(&enc).unwrap());
                     } else if rans.interleaved {
                         let _ =
                             std::hint::black_box(pz::rans::decode_interleaved(&enc, len).unwrap());
@@ -305,7 +309,7 @@ fn profile_rans_stage_gpu(
     let chunk_bytes = if rans.chunked {
         rans.chunk_bytes
     } else {
-        pz::rans::DEFAULT_CHUNK_BYTES
+        DEFAULT_RANS_CHUNK_BYTES
     };
     let scale_bits = pz::rans::DEFAULT_SCALE_BITS;
 
@@ -392,7 +396,7 @@ fn main() {
     let mut rans_interleaved_states = 4usize;
     let mut rans_chunked = false;
     let mut rans_chunked_min_bytes = 262_144usize;
-    let mut rans_chunk_bytes = pz::rans::DEFAULT_CHUNK_BYTES;
+    let mut rans_chunk_bytes = DEFAULT_RANS_CHUNK_BYTES;
     let mut rans_gpu_batch = 2usize;
     let mut unified_scheduler = false;
 
@@ -466,6 +470,7 @@ fn main() {
         interleaved: rans_interleaved,
         interleaved_states: rans_interleaved_states,
         chunked: rans_chunked,
+        chunked_min_bytes: rans_chunked_min_bytes,
         chunk_bytes: rans_chunk_bytes,
         gpu_batch: rans_gpu_batch,
     };
@@ -493,9 +498,6 @@ fn main() {
             rans_interleaved,
             rans_interleaved_min_bytes,
             rans_interleaved_states,
-            rans_chunked,
-            rans_chunked_min_bytes,
-            rans_chunk_bytes,
             unified_scheduler,
             ..CompressOptions::default()
         };
