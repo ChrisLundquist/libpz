@@ -1,5 +1,4 @@
 use super::*;
-use crate::webgpu::rans::RansChunkedDecodeParams;
 
 #[test]
 fn test_gpu_match_struct_size() {
@@ -1869,35 +1868,6 @@ fn test_lz77_lazy_kernel_round_trip() {
 }
 
 #[test]
-fn test_rans_chunked_round_trip() {
-    let engine = match WebGpuEngine::new() {
-        Ok(e) => e,
-        Err(PzError::Unsupported) => return,
-        Err(e) => panic!("unexpected error: {:?}", e),
-    };
-
-    let input: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
-    let (words, states, tables) = engine.rans_encode_chunked_gpu(&input, 4, 12, 1024).unwrap();
-    let decoded_buffer = engine
-        .rans_decode_chunked_gpu(
-            &words,
-            &states,
-            &tables,
-            input.len(),
-            RansChunkedDecodeParams {
-                num_lanes: 4,
-                scale_bits: 12,
-                chunk_size: 1024,
-            },
-        )
-        .unwrap();
-
-    let decoded_data = decoded_buffer.read_to_host(&engine).unwrap();
-
-    assert_eq!(decoded_data, input);
-}
-
-#[test]
 fn test_rans_interleaved_decode_gpu_round_trip() {
     let engine = match WebGpuEngine::new() {
         Ok(e) => e,
@@ -1911,4 +1881,190 @@ fn test_rans_interleaved_decode_gpu_round_trip() {
         .rans_decode_interleaved_gpu(&encoded, input.len())
         .unwrap();
     assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_rans_chunked_encode_gpu_cpu_decode_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..32768).map(|i| ((i * 13 + 5) % 256) as u8).collect();
+    let (encoded, used_chunked) = engine
+        .rans_encode_chunked_payload_gpu(&input, 4, crate::rans::DEFAULT_SCALE_BITS, 2048)
+        .unwrap();
+    assert!(used_chunked);
+    let decoded = crate::rans::decode_chunked(&encoded, input.len()).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_rans_chunked_encode_gpu_decode_gpu_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..24576).map(|i| ((i * 17 + 11) % 251) as u8).collect();
+    let (encoded, used_chunked) = engine
+        .rans_encode_chunked_payload_gpu(&input, 4, crate::rans::DEFAULT_SCALE_BITS, 1024)
+        .unwrap();
+    assert!(used_chunked);
+    let decoded = engine
+        .rans_decode_chunked_payload_gpu(&encoded, input.len())
+        .unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_rans_chunked_encode_gpu_fallback_matches_cpu() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..8192).map(|i| ((i * 31 + 7) % 256) as u8).collect();
+    let (encoded_gpu, used_chunked_gpu) = engine
+        .rans_encode_chunked_payload_gpu(&input, 4, crate::rans::DEFAULT_SCALE_BITS, 0)
+        .unwrap();
+    assert!(!used_chunked_gpu);
+
+    let encoded_cpu = crate::rans::encode_interleaved_n(&input, 4, crate::rans::DEFAULT_SCALE_BITS);
+    assert_eq!(encoded_gpu, encoded_cpu);
+    let decoded = crate::rans::decode_interleaved(&encoded_gpu, input.len()).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_rans_chunked_decode_gpu_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..32768).map(|i| ((i * 19 + 7) % 256) as u8).collect();
+    let (encoded, used_chunked) =
+        crate::rans::encode_chunked_n(&input, 4, crate::rans::DEFAULT_SCALE_BITS, 2048);
+    assert!(used_chunked);
+
+    let decoded = engine
+        .rans_decode_chunked_payload_gpu(&encoded, input.len())
+        .unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn test_rans_chunked_decode_gpu_rejects_chunk_len_mismatch() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..8192usize).map(|i| ((i * 23 + 3) % 256) as u8).collect();
+    let (mut encoded, used_chunked) =
+        crate::rans::encode_chunked_n(&input, 4, crate::rans::DEFAULT_SCALE_BITS, 1024);
+    assert!(used_chunked);
+
+    let first_chunk_len_offset = 1 + crate::rans::NUM_SYMBOLS * 2 + 2;
+    encoded[first_chunk_len_offset] ^= 1;
+    assert_eq!(
+        engine.rans_decode_chunked_payload_gpu(&encoded, input.len()),
+        Err(PzError::InvalidInput)
+    );
+}
+
+#[test]
+fn test_rans_chunked_parity_matrix_gpu_cpu() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let repetitive = vec![b'A'; 70_000];
+
+    let mut text = Vec::with_capacity(70_000);
+    let text_pattern = b"The Burrows-Wheeler transform clusters bytes. ";
+    while text.len() < 70_000 {
+        let take = (70_000 - text.len()).min(text_pattern.len());
+        text.extend_from_slice(&text_pattern[..take]);
+    }
+
+    let binary: Vec<u8> = (0..70_000).map(|i| ((i * 73 + 19) % 256) as u8).collect();
+
+    let small_edge: Vec<u8> = (0..509).map(|i| ((i * 29 + 7) % 251) as u8).collect();
+
+    let patterns = vec![
+        ("repetitive", repetitive),
+        ("mixed_text", text),
+        ("binary", binary),
+        ("small_edge", small_edge),
+    ];
+
+    for &num_lanes in &[4usize, 8usize] {
+        for &chunk_size in &[1024usize, 4096, 8192, 16_384] {
+            for (label, input) in &patterns {
+                // 1) CPU encode -> CPU decode
+                let (cpu_encoded, used_cpu_chunked) = crate::rans::encode_chunked_n(
+                    input,
+                    num_lanes,
+                    crate::rans::DEFAULT_SCALE_BITS,
+                    chunk_size,
+                );
+                assert!(
+                    used_cpu_chunked,
+                    "cpu chunked fallback for pattern={label}, lanes={num_lanes}, chunk={chunk_size}"
+                );
+                let cpu_decoded = crate::rans::decode_chunked(&cpu_encoded, input.len()).unwrap();
+                assert_eq!(
+                    cpu_decoded, *input,
+                    "cpu->cpu mismatch pattern={label}, lanes={num_lanes}, chunk={chunk_size}"
+                );
+
+                // 2) CPU encode -> GPU decode
+                let gpu_decoded_from_cpu = engine
+                    .rans_decode_chunked_payload_gpu(&cpu_encoded, input.len())
+                    .unwrap();
+                assert_eq!(
+                    gpu_decoded_from_cpu, *input,
+                    "cpu->gpu mismatch pattern={label}, lanes={num_lanes}, chunk={chunk_size}"
+                );
+
+                // 3) GPU encode -> CPU decode
+                let (gpu_encoded, used_gpu_chunked) = engine
+                    .rans_encode_chunked_payload_gpu(
+                        input,
+                        num_lanes,
+                        crate::rans::DEFAULT_SCALE_BITS,
+                        chunk_size,
+                    )
+                    .unwrap();
+                assert!(
+                    used_gpu_chunked,
+                    "gpu chunked fallback for pattern={label}, lanes={num_lanes}, chunk={chunk_size}"
+                );
+                let cpu_decoded_from_gpu =
+                    crate::rans::decode_chunked(&gpu_encoded, input.len()).unwrap();
+                assert_eq!(
+                    cpu_decoded_from_gpu, *input,
+                    "gpu->cpu mismatch pattern={label}, lanes={num_lanes}, chunk={chunk_size}"
+                );
+
+                // 4) GPU encode -> GPU decode
+                let gpu_decoded_from_gpu = engine
+                    .rans_decode_chunked_payload_gpu(&gpu_encoded, input.len())
+                    .unwrap();
+                assert_eq!(
+                    gpu_decoded_from_gpu, *input,
+                    "gpu->gpu mismatch pattern={label}, lanes={num_lanes}, chunk={chunk_size}"
+                );
+            }
+        }
+    }
 }
