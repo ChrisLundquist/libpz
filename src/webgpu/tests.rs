@@ -1991,6 +1991,41 @@ fn test_rans_chunked_decode_gpu_round_trip() {
 }
 
 #[test]
+fn test_rans_chunked_decode_gpu_batched_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let inputs: Vec<Vec<u8>> = vec![
+        (0..24_576).map(|i| ((i * 17 + 11) % 251) as u8).collect(),
+        (0..16_384).map(|i| ((i * 31 + 7) % 256) as u8).collect(),
+        (0..8_192).map(|i| ((i * 13 + 5) % 256) as u8).collect(),
+    ];
+    let mut payloads = Vec::with_capacity(inputs.len());
+    for input in &inputs {
+        let (encoded, used_chunked) =
+            crate::rans::encode_chunked_n(input, 4, crate::rans::DEFAULT_SCALE_BITS, 2048);
+        assert!(used_chunked);
+        payloads.push(encoded);
+    }
+
+    let decode_inputs: Vec<(&[u8], usize)> = payloads
+        .iter()
+        .zip(inputs.iter())
+        .map(|(payload, input)| (payload.as_slice(), input.len()))
+        .collect();
+    let decoded = engine
+        .rans_decode_chunked_payload_gpu_batched(&decode_inputs)
+        .unwrap();
+    assert_eq!(decoded.len(), inputs.len());
+    for (i, output) in decoded.iter().enumerate() {
+        assert_eq!(output, &inputs[i]);
+    }
+}
+
+#[test]
 fn test_rans_chunked_decode_gpu_rejects_chunk_len_mismatch() {
     let engine = match WebGpuEngine::new() {
         Ok(e) => e,

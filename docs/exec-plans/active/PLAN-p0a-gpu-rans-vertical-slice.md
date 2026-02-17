@@ -46,10 +46,10 @@ Current implementation status:
 
 Latest stage numbers (1MB, 300 iterations):
 
-1. GPU chunked rANS (`--webgpu`, lanes=4, chunk=8192, `--rans-gpu-batch=4`): encode 41.8 MB/s, decode 60.1 MB/s.
-2. CPU chunked interleaved rANS (`--no-default-features --rans-interleaved --rans-chunked --rans-interleaved-states 4 --rans-chunk-bytes 8192`): encode 77.4 MB/s, decode 202.6 MB/s.
-3. Relative: GPU is ~0.54x CPU on encode and ~0.30x CPU on decode for this host/device setup.
-4. Recent perf deltas: encode improved from ~24.3 MB/s to ~41.8 MB/s after host-side ring-buffered submit/completion, single-pass dual-buffer readback, and tuning profile batch size; decode remains below CPU and needs additional work.
+1. GPU chunked rANS (`--webgpu`, lanes=4, chunk=8192, `--rans-gpu-batch=2`): encode 36.7 MB/s, decode 72.0 MB/s.
+2. CPU chunked interleaved rANS (`--no-default-features --rans-interleaved --rans-chunked --rans-interleaved-states 4 --rans-chunk-bytes 8192`): encode 75.5 MB/s, decode 191.7 MB/s.
+3. Relative: GPU is ~0.49x CPU on encode and ~0.38x CPU on decode for this host/device setup.
+4. Recent perf deltas: encode improved from ~24.3 MB/s to ~36.7 MB/s after host-side ring-buffered submit/completion and single-pass dual-buffer readback; decode improved from ~54.5 MB/s (batch=1) to ~72.0 MB/s (batch=2) after adding ring-buffered batched GPU decode submission/completion.
 
 Interim Go/No-Go:
 

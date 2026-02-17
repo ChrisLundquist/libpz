@@ -116,6 +116,20 @@ struct PendingRansChunkedPayloadEncode {
     input_len: usize,
 }
 
+struct PreparedRansChunkedPayloadDecode {
+    words_dev: DeviceBuf,
+    states_dev: DeviceBuf,
+    tables: wgpu::Buffer,
+    params: RansChunkedDecodeParams,
+}
+
+struct PendingRansChunkedPayloadDecode {
+    output_dev: DeviceBuf,
+    _words_dev: DeviceBuf,
+    _states_dev: DeviceBuf,
+    _tables: wgpu::Buffer,
+}
+
 impl WebGpuEngine {
     fn rans_encode_chunked_gpu_with_norm(
         &self,
@@ -734,17 +748,11 @@ impl WebGpuEngine {
         decoded_dev.read_to_host(self)
     }
 
-    /// Decode chunked interleaved rANS payload (`rans::encode_chunked_n`) on GPU.
-    ///
-    /// Preserves CPU wire compatibility and rejects malformed metadata.
-    pub fn rans_decode_chunked_payload_gpu(
+    fn prepare_rans_chunked_payload_decode(
         &self,
         input: &[u8],
         original_len: usize,
-    ) -> PzResult<Vec<u8>> {
-        if original_len == 0 {
-            return Ok(Vec::new());
-        }
+    ) -> PzResult<PreparedRansChunkedPayloadDecode> {
         if input.len() < 1 + NUM_SYMBOLS * 2 + 2 {
             return Err(PzError::InvalidInput);
         }
@@ -902,18 +910,125 @@ impl WebGpuEngine {
             wgpu::BufferUsages::STORAGE,
         );
 
-        let decoded_dev = self.rans_decode_chunked_gpu(
-            &words_dev,
-            &states_dev,
-            &tables,
-            original_len,
-            RansChunkedDecodeParams {
+        Ok(PreparedRansChunkedPayloadDecode {
+            words_dev,
+            states_dev,
+            tables,
+            params: RansChunkedDecodeParams {
                 num_lanes,
                 scale_bits,
                 chunk_size,
             },
+        })
+    }
+
+    fn submit_rans_chunked_payload_decode(
+        &self,
+        input: &[u8],
+        original_len: usize,
+    ) -> PzResult<PendingRansChunkedPayloadDecode> {
+        let prepared = self.prepare_rans_chunked_payload_decode(input, original_len)?;
+        let output_dev = self.rans_decode_chunked_gpu(
+            &prepared.words_dev,
+            &prepared.states_dev,
+            &prepared.tables,
+            original_len,
+            prepared.params,
         )?;
-        decoded_dev.read_to_host(self)
+        Ok(PendingRansChunkedPayloadDecode {
+            output_dev,
+            _words_dev: prepared.words_dev,
+            _states_dev: prepared.states_dev,
+            _tables: prepared.tables,
+        })
+    }
+
+    fn complete_rans_chunked_payload_decode(
+        &self,
+        pending: PendingRansChunkedPayloadDecode,
+    ) -> PzResult<Vec<u8>> {
+        pending.output_dev.read_to_host(self)
+    }
+
+    /// Decode chunked interleaved rANS payload (`rans::encode_chunked_n`) on GPU.
+    ///
+    /// Preserves CPU wire compatibility and rejects malformed metadata.
+    pub fn rans_decode_chunked_payload_gpu(
+        &self,
+        input: &[u8],
+        original_len: usize,
+    ) -> PzResult<Vec<u8>> {
+        if original_len == 0 {
+            return Ok(Vec::new());
+        }
+        let pending = self.submit_rans_chunked_payload_decode(input, original_len)?;
+        self.complete_rans_chunked_payload_decode(pending)
+    }
+
+    fn rans_decode_pending_ring_depth(&self, inputs: &[(&[u8], usize)]) -> usize {
+        let max_payload = inputs
+            .iter()
+            .map(|(payload, _)| payload.len())
+            .max()
+            .unwrap_or(0);
+        let max_output = inputs
+            .iter()
+            .map(|(_, output_len)| *output_len)
+            .max()
+            .unwrap_or(0);
+        let per_slot = max_payload.saturating_add(max_output);
+        if per_slot == 0 {
+            return 1;
+        }
+
+        // Mirror the LZ77 streaming policy: reserve headroom, clamp to 3 slots.
+        let budget = (self.gpu_memory_budget() * 3) / 4;
+        (budget / per_slot).clamp(1, 3)
+    }
+
+    /// Batched GPU chunked rANS decode with ring-buffered submit/readback.
+    ///
+    /// Inputs are `(payload, original_len)` tuples where `payload` is in
+    /// `rans::encode_chunked_n` wire format.
+    pub fn rans_decode_chunked_payload_gpu_batched(
+        &self,
+        inputs: &[(&[u8], usize)],
+    ) -> PzResult<Vec<Vec<u8>>> {
+        let ring_depth = self.rans_decode_pending_ring_depth(inputs);
+        let mut results: Vec<Option<Vec<u8>>> = vec![None; inputs.len()];
+        let mut ring = BufferRing::new(
+            (0..ring_depth)
+                .map(|_| None::<(usize, PendingRansChunkedPayloadDecode)>)
+                .collect(),
+        );
+
+        for (idx, &(input, original_len)) in inputs.iter().enumerate() {
+            let slot_idx = ring.acquire();
+            if let Some((done_idx, done)) = ring.slots[slot_idx].take() {
+                let decoded = self.complete_rans_chunked_payload_decode(done)?;
+                results[done_idx] = Some(decoded);
+            }
+
+            if original_len == 0 {
+                results[idx] = Some(Vec::new());
+                continue;
+            }
+
+            let submitted = self.submit_rans_chunked_payload_decode(input, original_len)?;
+            ring.slots[slot_idx] = Some((idx, submitted));
+        }
+
+        for slot in &mut ring.slots {
+            if let Some((done_idx, done)) = slot.take() {
+                let decoded = self.complete_rans_chunked_payload_decode(done)?;
+                results[done_idx] = Some(decoded);
+            }
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|r| r.expect("all batched rans decode results must be populated"))
+            .collect())
     }
 
     /// Encode chunked interleaved rANS payload on GPU using CPU wire format.

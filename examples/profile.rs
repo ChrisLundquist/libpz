@@ -40,7 +40,7 @@ fn usage() {
         "  --rans-chunk-bytes N          Chunk size for chunked interleaved rANS (default: {})",
         pz::rans::DEFAULT_CHUNK_BYTES
     );
-    eprintln!("  --rans-gpu-batch N            Batch size for GPU rANS profiling (default: 4)");
+    eprintln!("  --rans-gpu-batch N            Batch size for GPU rANS profiling (default: 2)");
     eprintln!("  --unified-scheduler           Enable prototype mixed-task scheduler");
     eprintln!("  --help          Show this help");
 }
@@ -328,7 +328,17 @@ fn profile_rans_stage_gpu(
             return false;
         }
         let len = data.len();
-        for _ in 0..iterations {
+        let gpu_batch = rans.gpu_batch.max(1);
+        let batch_inputs: Vec<(&[u8], usize)> = vec![(enc.as_slice(), len); gpu_batch];
+        let full_batches = iterations / gpu_batch;
+        for _ in 0..full_batches {
+            let _ = std::hint::black_box(
+                engine
+                    .rans_decode_chunked_payload_gpu_batched(&batch_inputs)
+                    .unwrap(),
+            );
+        }
+        for _ in 0..(iterations % gpu_batch) {
             let _ =
                 std::hint::black_box(engine.rans_decode_chunked_payload_gpu(&enc, len).unwrap());
         }
@@ -383,7 +393,7 @@ fn main() {
     let mut rans_chunked = false;
     let mut rans_chunked_min_bytes = 262_144usize;
     let mut rans_chunk_bytes = pz::rans::DEFAULT_CHUNK_BYTES;
-    let mut rans_gpu_batch = 4usize;
+    let mut rans_gpu_batch = 2usize;
     let mut unified_scheduler = false;
 
     let mut i = 0;
