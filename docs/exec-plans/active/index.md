@@ -1,23 +1,23 @@
 # Active Execution Plans
 
-**Last Updated:** 2026-02-15
+**Last Updated:** 2026-02-16
 
 ## Active Plans
 
+### [PLAN-competitive-roadmap.md](PLAN-competitive-roadmap.md)
+**Status:** In Progress (Phases 0–1 complete, Phase 2 active) | **Priority:** P0
+
+### [PLAN-interleaved-rans.md](PLAN-interleaved-rans.md)
+**Status:** In Progress (Phase A merged in PR #91) | **Priority:** P1
+
+### [PLAN-unified-scheduler-north-star.md](PLAN-unified-scheduler-north-star.md)
+**Status:** In Progress (prototype merged, GPU Phases 1–5 TODO) | **Priority:** P1
+
 ### [agent-harness-implementation.md](agent-harness-implementation.md)
-**Status:** In Progress (Phase 1 complete) | **Priority:** P1
+**Status:** In Progress (Phase 1 complete 2026-02-14, Phases 2–8 deferred) | **Priority:** P1
 
 ### [TODO-huffman-sync-decode.md](TODO-huffman-sync-decode.md)
 **Status:** Planned | **Priority:** P2
-
-### [PLAN-competitive-roadmap.md](PLAN-competitive-roadmap.md)
-**Status:** Planned | **Priority:** P0
-
-### [PLAN-interleaved-rans.md](PLAN-interleaved-rans.md)
-**Status:** Planned | **Priority:** P1
-
-### [PLAN-unified-scheduler-north-star.md](PLAN-unified-scheduler-north-star.md)
-**Status:** Planned | **Priority:** P1
 
 ## Completed Plans (in ../completed/)
 

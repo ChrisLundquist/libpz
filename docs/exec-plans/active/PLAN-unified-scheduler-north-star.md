@@ -182,7 +182,7 @@ Acceptance:
 1. GPU rANS stage: `cargo bench --bench stages_rans --features webgpu`
 2. Full pipeline: `./scripts/bench.sh --webgpu -n 5 -p lzr`
 3. Cross-device equivalence: `cargo test --features webgpu` (CPU encode → GPU decode and vice versa)
-4. Profile harness: `./scripts/profile.sh --stage rans --size 1048576 --webgpu`
+4. Profile harness: `./scripts/profile.sh --stage rans --size 1048576 --features webgpu`
 5. Memory budget: `./scripts/gpu-meminfo.sh` before and after each phase
 
 ## Guardrails
