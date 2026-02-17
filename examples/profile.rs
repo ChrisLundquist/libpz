@@ -330,7 +330,23 @@ fn profile_rans_stage_gpu(
                 std::hint::black_box(engine.rans_decode_chunked_payload_gpu(&enc, len).unwrap());
         }
     } else {
-        for _ in 0..iterations {
+        // Use a small batch so the GPU path can overlap submit/readback.
+        const GPU_BATCH: usize = 8;
+        let batch_inputs: Vec<&[u8]> = vec![data; GPU_BATCH];
+        let full_batches = iterations / GPU_BATCH;
+        for _ in 0..full_batches {
+            let _ = std::hint::black_box(
+                engine
+                    .rans_encode_chunked_payload_gpu_batched(
+                        &batch_inputs,
+                        num_lanes,
+                        scale_bits,
+                        chunk_bytes,
+                    )
+                    .unwrap(),
+            );
+        }
+        for _ in 0..(iterations % GPU_BATCH) {
             let _ = std::hint::black_box(
                 engine
                     .rans_encode_chunked_payload_gpu(data, num_lanes, scale_bits, chunk_bytes)
