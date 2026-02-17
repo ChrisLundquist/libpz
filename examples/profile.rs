@@ -40,6 +40,7 @@ fn usage() {
         "  --rans-chunk-bytes N          Chunk size for chunked interleaved rANS (default: {})",
         pz::rans::DEFAULT_CHUNK_BYTES
     );
+    eprintln!("  --rans-gpu-batch N            Batch size for GPU rANS profiling (default: 4)");
     eprintln!("  --unified-scheduler           Enable prototype mixed-task scheduler");
     eprintln!("  --help          Show this help");
 }
@@ -50,6 +51,8 @@ struct RansProfileOptions {
     interleaved_states: usize,
     chunked: bool,
     chunk_bytes: usize,
+    #[cfg_attr(not(feature = "webgpu"), allow(dead_code))]
+    gpu_batch: usize,
 }
 
 fn load_data(size: usize) -> Vec<u8> {
@@ -331,9 +334,9 @@ fn profile_rans_stage_gpu(
         }
     } else {
         // Use a small batch so the GPU path can overlap submit/readback.
-        const GPU_BATCH: usize = 8;
-        let batch_inputs: Vec<&[u8]> = vec![data; GPU_BATCH];
-        let full_batches = iterations / GPU_BATCH;
+        let gpu_batch = rans.gpu_batch.max(1);
+        let batch_inputs: Vec<&[u8]> = vec![data; gpu_batch];
+        let full_batches = iterations / gpu_batch;
         for _ in 0..full_batches {
             let _ = std::hint::black_box(
                 engine
@@ -346,7 +349,7 @@ fn profile_rans_stage_gpu(
                     .unwrap(),
             );
         }
-        for _ in 0..(iterations % GPU_BATCH) {
+        for _ in 0..(iterations % gpu_batch) {
             let _ = std::hint::black_box(
                 engine
                     .rans_encode_chunked_payload_gpu(data, num_lanes, scale_bits, chunk_bytes)
@@ -380,6 +383,7 @@ fn main() {
     let mut rans_chunked = false;
     let mut rans_chunked_min_bytes = 262_144usize;
     let mut rans_chunk_bytes = pz::rans::DEFAULT_CHUNK_BYTES;
+    let mut rans_gpu_batch = 4usize;
     let mut unified_scheduler = false;
 
     let mut i = 0;
@@ -426,6 +430,13 @@ fn main() {
                     panic!("--rans-chunk-bytes must be > 0");
                 }
             }
+            "--rans-gpu-batch" => {
+                i += 1;
+                rans_gpu_batch = args[i].parse().expect("invalid --rans-gpu-batch");
+                if rans_gpu_batch == 0 {
+                    panic!("--rans-gpu-batch must be > 0");
+                }
+            }
             "--unified-scheduler" => unified_scheduler = true,
             "--help" | "-h" => {
                 usage();
@@ -446,6 +457,7 @@ fn main() {
         interleaved_states: rans_interleaved_states,
         chunked: rans_chunked,
         chunk_bytes: rans_chunk_bytes,
+        gpu_batch: rans_gpu_batch,
     };
 
     if let Some(ref stage_name) = stage {
