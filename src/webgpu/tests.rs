@@ -2026,6 +2026,37 @@ fn test_rans_chunked_decode_gpu_batched_round_trip() {
 }
 
 #[test]
+fn test_rans_chunked_gpu_round_trip_tiled_dispatch_chunks() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Chunk metadata encodes num_chunks as u16, so tiled dispatch can only be
+    // exercised on adapters whose max workgroups per dimension is below u16::MAX.
+    let max_wg = engine.max_workgroups_per_dimension() as usize;
+    if max_wg >= u16::MAX as usize {
+        return;
+    }
+
+    let num_chunks = (max_wg + 17).min(u16::MAX as usize);
+    let input: Vec<u8> = (0..num_chunks)
+        .map(|i| ((i * 29 + 13) % 256) as u8)
+        .collect();
+
+    let (encoded, used_chunked) = engine
+        .rans_encode_chunked_payload_gpu(&input, 4, crate::rans::DEFAULT_SCALE_BITS, 1)
+        .unwrap();
+    assert!(used_chunked);
+
+    let decoded = engine
+        .rans_decode_chunked_payload_gpu(&encoded, input.len())
+        .unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
 fn test_rans_chunked_decode_gpu_rejects_chunk_len_mismatch() {
     let engine = match WebGpuEngine::new() {
         Ok(e) => e,

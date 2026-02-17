@@ -57,13 +57,14 @@ fn write_output_byte(byte_pos: u32, value: u32) {
 @compute @workgroup_size(64)
 fn rans_decode_chunk(
     @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwork: vec3<u32>
 ) {
     let num_chunks = params.x;
     let num_lanes = params.y;
     let scale_bits = params.z;
 
-    let chunk_id = wid.x;
+    let chunk_id = wid.x + wid.y * nwork.x;
     let lane_id = lid.x;
     if (chunk_id >= num_chunks || lane_id >= num_lanes) {
         return;

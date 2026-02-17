@@ -460,6 +460,11 @@ impl WebGpuEngine {
         self.max_work_group_size
     }
 
+    /// Return the max compute workgroups per dispatch dimension.
+    pub fn max_workgroups_per_dimension(&self) -> u32 {
+        self.max_workgroups_per_dim
+    }
+
     /// Check if the selected device is a CPU (not a GPU or accelerator).
     pub fn is_cpu_device(&self) -> bool {
         self.is_cpu
