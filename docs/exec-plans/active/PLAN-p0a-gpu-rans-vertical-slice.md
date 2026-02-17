@@ -46,11 +46,14 @@ Current implementation status:
 
 Latest stage numbers (1MB, 300 iterations):
 
-1. GPU chunked rANS (`--webgpu`, lanes=4, chunk=8192, `--rans-gpu-batch=2`): encode 35.1 MB/s, decode 91.7 MB/s (warm rerun on rebased commit `c4beafa`, 2026-02-17).
-2. CPU chunked interleaved rANS (`--no-default-features --rans-interleaved --rans-chunked --rans-interleaved-states 4 --rans-chunk-bytes 8192`): encode 75.5 MB/s, decode 191.7 MB/s.
-3. Relative: GPU is ~0.46x CPU on encode and ~0.48x CPU on decode for this host/device setup.
-4. Batch overlap sweep (1MB, 300 iterations): batch=1 encode/decode 25.4/55.9 MB/s, batch=2 35.1/91.7 MB/s, batch=3 39.4/75.3 MB/s, batch=4 34.9/71.2 MB/s.
-5. Recent perf deltas: encode improved from ~24.3 MB/s to ~35.1 MB/s after host-side ring-buffered submit/completion, single-pass dual-buffer readback, and capping ring depth to active batch size; decode improved from ~54.5 MB/s (batch=1) to ~91.7 MB/s (batch=2) after adding ring-buffered batched GPU decode submission/completion.
+1. GPU chunked rANS default stage profile path (`lanes=4`, `chunk=2048`, `--rans-gpu-batch=3`): encode 57.9 MB/s, decode 103.0 MB/s (`a488474` + perf tuning, 2026-02-17).
+2. Prior rebased master default (`lanes=4`, `chunk=8192`, `--rans-gpu-batch=2`): encode 35.2 MB/s, decode 87.1 MB/s.
+3. CPU chunked interleaved rANS reference (`--no-default-features --rans-interleaved --rans-chunked --rans-interleaved-states 4 --rans-chunk-bytes 8192`): encode 75.5 MB/s, decode 191.7 MB/s.
+4. Relative vs CPU reference: GPU is ~0.77x CPU on encode and ~0.54x CPU on decode for this host/device setup.
+5. Recent perf deltas:
+   - stage baseline improvement vs prior master default: encode +64.5%, decode +18.3%
+   - larger host-side wins came from bulk LE pack/unpack in `src/webgpu/rans.rs` and lane-specialized WGSL entry points (`wg4`/`wg8`/`wg64`)
+   - chunk/batch sweep indicates a throughput sweet spot near `chunk=2048` with `batch=3` for this host/device
 
 Interim Go/No-Go:
 

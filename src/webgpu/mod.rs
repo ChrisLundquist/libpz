@@ -245,14 +245,18 @@ struct Lz77DecodePipelines {
     decode: wgpu::ComputePipeline,
 }
 
-/// rANS decode pipeline (1 pipeline from rans_decode.wgsl).
+/// rANS decode pipelines (lane-specialized entries from rans_decode.wgsl).
 struct RansDecodePipelines {
-    decode: wgpu::ComputePipeline,
+    decode_wg4: wgpu::ComputePipeline,
+    decode_wg8: wgpu::ComputePipeline,
+    decode_wg64: wgpu::ComputePipeline,
 }
 
-/// rANS encode pipeline (1 pipeline from rans_encode.wgsl).
+/// rANS encode pipelines (lane-specialized entries from rans_encode.wgsl).
 struct RansEncodePipelines {
-    encode: wgpu::ComputePipeline,
+    encode_wg4: wgpu::ComputePipeline,
+    encode_wg8: wgpu::ComputePipeline,
+    encode_wg64: wgpu::ComputePipeline,
 }
 
 /// WebGPU compute engine.
@@ -1171,46 +1175,74 @@ impl WebGpuEngine {
             .encode
     }
 
-    fn pipeline_rans_decode(&self) -> &wgpu::ComputePipeline {
-        &self
-            .rans_decode
-            .get_or_init(|| {
-                let t0 = std::time::Instant::now();
-                let group = RansDecodePipelines {
-                    decode: self.make_pipeline(
-                        "rans_decode",
-                        RANS_DECODE_KERNEL_SOURCE,
-                        "rans_decode_chunk",
-                    ),
-                };
-                if self.profiling {
-                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("[pz-gpu] compile rans_decode.wgsl: {ms:.3} ms");
-                }
-                group
-            })
-            .decode
+    fn pipeline_rans_decode_for_lanes(&self, num_lanes: usize) -> &wgpu::ComputePipeline {
+        let group = self.rans_decode.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let group = RansDecodePipelines {
+                decode_wg4: self.make_pipeline(
+                    "rans_decode_wg4",
+                    RANS_DECODE_KERNEL_SOURCE,
+                    "rans_decode_chunk_wg4",
+                ),
+                decode_wg8: self.make_pipeline(
+                    "rans_decode_wg8",
+                    RANS_DECODE_KERNEL_SOURCE,
+                    "rans_decode_chunk_wg8",
+                ),
+                decode_wg64: self.make_pipeline(
+                    "rans_decode_wg64",
+                    RANS_DECODE_KERNEL_SOURCE,
+                    "rans_decode_chunk",
+                ),
+            };
+            if self.profiling {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[pz-gpu] compile rans_decode.wgsl: {ms:.3} ms");
+            }
+            group
+        });
+        if num_lanes <= 4 {
+            &group.decode_wg4
+        } else if num_lanes <= 8 {
+            &group.decode_wg8
+        } else {
+            &group.decode_wg64
+        }
     }
 
-    fn pipeline_rans_encode(&self) -> &wgpu::ComputePipeline {
-        &self
-            .rans_encode
-            .get_or_init(|| {
-                let t0 = std::time::Instant::now();
-                let group = RansEncodePipelines {
-                    encode: self.make_pipeline(
-                        "rans_encode",
-                        RANS_ENCODE_KERNEL_SOURCE,
-                        "rans_encode_chunk",
-                    ),
-                };
-                if self.profiling {
-                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("[pz-gpu] compile rans_encode.wgsl: {ms:.3} ms");
-                }
-                group
-            })
-            .encode
+    fn pipeline_rans_encode_for_lanes(&self, num_lanes: usize) -> &wgpu::ComputePipeline {
+        let group = self.rans_encode.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let group = RansEncodePipelines {
+                encode_wg4: self.make_pipeline(
+                    "rans_encode_wg4",
+                    RANS_ENCODE_KERNEL_SOURCE,
+                    "rans_encode_chunk_wg4",
+                ),
+                encode_wg8: self.make_pipeline(
+                    "rans_encode_wg8",
+                    RANS_ENCODE_KERNEL_SOURCE,
+                    "rans_encode_chunk_wg8",
+                ),
+                encode_wg64: self.make_pipeline(
+                    "rans_encode_wg64",
+                    RANS_ENCODE_KERNEL_SOURCE,
+                    "rans_encode_chunk",
+                ),
+            };
+            if self.profiling {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[pz-gpu] compile rans_encode.wgsl: {ms:.3} ms");
+            }
+            group
+        });
+        if num_lanes <= 4 {
+            &group.encode_wg4
+        } else if num_lanes <= 8 {
+            &group.encode_wg8
+        } else {
+            &group.encode_wg64
+        }
     }
 }
 

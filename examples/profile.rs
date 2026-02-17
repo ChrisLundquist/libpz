@@ -14,6 +14,8 @@ use std::time::Instant;
 use pz::pipeline::{self, CompressOptions, Pipeline};
 
 const DEFAULT_RANS_CHUNK_BYTES: usize = 8192;
+const DEFAULT_RANS_GPU_CHUNK_BYTES: usize = 2048;
+const DEFAULT_RANS_GPU_BATCH: usize = 3;
 
 fn usage() {
     eprintln!("profile - run compression in a loop for profiling");
@@ -42,7 +44,10 @@ fn usage() {
         "  --rans-chunk-bytes N          Chunk size for chunked interleaved rANS (default: {})",
         DEFAULT_RANS_CHUNK_BYTES
     );
-    eprintln!("  --rans-gpu-batch N            Batch size for GPU rANS profiling (default: 2)");
+    eprintln!(
+        "  --rans-gpu-batch N            Batch size for GPU rANS profiling (default: {})",
+        DEFAULT_RANS_GPU_BATCH
+    );
     eprintln!("  --unified-scheduler           Enable prototype mixed-task scheduler");
     eprintln!("  --help          Show this help");
 }
@@ -309,7 +314,7 @@ fn profile_rans_stage_gpu(
     let chunk_bytes = if rans.chunked {
         rans.chunk_bytes
     } else {
-        DEFAULT_RANS_CHUNK_BYTES
+        DEFAULT_RANS_GPU_CHUNK_BYTES
     };
     let scale_bits = pz::rans::DEFAULT_SCALE_BITS;
 
@@ -397,7 +402,7 @@ fn main() {
     let mut rans_chunked = false;
     let mut rans_chunked_min_bytes = 262_144usize;
     let mut rans_chunk_bytes = DEFAULT_RANS_CHUNK_BYTES;
-    let mut rans_gpu_batch = 2usize;
+    let mut rans_gpu_batch = DEFAULT_RANS_GPU_BATCH;
     let mut unified_scheduler = false;
 
     let mut i = 0;

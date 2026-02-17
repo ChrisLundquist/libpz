@@ -14,13 +14,57 @@ use crate::rans::{
 
 const RANS_STORAGE_BINDINGS_PER_STAGE: u32 = 5;
 
-fn write_packed_u16(words: &mut [u32], idx_u16: usize, value: u16) {
-    let word_idx = idx_u16 / 2;
-    let half = idx_u16 % 2;
-    if half == 0 {
-        words[word_idx] = (words[word_idx] & 0xFFFF_0000) | u32::from(value);
-    } else {
-        words[word_idx] = (words[word_idx] & 0x0000_FFFF) | (u32::from(value) << 16);
+fn write_packed_u16_slice(words: &mut [u32], mut idx_u16: usize, mut values: &[u16]) {
+    if values.is_empty() {
+        return;
+    }
+
+    // Align to a u32 boundary when the write starts on the upper 16-bit lane.
+    if idx_u16 % 2 == 1 {
+        let word_idx = idx_u16 / 2;
+        words[word_idx] = (words[word_idx] & 0x0000_FFFF) | (u32::from(values[0]) << 16);
+        idx_u16 += 1;
+        values = &values[1..];
+        if values.is_empty() {
+            return;
+        }
+    }
+
+    let mut word_idx = idx_u16 / 2;
+    let mut pairs = values.chunks_exact(2);
+    for pair in &mut pairs {
+        words[word_idx] = u32::from(pair[0]) | (u32::from(pair[1]) << 16);
+        word_idx += 1;
+    }
+
+    if let Some(&tail) = pairs.remainder().first() {
+        words[word_idx] = (words[word_idx] & 0xFFFF_0000) | u32::from(tail);
+    }
+}
+
+fn append_u16_words_le(output: &mut Vec<u8>, words: &[u16]) {
+    #[cfg(target_endian = "little")]
+    {
+        output.extend_from_slice(bytemuck::cast_slice(words));
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &word in words {
+            output.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+}
+
+fn append_u32_words_le(output: &mut Vec<u8>, words: &[u32]) {
+    #[cfg(target_endian = "little")]
+    {
+        output.extend_from_slice(bytemuck::cast_slice(words));
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &word in words {
+            output.extend_from_slice(&word.to_le_bytes());
+        }
     }
 }
 
@@ -234,7 +278,8 @@ impl WebGpuEngine {
             wgpu::BufferUsages::UNIFORM,
         );
 
-        let bg_layout = self.pipeline_rans_encode().get_bind_group_layout(0);
+        let pipeline = self.pipeline_rans_encode_for_lanes(num_lanes);
+        let bg_layout = pipeline.get_bind_group_layout(0);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rans_encode_bg"),
             layout: &bg_layout,
@@ -267,12 +312,7 @@ impl WebGpuEngine {
         });
 
         let workgroups_x = u32::try_from(num_chunks).map_err(|_| PzError::Unsupported)?;
-        self.dispatch(
-            self.pipeline_rans_encode(),
-            &bg,
-            workgroups_x,
-            "rans_encode_chunked",
-        )?;
+        self.dispatch(pipeline, &bg, workgroups_x, "rans_encode_chunked")?;
 
         Ok((words_dev, states_dev, tables_buf))
     }
@@ -410,12 +450,8 @@ impl WebGpuEngine {
                 return Err(PzError::InvalidInput);
             }
 
-            for lane in 0..num_lanes {
-                output.extend_from_slice(&states_u32[chunk_base + lane].to_le_bytes());
-            }
-            for lane in 0..num_lanes {
-                output.extend_from_slice(&states_u32[chunk_base + num_lanes + lane].to_le_bytes());
-            }
+            let state_words = &states_u32[chunk_base..chunk_base + num_lanes * 2];
+            append_u32_words_le(&mut output, state_words);
 
             for lane in 0..num_lanes {
                 let count = usize::try_from(states_u32[chunk_base + num_lanes + lane])
@@ -430,13 +466,13 @@ impl WebGpuEngine {
                     )
                     .ok_or(PzError::InvalidInput)?;
                 let read_start_u16 = lane_start_u16 + (max_words_per_lane - count);
-                for j in 0..count {
-                    let word = words_u16
-                        .get(read_start_u16 + j)
-                        .copied()
-                        .ok_or(PzError::InvalidInput)?;
-                    output.extend_from_slice(&word.to_le_bytes());
-                }
+                let read_end_u16 = read_start_u16
+                    .checked_add(count)
+                    .ok_or(PzError::InvalidInput)?;
+                let words = words_u16
+                    .get(read_start_u16..read_end_u16)
+                    .ok_or(PzError::InvalidInput)?;
+                append_u16_words_le(&mut output, words);
             }
 
             running_words_u16 = running_words_u16
@@ -585,7 +621,8 @@ impl WebGpuEngine {
             wgpu::BufferUsages::UNIFORM,
         );
 
-        let bg_layout = self.pipeline_rans_decode().get_bind_group_layout(0);
+        let pipeline = self.pipeline_rans_decode_for_lanes(num_lanes);
+        let bg_layout = pipeline.get_bind_group_layout(0);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rans_decode_bg"),
             layout: &bg_layout,
@@ -618,12 +655,7 @@ impl WebGpuEngine {
         });
 
         let workgroups_x = u32::try_from(num_chunks).map_err(|_| PzError::Unsupported)?;
-        self.dispatch(
-            self.pipeline_rans_decode(),
-            &bg,
-            workgroups_x,
-            "rans_decode_chunked",
-        )?;
+        self.dispatch(pipeline, &bg, workgroups_x, "rans_decode_chunked")?;
 
         Ok(output)
     }
@@ -695,9 +727,7 @@ impl WebGpuEngine {
                 .checked_mul(max_words_per_lane)
                 .ok_or(PzError::InvalidInput)?;
             let write_start_u16 = lane_start_u16 + (max_words_per_lane - count);
-            for (j, &word) in stream.iter().enumerate() {
-                write_packed_u16(&mut words_packed, write_start_u16 + j, word);
-            }
+            write_packed_u16_slice(&mut words_packed, write_start_u16, &stream);
         }
 
         if cursor != input.len() {
@@ -856,9 +886,7 @@ impl WebGpuEngine {
                     )
                     .ok_or(PzError::InvalidInput)?;
                 let write_start_u16 = lane_start_u16 + (max_words_per_lane - count);
-                for (j, &word) in stream.iter().enumerate() {
-                    write_packed_u16(&mut words_packed, write_start_u16 + j, word);
-                }
+                write_packed_u16_slice(&mut words_packed, write_start_u16, &stream);
             }
 
             running_words_u16 = running_words_u16
