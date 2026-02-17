@@ -54,18 +54,13 @@ fn write_output_byte(byte_pos: u32, value: u32) {
     atomicOr(&output_data[word_idx], value << (byte_in_word * 8u));
 }
 
-@compute @workgroup_size(64)
-fn rans_decode_chunk(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(num_workgroups) nwork: vec3<u32>
+fn rans_decode_chunk_impl(
+    chunk_id: u32,
+    lane_id: u32,
+    num_chunks: u32,
+    num_lanes: u32,
+    scale_bits: u32
 ) {
-    let num_chunks = params.x;
-    let num_lanes = params.y;
-    let scale_bits = params.z;
-
-    let chunk_id = wid.x + wid.y * nwork.x;
-    let lane_id = lid.x;
     if (chunk_id >= num_chunks || lane_id >= num_lanes) {
         return;
     }
@@ -107,4 +102,35 @@ fn rans_decode_chunk(
             word_pos = word_pos + 1u;
         }
     }
+}
+
+@compute @workgroup_size(4)
+fn rans_decode_chunk_wg4(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwork: vec3<u32>
+) {
+    let chunk_id = wid.x + wid.y * nwork.x;
+    rans_decode_chunk_impl(chunk_id, lid.x, params.x, params.y, params.z);
+}
+
+@compute @workgroup_size(8)
+fn rans_decode_chunk_wg8(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwork: vec3<u32>
+) {
+    let chunk_id = wid.x + wid.y * nwork.x;
+    rans_decode_chunk_impl(chunk_id, lid.x, params.x, params.y, params.z);
+}
+
+// Wide fallback for high lane-count experiments.
+@compute @workgroup_size(64)
+fn rans_decode_chunk(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwork: vec3<u32>
+) {
+    let chunk_id = wid.x + wid.y * nwork.x;
+    rans_decode_chunk_impl(chunk_id, lid.x, params.x, params.y, params.z);
 }
