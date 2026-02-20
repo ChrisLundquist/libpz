@@ -244,6 +244,7 @@ fn test_multiblock_round_trip_all_pipelines() {
         Pipeline::Bw,
         Pipeline::Lzf,
         Pipeline::Lzfi,
+        Pipeline::LzSeqR,
     ] {
         let compressed = compress_mt(&input, pipeline, 4, 512).unwrap();
         assert_eq!(compressed[2], VERSION, "expected V2 for {:?}", pipeline);
@@ -1203,6 +1204,68 @@ fn test_lz78r_round_trip_binary() {
 fn test_lz78r_round_trip_all_same() {
     let input = vec![0xAA_u8; 500];
     let compressed = compress(&input, Pipeline::Lz78R).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+// --- LzSeqR pipeline tests (LzSeq + rANS) ---
+
+#[test]
+fn test_lzseqr_empty() {
+    let result = compress(&[], Pipeline::LzSeqR).unwrap();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_lzseqr_round_trip_hello() {
+    let input = b"hello, world! hello, world!";
+    let compressed = compress(input, Pipeline::LzSeqR).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_lzseqr_round_trip_repeating() {
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+    let compressed = compress(&input, Pipeline::LzSeqR).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+    assert!(
+        compressed.len() < input.len(),
+        "compressed {} >= input {}",
+        compressed.len(),
+        input.len()
+    );
+}
+
+#[test]
+fn test_lzseqr_round_trip_binary() {
+    let input: Vec<u8> = (0..=255).cycle().take(512).collect();
+    let compressed = compress(&input, Pipeline::LzSeqR).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_lzseqr_round_trip_all_same() {
+    let input = vec![0xAA_u8; 500];
+    let compressed = compress(&input, Pipeline::LzSeqR).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_lzseqr_round_trip_large() {
+    let pattern = b"abcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut input = Vec::new();
+    for _ in 0..200 {
+        input.extend_from_slice(pattern);
+    }
+    let compressed = compress(&input, Pipeline::LzSeqR).unwrap();
     let decompressed = decompress(&compressed).unwrap();
     assert_eq!(decompressed, input);
 }

@@ -16,12 +16,13 @@
 //! | `Lzfi`        | LZSS → interleaved FSE           | fast CPU decode |
 //! | `LzssR`       | LZSS → rANS                      | experimental    |
 //! | `Lz78R`       | LZ78 → rANS                      | experimental    |
+//! | `LzSeqR`      | LzSeq → rANS                     | zstd-style      |
 //!
 //! **Container format (V2, multi-block):**
 //! Each compressed stream starts with a header:
 //! - Magic bytes: `PZ` (2 bytes)
 //! - Version: 2 (1 byte)
-//! - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 5=Lzfi, 6=LzssR, 7=Lz78R (1 byte)
+//! - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 5=Lzfi, 6=LzssR, 7=Lz78R, 8=LzSeqR (1 byte)
 //! - Original length: u32 little-endian (4 bytes)
 //! - num_blocks: u32 little-endian (4 bytes)
 //! - Block table: \[compressed_len: u32, original_len: u32\] \* num_blocks
@@ -218,6 +219,8 @@ pub enum Pipeline {
     LzssR = 6,
     /// LZ78 + rANS (incremental trie + rANS, experimental)
     Lz78R = 7,
+    /// LzSeq + rANS (code+extra-bits sequence encoding, zstd-style)
+    LzSeqR = 8,
 }
 
 impl TryFrom<u8> for Pipeline {
@@ -233,6 +236,7 @@ impl TryFrom<u8> for Pipeline {
             5 => Ok(Self::Lzfi),
             6 => Ok(Self::LzssR),
             7 => Ok(Self::Lz78R),
+            8 => Ok(Self::LzSeqR),
             _ => Err(PzError::Unsupported),
         }
     }
@@ -480,6 +484,7 @@ pub fn select_pipeline_trial(
         Pipeline::Lzfi,
         Pipeline::LzssR,
         Pipeline::Lz78R,
+        Pipeline::LzSeqR,
     ];
     let mut best_pipeline = Pipeline::Deflate;
     let mut best_size = usize::MAX;
@@ -520,7 +525,12 @@ pub(crate) fn write_header(output: &mut Vec<u8>, pipeline: Pipeline, orig_len: u
 fn gpu_adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> CompressOptions {
     let is_lz_pipeline = matches!(
         pipeline,
-        Pipeline::Deflate | Pipeline::Lzr | Pipeline::Lzf | Pipeline::Lzfi | Pipeline::LzssR
+        Pipeline::Deflate
+            | Pipeline::Lzr
+            | Pipeline::Lzf
+            | Pipeline::Lzfi
+            | Pipeline::LzssR
+            | Pipeline::LzSeqR
     );
     let is_gpu = {
         #[allow(unused_mut)]

@@ -140,7 +140,7 @@ fn entropy_encode(
             let _ = (input_len, options);
             stage_huffman_encode(block)
         }
-        Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R => {
+        Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R | Pipeline::LzSeqR => {
             let _ = (input_len, options);
             stage_rans_encode_with_options(block, options)
         }
@@ -174,7 +174,9 @@ fn entropy_decode(
 ) -> PzResult<StageBlock> {
     match pipeline {
         Pipeline::Deflate => stage_huffman_decode(block),
-        Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R => stage_rans_decode(block),
+        Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R | Pipeline::LzSeqR => {
+            stage_rans_decode(block)
+        }
         Pipeline::Lzf => stage_fse_decode(block),
         Pipeline::Lzfi => {
             #[cfg(feature = "webgpu")]

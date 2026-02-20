@@ -3,6 +3,7 @@
 
 use crate::lz77;
 use crate::lz78;
+use crate::lzseq;
 use crate::lzss;
 use crate::{PzError, PzResult};
 
@@ -45,6 +46,8 @@ pub(crate) enum LzDemuxer {
     Lzss,
     /// LZ78: 1 stream (flat blob, no splitting).
     Lz78,
+    /// LzSeq: 6 streams (flags, literals, offset_codes, offset_extra, length_codes, length_extra).
+    LzSeq,
 }
 
 /// Map a pipeline to its demuxer, if it uses one.
@@ -56,6 +59,7 @@ pub(crate) fn demuxer_for_pipeline(pipeline: super::Pipeline) -> Option<LzDemuxe
         }
         super::Pipeline::Lzfi | super::Pipeline::LzssR => Some(LzDemuxer::Lzss),
         super::Pipeline::Lz78R => Some(LzDemuxer::Lz78),
+        super::Pipeline::LzSeqR => Some(LzDemuxer::LzSeq),
         super::Pipeline::Bw | super::Pipeline::Bbw => None,
     }
 }
@@ -66,6 +70,7 @@ impl StreamDemuxer for LzDemuxer {
             LzDemuxer::Lz77 => 3,
             LzDemuxer::Lzss => 4,
             LzDemuxer::Lz78 => 1,
+            LzDemuxer::LzSeq => 6,
         }
     }
 
@@ -176,6 +181,32 @@ impl StreamDemuxer for LzDemuxer {
                     streams: vec![encoded],
                     pre_entropy_len,
                     meta: Vec::new(),
+                })
+            }
+            LzDemuxer::LzSeq => {
+                let enc = lzseq::encode(input)?;
+                // Pre-entropy len: sum of all stream sizes (approximate wire cost)
+                let pre_entropy_len = enc.flags.len()
+                    + enc.literals.len()
+                    + enc.offset_codes.len()
+                    + enc.offset_extra.len()
+                    + enc.length_codes.len()
+                    + enc.length_extra.len();
+                // Meta: [num_tokens: u32 LE][num_matches: u32 LE]
+                let mut meta = Vec::with_capacity(8);
+                meta.extend_from_slice(&enc.num_tokens.to_le_bytes());
+                meta.extend_from_slice(&enc.num_matches.to_le_bytes());
+                Ok(DemuxOutput {
+                    streams: vec![
+                        enc.flags,
+                        enc.literals,
+                        enc.offset_codes,
+                        enc.offset_extra,
+                        enc.length_codes,
+                        enc.length_extra,
+                    ],
+                    pre_entropy_len,
+                    meta,
                 })
             }
         }
@@ -295,6 +326,29 @@ impl StreamDemuxer for LzDemuxer {
                 if decoded.len() != original_len {
                     return Err(PzError::InvalidInput);
                 }
+                Ok(decoded)
+            }
+            LzDemuxer::LzSeq => {
+                if streams.len() != 6 {
+                    return Err(PzError::InvalidInput);
+                }
+                if meta.len() < 8 {
+                    return Err(PzError::InvalidInput);
+                }
+                let num_tokens = u32::from_le_bytes(meta[..4].try_into().unwrap());
+                let num_matches = u32::from_le_bytes(meta[4..8].try_into().unwrap());
+
+                let decoded = lzseq::decode(
+                    &streams[0], // flags
+                    &streams[1], // literals
+                    &streams[2], // offset_codes
+                    &streams[3], // offset_extra
+                    &streams[4], // length_codes
+                    &streams[5], // length_extra
+                    num_tokens,
+                    num_matches,
+                    original_len,
+                )?;
                 Ok(decoded)
             }
         }

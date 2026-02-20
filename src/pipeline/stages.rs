@@ -822,7 +822,7 @@ pub(crate) fn pipeline_stage_count(pipeline: Pipeline) -> usize {
         Pipeline::Bbw => 4,
         Pipeline::Lzr => 2,
         Pipeline::Lzf | Pipeline::Lzfi => 2,
-        Pipeline::LzssR | Pipeline::Lz78R => 2,
+        Pipeline::LzssR | Pipeline::Lz78R | Pipeline::LzSeqR => 2,
     }
 }
 
@@ -864,6 +864,8 @@ pub(crate) fn run_compress_stage(
         (Pipeline::LzssR, 1) => stage_rans_encode_with_options(block, options),
         (Pipeline::Lz78R, 0) => stage_demux_compress(block, &LzDemuxer::Lz78, options),
         (Pipeline::Lz78R, 1) => stage_rans_encode_with_options(block, options),
+        (Pipeline::LzSeqR, 0) => stage_demux_compress(block, &LzDemuxer::LzSeq, options),
+        (Pipeline::LzSeqR, 1) => stage_rans_encode_with_options(block, options),
         _ => Err(PzError::Unsupported),
     }
 }
@@ -945,6 +947,19 @@ pub(crate) fn run_decompress_stage(
             stage_rans_decode(block)
         }
         (Pipeline::Lz78R, 1) => stage_demux_decompress(block, &LzDemuxer::Lz78),
+        // LzSeqR: rANS decode(0) → LzSeq decompress(1)
+        (Pipeline::LzSeqR, 0) => {
+            #[cfg(feature = "webgpu")]
+            {
+                if let super::Backend::WebGpu = options.backend {
+                    if let Some(ref engine) = options.webgpu_engine {
+                        return stage_rans_decode_webgpu(block, engine);
+                    }
+                }
+            }
+            stage_rans_decode(block)
+        }
+        (Pipeline::LzSeqR, 1) => stage_demux_decompress(block, &LzDemuxer::LzSeq),
         _ => Err(PzError::Unsupported),
     }
 }
