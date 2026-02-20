@@ -409,6 +409,17 @@ impl WebGpuEngine {
         &self,
         pending: PendingRansChunkedPayloadEncode,
     ) -> PzResult<Vec<u8>> {
+        let (words_raw, states_raw) =
+            self.read_two_buffers(&pending.words_dev.buf, &pending.states_dev.buf)?;
+        self.finish_rans_chunked_payload_encode_from_raw(pending, words_raw, states_raw)
+    }
+
+    fn finish_rans_chunked_payload_encode_from_raw(
+        &self,
+        pending: PendingRansChunkedPayloadEncode,
+        words_raw: Vec<u8>,
+        states_raw: Vec<u8>,
+    ) -> PzResult<Vec<u8>> {
         let PendingRansChunkedPayloadEncode {
             words_dev,
             states_dev,
@@ -419,7 +430,8 @@ impl WebGpuEngine {
             input_len,
         } = pending;
 
-        let (words_raw, states_raw) = self.read_two_buffers(&words_dev.buf, &states_dev.buf)?;
+        let _ = words_dev;
+        let _ = states_dev;
         let words_u32: &[u32] = bytemuck::cast_slice(&words_raw);
         let words_u16: &[u16] = bytemuck::cast_slice(words_u32);
         let states_u32: &[u32] = bytemuck::cast_slice(&states_raw);
@@ -1027,6 +1039,99 @@ impl WebGpuEngine {
         Ok(())
     }
 
+    fn complete_rans_chunked_payload_encode_batch(
+        &self,
+        batch: Vec<(usize, PendingRansChunkedPayloadEncode)>,
+        results: &mut [Option<(Vec<u8>, bool)>],
+    ) -> PzResult<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        struct EncodeReadbackSlot {
+            idx: usize,
+            pending: PendingRansChunkedPayloadEncode,
+            staging_words: wgpu::Buffer,
+            staging_states: wgpu::Buffer,
+        }
+
+        let mut slots = Vec::with_capacity(batch.len());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rans_encode_batched_readback"),
+            });
+        for (idx, pending) in batch {
+            let words_size = pending.words_dev.buf.size();
+            let states_size = pending.states_dev.buf.size();
+            let staging_words = self.create_buffer(
+                "rans_encode_batched_staging_words",
+                words_size,
+                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            );
+            let staging_states = self.create_buffer(
+                "rans_encode_batched_staging_states",
+                states_size,
+                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            );
+            encoder.copy_buffer_to_buffer(&pending.words_dev.buf, 0, &staging_words, 0, words_size);
+            encoder.copy_buffer_to_buffer(
+                &pending.states_dev.buf,
+                0,
+                &staging_states,
+                0,
+                states_size,
+            );
+            slots.push(EncodeReadbackSlot {
+                idx,
+                pending,
+                staging_words,
+                staging_states,
+            });
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        let mut waits = Vec::with_capacity(slots.len() * 2);
+        for slot in &slots {
+            let words_slice = slot.staging_words.slice(..);
+            let states_slice = slot.staging_states.slice(..);
+            let (tx_words, rx_words) = std::sync::mpsc::channel();
+            let (tx_states, rx_states) = std::sync::mpsc::channel();
+            words_slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx_words.send(result);
+            });
+            states_slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx_states.send(result);
+            });
+            waits.push(rx_words);
+            waits.push(rx_states);
+        }
+        self.poll_wait();
+        for rx in waits {
+            rx.recv()
+                .map_err(|_| PzError::Unsupported)?
+                .map_err(|_| PzError::Unsupported)?;
+        }
+
+        for slot in slots {
+            let words_slice = slot.staging_words.slice(..);
+            let states_slice = slot.staging_states.slice(..);
+            let words_raw = words_slice.get_mapped_range().to_vec();
+            let states_raw = states_slice.get_mapped_range().to_vec();
+            slot.staging_words.unmap();
+            slot.staging_states.unmap();
+
+            let encoded = self.finish_rans_chunked_payload_encode_from_raw(
+                slot.pending,
+                words_raw,
+                states_raw,
+            )?;
+            results[slot.idx] = Some((encoded, true));
+        }
+
+        Ok(())
+    }
+
     /// Decode chunked interleaved rANS payload (`rans::encode_chunked`) on GPU.
     ///
     /// Preserves CPU wire compatibility and rejects malformed metadata.
@@ -1210,6 +1315,8 @@ impl WebGpuEngine {
         let scale_bits = scale_bits.clamp(MIN_SCALE_BITS, MAX_SCALE_BITS);
         let ring_depth = self.rans_encode_pending_ring_depth(inputs, lanes_clamped, chunk_size);
         let mut results: Vec<Option<(Vec<u8>, bool)>> = vec![None; inputs.len()];
+        let mut done_batch: Vec<(usize, PendingRansChunkedPayloadEncode)> =
+            Vec::with_capacity(ring_depth);
         let mut ring = BufferRing::new(
             (0..ring_depth)
                 .map(|_| None::<(usize, PendingRansChunkedPayloadEncode)>)
@@ -1219,18 +1326,25 @@ impl WebGpuEngine {
         for (idx, input) in inputs.iter().enumerate() {
             let slot_idx = ring.acquire();
             if let Some((done_idx, done)) = ring.slots[slot_idx].take() {
-                let encoded = self.complete_rans_chunked_payload_encode(done)?;
-                results[done_idx] = Some((encoded, true));
+                done_batch.push((done_idx, done));
             }
 
             if input.is_empty() {
                 results[idx] = Some((Vec::new(), true));
+                if done_batch.len() >= ring_depth {
+                    let batch = std::mem::take(&mut done_batch);
+                    self.complete_rans_chunked_payload_encode_batch(batch, &mut results)?;
+                }
                 continue;
             }
 
             if !can_encode_chunked(input.len(), chunk_size) {
                 let encoded = rans::encode_interleaved_n(input, lanes_clamped, scale_bits);
                 results[idx] = Some((encoded, false));
+                if done_batch.len() >= ring_depth {
+                    let batch = std::mem::take(&mut done_batch);
+                    self.complete_rans_chunked_payload_encode_batch(batch, &mut results)?;
+                }
                 continue;
             }
 
@@ -1245,13 +1359,20 @@ impl WebGpuEngine {
                 chunk_size,
             )?;
             ring.slots[slot_idx] = Some((idx, submitted));
+
+            if done_batch.len() >= ring_depth {
+                let batch = std::mem::take(&mut done_batch);
+                self.complete_rans_chunked_payload_encode_batch(batch, &mut results)?;
+            }
         }
 
         for slot in &mut ring.slots {
             if let Some((done_idx, done)) = slot.take() {
-                let encoded = self.complete_rans_chunked_payload_encode(done)?;
-                results[done_idx] = Some((encoded, true));
+                done_batch.push((done_idx, done));
             }
+        }
+        if !done_batch.is_empty() {
+            self.complete_rans_chunked_payload_encode_batch(done_batch, &mut results)?;
         }
 
         Ok(results

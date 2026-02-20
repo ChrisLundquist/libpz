@@ -48,6 +48,9 @@ fn usage() {
         "  --rans-gpu-batch N            Batch size for GPU rANS profiling (default: {})",
         DEFAULT_RANS_GPU_BATCH
     );
+    eprintln!(
+        "  --rans-independent-block-bytes N  Split input into independent blocks for nvCOMP-style stage profiling (default: disabled)"
+    );
     eprintln!("  --unified-scheduler           Enable prototype mixed-task scheduler");
     eprintln!("  --help          Show this help");
 }
@@ -61,6 +64,8 @@ struct RansProfileOptions {
     chunk_bytes: usize,
     #[cfg_attr(not(feature = "webgpu"), allow(dead_code))]
     gpu_batch: usize,
+    #[cfg_attr(not(feature = "webgpu"), allow(dead_code))]
+    independent_block_bytes: usize,
 }
 
 fn load_data(size: usize) -> Vec<u8> {
@@ -89,6 +94,13 @@ fn load_data(size: usize) -> Vec<u8> {
     let pattern = b"The quick brown fox jumps over the lazy dog. ";
     let full = pattern.repeat((size / pattern.len()) + 1);
     full[..size].to_vec()
+}
+
+fn split_independent_blocks(data: &[u8], block_bytes: usize) -> Vec<&[u8]> {
+    if block_bytes == 0 || block_bytes >= data.len() {
+        return vec![data];
+    }
+    data.chunks(block_bytes).collect()
 }
 
 fn profile_pipeline(
@@ -322,34 +334,88 @@ fn profile_rans_stage_gpu(
         "using webgpu chunked rANS path (lanes={}, chunk={})",
         num_lanes, chunk_bytes
     );
+    let independent_blocks = split_independent_blocks(data, rans.independent_block_bytes);
+    let use_independent_blocks = independent_blocks.len() > 1;
+    if use_independent_blocks {
+        eprintln!(
+            "using independent-block batch split (blocks={}, block_bytes={})",
+            independent_blocks.len(),
+            rans.independent_block_bytes
+        );
+    }
 
     if decompress {
-        let (enc, used_chunked) = match engine.rans_encode_chunked_payload_gpu(
-            data,
-            num_lanes,
-            scale_bits,
-            chunk_bytes,
-        ) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        if !used_chunked {
-            return false;
+        if use_independent_blocks {
+            let encoded_blocks = match engine.rans_encode_chunked_payload_gpu_batched(
+                &independent_blocks,
+                num_lanes,
+                scale_bits,
+                chunk_bytes,
+            ) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if encoded_blocks
+                .iter()
+                .any(|(_, used_chunked)| !*used_chunked)
+            {
+                return false;
+            }
+
+            let decode_inputs: Vec<(&[u8], usize)> = encoded_blocks
+                .iter()
+                .zip(independent_blocks.iter())
+                .map(|((payload, _), block)| (payload.as_slice(), block.len()))
+                .collect();
+            for _ in 0..iterations {
+                let _ = std::hint::black_box(
+                    engine
+                        .rans_decode_chunked_payload_gpu_batched(&decode_inputs)
+                        .unwrap(),
+                );
+            }
+        } else {
+            let (enc, used_chunked) = match engine.rans_encode_chunked_payload_gpu(
+                data,
+                num_lanes,
+                scale_bits,
+                chunk_bytes,
+            ) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if !used_chunked {
+                return false;
+            }
+            let len = data.len();
+            let gpu_batch = rans.gpu_batch.max(1);
+            let batch_inputs: Vec<(&[u8], usize)> = vec![(enc.as_slice(), len); gpu_batch];
+            let full_batches = iterations / gpu_batch;
+            for _ in 0..full_batches {
+                let _ = std::hint::black_box(
+                    engine
+                        .rans_decode_chunked_payload_gpu_batched(&batch_inputs)
+                        .unwrap(),
+                );
+            }
+            for _ in 0..(iterations % gpu_batch) {
+                let _ = std::hint::black_box(
+                    engine.rans_decode_chunked_payload_gpu(&enc, len).unwrap(),
+                );
+            }
         }
-        let len = data.len();
-        let gpu_batch = rans.gpu_batch.max(1);
-        let batch_inputs: Vec<(&[u8], usize)> = vec![(enc.as_slice(), len); gpu_batch];
-        let full_batches = iterations / gpu_batch;
-        for _ in 0..full_batches {
+    } else if use_independent_blocks {
+        for _ in 0..iterations {
             let _ = std::hint::black_box(
                 engine
-                    .rans_decode_chunked_payload_gpu_batched(&batch_inputs)
+                    .rans_encode_chunked_payload_gpu_batched(
+                        &independent_blocks,
+                        num_lanes,
+                        scale_bits,
+                        chunk_bytes,
+                    )
                     .unwrap(),
             );
-        }
-        for _ in 0..(iterations % gpu_batch) {
-            let _ =
-                std::hint::black_box(engine.rans_decode_chunked_payload_gpu(&enc, len).unwrap());
         }
     } else {
         // Use a small batch so the GPU path can overlap submit/readback.
@@ -403,6 +469,7 @@ fn main() {
     let mut rans_chunked_min_bytes = 262_144usize;
     let mut rans_chunk_bytes = DEFAULT_RANS_CHUNK_BYTES;
     let mut rans_gpu_batch = DEFAULT_RANS_GPU_BATCH;
+    let mut rans_independent_block_bytes = 0usize;
     let mut unified_scheduler = false;
 
     let mut i = 0;
@@ -456,6 +523,12 @@ fn main() {
                     panic!("--rans-gpu-batch must be > 0");
                 }
             }
+            "--rans-independent-block-bytes" => {
+                i += 1;
+                rans_independent_block_bytes = args[i]
+                    .parse()
+                    .expect("invalid --rans-independent-block-bytes");
+            }
             "--unified-scheduler" => unified_scheduler = true,
             "--help" | "-h" => {
                 usage();
@@ -478,6 +551,7 @@ fn main() {
         chunked_min_bytes: rans_chunked_min_bytes,
         chunk_bytes: rans_chunk_bytes,
         gpu_batch: rans_gpu_batch,
+        independent_block_bytes: rans_independent_block_bytes,
     };
 
     if let Some(ref stage_name) = stage {

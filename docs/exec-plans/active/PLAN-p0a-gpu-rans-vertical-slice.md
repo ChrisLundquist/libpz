@@ -105,7 +105,12 @@ Interim Go/No-Go:
    - first: async submission/completion improvements (this pass)
    - second: nvCOMP-style independent stream/block splitting
    - third: additional Huffman GPU expansion only if decode-heavy benchmarks justify it
-14. Interim conclusion unchanged: Slice 4 perf gate remains open; do not promote to P0-B yet.
+14. Started nvCOMP-style independent-block split probe (profiling-harness stage path):
+   - added `--rans-independent-block-bytes` in `examples/profile.rs` to split one input into independent blocks and run batched GPU encode/decode over them.
+   - probe artifact: `docs/generated/2026-02-20-rans-webgpu-independent-block-split-probe.md`
+   - initial result: naive split path regressed vs current defaults on this host/device.
+   - follow-up: batched encode completion/readback in `src/webgpu/rans.rs` improved split encode throughput materially (notably for 16-block case), but split decode remains below non-split defaults.
+15. Interim conclusion unchanged: Slice 4 perf gate remains open; do not promote to P0-B yet.
 
 ## Existing Assets We Reuse
 
