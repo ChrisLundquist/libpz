@@ -1,0 +1,7 @@
+   Compiling pz v0.1.0 (/Users/clundquist/code/libpz)
+    Finished `profiling` profile [optimized + debuginfo] target(s) in 12.94s
+     Running `target/profiling/examples/profile --stage rans --size 1048576 --iterations 300 --rans-independent-block-bytes 262144`
+profiling stage rans encode: 1048576 bytes, 300 iterations
+using webgpu chunked rANS path (lanes=4, chunk=2048)
+using independent-block batch split (blocks=4, block_bytes=262144)
+done: 9.9s, 30.3 MB/s

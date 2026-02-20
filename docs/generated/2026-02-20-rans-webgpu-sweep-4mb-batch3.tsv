@@ -1,0 +1,5 @@
+mode	chunk_bytes	gpu_batch	iterations	mb_per_s	webgpu_path
+encode	2048	3	120	49.3	yes
+encode	4096	3	120	55.0	yes
+decode	2048	3	120	84.4	yes
+decode	4096	3	120	84.7	yes

@@ -1,0 +1,5 @@
+    Finished `profiling` profile [optimized + debuginfo] target(s) in 0.15s
+     Running `target/profiling/examples/profile --stage rans --decompress --size 1048576 --iterations 300 --rans-interleaved --rans-interleaved-states 4 --rans-chunked --rans-chunk-bytes 2048 --rans-gpu-batch 3`
+profiling stage rans decode: 1048576 bytes, 300 iterations
+using webgpu chunked rANS path (lanes=4, chunk=2048)
+done: 4.6s, 65.7 MB/s

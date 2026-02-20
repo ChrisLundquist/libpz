@@ -1,17 +1,20 @@
 # Active Execution Plans
 
-**Last Updated:** 2026-02-16
+**Last Updated:** 2026-02-20
 
 ## Active Plans
 
 ### [PLAN-competitive-roadmap.md](PLAN-competitive-roadmap.md)
 **Status:** In Progress (Phases 0–1 complete, Phase 2 active) | **Priority:** P0
 
+### [PLAN-p0a-gpu-rans-vertical-slice.md](PLAN-p0a-gpu-rans-vertical-slice.md)
+**Status:** In Progress (Slices 0–3 complete; Slice 4 perf gate open as of 2026-02-17) | **Priority:** P0
+
 ### [PLAN-interleaved-rans.md](PLAN-interleaved-rans.md)
 **Status:** In Progress (Phase A merged in PR #91) | **Priority:** P1
 
 ### [PLAN-unified-scheduler-north-star.md](PLAN-unified-scheduler-north-star.md)
-**Status:** In Progress (prototype merged, GPU Phases 1–5 TODO) | **Priority:** P1
+**Status:** In Progress (prototype merged; GPU Phases 1–5 pending P0-A perf gate) | **Priority:** P1
 
 ### [agent-harness-implementation.md](agent-harness-implementation.md)
 **Status:** In Progress (Phase 1 complete 2026-02-14, Phases 2–8 deferred) | **Priority:** P1

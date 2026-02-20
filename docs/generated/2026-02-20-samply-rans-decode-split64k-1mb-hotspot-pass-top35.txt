@@ -1,0 +1,37 @@
+COUNT  PROFILE_ADDR        BINARY_ADDR         SYMBOL+OFFSET
+-----  ------------------  ------------------  ---------------------------------------------
+ 1518  0x0000000000001609  0x0000000100001609  __mh_execute_header+0x1609
+  883  0x0000000000001aa9  0x0000000100001aa9  __mh_execute_header+0x1aa9
+  813  0x0000000000003ae6  0x0000000100003ae6  __ZN4core3ptr45drop_in_place$LT$pz..webgpu..WebGpuEngine$GT$17h4b91a29eb3164bf1E+0x486
+  262  0x000000000000106e  0x000000010000106e  __mh_execute_header+0x106e
+  165  0x0000000000000ee2  0x0000000100000ee2  __mh_execute_header+0xee2
+   12  0x00000000000016ec  0x00000001000016ec  __mh_execute_header+0x16ec
+   12  0x0000000000000f06  0x0000000100000f06  __mh_execute_header+0xf06
+    6  0x0000000000001ad4  0x0000000100001ad4  __mh_execute_header+0x1ad4
+    4  0x000000000000176b  0x000000010000176b  __mh_execute_header+0x176b
+    4  0x0000000000001713  0x0000000100001713  __mh_execute_header+0x1713
+    4  0x00000000000326a1  0x00000001000326a1  __ZN2pz7huffman9HuffTable6decode17h39ddd45632c89bb3E+0x131
+    4  0x000000000002b0a6  0x000000010002b0a6  __ZN2pz4gzip10decompress17h73fd8b05a330575fE+0x276
+    4  0x000000000000337a  0x000000010000337a  __mh_execute_header+0x337a
+    3  0x0000000000001ab5  0x0000000100001ab5  __mh_execute_header+0x1ab5
+    3  0x0000000000054ce7  0x0000000100054ce7  __ZN2pz7deflate15inflate_huffman17h1a970f444355a921E+0x2a7
+    3  0x0000000000022b83  0x0000000100022b83  __ZN2pz6webgpu4rans42_$LT$impl$u20$pz..webgpu..WebGpuEngine$GT$52rans_decode_chunked_payload_gpu_batched_shared_table17h8a7c8af935ef74e0E+0xa13
+    2  0x0000000000001bd4  0x0000000100001bd4  __mh_execute_header+0x1bd4
+    2  0x0000000000001756  0x0000000100001756  __mh_execute_header+0x1756
+    2  0x00000000000015e0  0x00000001000015e0  __mh_execute_header+0x15e0
+    2  0x0000000000054cd4  0x0000000100054cd4  __ZN2pz7deflate15inflate_huffman17h1a970f444355a921E+0x294
+    2  0x0000000000054ab6  0x0000000100054ab6  __ZN2pz7deflate15inflate_huffman17h1a970f444355a921E+0x76
+    2  0x000000000005497e  0x000000010005497e  __ZN2pz6webgpu4rans26total_words_u16_for_chunks17hd33378bffe1cbe08E+0x2e
+    2  0x0000000000054777  0x0000000100054777  __ZN2pz6webgpu4rans18build_tables_words17hdc2613feb2e873fbE+0x797
+    2  0x0000000000032662  0x0000000100032662  __ZN2pz7huffman9HuffTable6decode17h39ddd45632c89bb3E+0xf2
+    2  0x0000000000032656  0x0000000100032656  __ZN2pz7huffman9HuffTable6decode17h39ddd45632c89bb3E+0xe6
+    2  0x0000000000032643  0x0000000100032643  __ZN2pz7huffman9HuffTable6decode17h39ddd45632c89bb3E+0xd3
+    2  0x000000000003263e  0x000000010003263e  __ZN2pz7huffman9HuffTable6decode17h39ddd45632c89bb3E+0xce
+    2  0x0000000000032624  0x0000000100032624  __ZN2pz7huffman9HuffTable6decode17h39ddd45632c89bb3E+0xb4
+    2  0x00000000000325b3  0x00000001000325b3  __ZN2pz7huffman9HuffTable6decode17h39ddd45632c89bb3E+0x43
+    2  0x000000000002b08c  0x000000010002b08c  __ZN2pz4gzip10decompress17h73fd8b05a330575fE+0x25c
+    2  0x000000000000329d  0x000000010000329d  __mh_execute_header+0x329d
+    2  0x00000000000027de  0x00000001000027de  __mh_execute_header+0x27de
+    1  0x00000000000f1445  0x00000001000f1445  __ZN102_$LT$core..iter..adapters..map..Map$LT$I$C$F$GT$$u20$as$u20$core..iter..traits..iterator..Iterator$GT$4fold17h9fdef234c0355ac2E+0x175
+    1  0x00000000000024ae  0x00000001000024ae  __mh_execute_header+0x24ae
+    1  0x00000000000168d9  0x00000001000168d9  __ZN2pz6webgpu4lz7742_$LT$impl$u20$pz..webgpu..WebGpuEngine$GT$23complete_lz77_from_slot17hab27dac0cd712802E+0x209

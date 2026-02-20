@@ -61,6 +61,78 @@ Interim Go/No-Go:
 2. Stage perf gate (Slice 4): FAIL (no clear GPU advantage yet).
 3. Recommendation: hold promotion to P0-B until GPU stage throughput improves materially.
 
+### Execution Update (2026-02-20, commit `4a4f721`)
+
+1. Re-ran Slice 4 baseline commands on latest master-aligned head and captured dated artifacts:
+   - `docs/generated/2026-02-20-master-baseline.md`
+   - `docs/generated/2026-02-20-cargo-bench-stages-rans-webgpu-escalated.txt`
+   - `docs/generated/2026-02-20-bench-sh-n5-lzr-lzf-deflate.txt`
+2. `scripts/profile.sh` stage commands still fail in this environment due `samply` recorder constraints; direct profile binary fallback was used for throughput values.
+3. Direct 1MB WebGPU rANS stage profile (300 iterations, lanes=4, chunk=2048, batch=3):
+   - encode: 49.3 MB/s
+   - decode: 65.7 MB/s
+4. Performed a compact chunk/batch sweep (`docs/generated/2026-02-20-rans-webgpu-sweep-1mb.tsv`) at 1MB, 200 iterations:
+   - best encode: 58.5 MB/s (`chunk=2048`, `batch=3`)
+   - best decode: 83.5 MB/s (`chunk=4096`, `batch=3`)
+   - this sweep was taken before async depth retuning (ring depth still capped at 3).
+5. `cargo bench --bench stages_rans --features webgpu` now includes GPU rows outside sandbox:
+   - `encode_chunked_gpu/4194304`: 48.326 MiB/s
+   - `decode_chunked_gpu/4194304`: 76.964 MiB/s
+   - versus chunked CPU at 4MB: 47.357 MiB/s encode, 136.30 MiB/s decode.
+6. Implemented async pipelining depth pass:
+   - increased rANS batched pending-ring cap from 3 to 8 in `src/webgpu/rans.rs` (`RANS_MAX_PENDING_RING_DEPTH`).
+7. Re-ran extended batch sweeps after ring-depth increase:
+   - `docs/generated/2026-02-20-rans-webgpu-decode-batch-extended-1mb-after-ring8.tsv`
+   - `docs/generated/2026-02-20-rans-webgpu-encode-batch-extended-1mb-after-ring8.tsv`
+   - best region shifted to `gpu_batch=5..8` (higher than pre-change cap).
+8. Retuned profiling defaults in `examples/profile.rs`:
+   - `DEFAULT_RANS_GPU_BATCH`: 3 -> 6 (via intermediate 5)
+   - `DEFAULT_RANS_GPU_CHUNK_BYTES`: unchanged at 2048.
+9. Direct 1MB default-profile check after retune (`docs/generated/2026-02-20-rans-webgpu-async-pipelining-pass.md`):
+   - final defaults (`batch=6`): encode 51.0 MB/s, decode 73.4 MB/s
+   - vs original baseline (`batch=3`): encode +3.4%, decode +11.7%
+10. Targeted correctness verification after async-depth change:
+   - `cargo test --features webgpu batched` passed (12/12 tests).
+11. Implemented async completion pass (decode path):
+   - `rans_decode_chunked_payload_gpu_batched()` now batches completed work and performs batched output readback via `complete_rans_chunked_payload_decode_batch()`.
+   - This reduces per-output submit/map/poll overhead in decode-heavy batched runs while keeping memory bounded by ring-sized drains.
+12. Direct 1MB default-profile checks after batched decode readback:
+   - ring-depth-only defaults: encode 50.6 MB/s, decode 66.2 MB/s
+   - after readback + final retune: encode 51.0 MB/s, decode 73.4 MB/s
+   - decode uplift over ring-depth-only defaults: +10.9%
+   - artifact: `docs/generated/2026-02-20-rans-webgpu-async-pipelining-pass.md`
+13. Priority order for remaining work is now explicit:
+   - first: async submission/completion improvements (this pass)
+   - second: nvCOMP-style independent stream/block splitting
+   - third: additional Huffman GPU expansion only if decode-heavy benchmarks justify it
+14. Started nvCOMP-style independent-block split probe (profiling-harness stage path):
+   - added `--rans-independent-block-bytes` in `examples/profile.rs` to split one input into independent blocks and run batched GPU encode/decode over them.
+   - probe artifact: `docs/generated/2026-02-20-rans-webgpu-independent-block-split-probe.md`
+   - initial result: naive split path regressed vs current defaults on this host/device.
+   - follow-up: batched encode completion/readback in `src/webgpu/rans.rs` improved split encode throughput materially (notably for 16-block case), but split decode remains below non-split defaults.
+15. Added shared-table split encode path:
+   - new API in `src/webgpu/rans.rs`: `rans_encode_chunked_payload_gpu_batched_shared_table(...)`.
+   - profiling split mode now seeds one normalized table from full input and reuses it across independent blocks.
+16. Added shared-table split decode path:
+   - new API in `src/webgpu/rans.rs`: `rans_decode_chunked_payload_gpu_batched_shared_table(...)`.
+   - split decode profile path now reuses one precomputed GPU table across the independent-block batch.
+17. Added packed shared-table decode submission path:
+   - shared-table decode now has a packed mode that consolidates split payloads into one decode dispatch/readback cycle.
+   - packed mode is currently gated to `>= 8` non-empty payloads (`RANS_PACKED_SHARED_DECODE_MIN_PAYLOADS`) to avoid regressions on small split sets.
+18. Latest split results after packed-decode gating:
+   - 256KB split (4 blocks; falls back to prior path): encode 34.6 MB/s; decode typically 56.2-56.5 MB/s (one outlier run at 68.9 MB/s), still below the earlier 58.2 MB/s readback-only split result.
+   - 64KB split (16 blocks; packed decode active): encode 21.3 MB/s; decode 35.3-35.4 MB/s, improving over 32.9-33.0 MB/s shared-table decode and slightly above 34.5 MB/s readback-only split decode.
+19. Interim conclusion unchanged: Slice 4 perf gate remains open; do not promote to P0-B yet.
+20. Decode hotspot follow-up pass (2026-02-20):
+   - in `src/webgpu/rans.rs`, replaced repeated decode-side `write_packed_u16_slice(...)` packing with direct `u16` placement + one bulk pack, and removed per-call seed-frequency counting in shared-table split decode setup.
+   - new hotspot report: `docs/generated/2026-02-20-rans-webgpu-hotspot-pass.md`
+   - targeted sampled hotspots (`write_packed_u16_slice`, `simd::avx2::byte_frequencies`) dropped out of split decode top-symbol output after this change.
+21. Latest decode reruns after hotspot pass (1MB, 300 iters):
+   - defaults: 69.0-69.1 MB/s (stable on these runs).
+   - 256KB split (4 blocks): 53.2-71.7 MB/s (high variance under current host contention).
+   - 64KB split (16 blocks): 29.1-34.5 MB/s.
+   - interpretation: hotspot fixes are necessary but not sufficient; split decode still needs prep amortization and lower-overhead submission/completion symmetry.
+
 ## Existing Assets We Reuse
 
 1. CPU chunked rANS reference in `src/rans.rs` (`encode_chunked`, `decode_chunked`).

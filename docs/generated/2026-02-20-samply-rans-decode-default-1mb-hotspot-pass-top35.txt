@@ -1,0 +1,37 @@
+COUNT  PROFILE_ADDR        BINARY_ADDR         SYMBOL+OFFSET
+-----  ------------------  ------------------  ---------------------------------------------
+  902  0x0000000000001aa9  0x0000000100001aa9  __mh_execute_header+0x1aa9
+  225  0x000000000000106e  0x000000010000106e  __mh_execute_header+0x106e
+  183  0x0000000000001609  0x0000000100001609  __mh_execute_header+0x1609
+   88  0x0000000000003ae6  0x0000000100003ae6  __ZN4core3ptr45drop_in_place$LT$pz..webgpu..WebGpuEngine$GT$17h4b91a29eb3164bf1E+0x486
+   22  0x000000000000337a  0x000000010000337a  __mh_execute_header+0x337a
+    7  0x0000000000001ab5  0x0000000100001ab5  __mh_execute_header+0x1ab5
+    5  0x0000000000001ad4  0x0000000100001ad4  __mh_execute_header+0x1ad4
+    4  0x000000000002b090  0x000000010002b090  __ZN2pz4gzip10decompress17h73fd8b05a330575fE+0x260
+    3  0x00000000000326a4  0x00000001000326a4  __ZN2pz7huffman9HuffTable6decode17h39ddd45632c89bb3E+0x134
+    3  0x00000000000325f4  0x00000001000325f4  __ZN2pz7huffman9HuffTable6decode17h39ddd45632c89bb3E+0x84
+    2  0x0000000000001720  0x0000000100001720  __mh_execute_header+0x1720
+    2  0x0000000000001713  0x0000000100001713  __mh_execute_header+0x1713
+    2  0x0000000000000ee2  0x0000000100000ee2  __mh_execute_header+0xee2
+    2  0x0000000000054cd0  0x0000000100054cd0  __ZN2pz7deflate15inflate_huffman17h1a970f444355a921E+0x290
+    2  0x0000000000054b05  0x0000000100054b05  __ZN2pz7deflate15inflate_huffman17h1a970f444355a921E+0xc5
+    2  0x0000000000054ab6  0x0000000100054ab6  __ZN2pz7deflate15inflate_huffman17h1a970f444355a921E+0x76
+    2  0x00000000001fe91d  0x00000001001fe91d  __ZN4naga4back3msl6writer15Writer$LT$W$GT$9put_block17he4c853dd228c21f5E+0x4f6d
+    2  0x0000000000032643  0x0000000100032643  __ZN2pz7huffman9HuffTable6decode17h39ddd45632c89bb3E+0xd3
+    2  0x000000000002b0a6  0x000000010002b0a6  __ZN2pz4gzip10decompress17h73fd8b05a330575fE+0x276
+    2  0x000000000002b096  0x000000010002b096  __ZN2pz4gzip10decompress17h73fd8b05a330575fE+0x266
+    2  0x000000000000307c  0x000000010000307c  __mh_execute_header+0x307c
+    2  0x000000000000295e  0x000000010000295e  __mh_execute_header+0x295e
+    2  0x0000000000002826  0x0000000100002826  __mh_execute_header+0x2826
+    2  0x00000000000027de  0x00000001000027de  __mh_execute_header+0x27de
+    1  0x0000000000002565  0x0000000100002565  __mh_execute_header+0x2565
+    1  0x000000000001651e  0x000000010001651e  __ZN2pz6webgpu4lz7742_$LT$impl$u20$pz..webgpu..WebGpuEngine$GT$20find_matches_batched17h31c4b09a5ab293f8E+0x176e
+    1  0x00000000000d6d3f  0x00000001000d6d3f  __ZN9wgpu_core7storage16Storage$LT$T$GT$3get17hf4f4d29c8930e388E+0xf
+    1  0x00000000000020a6  0x00000001000020a6  __mh_execute_header+0x20a6
+    1  0x00000000000bda9d  0x00000001000bda9d  __ZN4core3ptr100drop_in_place$LT$wgpu_core..lock..vanilla..Mutex$LT$wgpu_core..command..CommandEncoderStatus$GT$$GT$17h89bd0b3b76f61700E+0x3cd
+    1  0x00000000000b3630  0x00000001000b3630  __ZN4core3ptr59drop_in_place$LT$wgpu_core..device..queue..TempResource$GT$17h95b55022751e4e5bE+0x0
+    1  0x0000000000011330  0x0000000100011330  __ZN2pz6webgpu3bwt42_$LT$impl$u20$pz..webgpu..WebGpuEngine$GT$24run_inclusive_prefix_sum17hfeec3cf6dc2991deE+0x950
+    1  0x0000000000001ae6  0x0000000100001ae6  __mh_execute_header+0x1ae6
+    1  0x000000000000178c  0x000000010000178c  __mh_execute_header+0x178c
+    1  0x000000000000176b  0x000000010000176b  __mh_execute_header+0x176b
+    1  0x0000000000001751  0x0000000100001751  __mh_execute_header+0x1751

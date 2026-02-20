@@ -1,0 +1,188 @@
+   Compiling pz v0.1.0 (/Users/clundquist/code/libpz)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 14.06s
+     Running benches/stages_rans.rs (target/release/deps/stages_rans-3daea41dcb89486a)
+Gnuplot not found, using plotters backend
+Benchmarking rans/encode/8192
+Benchmarking rans/encode/8192: Warming up for 2.0000 s
+Benchmarking rans/encode/8192: Collecting 10 samples in estimated 5.0017 s (88k iterations)
+Benchmarking rans/encode/8192: Analyzing
+rans/encode/8192        time:   [56.875 µs 56.911 µs 56.949 µs]
+                        thrpt:  [137.19 MiB/s 137.28 MiB/s 137.36 MiB/s]
+                 change:
+                        time:   [-0.3619% -0.2297% -0.0958%] (p = 0.01 < 0.05)
+                        thrpt:  [+0.0959% +0.2302% +0.3632%]
+                        Change within noise threshold.
+Benchmarking rans/decode/8192
+Benchmarking rans/decode/8192: Warming up for 2.0000 s
+Benchmarking rans/decode/8192: Collecting 10 samples in estimated 5.0018 s (75k iterations)
+Benchmarking rans/decode/8192: Analyzing
+rans/decode/8192        time:   [66.360 µs 66.457 µs 66.507 µs]
+                        thrpt:  [117.47 MiB/s 117.56 MiB/s 117.73 MiB/s]
+                 change:
+                        time:   [-0.1971% +0.0472% +0.2700%] (p = 0.72 > 0.05)
+                        thrpt:  [-0.2693% -0.0472% +0.1975%]
+                        No change in performance detected.
+Benchmarking rans/encode_chunked_cpu/8192
+Benchmarking rans/encode_chunked_cpu/8192: Warming up for 2.0000 s
+Benchmarking rans/encode_chunked_cpu/8192: Collecting 10 samples in estimated 5.0049 s (31k iterations)
+Benchmarking rans/encode_chunked_cpu/8192: Analyzing
+rans/encode_chunked_cpu/8192
+                        time:   [163.87 µs 163.96 µs 164.03 µs]
+                        thrpt:  [47.630 MiB/s 47.649 MiB/s 47.676 MiB/s]
+                 change:
+                        time:   [-0.1885% -0.0705% +0.0426%] (p = 0.28 > 0.05)
+                        thrpt:  [-0.0425% +0.0706% +0.1889%]
+                        No change in performance detected.
+Benchmarking rans/decode_chunked_cpu/8192
+Benchmarking rans/decode_chunked_cpu/8192: Warming up for 2.0000 s
+Benchmarking rans/decode_chunked_cpu/8192: Collecting 10 samples in estimated 5.0014 s (136k iterations)
+Benchmarking rans/decode_chunked_cpu/8192: Analyzing
+rans/decode_chunked_cpu/8192
+                        time:   [36.730 µs 36.835 µs 36.961 µs]
+                        thrpt:  [211.37 MiB/s 212.10 MiB/s 212.70 MiB/s]
+                 change:
+                        time:   [-1.2284% -0.7087% -0.2159%] (p = 0.02 < 0.05)
+                        thrpt:  [+0.2163% +0.7138% +1.2436%]
+                        Change within noise threshold.
+Benchmarking rans/encode_chunked_gpu/8192
+Benchmarking rans/encode_chunked_gpu/8192: Warming up for 2.0000 s
+Benchmarking rans/encode_chunked_gpu/8192: Collecting 10 samples in estimated 5.3830 s (605 iterations)
+Benchmarking rans/encode_chunked_gpu/8192: Analyzing
+rans/encode_chunked_gpu/8192
+                        time:   [8.5735 ms 8.7438 ms 8.9145 ms]
+                        thrpt:  [897.41 KiB/s 914.93 KiB/s 933.11 KiB/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
+Benchmarking rans/decode_chunked_gpu/8192
+Benchmarking rans/decode_chunked_gpu/8192: Warming up for 2.0000 s
+Benchmarking rans/decode_chunked_gpu/8192: Collecting 10 samples in estimated 5.1129 s (990 iterations)
+Benchmarking rans/decode_chunked_gpu/8192: Analyzing
+rans/decode_chunked_gpu/8192
+                        time:   [4.8726 ms 4.8967 ms 4.9200 ms]
+                        thrpt:  [1.5879 MiB/s 1.5955 MiB/s 1.6034 MiB/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
+Benchmarking rans/encode/65536
+Benchmarking rans/encode/65536: Warming up for 2.0000 s
+Benchmarking rans/encode/65536: Collecting 10 samples in estimated 5.0025 s (10k iterations)
+Benchmarking rans/encode/65536: Analyzing
+rans/encode/65536       time:   [490.93 µs 491.19 µs 491.37 µs]
+                        thrpt:  [127.20 MiB/s 127.24 MiB/s 127.31 MiB/s]
+                 change:
+                        time:   [-0.1792% -0.0304% +0.0794%] (p = 0.72 > 0.05)
+                        thrpt:  [-0.0794% +0.0304% +0.1795%]
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
+Benchmarking rans/decode/65536
+Benchmarking rans/decode/65536: Warming up for 2.0000 s
+Benchmarking rans/decode/65536: Collecting 10 samples in estimated 5.0071 s (8525 iterations)
+Benchmarking rans/decode/65536: Analyzing
+rans/decode/65536       time:   [586.94 µs 587.08 µs 587.27 µs]
+                        thrpt:  [106.42 MiB/s 106.46 MiB/s 106.48 MiB/s]
+                 change:
+                        time:   [-0.0547% +0.0180% +0.1064%] (p = 0.71 > 0.05)
+                        thrpt:  [-0.1063% -0.0180% +0.0547%]
+                        No change in performance detected.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) high mild
+  1 (10.00%) high severe
+Benchmarking rans/encode_chunked_cpu/65536
+Benchmarking rans/encode_chunked_cpu/65536: Warming up for 2.0000 s
+Benchmarking rans/encode_chunked_cpu/65536: Collecting 10 samples in estimated 5.0356 s (3740 iterations)
+Benchmarking rans/encode_chunked_cpu/65536: Analyzing
+rans/encode_chunked_cpu/65536
+                        time:   [1.3442 ms 1.3448 ms 1.3455 ms]
+                        thrpt:  [46.453 MiB/s 46.477 MiB/s 46.495 MiB/s]
+                 change:
+                        time:   [-0.5612% -0.2342% -0.0390%] (p = 0.11 > 0.05)
+                        thrpt:  [+0.0390% +0.2348% +0.5644%]
+                        No change in performance detected.
+Benchmarking rans/decode_chunked_cpu/65536
+Benchmarking rans/decode_chunked_cpu/65536: Warming up for 2.0000 s
+Benchmarking rans/decode_chunked_cpu/65536: Collecting 10 samples in estimated 5.0071 s (11k iterations)
+Benchmarking rans/decode_chunked_cpu/65536: Analyzing
+rans/decode_chunked_cpu/65536
+                        time:   [475.91 µs 476.27 µs 476.53 µs]
+                        thrpt:  [131.16 MiB/s 131.23 MiB/s 131.33 MiB/s]
+                 change:
+                        time:   [-0.0537% +0.0310% +0.1164%] (p = 0.51 > 0.05)
+                        thrpt:  [-0.1163% -0.0310% +0.0538%]
+                        No change in performance detected.
+Benchmarking rans/encode_chunked_gpu/65536
+Benchmarking rans/encode_chunked_gpu/65536: Warming up for 2.0000 s
+Benchmarking rans/encode_chunked_gpu/65536: Collecting 10 samples in estimated 5.2014 s (440 iterations)
+Benchmarking rans/encode_chunked_gpu/65536: Analyzing
+rans/encode_chunked_gpu/65536
+                        time:   [11.311 ms 11.522 ms 11.732 ms]
+                        thrpt:  [5.3273 MiB/s 5.4243 MiB/s 5.5256 MiB/s]
+Benchmarking rans/decode_chunked_gpu/65536
+Benchmarking rans/decode_chunked_gpu/65536: Warming up for 2.0000 s
+Benchmarking rans/decode_chunked_gpu/65536: Collecting 10 samples in estimated 5.1308 s (935 iterations)
+Benchmarking rans/decode_chunked_gpu/65536: Analyzing
+rans/decode_chunked_gpu/65536
+                        time:   [5.4184 ms 5.4592 ms 5.4913 ms]
+                        thrpt:  [11.382 MiB/s 11.448 MiB/s 11.535 MiB/s]
+Benchmarking rans/encode/4194304
+Benchmarking rans/encode/4194304: Warming up for 2.0000 s
+Benchmarking rans/encode/4194304: Collecting 10 samples in estimated 5.3859 s (165 iterations)
+Benchmarking rans/encode/4194304: Analyzing
+rans/encode/4194304     time:   [32.458 ms 32.494 ms 32.538 ms]
+                        thrpt:  [122.93 MiB/s 123.10 MiB/s 123.24 MiB/s]
+                 change:
+                        time:   [+0.0670% +0.1763% +0.3042%] (p = 0.01 < 0.05)
+                        thrpt:  [-0.3033% -0.1760% -0.0669%]
+                        Change within noise threshold.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking rans/decode/4194304
+Benchmarking rans/decode/4194304: Warming up for 2.0000 s
+Benchmarking rans/decode/4194304: Collecting 10 samples in estimated 5.8480 s (165 iterations)
+Benchmarking rans/decode/4194304: Analyzing
+rans/decode/4194304     time:   [35.388 ms 35.394 ms 35.401 ms]
+                        thrpt:  [112.99 MiB/s 113.01 MiB/s 113.03 MiB/s]
+                 change:
+                        time:   [-0.1686% -0.0642% +0.0329%] (p = 0.26 > 0.05)
+                        thrpt:  [-0.0329% +0.0643% +0.1689%]
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
+Benchmarking rans/encode_chunked_cpu/4194304
+Benchmarking rans/encode_chunked_cpu/4194304: Warming up for 2.0000 s
+Benchmarking rans/encode_chunked_cpu/4194304: Collecting 10 samples in estimated 9.3547 s (110 iterations)
+Benchmarking rans/encode_chunked_cpu/4194304: Analyzing
+rans/encode_chunked_cpu/4194304
+                        time:   [84.454 ms 84.465 ms 84.477 ms]
+                        thrpt:  [47.350 MiB/s 47.357 MiB/s 47.363 MiB/s]
+                 change:
+                        time:   [-0.1171% +0.0211% +0.1360%] (p = 0.77 > 0.05)
+                        thrpt:  [-0.1358% -0.0211% +0.1173%]
+                        No change in performance detected.
+Benchmarking rans/decode_chunked_cpu/4194304
+Benchmarking rans/decode_chunked_cpu/4194304: Warming up for 2.0000 s
+Benchmarking rans/decode_chunked_cpu/4194304: Collecting 10 samples in estimated 6.4757 s (220 iterations)
+Benchmarking rans/decode_chunked_cpu/4194304: Analyzing
+rans/decode_chunked_cpu/4194304
+                        time:   [29.328 ms 29.347 ms 29.362 ms]
+                        thrpt:  [136.23 MiB/s 136.30 MiB/s 136.39 MiB/s]
+                 change:
+                        time:   [+0.1446% +0.2772% +0.4087%] (p = 0.00 < 0.05)
+                        thrpt:  [-0.4070% -0.2764% -0.1444%]
+                        Change within noise threshold.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking rans/encode_chunked_gpu/4194304
+Benchmarking rans/encode_chunked_gpu/4194304: Warming up for 2.0000 s
+Benchmarking rans/encode_chunked_gpu/4194304: Collecting 10 samples in estimated 9.1227 s (110 iterations)
+Benchmarking rans/encode_chunked_gpu/4194304: Analyzing
+rans/encode_chunked_gpu/4194304
+                        time:   [82.647 ms 82.770 ms 82.926 ms]
+                        thrpt:  [48.236 MiB/s 48.326 MiB/s 48.399 MiB/s]
+Benchmarking rans/decode_chunked_gpu/4194304
+Benchmarking rans/decode_chunked_gpu/4194304: Warming up for 2.0000 s
+Benchmarking rans/decode_chunked_gpu/4194304: Collecting 10 samples in estimated 5.8124 s (110 iterations)
+Benchmarking rans/decode_chunked_gpu/4194304: Analyzing
+rans/decode_chunked_gpu/4194304
+                        time:   [51.891 ms 51.972 ms 52.083 ms]
+                        thrpt:  [76.800 MiB/s 76.964 MiB/s 77.085 MiB/s]
+
