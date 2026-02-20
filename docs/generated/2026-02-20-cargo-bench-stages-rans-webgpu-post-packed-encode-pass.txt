@@ -1,0 +1,141 @@
+   Compiling pz v0.1.0 (/Users/clundquist/code/libpz)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 12.34s
+     Running benches/stages_rans.rs (target/release/deps/stages_rans-3daea41dcb89486a)
+Gnuplot not found, using plotters backend
+Benchmarking rans/encode/8192
+Benchmarking rans/encode/8192: Warming up for 2.0000 s
+Benchmarking rans/encode/8192: Collecting 10 samples in estimated 5.0017 s (143k iterations)
+Benchmarking rans/encode/8192: Analyzing
+rans/encode/8192        time:   [34.448 µs 34.847 µs 35.198 µs]
+                        thrpt:  [221.96 MiB/s 224.19 MiB/s 226.79 MiB/s]
+                 change:
+                        time:   [-39.053% -38.456% -37.973%] (p = 0.00 < 0.05)
+                        thrpt:  [+61.220% +62.485% +64.078%]
+                        Performance has improved.
+Benchmarking rans/decode/8192
+Benchmarking rans/decode/8192: Warming up for 2.0000 s
+Benchmarking rans/decode/8192: Collecting 10 samples in estimated 5.0015 s (115k iterations)
+Benchmarking rans/decode/8192: Analyzing
+rans/decode/8192        time:   [41.228 µs 42.928 µs 44.730 µs]
+                        thrpt:  [174.66 MiB/s 181.99 MiB/s 189.49 MiB/s]
+                 change:
+                        time:   [-37.957% -36.880% -35.095%] (p = 0.00 < 0.05)
+                        thrpt:  [+54.072% +58.427% +61.177%]
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+Benchmarking rans/encode_chunked_cpu/8192
+Benchmarking rans/encode_chunked_cpu/8192: Warming up for 2.0000 s
+Benchmarking rans/encode_chunked_cpu/8192: Collecting 10 samples in estimated 5.0033 s (46k iterations)
+Benchmarking rans/encode_chunked_cpu/8192: Analyzing
+rans/encode_chunked_cpu/8192
+                        time:   [100.11 µs 101.46 µs 103.08 µs]
+                        thrpt:  [75.793 MiB/s 77.002 MiB/s 78.041 MiB/s]
+                 change:
+                        time:   [-38.595% -38.035% -37.389%] (p = 0.00 < 0.05)
+                        thrpt:  [+59.716% +61.380% +62.852%]
+                        Performance has improved.
+Benchmarking rans/decode_chunked_cpu/8192
+Benchmarking rans/decode_chunked_cpu/8192: Warming up for 2.0000 s
+Benchmarking rans/decode_chunked_cpu/8192: Collecting 10 samples in estimated 5.0013 s (195k iterations)
+Benchmarking rans/decode_chunked_cpu/8192: Analyzing
+rans/decode_chunked_cpu/8192
+                        time:   [24.695 µs 24.890 µs 25.214 µs]
+                        thrpt:  [309.84 MiB/s 313.88 MiB/s 316.36 MiB/s]
+                 change:
+                        time:   [-32.346% -31.653% -30.940%] (p = 0.00 < 0.05)
+                        thrpt:  [+44.802% +46.312% +47.811%]
+                        Performance has improved.
+Benchmarking rans/encode/65536
+Benchmarking rans/encode/65536: Warming up for 2.0000 s
+Benchmarking rans/encode/65536: Collecting 10 samples in estimated 5.0019 s (17k iterations)
+Benchmarking rans/encode/65536: Analyzing
+rans/encode/65536       time:   [306.22 µs 318.07 µs 332.77 µs]
+                        thrpt:  [187.82 MiB/s 196.50 MiB/s 204.10 MiB/s]
+                 change:
+                        time:   [-38.087% -35.544% -32.963%] (p = 0.00 < 0.05)
+                        thrpt:  [+49.171% +55.145% +61.516%]
+                        Performance has improved.
+Benchmarking rans/decode/65536
+Benchmarking rans/decode/65536: Warming up for 2.0000 s
+Benchmarking rans/decode/65536: Collecting 10 samples in estimated 5.0200 s (13k iterations)
+Benchmarking rans/decode/65536: Analyzing
+rans/decode/65536       time:   [388.42 µs 391.64 µs 395.30 µs]
+                        thrpt:  [158.11 MiB/s 159.59 MiB/s 160.91 MiB/s]
+                 change:
+                        time:   [-34.985% -33.884% -32.645%] (p = 0.00 < 0.05)
+                        thrpt:  [+48.467% +51.250% +53.811%]
+                        Performance has improved.
+Benchmarking rans/encode_chunked_cpu/65536
+Benchmarking rans/encode_chunked_cpu/65536: Warming up for 2.0000 s
+Benchmarking rans/encode_chunked_cpu/65536: Collecting 10 samples in estimated 5.0447 s (6050 iterations)
+Benchmarking rans/encode_chunked_cpu/65536: Analyzing
+rans/encode_chunked_cpu/65536
+                        time:   [831.76 µs 837.30 µs 842.12 µs]
+                        thrpt:  [74.218 MiB/s 74.644 MiB/s 75.142 MiB/s]
+                 change:
+                        time:   [-38.970% -38.356% -37.655%] (p = 0.00 < 0.05)
+                        thrpt:  [+60.398% +62.221% +63.854%]
+                        Performance has improved.
+Benchmarking rans/decode_chunked_cpu/65536
+Benchmarking rans/decode_chunked_cpu/65536: Warming up for 2.0000 s
+Benchmarking rans/decode_chunked_cpu/65536: Collecting 10 samples in estimated 5.0073 s (17k iterations)
+Benchmarking rans/decode_chunked_cpu/65536: Analyzing
+rans/decode_chunked_cpu/65536
+                        time:   [313.90 µs 324.91 µs 341.40 µs]
+                        thrpt:  [183.07 MiB/s 192.36 MiB/s 199.11 MiB/s]
+                 change:
+                        time:   [-34.327% -31.596% -29.112%] (p = 0.00 < 0.05)
+                        thrpt:  [+41.067% +46.190% +52.269%]
+                        Performance has improved.
+Benchmarking rans/encode/4194304
+Benchmarking rans/encode/4194304: Warming up for 2.0000 s
+Benchmarking rans/encode/4194304: Collecting 10 samples in estimated 5.8589 s (275 iterations)
+Benchmarking rans/encode/4194304: Analyzing
+rans/encode/4194304     time:   [21.031 ms 21.755 ms 22.589 ms]
+                        thrpt:  [177.08 MiB/s 183.87 MiB/s 190.20 MiB/s]
+                 change:
+                        time:   [-34.969% -33.447% -32.048%] (p = 0.00 < 0.05)
+                        thrpt:  [+47.162% +50.256% +53.772%]
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking rans/decode/4194304
+Benchmarking rans/decode/4194304: Warming up for 2.0000 s
+Benchmarking rans/decode/4194304: Collecting 10 samples in estimated 5.1534 s (220 iterations)
+Benchmarking rans/decode/4194304: Analyzing
+rans/decode/4194304     time:   [22.675 ms 23.003 ms 23.395 ms]
+                        thrpt:  [170.98 MiB/s 173.89 MiB/s 176.41 MiB/s]
+                 change:
+                        time:   [-35.867% -35.247% -34.556%] (p = 0.00 < 0.05)
+                        thrpt:  [+52.803% +54.434% +55.925%]
+                        Performance has improved.
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high mild
+Benchmarking rans/encode_chunked_cpu/4194304
+Benchmarking rans/encode_chunked_cpu/4194304: Warming up for 2.0000 s
+Benchmarking rans/encode_chunked_cpu/4194304: Collecting 10 samples in estimated 6.4547 s (110 iterations)
+Benchmarking rans/encode_chunked_cpu/4194304: Analyzing
+rans/encode_chunked_cpu/4194304
+                        time:   [54.164 ms 54.547 ms 55.078 ms]
+                        thrpt:  [72.624 MiB/s 73.331 MiB/s 73.850 MiB/s]
+                 change:
+                        time:   [-35.635% -34.445% -33.074%] (p = 0.00 < 0.05)
+                        thrpt:  [+49.419% +52.544% +55.365%]
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking rans/decode_chunked_cpu/4194304
+Benchmarking rans/decode_chunked_cpu/4194304: Warming up for 2.0000 s
+Benchmarking rans/decode_chunked_cpu/4194304: Collecting 10 samples in estimated 5.3034 s (275 iterations)
+Benchmarking rans/decode_chunked_cpu/4194304: Analyzing
+rans/decode_chunked_cpu/4194304
+                        time:   [18.995 ms 19.178 ms 19.429 ms]
+                        thrpt:  [205.88 MiB/s 208.58 MiB/s 210.59 MiB/s]
+                 change:
+                        time:   [-34.774% -33.918% -32.267%] (p = 0.00 < 0.05)
+                        thrpt:  [+47.639% +51.328% +53.312%]
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+

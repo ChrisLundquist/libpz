@@ -1,0 +1,4 @@
+    Finished `profiling` profile [optimized + debuginfo] target(s) in 0.17s
+     Running `target/profiling/examples/profile --stage rans --decompress --size 1048576 --iterations 300`
+profiling stage rans decode: 1048576 bytes, 300 iterations
+done: 1.7s, 180.4 MB/s

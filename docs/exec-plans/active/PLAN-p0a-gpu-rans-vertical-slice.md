@@ -157,6 +157,10 @@ Interim Go/No-Go:
 28. Correctness gate for packed encode is green:
    - added `test_rans_chunked_encode_gpu_batched_shared_table_packed_cpu_decode_round_trip`.
    - `cargo fmt --check`, `cargo clippy --features webgpu -- -D warnings`, and `cargo test --features webgpu batched` passed on this head.
+29. Post-packed-encode benchmark sweep executed (2026-02-20):
+   - captured profile + `cargo bench` artifacts under `docs/generated/2026-02-20-rans-webgpu-post-packed-encode-bench.md`.
+   - direct profile outputs in this environment likely fell back to CPU path (missing WebGPU stage banners), and `stages_rans` run did not emit GPU-specific rows.
+   - conclusion: collect stable-GPU reruns before changing Slice 4 go/no-go status.
 
 ## Existing Assets We Reuse
 
