@@ -132,6 +132,18 @@ Interim Go/No-Go:
    - 256KB split (4 blocks): 53.2-71.7 MB/s (high variance under current host contention).
    - 64KB split (16 blocks): 29.1-34.5 MB/s.
    - interpretation: hotspot fixes are necessary but not sufficient; split decode still needs prep amortization and lower-overhead submission/completion symmetry.
+22. Implemented split decode prep reuse pass (2026-02-20):
+   - refactored packed shared-table split decode in `src/webgpu/rans.rs` into prepare + execute phases.
+   - added `rans_decode_chunked_payload_gpu_batched_shared_table_repeated(...)` so repeated runs reuse table setup and packed split preparation.
+   - updated `examples/profile.rs` split decode path to use the repeated API.
+   - added test coverage: `test_rans_chunked_decode_gpu_batched_shared_table_repeated_round_trip`.
+23. Prep reuse pass validation status:
+   - `cargo fmt --check`, `cargo clippy --features webgpu -- -D warnings`, and `cargo test --features webgpu batched` all pass.
+   - implementation notes: `docs/generated/2026-02-20-rans-webgpu-split-decode-prep-reuse-pass.md`.
+24. Non-approved sandbox profile reruns were captured but likely CPU fallback (missing WebGPU banners), so these are retained for traceability only and not used as Slice 4 GPU gate evidence:
+   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-defaults-prep-cache-pass.txt`
+   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-256k-prep-cache-pass.txt`
+   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-64k-prep-cache-pass.txt`
 
 ## Existing Assets We Reuse
 
