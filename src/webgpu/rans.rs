@@ -318,16 +318,13 @@ impl WebGpuEngine {
         Ok((words_dev, states_dev, tables_buf))
     }
 
-    fn submit_rans_chunked_payload_encode(
+    fn submit_rans_chunked_payload_encode_with_norm(
         &self,
         input: &[u8],
         num_lanes: usize,
-        scale_bits: u8,
         chunk_size: usize,
+        norm: &rans::NormalizedFreqs,
     ) -> PzResult<PendingRansChunkedPayloadEncode> {
-        let mut freq = FrequencyTable::new();
-        freq.count(input);
-        let norm = normalize_frequencies(&freq, scale_bits)?;
         let num_chunks = input.len().div_ceil(chunk_size);
         let chunk_lens: Vec<usize> = (0..num_chunks)
             .map(|chunk_idx| {
@@ -340,17 +337,30 @@ impl WebGpuEngine {
             .collect();
 
         let (words_dev, states_dev, tables) =
-            self.rans_encode_chunked_gpu_with_norm(input, num_lanes, chunk_size, &norm)?;
+            self.rans_encode_chunked_gpu_with_norm(input, num_lanes, chunk_size, norm)?;
 
         Ok(PendingRansChunkedPayloadEncode {
             words_dev,
             states_dev,
             _tables: tables,
-            norm,
+            norm: norm.clone(),
             chunk_lens,
             num_lanes,
             input_len: input.len(),
         })
+    }
+
+    fn submit_rans_chunked_payload_encode(
+        &self,
+        input: &[u8],
+        num_lanes: usize,
+        scale_bits: u8,
+        chunk_size: usize,
+    ) -> PzResult<PendingRansChunkedPayloadEncode> {
+        let mut freq = FrequencyTable::new();
+        freq.count(input);
+        let norm = normalize_frequencies(&freq, scale_bits)?;
+        self.submit_rans_chunked_payload_encode_with_norm(input, num_lanes, chunk_size, &norm)
     }
 
     fn read_two_buffers(&self, a: &wgpu::Buffer, b: &wgpu::Buffer) -> PzResult<(Vec<u8>, Vec<u8>)> {
@@ -1301,15 +1311,13 @@ impl WebGpuEngine {
             .min(max_depth)
     }
 
-    /// Batched GPU chunked rANS encode with ring-buffered submit/readback.
-    ///
-    /// This is intended for CPU+GPU overlap scenarios in higher-level schedulers.
-    pub fn rans_encode_chunked_payload_gpu_batched(
+    fn rans_encode_chunked_payload_gpu_batched_impl(
         &self,
         inputs: &[&[u8]],
         num_lanes: usize,
         scale_bits: u8,
         chunk_size: usize,
+        shared_norm: Option<&rans::NormalizedFreqs>,
     ) -> PzResult<Vec<(Vec<u8>, bool)>> {
         let lanes_clamped = num_lanes.clamp(1, u8::MAX as usize);
         let scale_bits = scale_bits.clamp(MIN_SCALE_BITS, MAX_SCALE_BITS);
@@ -1352,12 +1360,21 @@ impl WebGpuEngine {
                 return Err(PzError::Unsupported);
             }
 
-            let submitted = self.submit_rans_chunked_payload_encode(
-                input,
-                lanes_clamped,
-                scale_bits,
-                chunk_size,
-            )?;
+            let submitted = if let Some(norm) = shared_norm {
+                self.submit_rans_chunked_payload_encode_with_norm(
+                    input,
+                    lanes_clamped,
+                    chunk_size,
+                    norm,
+                )?
+            } else {
+                self.submit_rans_chunked_payload_encode(
+                    input,
+                    lanes_clamped,
+                    scale_bits,
+                    chunk_size,
+                )?
+            };
             ring.slots[slot_idx] = Some((idx, submitted));
 
             if done_batch.len() >= ring_depth {
@@ -1379,5 +1396,52 @@ impl WebGpuEngine {
             .into_iter()
             .map(|r| r.expect("all batched rans results must be populated"))
             .collect())
+    }
+
+    /// Batched GPU chunked rANS encode with ring-buffered submit/readback.
+    ///
+    /// This is intended for CPU+GPU overlap scenarios in higher-level schedulers.
+    pub fn rans_encode_chunked_payload_gpu_batched(
+        &self,
+        inputs: &[&[u8]],
+        num_lanes: usize,
+        scale_bits: u8,
+        chunk_size: usize,
+    ) -> PzResult<Vec<(Vec<u8>, bool)>> {
+        self.rans_encode_chunked_payload_gpu_batched_impl(
+            inputs, num_lanes, scale_bits, chunk_size, None,
+        )
+    }
+
+    /// Batched GPU chunked rANS encode that reuses one normalized table for all
+    /// chunked payloads in the batch.
+    ///
+    /// Useful for nvCOMP-style independent-block probes where setup overhead
+    /// dominates and blocks share a common input distribution.
+    pub fn rans_encode_chunked_payload_gpu_batched_shared_table(
+        &self,
+        inputs: &[&[u8]],
+        shared_table_seed: &[u8],
+        num_lanes: usize,
+        scale_bits: u8,
+        chunk_size: usize,
+    ) -> PzResult<Vec<(Vec<u8>, bool)>> {
+        if shared_table_seed.is_empty() {
+            return self.rans_encode_chunked_payload_gpu_batched(
+                inputs, num_lanes, scale_bits, chunk_size,
+            );
+        }
+
+        let scale_bits = scale_bits.clamp(MIN_SCALE_BITS, MAX_SCALE_BITS);
+        let mut freq = FrequencyTable::new();
+        freq.count(shared_table_seed);
+        let norm = normalize_frequencies(&freq, scale_bits)?;
+        self.rans_encode_chunked_payload_gpu_batched_impl(
+            inputs,
+            num_lanes,
+            scale_bits,
+            chunk_size,
+            Some(&norm),
+        )
     }
 }

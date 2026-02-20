@@ -110,7 +110,11 @@ Interim Go/No-Go:
    - probe artifact: `docs/generated/2026-02-20-rans-webgpu-independent-block-split-probe.md`
    - initial result: naive split path regressed vs current defaults on this host/device.
    - follow-up: batched encode completion/readback in `src/webgpu/rans.rs` improved split encode throughput materially (notably for 16-block case), but split decode remains below non-split defaults.
-15. Interim conclusion unchanged: Slice 4 perf gate remains open; do not promote to P0-B yet.
+15. Added shared-table split encode path:
+   - new API in `src/webgpu/rans.rs`: `rans_encode_chunked_payload_gpu_batched_shared_table(...)`.
+   - profiling split mode now seeds one normalized table from full input and reuses it across independent blocks.
+   - results were mixed: 256KB split case stayed roughly flat (encode 34.9 vs 35.8 MB/s; decode 58.1 vs 58.2 MB/s), 64KB split encode rose slightly (21.5 vs 20.8 MB/s) while 64KB split decode regressed (32.8 vs 34.5 MB/s).
+16. Interim conclusion unchanged: Slice 4 perf gate remains open; do not promote to P0-B yet.
 
 ## Existing Assets We Reuse
 

@@ -342,12 +342,14 @@ fn profile_rans_stage_gpu(
             independent_blocks.len(),
             rans.independent_block_bytes
         );
+        eprintln!("using shared frequency-table seed from full input");
     }
 
     if decompress {
         if use_independent_blocks {
-            let encoded_blocks = match engine.rans_encode_chunked_payload_gpu_batched(
+            let encoded_blocks = match engine.rans_encode_chunked_payload_gpu_batched_shared_table(
                 &independent_blocks,
+                data,
                 num_lanes,
                 scale_bits,
                 chunk_bytes,
@@ -408,8 +410,9 @@ fn profile_rans_stage_gpu(
         for _ in 0..iterations {
             let _ = std::hint::black_box(
                 engine
-                    .rans_encode_chunked_payload_gpu_batched(
+                    .rans_encode_chunked_payload_gpu_batched_shared_table(
                         &independent_blocks,
+                        data,
                         num_lanes,
                         scale_bits,
                         chunk_bytes,
