@@ -933,8 +933,8 @@ impl WebGpuEngine {
             for k in 0..TOPK_K {
                 let p = packed[pos * TOPK_K + k];
                 slot[k] = MatchCandidate {
-                    offset: (p & 0xFFFF) as u16,
-                    length: (p >> 16) as u16,
+                    offset: p & 0xFFFF,
+                    length: p >> 16,
                 };
             }
         }

@@ -253,6 +253,48 @@ fn unpack_flags(bytes: &[u8], count: usize) -> Vec<bool> {
 }
 
 // ---------------------------------------------------------------------------
+// Distance-dependent minimum match length
+// ---------------------------------------------------------------------------
+
+/// Minimum profitable match length at a given offset.
+///
+/// Short matches at large distances aren't worth encoding because the
+/// code+extra-bits cost exceeds the literal cost. This function returns
+/// the minimum match length that's worth emitting for a given offset.
+///
+/// Cost model (approximate bytes):
+/// - Each literal: ~1 byte (flag bit + literal byte, entropy coded)
+/// - Each match: ~2 bytes overhead (offset_code + length_code, entropy coded)
+///   + extra_bits / 8 bytes (raw extra bits for offset + length)
+///
+/// A match of length L saves L literal bytes and costs the match overhead.
+/// Break-even: L > overhead. Close offsets have few extra bits (cheap),
+/// far offsets have many extra bits (expensive).
+#[inline]
+pub(crate) fn min_profitable_length(offset: u32) -> u16 {
+    if offset == 0 {
+        return u16::MAX; // No valid match
+    }
+    // extra_bits for the offset code
+    let (oc, _, _) = encode_offset(offset);
+    let oeb = extra_bits_for_code(oc);
+    // Approximate cost: 2 code bytes + ceil(offset_extra_bits / 8) bytes
+    // vs L literal bytes. Minimum length code is 0 (0 extra bits), so
+    // length overhead is just 1 code byte.
+    //
+    // Total match overhead ≈ 2 + oeb/8 bytes (conservative: ignore length extra)
+    // Break-even: L >= ceil(2 + oeb/8) + 1 (need to save at least 1 byte net)
+    //
+    // Simplified tiers:
+    //   oeb 0-3  (offset 1-16):       min 3 (MIN_MATCH)
+    //   oeb 4-7  (offset 17-256):      min 3
+    //   oeb 8-11 (offset 257-4096):    min 4
+    //   oeb 12-15 (offset 4097-65536): min 5
+    //   oeb 16-19 (offset 65537+):     min 6
+    MIN_MATCH + (oeb.saturating_sub(7) as u16).div_ceil(4)
+}
+
+// ---------------------------------------------------------------------------
 // Encode
 // ---------------------------------------------------------------------------
 
@@ -303,12 +345,25 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
         let m = finder.find_match_wide(input, pos);
         finder.insert(input, pos);
 
+        // Distance-dependent minimum match length: reject short matches
+        // at large distances where code+extra-bits cost exceeds literal cost.
+        let effective_min = if m.length >= MIN_MATCH {
+            min_profitable_length(m.offset)
+        } else {
+            MIN_MATCH
+        };
+
         // Lazy matching: check if next position has a longer match
-        if m.length >= MIN_MATCH && m.length < LAZY_SKIP_THRESHOLD && pos + 1 < input.len() {
+        if m.length >= effective_min && m.length < LAZY_SKIP_THRESHOLD && pos + 1 < input.len() {
             finder.insert(input, pos + 1);
             let next_m = finder.find_match_wide(input, pos + 1);
+            let next_effective_min = if next_m.offset > 0 {
+                min_profitable_length(next_m.offset)
+            } else {
+                u16::MAX // No match found, require impossible length
+            };
 
-            if next_m.length > m.length {
+            if next_m.length >= next_effective_min && next_m.length > m.length {
                 // Emit literal for current position, use the better match
                 flags_vec.push(true);
                 literals.push(input[pos]);
@@ -334,7 +389,7 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
             }
         }
 
-        if m.length >= MIN_MATCH {
+        if m.length >= effective_min {
             // Emit match
             flags_vec.push(false);
             let (oc, oeb, oev) = encode_offset(m.offset);
@@ -870,6 +925,57 @@ mod tests {
             input.len(),
         )
         .unwrap();
+        assert_eq!(output, input);
+    }
+
+    // --- Distance-dependent MIN_MATCH tests (Phase 4) ---
+
+    #[test]
+    fn test_min_profitable_length_close_offsets() {
+        // Close offsets (1-16) should need only MIN_MATCH (3)
+        for offset in 1..=16 {
+            assert_eq!(
+                min_profitable_length(offset),
+                MIN_MATCH,
+                "offset {offset} should need min_match=3"
+            );
+        }
+    }
+
+    #[test]
+    fn test_min_profitable_length_increases_with_distance() {
+        // Minimum length should be non-decreasing with offset
+        let mut prev = min_profitable_length(1);
+        for offset in [16, 256, 4096, 65536, 500_000u32] {
+            let cur = min_profitable_length(offset);
+            assert!(
+                cur >= prev,
+                "min_profitable_length should be non-decreasing: offset {offset} gave {cur}, prev was {prev}"
+            );
+            prev = cur;
+        }
+    }
+
+    #[test]
+    fn test_min_profitable_length_far_offsets_require_longer() {
+        // Very far offsets should require longer matches
+        let close = min_profitable_length(1);
+        let far = min_profitable_length(100_000);
+        assert!(
+            far > close,
+            "far offset (100K) should need longer match than close (1): {far} vs {close}"
+        );
+    }
+
+    #[test]
+    fn test_distance_dependent_round_trip() {
+        // Ensure distance-dependent filtering doesn't break round-trip
+        let pattern = b"mixed content with some repeats mixed content! ";
+        let mut input = Vec::new();
+        for _ in 0..500 {
+            input.extend_from_slice(pattern);
+        }
+        let output = round_trip(&input).unwrap();
         assert_eq!(output, input);
     }
 }
