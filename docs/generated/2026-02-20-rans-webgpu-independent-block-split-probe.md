@@ -130,16 +130,46 @@ Source files:
   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-64k-shared-table-packed-gated.txt`
   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-64k-shared-table-packed-gated-rerun.txt`
 
+## Hotspot Follow-up Pass (Decode Prep)
+
+Additional decode-prep optimization pass in `src/webgpu/rans.rs`:
+
+1. Replaced repeated per-lane `write_packed_u16_slice(...)` calls with direct `u16` buffer placement plus one bulk `u16 -> u32` pack.
+2. Removed per-call shared-table seed frequency counting from split decode setup and reused normalized table data derived from payload header.
+3. Kept split wire format unchanged.
+
+Follow-up decode measurements (1MB, 300 iterations):
+
+1. Defaults: 69.0-69.1 MB/s
+   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-defaults-hotspot-pass.txt`
+   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-defaults-hotspot-pass-rerun.txt`
+2. 256KB split (4 blocks): 53.2-71.7 MB/s (high variance)
+   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-256k-hotspot-pass.txt`
+   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-256k-hotspot-pass-rerun1.txt`
+   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-256k-hotspot-pass-rerun2.txt`
+   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-256k-hotspot-pass-rerun3.txt`
+3. 64KB split (16 blocks): 29.1-34.5 MB/s
+   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-64k-hotspot-pass.txt`
+   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-64k-hotspot-pass-rerun.txt`
+   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-64k-hotspot-pass-rerun2.txt`
+
+`samply` symbol diff for split decode indicates the targeted CPU hotspots were removed from top rows:
+
+1. Before: `docs/generated/2026-02-20-samply-rans-decode-split64k-1mb-top35.txt`
+2. After: `docs/generated/2026-02-20-samply-rans-decode-split64k-1mb-hotspot-pass-top35.txt`
+
 ## Interpretation
 
 1. Independent-block splitting is still below the non-split default path on this host/device.
 2. Batched encode readback materially improves split encode throughput (especially at higher block counts), confirming per-block readback overhead was a major contributor.
-3. Shared-table seeding plus decode-side table reuse alone did not recover split throughput; table setup overhead is not the primary remaining bottleneck.
-4. Packed multi-block decode submission helps the high-block-count (64KB/16-block) case and is now gated so smaller split sets keep the prior path.
-5. Split decode remains below non-split defaults overall; next wins likely require reducing split decode preparation/packing CPU overhead and adding analogous packed submission for encode.
+3. Shared-table seeding plus decode-side table reuse alone did not recover split throughput; table setup overhead is not the only remaining bottleneck.
+4. Decode-prep hotspot pass removed `write_packed_u16_slice`/`byte_frequencies` from sampled top symbols, but end-to-end split decode remains variable and often below default path.
+5. Packed multi-block decode submission helps the high-block-count (64KB/16-block) case and is now gated so smaller split sets keep the prior path.
+6. Next wins likely require amortizing split decode preparation across iterations and adding analogous packed submission for encode.
 
 ## Next Implementation Targets
 
-1. Add packed split decode preparation cache so payload parsing/state packing are amortized across iterations (not rebuilt every decode call).
+1. Add split decode prep caching so payload parse/pack work is amortized across iterations instead of rebuilt every call.
 2. Extend packed submission to split encode path (single metadata/input staging + consolidated readback) so both directions share the same model.
-3. Keep block splitting as a scheduler-level option, with thresholds tied to block count/device break-even data.
+3. Add a low-noise benchmark mode for split decode (longer runs or isolated host) before changing scheduler defaults.
+4. Keep block splitting as a scheduler-level option, with thresholds tied to block count/device break-even data.

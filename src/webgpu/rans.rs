@@ -70,6 +70,47 @@ fn append_u32_words_le(output: &mut Vec<u8>, words: &[u32]) {
     }
 }
 
+fn copy_u16_words_from_le_bytes(dst: &mut [u16], src: &[u8]) -> PzResult<()> {
+    let expected = dst.len().checked_mul(2).ok_or(PzError::InvalidInput)?;
+    if src.len() != expected {
+        return Err(PzError::InvalidInput);
+    }
+    #[cfg(target_endian = "little")]
+    {
+        let dst_bytes: &mut [u8] = bytemuck::cast_slice_mut(dst);
+        dst_bytes.copy_from_slice(src);
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for (word, bytes) in dst.iter_mut().zip(src.chunks_exact(2)) {
+            *word = u16::from_le_bytes([bytes[0], bytes[1]]);
+        }
+    }
+    Ok(())
+}
+
+fn pack_u16_words(words_u16: &[u16]) -> Vec<u32> {
+    let mut packed = vec![0u32; words_u16.len().div_ceil(2).max(1)];
+    #[cfg(target_endian = "little")]
+    {
+        let src_bytes: &[u8] = bytemuck::cast_slice(words_u16);
+        let dst_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut packed);
+        dst_bytes[..src_bytes.len()].copy_from_slice(src_bytes);
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for (idx, &word) in words_u16.iter().enumerate() {
+            let out_idx = idx / 2;
+            if idx % 2 == 0 {
+                packed[out_idx] = (packed[out_idx] & 0xFFFF_0000) | u32::from(word);
+            } else {
+                packed[out_idx] = (packed[out_idx] & 0x0000_FFFF) | (u32::from(word) << 16);
+            }
+        }
+    }
+    packed
+}
+
 fn read_u16_le(input: &[u8], cursor: &mut usize) -> PzResult<u16> {
     if input.len() < *cursor + 2 {
         return Err(PzError::InvalidInput);
@@ -892,7 +933,7 @@ impl WebGpuEngine {
         }
 
         let total_words_u16 = total_words_u16_for_chunks(&chunk_lens, num_lanes)?;
-        let mut words_packed = vec![0u32; total_words_u16.div_ceil(2).max(1)];
+        let mut words_u16 = vec![0u16; total_words_u16];
         let mut state_words = vec![0u32; num_chunks * num_lanes * 2];
         let mut running_words_u16 = 0usize;
 
@@ -919,7 +960,7 @@ impl WebGpuEngine {
                 if input.len() < cursor + bytes {
                     return Err(PzError::InvalidInput);
                 }
-                let stream = bytes_as_u16_le(&input[cursor..], count);
+                let stream_bytes = &input[cursor..cursor + bytes];
                 cursor += bytes;
 
                 let lane_start_u16 = running_words_u16
@@ -929,7 +970,10 @@ impl WebGpuEngine {
                     )
                     .ok_or(PzError::InvalidInput)?;
                 let write_start_u16 = lane_start_u16 + (max_words_per_lane - count);
-                write_packed_u16_slice(&mut words_packed, write_start_u16, &stream);
+                let dst = words_u16
+                    .get_mut(write_start_u16..write_start_u16 + count)
+                    .ok_or(PzError::InvalidInput)?;
+                copy_u16_words_from_le_bytes(dst, stream_bytes)?;
             }
 
             running_words_u16 = running_words_u16
@@ -946,7 +990,7 @@ impl WebGpuEngine {
         }
 
         Ok(ParsedRansChunkedPayloadDecode {
-            words_packed,
+            words_packed: pack_u16_words(&words_u16),
             state_words,
             scale_bits,
             num_lanes,
@@ -1573,8 +1617,7 @@ impl WebGpuEngine {
             return Err(PzError::InvalidInput);
         }
 
-        let mut all_words_packed = vec![0u32; total_words_u16.div_ceil(2).max(1)];
-        write_packed_u16_slice(&mut all_words_packed, 0, &all_words_u16);
+        let all_words_packed = pack_u16_words(&all_words_u16);
 
         let words_buf = self.create_buffer_init(
             "rans_decode_words_packed_batch",
@@ -1654,20 +1697,19 @@ impl WebGpuEngine {
         if shared_table_seed.is_empty() {
             return self.rans_decode_chunked_payload_gpu_batched(inputs);
         }
+        let _ = shared_table_seed;
 
-        let shared_scale_bits = if let Some((payload, _)) = inputs.iter().find(|(_, len)| *len > 0)
-        {
-            *payload.first().ok_or(PzError::InvalidInput)?
-        } else {
-            return Ok(vec![Vec::new(); inputs.len()]);
-        };
+        let (first_payload, _) =
+            if let Some((payload, output_len)) = inputs.iter().find(|(_, len)| *len > 0) {
+                (*payload, *output_len)
+            } else {
+                return Ok(vec![Vec::new(); inputs.len()]);
+            };
+        let shared_scale_bits = *first_payload.first().ok_or(PzError::InvalidInput)?;
         if !(MIN_SCALE_BITS..=MAX_SCALE_BITS).contains(&shared_scale_bits) {
             return Err(PzError::InvalidInput);
         }
-
-        let mut freq = FrequencyTable::new();
-        freq.count(shared_table_seed);
-        let norm = normalize_frequencies(&freq, shared_scale_bits)?;
+        let norm = deserialize_freq_table(&first_payload[1..], shared_scale_bits)?;
         let tables_words = build_tables_words(&norm, shared_scale_bits);
         let tables = self.create_buffer_init(
             "rans_chunked_tables_shared_decode",

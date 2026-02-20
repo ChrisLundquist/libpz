@@ -123,6 +123,15 @@ Interim Go/No-Go:
    - 256KB split (4 blocks; falls back to prior path): encode 34.6 MB/s; decode typically 56.2-56.5 MB/s (one outlier run at 68.9 MB/s), still below the earlier 58.2 MB/s readback-only split result.
    - 64KB split (16 blocks; packed decode active): encode 21.3 MB/s; decode 35.3-35.4 MB/s, improving over 32.9-33.0 MB/s shared-table decode and slightly above 34.5 MB/s readback-only split decode.
 19. Interim conclusion unchanged: Slice 4 perf gate remains open; do not promote to P0-B yet.
+20. Decode hotspot follow-up pass (2026-02-20):
+   - in `src/webgpu/rans.rs`, replaced repeated decode-side `write_packed_u16_slice(...)` packing with direct `u16` placement + one bulk pack, and removed per-call seed-frequency counting in shared-table split decode setup.
+   - new hotspot report: `docs/generated/2026-02-20-rans-webgpu-hotspot-pass.md`
+   - targeted sampled hotspots (`write_packed_u16_slice`, `simd::avx2::byte_frequencies`) dropped out of split decode top-symbol output after this change.
+21. Latest decode reruns after hotspot pass (1MB, 300 iters):
+   - defaults: 69.0-69.1 MB/s (stable on these runs).
+   - 256KB split (4 blocks): 53.2-71.7 MB/s (high variance under current host contention).
+   - 64KB split (16 blocks): 29.1-34.5 MB/s.
+   - interpretation: hotspot fixes are necessary but not sufficient; split decode still needs prep amortization and lower-overhead submission/completion symmetry.
 
 ## Existing Assets We Reuse
 
