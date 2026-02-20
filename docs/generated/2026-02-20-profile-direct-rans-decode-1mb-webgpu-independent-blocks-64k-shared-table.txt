@@ -4,4 +4,4 @@ profiling stage rans decode: 1048576 bytes, 300 iterations
 using webgpu chunked rANS path (lanes=4, chunk=2048)
 using independent-block batch split (blocks=16, block_bytes=65536)
 using shared frequency-table seed from full input
-done: 9.2s, 32.8 MB/s
+done: 9.1s, 32.9 MB/s

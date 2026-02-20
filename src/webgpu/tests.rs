@@ -2052,6 +2052,45 @@ fn test_rans_chunked_decode_gpu_batched_round_trip() {
 }
 
 #[test]
+fn test_rans_chunked_decode_gpu_batched_shared_table_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let full_input: Vec<u8> = (0..65_536).map(|i| ((i * 41 + 3) % 251) as u8).collect();
+    let input_blocks: Vec<&[u8]> = full_input.chunks(16_384).collect();
+    let expected_blocks: Vec<Vec<u8>> = input_blocks.iter().map(|block| block.to_vec()).collect();
+
+    let encoded = engine
+        .rans_encode_chunked_payload_gpu_batched_shared_table(
+            &input_blocks,
+            &full_input,
+            4,
+            crate::rans::DEFAULT_SCALE_BITS,
+            2048,
+        )
+        .unwrap();
+    let decode_inputs: Vec<(&[u8], usize)> = encoded
+        .iter()
+        .zip(expected_blocks.iter())
+        .map(|((payload, used_chunked), block)| {
+            assert!(*used_chunked);
+            (payload.as_slice(), block.len())
+        })
+        .collect();
+
+    let decoded = engine
+        .rans_decode_chunked_payload_gpu_batched_shared_table(&decode_inputs, &full_input)
+        .unwrap();
+    assert_eq!(decoded.len(), expected_blocks.len());
+    for (i, output) in decoded.iter().enumerate() {
+        assert_eq!(output, &expected_blocks[i]);
+    }
+}
+
+#[test]
 fn test_rans_chunked_gpu_round_trip_tiled_dispatch_chunks() {
     let engine = match WebGpuEngine::new() {
         Ok(e) => e,

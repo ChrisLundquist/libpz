@@ -372,7 +372,7 @@ fn profile_rans_stage_gpu(
             for _ in 0..iterations {
                 let _ = std::hint::black_box(
                     engine
-                        .rans_decode_chunked_payload_gpu_batched(&decode_inputs)
+                        .rans_decode_chunked_payload_gpu_batched_shared_table(&decode_inputs, data)
                         .unwrap(),
                 );
             }

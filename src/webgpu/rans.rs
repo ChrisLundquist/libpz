@@ -801,10 +801,11 @@ impl WebGpuEngine {
         decoded_dev.read_to_host(self)
     }
 
-    fn prepare_rans_chunked_payload_decode(
+    fn prepare_rans_chunked_payload_decode_with_shared_table(
         &self,
         input: &[u8],
         original_len: usize,
+        shared_tables: Option<(&wgpu::Buffer, u8)>,
     ) -> PzResult<PreparedRansChunkedPayloadDecode> {
         if input.len() < 1 + NUM_SYMBOLS * 2 + 2 {
             return Err(PzError::InvalidInput);
@@ -814,7 +815,15 @@ impl WebGpuEngine {
         if !(MIN_SCALE_BITS..=MAX_SCALE_BITS).contains(&scale_bits) {
             return Err(PzError::InvalidInput);
         }
-        let norm = deserialize_freq_table(&input[1..], scale_bits)?;
+        if let Some((_, shared_scale_bits)) = shared_tables {
+            if scale_bits != shared_scale_bits {
+                return Err(PzError::InvalidInput);
+            }
+        }
+        let norm = match shared_tables {
+            Some(_) => None,
+            None => Some(deserialize_freq_table(&input[1..], scale_bits)?),
+        };
 
         let mut cursor = 1 + NUM_SYMBOLS * 2;
         let num_chunks = read_u16_le(input, &mut cursor)? as usize;
@@ -945,12 +954,18 @@ impl WebGpuEngine {
             len: state_words.len() * std::mem::size_of::<u32>(),
         };
 
-        let tables_words = build_tables_words(&norm, scale_bits);
-        let tables = self.create_buffer_init(
-            "rans_chunked_tables",
-            bytemuck::cast_slice(&tables_words),
-            wgpu::BufferUsages::STORAGE,
-        );
+        let tables = match shared_tables {
+            Some((shared_buf, _)) => shared_buf.clone(),
+            None => {
+                let norm = norm.as_ref().ok_or(PzError::InvalidInput)?;
+                let tables_words = build_tables_words(norm, scale_bits);
+                self.create_buffer_init(
+                    "rans_chunked_tables",
+                    bytemuck::cast_slice(&tables_words),
+                    wgpu::BufferUsages::STORAGE,
+                )
+            }
+        };
 
         Ok(PreparedRansChunkedPayloadDecode {
             words_dev,
@@ -964,12 +979,47 @@ impl WebGpuEngine {
         })
     }
 
+    fn prepare_rans_chunked_payload_decode(
+        &self,
+        input: &[u8],
+        original_len: usize,
+    ) -> PzResult<PreparedRansChunkedPayloadDecode> {
+        self.prepare_rans_chunked_payload_decode_with_shared_table(input, original_len, None)
+    }
+
     fn submit_rans_chunked_payload_decode(
         &self,
         input: &[u8],
         original_len: usize,
     ) -> PzResult<PendingRansChunkedPayloadDecode> {
         let prepared = self.prepare_rans_chunked_payload_decode(input, original_len)?;
+        let output_dev = self.rans_decode_chunked_gpu(
+            &prepared.words_dev,
+            &prepared.states_dev,
+            &prepared.tables,
+            original_len,
+            prepared.params,
+        )?;
+        Ok(PendingRansChunkedPayloadDecode {
+            output_dev,
+            _words_dev: prepared.words_dev,
+            _states_dev: prepared.states_dev,
+            _tables: prepared.tables,
+        })
+    }
+
+    fn submit_rans_chunked_payload_decode_with_shared_table(
+        &self,
+        input: &[u8],
+        original_len: usize,
+        shared_tables: &wgpu::Buffer,
+        shared_scale_bits: u8,
+    ) -> PzResult<PendingRansChunkedPayloadDecode> {
+        let prepared = self.prepare_rans_chunked_payload_decode_with_shared_table(
+            input,
+            original_len,
+            Some((shared_tables, shared_scale_bits)),
+        )?;
         let output_dev = self.rans_decode_chunked_gpu(
             &prepared.words_dev,
             &prepared.states_dev,
@@ -1182,13 +1232,10 @@ impl WebGpuEngine {
             .min(max_depth)
     }
 
-    /// Batched GPU chunked rANS decode with ring-buffered submit/readback.
-    ///
-    /// Inputs are `(payload, original_len)` tuples where `payload` is in
-    /// `rans::encode_chunked` wire format.
-    pub fn rans_decode_chunked_payload_gpu_batched(
+    fn rans_decode_chunked_payload_gpu_batched_impl(
         &self,
         inputs: &[(&[u8], usize)],
+        shared_tables: Option<(&wgpu::Buffer, u8)>,
     ) -> PzResult<Vec<Vec<u8>>> {
         let ring_depth = self.rans_decode_pending_ring_depth(inputs);
         let mut results: Vec<Option<Vec<u8>>> = vec![None; inputs.len()];
@@ -1215,7 +1262,20 @@ impl WebGpuEngine {
                 continue;
             }
 
-            let submitted = self.submit_rans_chunked_payload_decode(input, original_len)?;
+            let submitted = if let Some((shared_tables, shared_scale_bits)) = shared_tables {
+                let payload_scale_bits = *input.first().ok_or(PzError::InvalidInput)?;
+                if payload_scale_bits != shared_scale_bits {
+                    return Err(PzError::InvalidInput);
+                }
+                self.submit_rans_chunked_payload_decode_with_shared_table(
+                    input,
+                    original_len,
+                    shared_tables,
+                    shared_scale_bits,
+                )?
+            } else {
+                self.submit_rans_chunked_payload_decode(input, original_len)?
+            };
             ring.slots[slot_idx] = Some((idx, submitted));
 
             if done_batch.len() >= ring_depth {
@@ -1237,6 +1297,56 @@ impl WebGpuEngine {
             .into_iter()
             .map(|r| r.expect("all batched rans decode results must be populated"))
             .collect())
+    }
+
+    /// Batched GPU chunked rANS decode with ring-buffered submit/readback.
+    ///
+    /// Inputs are `(payload, original_len)` tuples where `payload` is in
+    /// `rans::encode_chunked` wire format.
+    pub fn rans_decode_chunked_payload_gpu_batched(
+        &self,
+        inputs: &[(&[u8], usize)],
+    ) -> PzResult<Vec<Vec<u8>>> {
+        self.rans_decode_chunked_payload_gpu_batched_impl(inputs, None)
+    }
+
+    /// Batched GPU chunked rANS decode that reuses one precomputed table
+    /// across all chunked payloads in the batch.
+    ///
+    /// Callers must ensure payloads were encoded with a normalization that
+    /// matches `shared_table_seed` and share the same `scale_bits`.
+    pub fn rans_decode_chunked_payload_gpu_batched_shared_table(
+        &self,
+        inputs: &[(&[u8], usize)],
+        shared_table_seed: &[u8],
+    ) -> PzResult<Vec<Vec<u8>>> {
+        if shared_table_seed.is_empty() {
+            return self.rans_decode_chunked_payload_gpu_batched(inputs);
+        }
+
+        let shared_scale_bits = if let Some((payload, _)) = inputs.iter().find(|(_, len)| *len > 0)
+        {
+            *payload.first().ok_or(PzError::InvalidInput)?
+        } else {
+            return Ok(vec![Vec::new(); inputs.len()]);
+        };
+        if !(MIN_SCALE_BITS..=MAX_SCALE_BITS).contains(&shared_scale_bits) {
+            return Err(PzError::InvalidInput);
+        }
+
+        let mut freq = FrequencyTable::new();
+        freq.count(shared_table_seed);
+        let norm = normalize_frequencies(&freq, shared_scale_bits)?;
+        let tables_words = build_tables_words(&norm, shared_scale_bits);
+        let tables = self.create_buffer_init(
+            "rans_chunked_tables_shared_decode",
+            bytemuck::cast_slice(&tables_words),
+            wgpu::BufferUsages::STORAGE,
+        );
+        self.rans_decode_chunked_payload_gpu_batched_impl(
+            inputs,
+            Some((&tables, shared_scale_bits)),
+        )
     }
 
     /// Encode chunked interleaved rANS payload on GPU using CPU wire format.

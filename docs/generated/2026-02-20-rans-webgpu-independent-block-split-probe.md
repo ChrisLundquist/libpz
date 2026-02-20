@@ -14,6 +14,8 @@ Implementation for this probe:
   - `src/webgpu/rans.rs` batched encode path now supports batched completion/readback (`complete_rans_chunked_payload_encode_batch`) to reduce per-block readback overhead.
 - Additional follow-up pass:
   - added shared-table split encode API (`rans_encode_chunked_payload_gpu_batched_shared_table`) and wired profile split mode to seed one normalized table from the full input.
+- Additional follow-up pass:
+  - added shared-table split decode API (`rans_decode_chunked_payload_gpu_batched_shared_table`) to reuse one precomputed GPU table across independent-block decode batches.
 
 No wire format changes were made in this probe.
 
@@ -57,10 +59,10 @@ After batched-encode readback:
 - Encode: 35.8 MB/s
 - Decode: 58.2 MB/s
 
-After shared-table seed:
+After shared-table seed (+ decode table reuse):
 
-- Encode: 34.9 MB/s
-- Decode: 58.1 MB/s
+- Encode: 33.8 MB/s (rerun: 34.0 MB/s)
+- Decode: 55.2 MB/s (rerun: 55.7 MB/s)
 
 Source files:
 - before:
@@ -72,6 +74,8 @@ Source files:
 - shared table:
   - `docs/generated/2026-02-20-profile-direct-rans-encode-1mb-webgpu-independent-blocks-256k-shared-table.txt`
   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-256k-shared-table.txt`
+  - `docs/generated/2026-02-20-profile-direct-rans-encode-1mb-webgpu-independent-blocks-256k-shared-table-rerun.txt`
+  - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-256k-shared-table-rerun.txt`
 
 ### Independent split: 64KB blocks (16 blocks)
 
@@ -85,10 +89,10 @@ After batched-encode readback:
 - Encode: 20.8 MB/s
 - Decode: 34.5 MB/s
 
-After shared-table seed:
+After shared-table seed (+ decode table reuse):
 
-- Encode: 21.5 MB/s
-- Decode: 32.8 MB/s
+- Encode: 19.9 MB/s (rerun: 19.9 MB/s)
+- Decode: 32.9 MB/s (rerun: 33.0 MB/s)
 
 Source files:
 - before:
@@ -100,16 +104,18 @@ Source files:
 - shared table:
   - `docs/generated/2026-02-20-profile-direct-rans-encode-1mb-webgpu-independent-blocks-64k-shared-table.txt`
   - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-64k-shared-table.txt`
+  - `docs/generated/2026-02-20-profile-direct-rans-encode-1mb-webgpu-independent-blocks-64k-shared-table-rerun.txt`
+  - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-64k-shared-table-rerun.txt`
 
 ## Interpretation
 
 1. Independent-block splitting is still below the non-split default path on this host/device.
 2. Batched encode readback materially improves split encode throughput (especially at higher block counts), confirming per-block readback overhead was a major contributor.
-3. Shared-table seeding does not materially improve the 256KB split case and only modestly helps 64KB encode while regressing 64KB decode; table normalization is not the primary remaining bottleneck.
-4. Decode in split mode remains well below non-split defaults; next wins likely require deeper dispatch/framing amortization, not just host readback tuning.
+3. Shared-table seeding plus decode-side table reuse does not recover split throughput and remains below the readback-only split pass; table setup overhead is not the primary remaining bottleneck.
+4. Decode in split mode remains well below non-split defaults; next wins likely require deeper dispatch/framing amortization and packed multi-block submission, not just table reuse/readback tuning.
 
 ## Next Implementation Targets
 
 1. Add a packed multi-block submission path (single metadata buffer, single dispatch/readback cycle per batch group).
-2. Add decode-side shared-setup amortization for split payloads (avoid rebuilding/uploading equivalent tables per block where possible).
+2. Add packed split decode preparation path to amortize CPU payload parsing/state packing across independent blocks.
 3. Keep block splitting as a scheduler-level option, but gate it behind measured break-even thresholds.
