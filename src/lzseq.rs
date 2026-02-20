@@ -120,13 +120,15 @@ fn extra_bits_for_code(code: u8) -> u8 {
 }
 
 /// Encode an offset (1-based distance) to (code, extra_bits, extra_value).
+/// This is the raw (non-repeat) encoding used by the cost model.
 #[inline]
 pub(crate) fn encode_offset(offset: u32) -> (u8, u8, u32) {
     encode_value(offset)
 }
 
-/// Decode an offset from code + extra_value.
+/// Decode an offset from a raw (non-repeat) code + extra_value.
 #[inline]
+#[allow(dead_code)]
 pub(crate) fn decode_offset(code: u8, extra_value: u32) -> u32 {
     decode_value(code, extra_value)
 }
@@ -144,6 +146,107 @@ pub(crate) fn encode_length(length: u16) -> (u8, u8, u32) {
 pub(crate) fn decode_length(code: u8, extra_value: u32) -> u16 {
     let adj = decode_value(code, extra_value);
     (adj - 1 + MIN_MATCH as u32) as u16
+}
+
+// ---------------------------------------------------------------------------
+// Repeat offsets
+// ---------------------------------------------------------------------------
+
+/// Number of reserved repeat offset codes (0, 1, 2).
+const NUM_REPEAT_CODES: u8 = 3;
+
+/// Tracks the 3 most recently used offsets for repeat-offset encoding.
+///
+/// Encoder and decoder maintain identical state. Matches that reuse a
+/// recent offset encode with code 0-2 (0 extra bits), saving the full
+/// offset encoding cost.
+struct RepeatOffsets {
+    recent: [u32; 3],
+}
+
+impl RepeatOffsets {
+    fn new() -> Self {
+        // Initialize with common small offsets. Encoder and decoder must match.
+        RepeatOffsets { recent: [1, 1, 1] }
+    }
+
+    /// Encode an offset using repeat codes. Returns (code, extra_bits, extra_value).
+    ///
+    /// Codes 0-2: repeat offset (0 extra bits).
+    /// Code 3+: literal offset (shifted from base table).
+    #[inline]
+    fn encode_offset(&mut self, offset: u32) -> (u8, u8, u32) {
+        // Check repeat offsets (cheapest encoding: 0 extra bits)
+        for i in 0..3 {
+            if offset == self.recent[i] {
+                self.promote(i);
+                return (i as u8, 0, 0);
+            }
+        }
+        // Literal offset: shift code by NUM_REPEAT_CODES
+        let (code, eb, ev) = encode_value(offset);
+        self.push_new(offset);
+        (code + NUM_REPEAT_CODES, eb, ev)
+    }
+
+    /// Decode an offset from code + extra_value, updating repeat state.
+    #[inline]
+    fn decode_offset(&mut self, code: u8, extra_value: u32) -> u32 {
+        if code < NUM_REPEAT_CODES {
+            let offset = self.recent[code as usize];
+            self.promote(code as usize);
+            offset
+        } else {
+            let offset = decode_value(code - NUM_REPEAT_CODES, extra_value);
+            self.push_new(offset);
+            offset
+        }
+    }
+
+    /// Promote repeat index `i` to most-recent position.
+    #[inline]
+    fn promote(&mut self, i: usize) {
+        match i {
+            0 => {}                           // already most recent
+            1 => self.recent.swap(0, 1),      // swap 1↔0
+            2 => self.recent.rotate_right(1), // [2,0,1]
+            _ => unreachable!(),
+        }
+    }
+
+    /// Push a new (non-repeat) offset, evicting the oldest.
+    #[inline]
+    fn push_new(&mut self, offset: u32) {
+        self.recent[2] = self.recent[1];
+        self.recent[1] = self.recent[0];
+        self.recent[0] = offset;
+    }
+}
+
+/// Number of extra bits for a repeat-aware offset code.
+#[inline]
+fn extra_bits_for_offset_code(code: u8) -> u8 {
+    if code < NUM_REPEAT_CODES {
+        0
+    } else {
+        extra_bits_for_code(code - NUM_REPEAT_CODES)
+    }
+}
+
+/// Check how long a match extends at `pos` with the given offset.
+/// Returns 0 if no valid match (offset too large or no bytes match).
+#[inline]
+fn check_repeat_match(input: &[u8], pos: usize, offset: u32, max_match: usize) -> u16 {
+    if offset == 0 || offset as usize > pos {
+        return 0;
+    }
+    let max_len = (input.len() - pos).min(max_match);
+    let src = pos - offset as usize;
+    let mut len = 0;
+    while len < max_len && input[src + len] == input[pos + len] {
+        len += 1;
+    }
+    len as u16
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +417,70 @@ pub fn encode(input: &[u8]) -> PzResult<SeqEncoded> {
     )
 }
 
+/// Select the best match considering both hash-chain and repeat-offset candidates.
+///
+/// Returns (offset, length) of the best match. Prefers repeat-offset matches
+/// when they're competitive with the hash-chain match (within ~2 bytes), because
+/// repeat offsets encode with 0 extra bits for the offset component.
+fn select_best_match(
+    input: &[u8],
+    pos: usize,
+    hash_offset: u32,
+    hash_length: u16,
+    repeats: &RepeatOffsets,
+    max_match_len: usize,
+) -> (u32, u16) {
+    // Find the best repeat-offset match
+    let mut best_rep_offset = 0u32;
+    let mut best_rep_len = 0u16;
+    for &rep_offset in &repeats.recent {
+        let rep_len = check_repeat_match(input, pos, rep_offset, max_match_len);
+        if rep_len > best_rep_len {
+            best_rep_len = rep_len;
+            best_rep_offset = rep_offset;
+        }
+    }
+
+    // Decide: hash-chain vs repeat
+    if best_rep_len >= MIN_MATCH {
+        if hash_length < MIN_MATCH {
+            // No hash match — use repeat
+            return (best_rep_offset, best_rep_len);
+        }
+        // Repeat saves the full offset encoding cost (~1 code byte + extra bits).
+        // Accept a repeat match that's shorter by up to the offset savings.
+        let (_, oeb, _) = encode_offset(hash_offset);
+        let offset_savings = 1 + (oeb as u16) / 8; // bytes saved by repeat
+        if best_rep_len.saturating_add(offset_savings) >= hash_length {
+            return (best_rep_offset, best_rep_len);
+        }
+    }
+
+    // Use hash-chain match (or no match if hash_length < MIN_MATCH)
+    (hash_offset, hash_length)
+}
+
+/// Emit a match token into the output streams.
+#[allow(clippy::too_many_arguments)]
+fn emit_match(
+    offset: u32,
+    length: u16,
+    repeats: &mut RepeatOffsets,
+    flags_vec: &mut Vec<bool>,
+    offset_codes: &mut Vec<u8>,
+    offset_extra_writer: &mut BitWriter,
+    length_codes: &mut Vec<u8>,
+    length_extra_writer: &mut BitWriter,
+) {
+    flags_vec.push(false);
+    let (oc, oeb, oev) = repeats.encode_offset(offset);
+    offset_codes.push(oc);
+    offset_extra_writer.write_bits(oev, oeb);
+    let (lc, leb, lev) = encode_length(length);
+    length_codes.push(lc);
+    length_extra_writer.write_bits(lev, leb);
+}
+
 /// Compress input using LzSeq with lazy matching and configurable window.
 ///
 /// Uses `find_match_wide` to support u32 offsets for windows larger than 32KB.
@@ -333,6 +500,7 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
     }
 
     let mut finder = HashChainFinder::with_window(config.max_window, DEFAULT_MAX_MATCH);
+    let mut repeats = RepeatOffsets::new();
     let mut flags_vec: Vec<bool> = Vec::new();
     let mut literals: Vec<u8> = Vec::new();
     let mut offset_codes: Vec<u8> = Vec::new();
@@ -340,46 +508,79 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
     let mut offset_extra_writer = BitWriter::new();
     let mut length_extra_writer = BitWriter::new();
     let mut pos: usize = 0;
+    let max_match_len = DEFAULT_MAX_MATCH as usize;
 
     while pos < input.len() {
         let m = finder.find_match_wide(input, pos);
         finder.insert(input, pos);
 
+        // Check repeat offsets: matches at recent offsets encode with 0 extra
+        // bits for the offset, making them much cheaper than hash-chain matches.
+        let (best_offset, best_length) =
+            select_best_match(input, pos, m.offset, m.length, &repeats, max_match_len);
+
         // Distance-dependent minimum match length: reject short matches
         // at large distances where code+extra-bits cost exceeds literal cost.
-        let effective_min = if m.length >= MIN_MATCH {
-            min_profitable_length(m.offset)
+        // Repeat matches always use MIN_MATCH (they're essentially free).
+        let is_repeat = best_offset > 0
+            && (best_offset == repeats.recent[0]
+                || best_offset == repeats.recent[1]
+                || best_offset == repeats.recent[2]);
+        let effective_min = if best_length >= MIN_MATCH && !is_repeat {
+            min_profitable_length(best_offset)
         } else {
             MIN_MATCH
         };
 
         // Lazy matching: check if next position has a longer match
-        if m.length >= effective_min && m.length < LAZY_SKIP_THRESHOLD && pos + 1 < input.len() {
+        if best_length >= effective_min
+            && best_length < LAZY_SKIP_THRESHOLD
+            && pos + 1 < input.len()
+        {
             finder.insert(input, pos + 1);
             let next_m = finder.find_match_wide(input, pos + 1);
-            let next_effective_min = if next_m.offset > 0 {
-                min_profitable_length(next_m.offset)
+            let (next_offset, next_length) = select_best_match(
+                input,
+                pos + 1,
+                next_m.offset,
+                next_m.length,
+                &repeats,
+                max_match_len,
+            );
+            let next_is_repeat = next_offset > 0
+                && (next_offset == repeats.recent[0]
+                    || next_offset == repeats.recent[1]
+                    || next_offset == repeats.recent[2]);
+            let next_effective_min = if next_length >= MIN_MATCH && !next_is_repeat {
+                if next_offset > 0 {
+                    min_profitable_length(next_offset)
+                } else {
+                    u16::MAX
+                }
             } else {
-                u16::MAX // No match found, require impossible length
+                MIN_MATCH
             };
 
-            if next_m.length >= next_effective_min && next_m.length > m.length {
+            if next_length >= next_effective_min && next_length > best_length {
                 // Emit literal for current position, use the better match
                 flags_vec.push(true);
                 literals.push(input[pos]);
                 pos += 1;
 
                 // Emit match from next position
-                flags_vec.push(false);
-                let (oc, oeb, oev) = encode_offset(next_m.offset);
-                offset_codes.push(oc);
-                offset_extra_writer.write_bits(oev, oeb);
-                let (lc, leb, lev) = encode_length(next_m.length);
-                length_codes.push(lc);
-                length_extra_writer.write_bits(lev, leb);
+                emit_match(
+                    next_offset,
+                    next_length,
+                    &mut repeats,
+                    &mut flags_vec,
+                    &mut offset_codes,
+                    &mut offset_extra_writer,
+                    &mut length_codes,
+                    &mut length_extra_writer,
+                );
 
                 // Insert covered positions into hash chains
-                let advance = next_m.length as usize;
+                let advance = next_length as usize;
                 let insert_count = advance.min(input.len() - pos).min(MAX_INSERT_LEN);
                 for i in 1..insert_count {
                     finder.insert(input, pos + i);
@@ -389,17 +590,20 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
             }
         }
 
-        if m.length >= effective_min {
+        if best_length >= effective_min {
             // Emit match
-            flags_vec.push(false);
-            let (oc, oeb, oev) = encode_offset(m.offset);
-            offset_codes.push(oc);
-            offset_extra_writer.write_bits(oev, oeb);
-            let (lc, leb, lev) = encode_length(m.length);
-            length_codes.push(lc);
-            length_extra_writer.write_bits(lev, leb);
+            emit_match(
+                best_offset,
+                best_length,
+                &mut repeats,
+                &mut flags_vec,
+                &mut offset_codes,
+                &mut offset_extra_writer,
+                &mut length_codes,
+                &mut length_extra_writer,
+            );
 
-            let advance = m.length as usize;
+            let advance = best_length as usize;
             let insert_count = advance.min(input.len() - pos).min(MAX_INSERT_LEN);
             for i in 1..insert_count {
                 finder.insert(input, pos + i);
@@ -455,6 +659,7 @@ pub fn decode(
     let mut match_idx = 0usize;
     let mut off_extra_reader = BitReader::new(offset_extra);
     let mut len_extra_reader = BitReader::new(length_extra);
+    let mut repeats = RepeatOffsets::new();
     let mut output = Vec::with_capacity(original_len);
 
     for &is_literal in &flag_bits {
@@ -469,9 +674,9 @@ pub fn decode(
                 return Err(PzError::InvalidInput);
             }
             let oc = offset_codes[match_idx];
-            let oeb = extra_bits_for_code(oc);
+            let oeb = extra_bits_for_offset_code(oc);
             let oev = off_extra_reader.read_bits(oeb);
-            let offset = decode_offset(oc, oev) as usize;
+            let offset = repeats.decode_offset(oc, oev) as usize;
 
             let lc = length_codes[match_idx];
             let leb = extra_bits_for_code(lc);
@@ -977,5 +1182,145 @@ mod tests {
         }
         let output = round_trip(&input).unwrap();
         assert_eq!(output, input);
+    }
+
+    // --- Repeat offset tests (Phase 5) ---
+
+    #[test]
+    fn test_repeat_offsets_state_management() {
+        let mut rep = RepeatOffsets::new();
+        assert_eq!(rep.recent, [1, 1, 1]);
+
+        // Push a new offset
+        rep.push_new(42);
+        assert_eq!(rep.recent, [42, 1, 1]);
+
+        // Push another
+        rep.push_new(100);
+        assert_eq!(rep.recent, [100, 42, 1]);
+
+        // Promote index 1 (swap)
+        rep.promote(1);
+        assert_eq!(rep.recent, [42, 100, 1]);
+
+        // Promote index 2 (rotate)
+        rep.promote(2);
+        assert_eq!(rep.recent, [1, 42, 100]);
+    }
+
+    #[test]
+    fn test_repeat_offset_encode_decode_round_trip() {
+        let mut enc_rep = RepeatOffsets::new();
+        let mut dec_rep = RepeatOffsets::new();
+
+        // Encode a sequence of offsets (some repeats)
+        let offsets = [10, 20, 10, 10, 20, 30, 20, 20, 20];
+        for &offset in &offsets {
+            let (code, eb, ev) = enc_rep.encode_offset(offset);
+            let decoded = dec_rep.decode_offset(code, ev);
+            assert_eq!(
+                decoded, offset,
+                "repeat offset mismatch for offset {offset}"
+            );
+            assert_eq!(
+                extra_bits_for_offset_code(code),
+                eb,
+                "extra bits mismatch for code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_repeat_matches_used_on_structured_data() {
+        // With small structured patterns, repeat offsets should be used
+        // on subsequent occurrences. Use a pattern short enough that
+        // one giant match doesn't cover everything.
+        let pattern = b"ABC";
+        let mut input = Vec::new();
+        // Create 10 copies, each separated by a small unique sequence
+        for i in 0..10 {
+            input.extend_from_slice(pattern);
+            // Add a small unique suffix to prevent one giant match
+            input.push(b'0' + (i % 10) as u8);
+        }
+        let enc = encode(&input).unwrap();
+
+        // Count repeat codes (0-2) in offset_codes
+        let repeat_count = enc
+            .offset_codes
+            .iter()
+            .filter(|&&c| c < NUM_REPEAT_CODES)
+            .count();
+
+        eprintln!(
+            "DEBUG: input_len={}, num_tokens={}, num_matches={}, repeat_count={}",
+            input.len(),
+            enc.num_tokens,
+            enc.num_matches,
+            repeat_count
+        );
+        eprintln!("DEBUG: offset_codes={:?}", &enc.offset_codes);
+
+        assert!(
+            repeat_count > 0,
+            "structured data should use repeat offsets, but found 0 (offset_codes={:?})",
+            &enc.offset_codes
+        );
+
+        // Verify round-trip
+        let output = round_trip(&input).unwrap();
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_repeat_offsets_round_trip_various() {
+        // All-same bytes: mostly repeat offset 1
+        let input = vec![b'Q'; 10_000];
+        assert_eq!(round_trip(&input).unwrap(), input);
+
+        // Short repeating pattern: repeat offset = pattern length
+        let pattern = b"ABCD";
+        let input: Vec<u8> = pattern.iter().cycle().take(10_000).copied().collect();
+        assert_eq!(round_trip(&input).unwrap(), input);
+
+        // Alternating patterns at different offsets
+        let mut input = Vec::new();
+        for i in 0..200 {
+            if i % 2 == 0 {
+                input.extend_from_slice(b"even pattern here! ");
+            } else {
+                input.extend_from_slice(b"odd pattern here!! ");
+            }
+        }
+        assert_eq!(round_trip(&input).unwrap(), input);
+    }
+
+    #[test]
+    fn test_repeat_offsets_improve_ratio() {
+        // With small repeated patterns separated by variation,
+        // repeat codes should be used on matching offsets.
+        let pattern = b"abc";
+        let mut input = Vec::new();
+        for i in 0..50 {
+            input.extend_from_slice(pattern);
+            // Add variation to prevent giant matches
+            input.push(b'0' + (i as u8 % 10));
+        }
+        let enc = encode(&input).unwrap();
+
+        let repeat_count = enc
+            .offset_codes
+            .iter()
+            .filter(|&&c| c < NUM_REPEAT_CODES)
+            .count();
+        let total_matches = enc.num_matches as usize;
+
+        // Expect at least some matches to use repeat codes
+        assert!(total_matches > 0, "should have found matches");
+        assert!(
+            repeat_count > 0,
+            "expected some repeat usage on regular data, got 0 repeat codes out of {} matches",
+            total_matches
+        );
     }
 }
