@@ -150,6 +150,13 @@ Interim Go/No-Go:
    - notes: `docs/generated/2026-02-20-rans-webgpu-split-encode-shared-table-reuse-pass.md`.
 26. Next performance gate action remains unchanged:
    - collect fresh stable-GPU stage measurements for both decode prep reuse and encode shared-table reuse before deciding on split-path default policies.
+27. Implemented packed split encode submission pass (2026-02-20):
+   - new packed shared-table encode path in `src/webgpu/rans.rs` consolidates high-block-count split inputs into one encode dispatch/readback cycle and reconstructs per-block chunked payloads.
+   - currently gated by `RANS_PACKED_SHARED_ENCODE_MIN_INPUTS` (>= 8 non-empty inputs).
+   - notes: `docs/generated/2026-02-20-rans-webgpu-split-encode-packed-pass.md`.
+28. Correctness gate for packed encode is green:
+   - added `test_rans_chunked_encode_gpu_batched_shared_table_packed_cpu_decode_round_trip`.
+   - `cargo fmt --check`, `cargo clippy --features webgpu -- -D warnings`, and `cargo test --features webgpu batched` passed on this head.
 
 ## Existing Assets We Reuse
 
