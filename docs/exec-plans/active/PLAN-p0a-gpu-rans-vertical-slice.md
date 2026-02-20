@@ -144,6 +144,12 @@ Interim Go/No-Go:
    - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-defaults-prep-cache-pass.txt`
    - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-256k-prep-cache-pass.txt`
    - `docs/generated/2026-02-20-profile-direct-rans-decode-1mb-webgpu-independent-blocks-64k-prep-cache-pass.txt`
+25. Implemented split encode shared-table reuse pass (2026-02-20):
+   - in `src/webgpu/rans.rs`, batched shared-table encode now builds one GPU table buffer per batch call and reuses it across all inputs (instead of rebuilding identical tables per input).
+   - this advances the encode side toward the same amortized model used by split decode prep reuse.
+   - notes: `docs/generated/2026-02-20-rans-webgpu-split-encode-shared-table-reuse-pass.md`.
+26. Next performance gate action remains unchanged:
+   - collect fresh stable-GPU stage measurements for both decode prep reuse and encode shared-table reuse before deciding on split-path default policies.
 
 ## Existing Assets We Reuse
 

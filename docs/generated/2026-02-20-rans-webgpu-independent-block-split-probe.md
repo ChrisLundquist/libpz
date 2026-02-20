@@ -24,6 +24,9 @@ Implementation for this probe:
   - added split decode prep reuse path:
     - `rans_decode_chunked_payload_gpu_batched_shared_table_repeated(...)` now reuses shared-table decode setup and packed split decode preparation across repeated runs.
     - profiling split decode loop in `examples/profile.rs` now uses the repeated API.
+- Additional follow-up pass:
+  - reduced split shared-table encode setup overhead:
+    - `rans_encode_chunked_payload_gpu_batched_impl(...)` now builds one shared table buffer per batch call when `shared_norm` is provided, instead of rebuilding identical tables per input.
 
 No wire format changes were made in this probe.
 
@@ -176,6 +179,14 @@ Measurement status:
 1. Non-approved sandbox runs produced `*prep-cache-pass.txt` artifacts.
 2. Those captures appear to have fallen back to CPU path (missing WebGPU path banners), so they are not used as GPU gate evidence.
 
+## Encode Shared-Table Reuse Follow-up Pass
+
+Implementation details:
+
+1. Added encode helper path that accepts a prebuilt shared table buffer.
+2. Updated batched shared-table encode to reuse one table buffer across all inputs in the batch call.
+3. Detailed notes: `docs/generated/2026-02-20-rans-webgpu-split-encode-shared-table-reuse-pass.md`.
+
 ## Interpretation
 
 1. Independent-block splitting is still below the non-split default path on this host/device.
@@ -188,6 +199,6 @@ Measurement status:
 ## Next Implementation Targets
 
 1. Re-run split decode profiling for the prep-reuse pass on stable WebGPU hardware to quantify true GPU delta.
-2. Extend packed submission + prep reuse to split encode path so both directions share the same amortized model.
+2. Extend packed submission/readback symmetry to split encode path so both directions share the same packed dispatch model.
 3. Add a low-noise benchmark mode for split decode (longer runs or isolated host) before changing scheduler defaults.
 4. Keep block splitting as a scheduler-level option, with thresholds tied to block count/device break-even data.
