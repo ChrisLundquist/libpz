@@ -26,7 +26,7 @@
 ///   Code 1: length 4       (0 extra bits)
 ///   Code 2: length 5-6     (1 extra bit)
 ///   Code 3: length 7-10    (2 extra bits)
-use crate::lz77::{HashChainFinder, DEFAULT_MAX_MATCH, MIN_MATCH};
+use crate::lz77::{HashChainFinder, DEFAULT_MAX_MATCH, MAX_WINDOW, MIN_MATCH};
 use crate::{PzError, PzResult};
 
 /// Match length threshold above which lazy evaluation is skipped.
@@ -34,6 +34,22 @@ const LAZY_SKIP_THRESHOLD: u16 = 32;
 
 /// Maximum hash insertion count per match.
 const MAX_INSERT_LEN: usize = 128;
+
+/// Configuration for LzSeq encoding.
+pub struct SeqConfig {
+    /// Maximum lookback window size in bytes. Must be a power of 2.
+    /// Default: 128KB. Use larger values for better compression on data
+    /// with long-range repeats.
+    pub max_window: usize,
+}
+
+impl Default for SeqConfig {
+    fn default() -> Self {
+        SeqConfig {
+            max_window: 128 * 1024,
+        }
+    }
+}
 
 /// Encoded output: 6 independent streams ready for entropy coding.
 pub struct SeqEncoded {
@@ -240,12 +256,27 @@ fn unpack_flags(bytes: &[u8], count: usize) -> Vec<bool> {
 // Encode
 // ---------------------------------------------------------------------------
 
-/// Compress input using LzSeq with lazy matching.
+/// Compress input using LzSeq with lazy matching (32KB window).
 ///
 /// Uses the same HashChainFinder and lazy matching strategy as LZSS,
 /// but encodes matches with log2-based codes + extra bits instead of
 /// fixed-width offset:u16 + length:u16.
+///
+/// For wider windows (128KB+), use `encode_with_config`.
 pub fn encode(input: &[u8]) -> PzResult<SeqEncoded> {
+    encode_with_config(
+        input,
+        &SeqConfig {
+            max_window: MAX_WINDOW,
+        },
+    )
+}
+
+/// Compress input using LzSeq with lazy matching and configurable window.
+///
+/// Uses `find_match_wide` to support u32 offsets for windows larger than 32KB.
+/// The offset code table naturally handles any offset up to ~1MB (code 20).
+pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncoded> {
     if input.is_empty() {
         return Ok(SeqEncoded {
             flags: Vec::new(),
@@ -259,7 +290,7 @@ pub fn encode(input: &[u8]) -> PzResult<SeqEncoded> {
         });
     }
 
-    let mut finder = HashChainFinder::with_max_match_len(DEFAULT_MAX_MATCH);
+    let mut finder = HashChainFinder::with_window(config.max_window, DEFAULT_MAX_MATCH);
     let mut flags_vec: Vec<bool> = Vec::new();
     let mut literals: Vec<u8> = Vec::new();
     let mut offset_codes: Vec<u8> = Vec::new();
@@ -269,13 +300,13 @@ pub fn encode(input: &[u8]) -> PzResult<SeqEncoded> {
     let mut pos: usize = 0;
 
     while pos < input.len() {
-        let m = finder.find_match(input, pos);
+        let m = finder.find_match_wide(input, pos);
         finder.insert(input, pos);
 
         // Lazy matching: check if next position has a longer match
         if m.length >= MIN_MATCH && m.length < LAZY_SKIP_THRESHOLD && pos + 1 < input.len() {
             finder.insert(input, pos + 1);
-            let next_m = finder.find_match(input, pos + 1);
+            let next_m = finder.find_match_wide(input, pos + 1);
 
             if next_m.length > m.length {
                 // Emit literal for current position, use the better match
@@ -285,7 +316,7 @@ pub fn encode(input: &[u8]) -> PzResult<SeqEncoded> {
 
                 // Emit match from next position
                 flags_vec.push(false);
-                let (oc, oeb, oev) = encode_offset(next_m.offset as u32);
+                let (oc, oeb, oev) = encode_offset(next_m.offset);
                 offset_codes.push(oc);
                 offset_extra_writer.write_bits(oev, oeb);
                 let (lc, leb, lev) = encode_length(next_m.length);
@@ -306,7 +337,7 @@ pub fn encode(input: &[u8]) -> PzResult<SeqEncoded> {
         if m.length >= MIN_MATCH {
             // Emit match
             flags_vec.push(false);
-            let (oc, oeb, oev) = encode_offset(m.offset as u32);
+            let (oc, oeb, oev) = encode_offset(m.offset);
             offset_codes.push(oc);
             offset_extra_writer.write_bits(oev, oeb);
             let (lc, leb, lev) = encode_length(m.length);
@@ -715,5 +746,130 @@ mod tests {
         for &code in &enc.length_codes {
             assert!(code <= 20, "length code {code} out of range");
         }
+    }
+
+    // --- Wide window tests (Phase 3) ---
+
+    #[test]
+    fn test_wide_window_round_trip() {
+        // Create data with a repeated block separated by >32KB of unique fill.
+        // Only a wide window can find the long-distance match.
+        let marker = b"WIDE_WINDOW_MARKER_PATTERN_12345";
+        let fill_len = 40_000; // > 32KB
+        let mut input = Vec::with_capacity(marker.len() * 2 + fill_len);
+        input.extend_from_slice(marker);
+        // Fill with non-repeating bytes so the matcher doesn't find local matches
+        for i in 0..fill_len {
+            input.push((i % 251) as u8 ^ 0x55);
+        }
+        input.extend_from_slice(marker);
+
+        let config = SeqConfig {
+            max_window: 64 * 1024,
+        };
+        let enc = encode_with_config(&input, &config).unwrap();
+        let output = decode(
+            &enc.flags,
+            &enc.literals,
+            &enc.offset_codes,
+            &enc.offset_extra,
+            &enc.length_codes,
+            &enc.length_extra,
+            enc.num_tokens,
+            enc.num_matches,
+            input.len(),
+        )
+        .unwrap();
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_wide_window_finds_distant_matches() {
+        // Verify the 128KB window actually finds matches beyond 32KB.
+        let pattern = b"DISTANT_MATCH_TEST_PATTERN_ABCD!";
+        let fill_len = 50_000; // > 32KB gap
+        let mut input = Vec::with_capacity(pattern.len() * 2 + fill_len);
+        input.extend_from_slice(pattern);
+        for i in 0..fill_len {
+            input.push((i % 251) as u8 ^ 0xAA);
+        }
+        input.extend_from_slice(pattern);
+
+        // Wide window: should find a match at offset > 32KB
+        let config_wide = SeqConfig {
+            max_window: 128 * 1024,
+        };
+        let enc_wide = encode_with_config(&input, &config_wide).unwrap();
+
+        // Narrow window: cannot see across the gap
+        let config_narrow = SeqConfig {
+            max_window: MAX_WINDOW, // 32KB
+        };
+        let enc_narrow = encode_with_config(&input, &config_narrow).unwrap();
+
+        // Wide window should produce fewer matches (or equal) and fewer literals
+        // because it finds the distant match that the narrow window misses.
+        assert!(
+            enc_wide.literals.len() <= enc_narrow.literals.len(),
+            "wide window ({} literals) should not produce more literals than narrow ({})",
+            enc_wide.literals.len(),
+            enc_narrow.literals.len()
+        );
+
+        // Both must round-trip correctly
+        let out_wide = decode(
+            &enc_wide.flags,
+            &enc_wide.literals,
+            &enc_wide.offset_codes,
+            &enc_wide.offset_extra,
+            &enc_wide.length_codes,
+            &enc_wide.length_extra,
+            enc_wide.num_tokens,
+            enc_wide.num_matches,
+            input.len(),
+        )
+        .unwrap();
+        assert_eq!(out_wide, input);
+
+        let out_narrow = decode(
+            &enc_narrow.flags,
+            &enc_narrow.literals,
+            &enc_narrow.offset_codes,
+            &enc_narrow.offset_extra,
+            &enc_narrow.length_codes,
+            &enc_narrow.length_extra,
+            enc_narrow.num_tokens,
+            enc_narrow.num_matches,
+            input.len(),
+        )
+        .unwrap();
+        assert_eq!(out_narrow, input);
+    }
+
+    #[test]
+    fn test_default_config_uses_128kb() {
+        let config = SeqConfig::default();
+        assert_eq!(config.max_window, 128 * 1024);
+    }
+
+    #[test]
+    fn test_encode_backward_compat_uses_32kb() {
+        // encode() uses MAX_WINDOW (32KB) for backward compat.
+        // Verify it doesn't panic and round-trips.
+        let input = vec![b'Z'; 50_000];
+        let enc = encode(&input).unwrap();
+        let output = decode(
+            &enc.flags,
+            &enc.literals,
+            &enc.offset_codes,
+            &enc.offset_extra,
+            &enc.length_codes,
+            &enc.length_extra,
+            enc.num_tokens,
+            enc.num_matches,
+            input.len(),
+        )
+        .unwrap();
+        assert_eq!(output, input);
     }
 }

@@ -184,7 +184,12 @@ impl StreamDemuxer for LzDemuxer {
                 })
             }
             LzDemuxer::LzSeq => {
-                let enc = lzseq::encode(input)?;
+                let config = lzseq::SeqConfig {
+                    max_window: options
+                        .seq_window_size
+                        .unwrap_or_else(|| lzseq::SeqConfig::default().max_window),
+                };
+                let enc = lzseq::encode_with_config(input, &config)?;
                 // Pre-entropy len: sum of all stream sizes (approximate wire cost)
                 let pre_entropy_len = enc.flags.len()
                     + enc.literals.len()

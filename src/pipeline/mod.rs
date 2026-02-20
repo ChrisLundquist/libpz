@@ -123,6 +123,13 @@ pub struct CompressOptions {
     /// When enabled, the same worker pool executes both stage-0 transform
     /// tasks and stage-1 entropy tasks from a shared work queue.
     pub unified_scheduler: bool,
+    /// LzSeq sliding window size in bytes. Must be a power of 2.
+    ///
+    /// `None` = use the default (128KB). Only affects the `LzSeqR` pipeline;
+    /// other pipelines ignore this. Larger windows find longer-range matches
+    /// at the cost of more memory (4 bytes per window position for the
+    /// hash-chain `prev` array).
+    pub seq_window_size: Option<usize>,
 }
 
 impl Default for CompressOptions {
@@ -139,6 +146,7 @@ impl Default for CompressOptions {
             rans_interleaved_min_bytes: 64 * 1024,
             rans_interleaved_states: crate::rans::DEFAULT_INTERLEAVE,
             unified_scheduler: false,
+            seq_window_size: None,
         }
     }
 }
