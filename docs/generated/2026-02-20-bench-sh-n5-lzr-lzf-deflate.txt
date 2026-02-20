@@ -1,0 +1,24 @@
+=== BENCHMARK SUMMARY ===
+
+Configuration:
+  Files:      14 files (13.32 MB total)
+  Iterations: 5 per operation
+  Pipelines:  lzr lzf deflate
+
+Compression Results:
+  Pipeline           Size    Ratio       Time Throughput
+  ────────────────────────────────────────────────────────────
+  gzip            3.81 MB    28.6%  2266.6 ms   5.9 MB/s
+  pz-lzr          5.41 MB    40.6%   657.4 ms  20.3 MB/s
+  pz-lzf          5.56 MB    41.7%   634.1 ms  21.0 MB/s
+  pz-deflate      5.54 MB    41.6%   546.7 ms  24.4 MB/s
+
+Decompression Results:
+  Pipeline         Time Throughput
+  ────────────────────────────────────
+  gzip         395.8 ms  33.7 MB/s
+  pz-lzr       494.4 ms  26.9 MB/s
+  pz-lzf       531.3 ms  25.1 MB/s
+  pz-deflate   513.0 ms  26.0 MB/s
+
+Run with --verbose for per-file breakdown

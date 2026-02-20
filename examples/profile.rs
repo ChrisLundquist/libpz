@@ -15,7 +15,7 @@ use pz::pipeline::{self, CompressOptions, Pipeline};
 
 const DEFAULT_RANS_CHUNK_BYTES: usize = 8192;
 const DEFAULT_RANS_GPU_CHUNK_BYTES: usize = 2048;
-const DEFAULT_RANS_GPU_BATCH: usize = 3;
+const DEFAULT_RANS_GPU_BATCH: usize = 6;
 
 fn usage() {
     eprintln!("profile - run compression in a loop for profiling");

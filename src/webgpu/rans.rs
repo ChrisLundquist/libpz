@@ -13,6 +13,7 @@ use crate::rans::{
 };
 
 const RANS_STORAGE_BINDINGS_PER_STAGE: u32 = 5;
+const RANS_MAX_PENDING_RING_DEPTH: usize = 8;
 
 fn write_packed_u16_slice(words: &mut [u32], mut idx_u16: usize, mut values: &[u16]) {
     if values.is_empty() {
@@ -969,6 +970,63 @@ impl WebGpuEngine {
         pending.output_dev.read_to_host(self)
     }
 
+    fn complete_rans_chunked_payload_decode_batch(
+        &self,
+        batch: Vec<(usize, PendingRansChunkedPayloadDecode)>,
+        results: &mut [Option<Vec<u8>>],
+    ) -> PzResult<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let mut staging = Vec::with_capacity(batch.len());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rans_decode_batched_readback"),
+            });
+
+        for (_, pending) in &batch {
+            let size = pending.output_dev.buf.size();
+            let staging_buf = self.create_buffer(
+                "rans_decode_batched_staging",
+                size,
+                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            );
+            encoder.copy_buffer_to_buffer(&pending.output_dev.buf, 0, &staging_buf, 0, size);
+            staging.push(staging_buf);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        let mut waits = Vec::with_capacity(staging.len());
+        for staging_buf in &staging {
+            let slice = staging_buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            waits.push(rx);
+        }
+        self.poll_wait();
+        for rx in waits {
+            rx.recv()
+                .map_err(|_| PzError::Unsupported)?
+                .map_err(|_| PzError::Unsupported)?;
+        }
+
+        for ((idx, pending), staging_buf) in batch.into_iter().zip(staging.into_iter()) {
+            let slice = staging_buf.slice(..);
+            let mapped = slice.get_mapped_range();
+            let len = pending.output_dev.len();
+            let decoded = mapped.get(..len).ok_or(PzError::InvalidInput)?.to_vec();
+            drop(mapped);
+            staging_buf.unmap();
+            results[idx] = Some(decoded);
+        }
+
+        Ok(())
+    }
+
     /// Decode chunked interleaved rANS payload (`rans::encode_chunked`) on GPU.
     ///
     /// Preserves CPU wire compatibility and rejects malformed metadata.
@@ -1001,9 +1059,12 @@ impl WebGpuEngine {
             return 1;
         }
 
-        // Mirror the LZ77 streaming policy: reserve headroom, clamp to 3 slots.
+        // Reserve headroom but allow deeper in-flight queues than LZ77 so rANS
+        // payload upload/readback can overlap across more batches.
         let budget = (self.gpu_memory_budget() * 3) / 4;
-        (budget / per_slot).clamp(1, 3).min(max_depth)
+        (budget / per_slot)
+            .clamp(1, RANS_MAX_PENDING_RING_DEPTH)
+            .min(max_depth)
     }
 
     /// Batched GPU chunked rANS decode with ring-buffered submit/readback.
@@ -1016,6 +1077,8 @@ impl WebGpuEngine {
     ) -> PzResult<Vec<Vec<u8>>> {
         let ring_depth = self.rans_decode_pending_ring_depth(inputs);
         let mut results: Vec<Option<Vec<u8>>> = vec![None; inputs.len()];
+        let mut done_batch: Vec<(usize, PendingRansChunkedPayloadDecode)> =
+            Vec::with_capacity(ring_depth);
         let mut ring = BufferRing::new(
             (0..ring_depth)
                 .map(|_| None::<(usize, PendingRansChunkedPayloadDecode)>)
@@ -1025,24 +1088,34 @@ impl WebGpuEngine {
         for (idx, &(input, original_len)) in inputs.iter().enumerate() {
             let slot_idx = ring.acquire();
             if let Some((done_idx, done)) = ring.slots[slot_idx].take() {
-                let decoded = self.complete_rans_chunked_payload_decode(done)?;
-                results[done_idx] = Some(decoded);
+                done_batch.push((done_idx, done));
             }
 
             if original_len == 0 {
                 results[idx] = Some(Vec::new());
+                if done_batch.len() >= ring_depth {
+                    let batch = std::mem::take(&mut done_batch);
+                    self.complete_rans_chunked_payload_decode_batch(batch, &mut results)?;
+                }
                 continue;
             }
 
             let submitted = self.submit_rans_chunked_payload_decode(input, original_len)?;
             ring.slots[slot_idx] = Some((idx, submitted));
+
+            if done_batch.len() >= ring_depth {
+                let batch = std::mem::take(&mut done_batch);
+                self.complete_rans_chunked_payload_decode_batch(batch, &mut results)?;
+            }
         }
 
         for slot in &mut ring.slots {
             if let Some((done_idx, done)) = slot.take() {
-                let decoded = self.complete_rans_chunked_payload_decode(done)?;
-                results[done_idx] = Some(decoded);
+                done_batch.push((done_idx, done));
             }
+        }
+        if !done_batch.is_empty() {
+            self.complete_rans_chunked_payload_decode_batch(done_batch, &mut results)?;
         }
 
         Ok(results
@@ -1115,9 +1188,12 @@ impl WebGpuEngine {
             return 1;
         }
 
-        // Mirror the LZ77 streaming policy: reserve headroom, clamp to 3 slots.
+        // Reserve headroom but allow deeper in-flight queues than LZ77 so rANS
+        // payload upload/readback can overlap across more batches.
         let budget = (self.gpu_memory_budget() * 3) / 4;
-        (budget / per_slot).clamp(1, 3).min(max_depth)
+        (budget / per_slot)
+            .clamp(1, RANS_MAX_PENDING_RING_DEPTH)
+            .min(max_depth)
     }
 
     /// Batched GPU chunked rANS encode with ring-buffered submit/readback.

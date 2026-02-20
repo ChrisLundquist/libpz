@@ -61,6 +61,52 @@ Interim Go/No-Go:
 2. Stage perf gate (Slice 4): FAIL (no clear GPU advantage yet).
 3. Recommendation: hold promotion to P0-B until GPU stage throughput improves materially.
 
+### Execution Update (2026-02-20, commit `4a4f721`)
+
+1. Re-ran Slice 4 baseline commands on latest master-aligned head and captured dated artifacts:
+   - `docs/generated/2026-02-20-master-baseline.md`
+   - `docs/generated/2026-02-20-cargo-bench-stages-rans-webgpu-escalated.txt`
+   - `docs/generated/2026-02-20-bench-sh-n5-lzr-lzf-deflate.txt`
+2. `scripts/profile.sh` stage commands still fail in this environment due `samply` recorder constraints; direct profile binary fallback was used for throughput values.
+3. Direct 1MB WebGPU rANS stage profile (300 iterations, lanes=4, chunk=2048, batch=3):
+   - encode: 49.3 MB/s
+   - decode: 65.7 MB/s
+4. Performed a compact chunk/batch sweep (`docs/generated/2026-02-20-rans-webgpu-sweep-1mb.tsv`) at 1MB, 200 iterations:
+   - best encode: 58.5 MB/s (`chunk=2048`, `batch=3`)
+   - best decode: 83.5 MB/s (`chunk=4096`, `batch=3`)
+   - this sweep was taken before async depth retuning (ring depth still capped at 3).
+5. `cargo bench --bench stages_rans --features webgpu` now includes GPU rows outside sandbox:
+   - `encode_chunked_gpu/4194304`: 48.326 MiB/s
+   - `decode_chunked_gpu/4194304`: 76.964 MiB/s
+   - versus chunked CPU at 4MB: 47.357 MiB/s encode, 136.30 MiB/s decode.
+6. Implemented async pipelining depth pass:
+   - increased rANS batched pending-ring cap from 3 to 8 in `src/webgpu/rans.rs` (`RANS_MAX_PENDING_RING_DEPTH`).
+7. Re-ran extended batch sweeps after ring-depth increase:
+   - `docs/generated/2026-02-20-rans-webgpu-decode-batch-extended-1mb-after-ring8.tsv`
+   - `docs/generated/2026-02-20-rans-webgpu-encode-batch-extended-1mb-after-ring8.tsv`
+   - best region shifted to `gpu_batch=5..8` (higher than pre-change cap).
+8. Retuned profiling defaults in `examples/profile.rs`:
+   - `DEFAULT_RANS_GPU_BATCH`: 3 -> 6 (via intermediate 5)
+   - `DEFAULT_RANS_GPU_CHUNK_BYTES`: unchanged at 2048.
+9. Direct 1MB default-profile check after retune (`docs/generated/2026-02-20-rans-webgpu-async-pipelining-pass.md`):
+   - final defaults (`batch=6`): encode 51.0 MB/s, decode 73.4 MB/s
+   - vs original baseline (`batch=3`): encode +3.4%, decode +11.7%
+10. Targeted correctness verification after async-depth change:
+   - `cargo test --features webgpu batched` passed (12/12 tests).
+11. Implemented async completion pass (decode path):
+   - `rans_decode_chunked_payload_gpu_batched()` now batches completed work and performs batched output readback via `complete_rans_chunked_payload_decode_batch()`.
+   - This reduces per-output submit/map/poll overhead in decode-heavy batched runs while keeping memory bounded by ring-sized drains.
+12. Direct 1MB default-profile checks after batched decode readback:
+   - ring-depth-only defaults: encode 50.6 MB/s, decode 66.2 MB/s
+   - after readback + final retune: encode 51.0 MB/s, decode 73.4 MB/s
+   - decode uplift over ring-depth-only defaults: +10.9%
+   - artifact: `docs/generated/2026-02-20-rans-webgpu-async-pipelining-pass.md`
+13. Priority order for remaining work is now explicit:
+   - first: async submission/completion improvements (this pass)
+   - second: nvCOMP-style independent stream/block splitting
+   - third: additional Huffman GPU expansion only if decode-heavy benchmarks justify it
+14. Interim conclusion unchanged: Slice 4 perf gate remains open; do not promote to P0-B yet.
+
 ## Existing Assets We Reuse
 
 1. CPU chunked rANS reference in `src/rans.rs` (`encode_chunked`, `decode_chunked`).
