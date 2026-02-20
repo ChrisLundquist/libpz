@@ -116,10 +116,13 @@ Interim Go/No-Go:
 16. Added shared-table split decode path:
    - new API in `src/webgpu/rans.rs`: `rans_decode_chunked_payload_gpu_batched_shared_table(...)`.
    - split decode profile path now reuses one precomputed GPU table across the independent-block batch.
-17. Latest split results (with reruns) remain below the readback-only split pass:
-   - 256KB split: encode 33.8-34.0 MB/s vs 35.8 MB/s prior; decode 55.2-55.7 MB/s vs 58.2 MB/s prior.
-   - 64KB split: encode 19.9 MB/s vs 20.8 MB/s prior; decode 32.9-33.0 MB/s vs 34.5 MB/s prior.
-18. Interim conclusion unchanged: Slice 4 perf gate remains open; do not promote to P0-B yet.
+17. Added packed shared-table decode submission path:
+   - shared-table decode now has a packed mode that consolidates split payloads into one decode dispatch/readback cycle.
+   - packed mode is currently gated to `>= 8` non-empty payloads (`RANS_PACKED_SHARED_DECODE_MIN_PAYLOADS`) to avoid regressions on small split sets.
+18. Latest split results after packed-decode gating:
+   - 256KB split (4 blocks; falls back to prior path): encode 34.6 MB/s; decode typically 56.2-56.5 MB/s (one outlier run at 68.9 MB/s), still below the earlier 58.2 MB/s readback-only split result.
+   - 64KB split (16 blocks; packed decode active): encode 21.3 MB/s; decode 35.3-35.4 MB/s, improving over 32.9-33.0 MB/s shared-table decode and slightly above 34.5 MB/s readback-only split decode.
+19. Interim conclusion unchanged: Slice 4 perf gate remains open; do not promote to P0-B yet.
 
 ## Existing Assets We Reuse
 
