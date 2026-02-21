@@ -1,6 +1,6 @@
 # Quality Status
 
-**Last Updated:** 2026-02-14
+**Last Updated:** 2026-02-22
 **Owner:** Engineering team
 
 ## Purpose
@@ -158,6 +158,32 @@ Each module is graded on five dimensions:
 
 ---
 
+### lzseq (Sequence Encoding — zstd-style)
+**Overall Grade:** ⚠️ B
+
+- **Correctness:** ✅ All validation tests pass
+- **Test Coverage:** ✅ 90%+ lines covered
+  - Code table exhaustive round-trip (encode/decode offset/length for all valid values)
+  - BitWriter/BitReader round-trip
+  - Encode/decode round-trip on varied inputs (empty, small, large, repetitive, random)
+  - Repeat offset coverage (structured data, 30%+ repeat rate)
+  - Distance-dependent MIN_MATCH filtering
+  - Decode hardening (truncated streams, overflow detection)
+- **GPU:** ❌ CPU-only (GPU pipeline planned as Phase 6)
+- **Performance:** ✅ Best compression ratio of all libpz pipelines
+  - Ratio: 32.0% on Canterbury corpus (vs 40.7% LzssR, 28.6% gzip)
+  - Encode: ~17-19 MB/s (CPU lazy matching)
+  - Decode: ~23 MB/s (CPU)
+- **Documentation:** ✅ Module doc with code tables, repeat offset design, stream layout
+
+**Gaps:**
+- No fuzz/adversarial decode tests (deferred to M5.3)
+- Optimal parser not yet adapted for LzSeq (uses LZ77 `match_cost` approximation)
+- GPU pipeline (Phase 6) not started
+- Repeat match checking uses scalar byte-by-byte comparison (no SIMD)
+
+---
+
 ### optimal (Optimal LZ77 Parsing)
 **Overall Grade:** ⚠️ B
 
@@ -214,6 +240,21 @@ Each module is graded on five dimensions:
 - **Documentation:** ✅ Complete
 
 **Gaps:** rANS SIMD decode not wired
+
+---
+
+### lzseqr (LzSeq + rANS)
+**Overall Grade:** ⚠️ B
+
+- **Correctness:** ✅ All validation tests pass
+- **Multi-stream:** ✅ 6-stream demux (flags, literals, offset_codes, offset_extra, length_codes, length_extra)
+- **GPU:** ❌ CPU-only (GPU on-device pipeline planned)
+- **Performance:** ✅ Best compression ratio of any libpz pipeline (32.0%)
+  - 8.7pp better than LzssR, 3.4pp behind gzip
+  - Encode: ~17-19 MB/s, Decode: ~23 MB/s
+- **Documentation:** ✅ Complete
+
+**Gaps:** GPU pipeline (on-device match → code split → rANS → pack)
 
 ---
 
@@ -337,7 +378,7 @@ See `exec-plans/tech-debt-tracker.md` for the full prioritized list of known gap
 
 ## Summary Statistics
 
-- **Total tests:** 651 passing, 0 failing
+- **Total tests:** 700+ passing, 0 failing
 - **Overall quality:** 11/12 milestones complete
 - **GPU readiness:** 80% (LZ77, Huffman encode fully GPU-accelerated)
 - **Documentation coverage:** 90% (missing optimal parsing, some FFI docs)

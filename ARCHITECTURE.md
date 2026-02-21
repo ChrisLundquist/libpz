@@ -4,9 +4,9 @@ Detailed implementation notes, benchmarks, and roadmap for libpz.
 For day-to-day development instructions, see `CLAUDE.md`.
 
 ## Completed milestones (11/12)
-- **Algorithms:** LZ77 (brute, hashchain, lazy, parallel), Huffman, BWT (SA-IS), MTF, RLE, FSE, rANS
-- **Pipelines:** Deflate (LZ77+Huffman), Bw (BWT+MTF+RLE+FSE), Lzr (LZ77+rANS), Lzf (LZ77+FSE) — Deflate, Lzr, and Lzf use multi-stream entropy coding for ~16-18% better compression
-- **Auto-selection:** Heuristic (`select_pipeline`) and trial-based (`select_pipeline_trial`) pipeline selection using data analysis (entropy, match density, run ratio, autocorrelation)
+- **Algorithms:** LZ77 (brute, hashchain, lazy, parallel), LzSeq (code+extra-bits, repeat offsets, 128KB window), Huffman, BWT (SA-IS), MTF, RLE, FSE, rANS
+- **Pipelines:** Deflate (LZ77+Huffman), Bw (BWT+MTF+RLE+FSE), Lzr (LZ77+rANS), Lzf (LZ77+FSE), LzSeqR (LzSeq+rANS) — Deflate, Lzr, and Lzf use multi-stream entropy coding for ~16-18% better compression; LzSeqR uses zstd-style code+extra-bits encoding with 6-stream demux
+- **Auto-selection:** Heuristic (`select_pipeline`) and trial-based (`select_pipeline_trial`) pipeline selection using data analysis (entropy, match density, run ratio, autocorrelation); LzSeqR included in trial candidates
 - **Data analysis:** `src/analysis.rs` — statistical profiling (Shannon entropy, autocorrelation, run ratio, match density, distribution shape) with sampling support
 - **Optimal parsing:** GPU top-K match table → CPU backward DP (4-6% better compression)
 - **Multi-threading:** Block-parallel and pipeline-parallel via V2 container format; within-block parallel LZ77 match finding (`compress_lazy_parallel`)

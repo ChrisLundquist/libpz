@@ -127,12 +127,21 @@ Tasks:
 2. Re-evaluate auto-selection and trial mode thresholds using collected corpus stats.
 3. Add focused benchmarks for 256KB, 1MB, 4MB blocks to reflect crossover behavior.
 4. Benchmark against external baselines in existing throughput suite workflow.
+5. ✅ **LzSeq: zstd-style code+extra-bits encoding** (PR #99)
+   - Log2-based offset/length codes with packed extra-bits bitstreams
+   - 128KB configurable sliding window (4x LZSS's 32KB)
+   - Repeat offset tracking (3 recent offsets, 0 extra bits per repeat)
+   - Distance-dependent MIN_MATCH (reject unprofitable far matches)
+   - 6-stream demux for entropy coding
+   - Pipeline: LzSeqR (ID=8) achieving 32.0% ratio (best in libpz, 8.7pp better than LzssR)
+   - Distance-aware `match_cost()` wired into optimal parser for all pipelines
 
 Acceptance criteria:
 
 1. `lzf` and/or `deflate` consistently beat gzip ratio and throughput on corpus.
 2. `lzr` no longer materially lags `lzf` on decode-heavy workloads.
 3. No degradation on small-input latency path.
+4. ✅ `lzseqr` achieves best compression ratio of any libpz pipeline.
 
 ### Phase 3: GPU Scheduling and Crossover Optimization (Weeks 6-9)
 
@@ -283,3 +292,25 @@ Acceptance criteria:
       - `pz-lzr` compression: 26.7 MB/s
       - `pz-lzr` decompression: 36.4 MB/s
       - ratio unchanged at 40.6% (Canterbury set in script).
+
+### 2026-02-22
+
+23. Completed LzSeq implementation (Phase 2, Task 5) across 5 phases:
+    - Phase 1+2: Core lzseq module + pipeline integration as LzSeqR (PR #99)
+    - Phase 3: Window expansion to 128KB with configurable SeqConfig
+    - Phase 4: Distance-dependent MIN_MATCH (reject unprofitable far matches)
+    - Phase 5: Repeat offset tracking (3 recent offsets, 0 extra bits)
+    - Review pass: BitReader overflow detection, decode hardening, match_cost wiring
+24. Benchmark results (Canterbury corpus, n=5):
+    - `pz-lzseqr` compression: 16.9 MB/s, ratio 32.0% (best in libpz)
+    - `pz-lzseqr` decompression: 23.7 MB/s
+    - `pz-lzssr` compression: 21.0 MB/s, ratio 40.7%
+    - `pz-deflate` compression: 21.6 MB/s, ratio 41.6%
+    - gzip: 5.8 MB/s encode, 31.7 MB/s decode, ratio 28.6%
+25. LzSeqR achieves 8.7pp better ratio than LzssR at 3x faster than gzip encode.
+    Strongest on structured binary (kennedy.xls: 12.9% vs LzssR 21.2%).
+26. Wired distance-aware `match_cost()` into optimal parser for all pipelines.
+    Uses LzSeq code+extra-bits model — closer matches cost less. Benefits all
+    LZ77 pipelines, not just LzSeq.
+27. Next steps: GPU-only LzSeq pipeline (on-device match → code split → rANS),
+    SIMD repeat match checking, LzSeq-specific optimal parser with repeat state.
