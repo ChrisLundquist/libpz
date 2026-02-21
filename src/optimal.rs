@@ -171,6 +171,10 @@ impl CostModel {
     /// Cost = offset_code entropy (~4 bits) + offset_extra bits
     ///      + length_code entropy (~4 bits) + length_extra bits
     ///      + next_byte entropy
+    ///
+    /// Note: Uses raw `encode_offset` (not repeat-shifted). Does not model
+    /// repeat offset savings — a future enhancement could track repeat state
+    /// in the DP for even better LzSeq optimal parsing.
     #[inline]
     pub fn match_cost(&self, offset: u32, length: u16, next_byte: u8) -> u32 {
         if offset == 0 {
@@ -238,10 +242,11 @@ pub(crate) fn build_match_table_cpu_with_limit(
 /// literals and matches, compatible with `lz77::decompress()`.
 ///
 /// NOTE: This parser outputs LZ77 `Match` structs with u16 offset/length.
-/// It is designed for LZ77-based pipelines (Deflate, Lzr, Lzf) where
-/// matches have fixed 5-byte encoding. For LzSeq with wider windows and
-/// code+extra-bits encoding, a separate optimal parser would be needed
-/// that uses `match_cost()` and produces u32 offsets.
+/// It uses distance-aware `match_cost()` which models the LzSeq code+extra-bits
+/// encoding cost (closer matches are cheaper). This also improves decisions for
+/// LZ77 pipelines since shorter offsets genuinely cost less to encode.
+/// For LzSeq with windows >32KB, a wider parser producing u32 offsets would
+/// be needed.
 pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -> Vec<Match> {
     let n = input.len();
     if n == 0 {
@@ -277,10 +282,10 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
             let next_pos = match_end + 1;
             // Token: Match { offset, length, next:input[match_end] }
             // Covers (length + 1) input bytes with one 5-byte token.
-            // Uses fixed-overhead match_token (not distance-aware match_cost)
-            // because this parser targets LZ77 pipelines with uniform encoding.
+            // Uses distance-aware match_cost: shorter offsets are cheaper
+            // (fewer extra bits), improving parse decisions for all pipelines.
             let mcost = cost_model
-                .match_token(input[match_end])
+                .match_cost(cand.offset, cand.length as u16, input[match_end])
                 .saturating_add(cost[next_pos]);
             if mcost < cost[i] {
                 cost[i] = mcost;

@@ -304,6 +304,12 @@ struct BitReader<'a> {
     byte_pos: usize,
     container: u64,
     bits_available: u32,
+    /// Total bits consumed so far (for overflow detection).
+    bits_consumed: u64,
+    /// Total bits available in the underlying data.
+    total_bits: u64,
+    /// Set if a read consumed more bits than available in the data.
+    pub overflow: bool,
 }
 
 impl<'a> BitReader<'a> {
@@ -313,6 +319,9 @@ impl<'a> BitReader<'a> {
             byte_pos: 0,
             container: 0,
             bits_available: 0,
+            bits_consumed: 0,
+            total_bits: data.len() as u64 * 8,
+            overflow: false,
         };
         r.refill();
         r
@@ -328,6 +337,10 @@ impl<'a> BitReader<'a> {
         let value = (self.container & mask) as u32;
         self.container >>= nb_bits;
         self.bits_available = self.bits_available.saturating_sub(nb_bits as u32);
+        self.bits_consumed += nb_bits as u64;
+        if self.bits_consumed > self.total_bits {
+            self.overflow = true;
+        }
         value
     }
 
@@ -357,7 +370,18 @@ fn pack_flags(flags: &[bool]) -> Vec<u8> {
 }
 
 /// Unpack boolean flags from bytes, MSB-first.
+///
+/// # Panics (debug only)
+/// Panics if `bytes` is too short to hold `count` flags.
+/// Callers must validate length before calling.
 fn unpack_flags(bytes: &[u8], count: usize) -> Vec<bool> {
+    debug_assert!(
+        bytes.len() >= count.div_ceil(8),
+        "unpack_flags: need {} bytes for {} flags, got {}",
+        count.div_ceil(8),
+        count,
+        bytes.len()
+    );
     (0..count)
         .map(|i| bytes[i / 8] & (1 << (7 - (i % 8))) != 0)
         .collect()
@@ -693,6 +717,11 @@ pub fn decode(
             let length = decode_length(lc, lev) as usize;
 
             match_idx += 1;
+
+            // Check for truncated extra-bits streams.
+            if off_extra_reader.overflow || len_extra_reader.overflow {
+                return Err(PzError::InvalidInput);
+            }
 
             if offset == 0 || offset > output.len() {
                 return Err(PzError::InvalidInput);
