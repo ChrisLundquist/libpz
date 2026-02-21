@@ -2227,13 +2227,14 @@ impl WebGpuEngine {
     ) -> PzResult<RansEncodedBatch> {
         let lanes_clamped = num_lanes.clamp(1, u8::MAX as usize);
         let scale_bits = scale_bits.clamp(MIN_SCALE_BITS, MAX_SCALE_BITS);
-        if lanes_clamped > 64 {
-            return Err(PzError::Unsupported);
-        }
+        let ring_depth = self.rans_encode_pending_ring_depth(inputs, lanes_clamped, chunk_size);
         let shared_tables = shared_norm
             .map(|norm| self.create_rans_encode_tables_buffer(norm, "rans_encode_tables_shared"));
         let non_empty_inputs = inputs.iter().filter(|input| !input.is_empty()).count();
-        if non_empty_inputs >= RANS_PACKED_SHARED_ENCODE_MIN_INPUTS {
+        let packed_encode_allowed = lanes_clamped <= 64
+            && non_empty_inputs >= RANS_PACKED_SHARED_ENCODE_MIN_INPUTS
+            && ring_depth >= non_empty_inputs;
+        if packed_encode_allowed {
             if let Some(norm) = shared_norm {
                 if let Some(packed) = self
                     .rans_encode_chunked_payload_gpu_batched_shared_table_packed(
@@ -2247,7 +2248,6 @@ impl WebGpuEngine {
                 }
             }
         }
-        let ring_depth = self.rans_encode_pending_ring_depth(inputs, lanes_clamped, chunk_size);
         let mut results: Vec<Option<(Vec<u8>, bool)>> = vec![None; inputs.len()];
         let mut done_batch: Vec<(usize, PendingRansChunkedPayloadEncode)> =
             Vec::with_capacity(ring_depth);
@@ -2280,6 +2280,10 @@ impl WebGpuEngine {
                     self.complete_rans_chunked_payload_encode_batch(batch, &mut results)?;
                 }
                 continue;
+            }
+
+            if lanes_clamped > 64 {
+                return Err(PzError::Unsupported);
             }
 
             let submitted = if let Some(norm) = shared_norm {

@@ -2009,8 +2009,9 @@ fn test_rans_chunked_encode_gpu_batched_shared_table_packed_cpu_decode_round_tri
         Err(e) => panic!("unexpected error: {:?}", e),
     };
 
-    // 16 blocks to force packed shared-table encode path.
-    let full_input: Vec<u8> = (0..65_536).map(|i| ((i * 23 + 29) % 251) as u8).collect();
+    // 8 blocks so packed shared-table encode remains eligible under the
+    // ring-depth safety gate.
+    let full_input: Vec<u8> = (0..32_768).map(|i| ((i * 23 + 29) % 251) as u8).collect();
     let input_blocks: Vec<&[u8]> = full_input.chunks(4_096).collect();
     let expected_blocks: Vec<Vec<u8>> = input_blocks.iter().map(|block| block.to_vec()).collect();
 
@@ -2028,6 +2029,38 @@ fn test_rans_chunked_encode_gpu_batched_shared_table_packed_cpu_decode_round_tri
     for (i, (payload, used_chunked)) in encoded.iter().enumerate() {
         assert!(*used_chunked);
         let decoded = crate::rans::decode_chunked(payload).unwrap();
+        assert_eq!(decoded, expected_blocks[i]);
+    }
+}
+
+#[test]
+fn test_rans_chunked_encode_gpu_batched_shared_table_lanes_over_64_falls_back() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let full_input: Vec<u8> = (0..16_384).map(|i| ((i * 17 + 13) % 251) as u8).collect();
+    let input_blocks: Vec<&[u8]> = full_input.chunks(4_096).collect();
+    let expected_blocks: Vec<Vec<u8>> = input_blocks.iter().map(|block| block.to_vec()).collect();
+
+    // chunk_size=0 forces non-chunked fallback; this should remain valid even
+    // when lanes exceed the GPU-supported maximum.
+    let encoded = engine
+        .rans_encode_chunked_payload_gpu_batched_shared_table(
+            &input_blocks,
+            &full_input,
+            128,
+            crate::rans::DEFAULT_SCALE_BITS,
+            0,
+        )
+        .unwrap();
+    assert_eq!(encoded.len(), expected_blocks.len());
+
+    for (i, (payload, used_chunked)) in encoded.iter().enumerate() {
+        assert!(!*used_chunked);
+        let decoded = crate::rans::decode_interleaved(payload, expected_blocks[i].len()).unwrap();
         assert_eq!(decoded, expected_blocks[i]);
     }
 }
