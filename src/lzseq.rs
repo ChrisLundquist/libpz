@@ -4,17 +4,24 @@
 /// extra bits packed into separate bitstreams. Close matches cost 2-3 bytes,
 /// far matches cost proportionally to log2(distance).
 ///
-/// Output: 6 independent streams for entropy coding:
+/// ## Repeat offsets
+///
+/// The encoder/decoder track the 3 most recently used offsets. Offset codes
+/// 0-2 signal repeat offsets (0 extra bits each). Codes 3+ are literal
+/// offsets shifted by 3 from the base table.
+///
+/// ## Output: 6 independent streams for entropy coding
+///
 /// - flags: 1 bit/token packed MSB-first (literal=1, match=0)
 /// - literals: 1 byte per literal token
-/// - offset_codes: 1 byte per match (values 0-31)
-/// - offset_extra: packed bitstream (LSB-first)
-/// - length_codes: 1 byte per match (values 0-20)
+/// - offset_codes: 1 byte per match (0-2 = repeat, 3+ = literal offset)
+/// - offset_extra: packed bitstream (LSB-first, 0 bits for repeats)
+/// - length_codes: 1 byte per match (log2-based code)
 /// - length_extra: packed bitstream (LSB-first)
 ///
-/// Code tables (log2-based, similar to zstd):
+/// ## Base code table (log2-based, applied after repeat offset shift)
 ///
-/// Offset codes:
+/// Offset codes (raw, before +3 shift for repeat reservation):
 ///   Code 0: offset 1       (0 extra bits)
 ///   Code 1: offset 2       (0 extra bits)
 ///   Code 2: offset 3-4     (1 extra bit)
@@ -127,8 +134,9 @@ pub(crate) fn encode_offset(offset: u32) -> (u8, u8, u32) {
 }
 
 /// Decode an offset from a raw (non-repeat) code + extra_value.
+/// Used in tests and by the cost model; the decoder uses `RepeatOffsets::decode_offset`.
+#[cfg(test)]
 #[inline]
-#[allow(dead_code)]
 pub(crate) fn decode_offset(code: u8, extra_value: u32) -> u32 {
     decode_value(code, extra_value)
 }
@@ -419,9 +427,9 @@ pub fn encode(input: &[u8]) -> PzResult<SeqEncoded> {
 
 /// Select the best match considering both hash-chain and repeat-offset candidates.
 ///
-/// Returns (offset, length) of the best match. Prefers repeat-offset matches
-/// when they're competitive with the hash-chain match (within ~2 bytes), because
-/// repeat offsets encode with 0 extra bits for the offset component.
+/// Returns (offset, length, is_repeat) of the best match. Prefers repeat-offset
+/// matches when they're competitive with the hash-chain match, because repeat
+/// offsets encode with 0 extra bits for the offset component.
 fn select_best_match(
     input: &[u8],
     pos: usize,
@@ -429,7 +437,7 @@ fn select_best_match(
     hash_length: u16,
     repeats: &RepeatOffsets,
     max_match_len: usize,
-) -> (u32, u16) {
+) -> (u32, u16, bool) {
     // Find the best repeat-offset match
     let mut best_rep_offset = 0u32;
     let mut best_rep_len = 0u16;
@@ -445,19 +453,19 @@ fn select_best_match(
     if best_rep_len >= MIN_MATCH {
         if hash_length < MIN_MATCH {
             // No hash match — use repeat
-            return (best_rep_offset, best_rep_len);
+            return (best_rep_offset, best_rep_len, true);
         }
         // Repeat saves the full offset encoding cost (~1 code byte + extra bits).
         // Accept a repeat match that's shorter by up to the offset savings.
         let (_, oeb, _) = encode_offset(hash_offset);
         let offset_savings = 1 + (oeb as u16) / 8; // bytes saved by repeat
         if best_rep_len.saturating_add(offset_savings) >= hash_length {
-            return (best_rep_offset, best_rep_len);
+            return (best_rep_offset, best_rep_len, true);
         }
     }
 
     // Use hash-chain match (or no match if hash_length < MIN_MATCH)
-    (hash_offset, hash_length)
+    (hash_offset, hash_length, false)
 }
 
 /// Emit a match token into the output streams.
@@ -516,16 +524,12 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
 
         // Check repeat offsets: matches at recent offsets encode with 0 extra
         // bits for the offset, making them much cheaper than hash-chain matches.
-        let (best_offset, best_length) =
+        let (best_offset, best_length, is_repeat) =
             select_best_match(input, pos, m.offset, m.length, &repeats, max_match_len);
 
         // Distance-dependent minimum match length: reject short matches
         // at large distances where code+extra-bits cost exceeds literal cost.
         // Repeat matches always use MIN_MATCH (they're essentially free).
-        let is_repeat = best_offset > 0
-            && (best_offset == repeats.recent[0]
-                || best_offset == repeats.recent[1]
-                || best_offset == repeats.recent[2]);
         let effective_min = if best_length >= MIN_MATCH && !is_repeat {
             min_profitable_length(best_offset)
         } else {
@@ -539,7 +543,7 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
         {
             finder.insert(input, pos + 1);
             let next_m = finder.find_match_wide(input, pos + 1);
-            let (next_offset, next_length) = select_best_match(
+            let (next_offset, next_length, next_is_repeat) = select_best_match(
                 input,
                 pos + 1,
                 next_m.offset,
@@ -547,10 +551,6 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
                 &repeats,
                 max_match_len,
             );
-            let next_is_repeat = next_offset > 0
-                && (next_offset == repeats.recent[0]
-                    || next_offset == repeats.recent[1]
-                    || next_offset == repeats.recent[2]);
             let next_effective_min = if next_length >= MIN_MATCH && !next_is_repeat {
                 if next_offset > 0 {
                     min_profitable_length(next_offset)
@@ -654,6 +654,15 @@ pub fn decode(
         return Ok(Vec::new());
     }
 
+    // Validate stream lengths to avoid panics on malformed input.
+    let required_flag_bytes = (num_tokens as usize).div_ceil(8);
+    if flags.len() < required_flag_bytes {
+        return Err(PzError::InvalidInput);
+    }
+    if offset_codes.len() < num_matches as usize || length_codes.len() < num_matches as usize {
+        return Err(PzError::InvalidInput);
+    }
+
     let flag_bits = unpack_flags(flags, num_tokens as usize);
     let mut lit_pos = 0usize;
     let mut match_idx = 0usize;
@@ -686,6 +695,9 @@ pub fn decode(
             match_idx += 1;
 
             if offset == 0 || offset > output.len() {
+                return Err(PzError::InvalidInput);
+            }
+            if output.len() + length > original_len {
                 return Err(PzError::InvalidInput);
             }
 
@@ -1251,15 +1263,6 @@ mod tests {
             .iter()
             .filter(|&&c| c < NUM_REPEAT_CODES)
             .count();
-
-        eprintln!(
-            "DEBUG: input_len={}, num_tokens={}, num_matches={}, repeat_count={}",
-            input.len(),
-            enc.num_tokens,
-            enc.num_matches,
-            repeat_count
-        );
-        eprintln!("DEBUG: offset_codes={:?}", &enc.offset_codes);
 
         assert!(
             repeat_count > 0,
