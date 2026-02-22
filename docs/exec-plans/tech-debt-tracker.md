@@ -18,29 +18,26 @@ Catalog of known issues, gaps, and technical debt in libpz. Items are prioritize
 
 ### P0: Critical
 
-#### M5.3: Fuzz Testing Not Started
-**Status:** Not started
-**Impact:** Correctness (cannot verify random input handling)
+#### M5.3: Fuzz Testing Infrastructure
+**Status:** Complete (infrastructure); 24h campaign pending
+**Impact:** Correctness (random input handling validation)
 **Milestone:** M5.3
-**Estimated effort:** 2-3 days
 
-**Description:**
-No fuzz testing infrastructure. Should use `cargo-fuzz` to test:
-- Random inputs 0-1MB
-- Verify round-trip property (encode → decode → original)
-- Check error handling on malformed compressed data
-- Test all pipelines and standalone algorithms
+**Completed:**
+- `fuzz/` directory with `cargo-fuzz` Cargo.toml
+- 12 fuzz targets covering all algorithms and pipelines:
+  - `fuzz_pipeline_roundtrip` — all 9 pipelines compress/decompress roundtrip
+  - `fuzz_decompress` — arbitrary bytes to decompress (crash resistance)
+  - `fuzz_bwt`, `fuzz_rans`, `fuzz_fse`, `fuzz_huffman` — entropy coding roundtrips
+  - `fuzz_lz77`, `fuzz_lz78`, `fuzz_lzss`, `fuzz_lzseq` — LZ family roundtrips
+  - `fuzz_rle`, `fuzz_mtf` — simple codec roundtrips
+- Each target tests encode→decode roundtrip AND arbitrary-bytes decode crash resistance
+- Requires: `rustup toolchain install nightly && cargo install cargo-fuzz`
+- Run: `cd fuzz && cargo +nightly fuzz run <target> -- -max_len=65536`
 
-**References:**
-- ARCHITECTURE.md mentions M5.3 as only incomplete milestone
-- validation.rs has corpus tests but no property tests
-
-**Action items:**
-1. Add `cargo-fuzz` to dev dependencies
-2. Create fuzz targets for each algorithm
-3. Create fuzz targets for each pipeline
-4. Run 24h fuzz campaign on CI
-5. Document findings in design-docs/
+**Remaining:**
+1. Run 24h fuzz campaign on CI
+2. Document any findings
 
 ---
 

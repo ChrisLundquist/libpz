@@ -177,7 +177,7 @@ Each module is graded on five dimensions:
 - **Documentation:** ✅ Module doc with code tables, repeat offset design, stream layout
 
 **Gaps:**
-- No fuzz/adversarial decode tests (deferred to M5.3)
+- Fuzz infrastructure in `fuzz/` (12 targets); 24h campaign pending
 - Optimal parser not yet adapted for LzSeq (uses LZ77 `match_cost` approximation)
 - GPU pipeline (Phase 6) not started
 - Repeat match checking uses scalar byte-by-byte comparison (no SIMD)
@@ -379,10 +379,10 @@ See `exec-plans/tech-debt-tracker.md` for the full prioritized list of known gap
 ## Summary Statistics
 
 - **Total tests:** 700+ passing, 0 failing
-- **Overall quality:** 11/12 milestones complete
+- **Overall quality:** 12/12 milestones complete
 - **GPU readiness:** 80% (LZ77, Huffman encode fully GPU-accelerated)
 - **Documentation coverage:** 90% (missing optimal parsing, some FFI docs)
 
 ---
 
-**Next quality review:** After M5.3 (fuzz testing) completion
+**Next quality review:** After 24h fuzz campaign results
