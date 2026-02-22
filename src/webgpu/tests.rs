@@ -193,23 +193,14 @@ fn test_lz77_lazy_improves_over_greedy() {
         Err(e) => panic!("unexpected error: {:?}", e),
     };
 
-    // Repetitive text where lazy matching should produce fewer sequences.
-    // Uses the coop kernel (32KB window) for quality comparison — the local
-    // kernel intentionally trades quality for throughput.
+    // Repetitive text where lazy matching should produce fewer sequences
     let pattern = b"the quick brown fox jumps over the lazy dog. ";
     let mut input = Vec::new();
     for _ in 0..50 {
         input.extend_from_slice(pattern);
     }
 
-    let lazy_matches = engine.find_matches_coop(&input).unwrap();
-    let lazy_compressed = {
-        let mut out = Vec::with_capacity(lazy_matches.len() * Match::SERIALIZED_SIZE);
-        for m in &lazy_matches {
-            out.extend_from_slice(&m.to_bytes());
-        }
-        out
-    };
+    let lazy_compressed = engine.lz77_compress(&input).unwrap();
     let greedy_compressed = {
         let matches = engine.find_matches_greedy(&input).unwrap();
         let mut out = Vec::with_capacity(matches.len() * Match::SERIALIZED_SIZE);
@@ -1234,14 +1225,13 @@ fn test_gpu_lazy_quality_repeated_pattern() {
 
     // 200 repeats of a 38-byte pattern = 7600 bytes.
     // CPU golden: 65 seqs, 31 matches, 7535 bytes matched.
-    // Uses coop kernel (32KB window) for quality testing.
     let pattern = b"Hello, World! This is a test pattern. ";
     let mut input = Vec::new();
     for _ in 0..200 {
         input.extend_from_slice(pattern);
     }
 
-    let matches = engine.find_matches_coop(&input).unwrap();
+    let matches = engine.find_matches(&input).unwrap();
     gpu_verify_round_trip(&matches, &input, "repeated_pattern");
 
     let (total_seqs, _match_seqs) = gpu_count_sequences(&matches);
@@ -1276,10 +1266,9 @@ fn test_gpu_lazy_quality_all_same() {
     // 10000 identical bytes.
     // CPU golden: 40 seqs, 39 matches, 9960 bytes matched.
     // GPU is non-deterministic here (2-98 seqs across runs) due to atomics.
-    // Uses coop kernel (32KB window) for quality testing.
     let input = vec![b'A'; 10000];
 
-    let matches = engine.find_matches_coop(&input).unwrap();
+    let matches = engine.find_matches(&input).unwrap();
     gpu_verify_round_trip(&matches, &input, "all_same");
 
     let (total_seqs, _match_seqs) = gpu_count_sequences(&matches);
@@ -1313,7 +1302,6 @@ fn test_gpu_lazy_quality_pattern_64kb() {
     };
 
     // 64KB repetitive text — this is the GPU's sweet spot.
-    // Uses coop kernel (32KB window) for quality testing.
     let pattern = b"the quick brown fox jumps over the lazy dog. ";
     let mut input = Vec::new();
     while input.len() < 65536 {
@@ -1321,7 +1309,7 @@ fn test_gpu_lazy_quality_pattern_64kb() {
     }
     input.truncate(65536);
 
-    let matches = engine.find_matches_coop(&input).unwrap();
+    let matches = engine.find_matches(&input).unwrap();
     gpu_verify_round_trip(&matches, &input, "pattern_64KB");
 
     let (total_seqs, _) = gpu_count_sequences(&matches);
@@ -1352,8 +1340,8 @@ fn test_gpu_lazy_quality_vs_cpu_64kb() {
         Err(e) => panic!("unexpected error: {:?}", e),
     };
 
-    // Compare GPU coop vs CPU match quality on 64KB text data.
-    // Uses coop kernel (32KB window) for quality testing.
+    // Compare GPU vs CPU match quality on 64KB text data.
+    // After the hash table fix, GPU should be within 2x of CPU seqs at this size.
     let pattern = b"the quick brown fox jumps over the lazy dog. ";
     let mut input = Vec::new();
     while input.len() < 65536 {
@@ -1361,7 +1349,7 @@ fn test_gpu_lazy_quality_vs_cpu_64kb() {
     }
     input.truncate(65536);
 
-    let gpu_matches = engine.find_matches_coop(&input).unwrap();
+    let gpu_matches = engine.find_matches(&input).unwrap();
     let cpu_matches = crate::lz77::compress_lazy_to_matches(&input).unwrap();
 
     gpu_verify_round_trip(&gpu_matches, &input, "vs_cpu_64KB");
@@ -1408,8 +1396,7 @@ fn test_gpu_lazy_quality_vs_cpu_128kb() {
     }
     input.truncate(131072);
 
-    // Uses coop kernel (32KB window) for quality testing.
-    let gpu_matches = engine.find_matches_coop(&input).unwrap();
+    let gpu_matches = engine.find_matches(&input).unwrap();
     let cpu_matches = crate::lz77::compress_lazy_to_matches(&input).unwrap();
 
     gpu_verify_round_trip(&gpu_matches, &input, "vs_cpu_128KB");
@@ -1450,8 +1437,7 @@ fn test_gpu_lazy_quality_alice29() {
     };
     assert_eq!(data.len(), 152089);
 
-    // Uses coop kernel (32KB window) for quality testing.
-    let gpu_matches = engine.find_matches_coop(&data).unwrap();
+    let gpu_matches = engine.find_matches(&data).unwrap();
     let cpu_matches = crate::lz77::compress_lazy_to_matches(&data).unwrap();
     gpu_verify_round_trip(&gpu_matches, &data, "alice29.txt");
 
@@ -1486,8 +1472,7 @@ fn test_gpu_lazy_quality_fields_c() {
     };
     assert_eq!(data.len(), 11150);
 
-    // Uses coop kernel (32KB window) for quality testing.
-    let gpu_matches = engine.find_matches_coop(&data).unwrap();
+    let gpu_matches = engine.find_matches(&data).unwrap();
     let cpu_matches = crate::lz77::compress_lazy_to_matches(&data).unwrap();
     gpu_verify_round_trip(&gpu_matches, &data, "fields.c");
 

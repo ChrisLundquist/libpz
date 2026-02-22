@@ -40,20 +40,9 @@ pub(crate) fn compress_parallel(
     if is_batchable {
         if let super::Backend::WebGpu = options.backend {
             if let Some(ref engine) = options.webgpu_engine {
-                // Multi-block: single-dispatch bulk LZ77 (one GPU round-trip)
+                // Multi-block: use double-buffered streaming for GPU/CPU overlap
                 let block_size = options.block_size;
                 if input.len() > block_size {
-                    // Check if the full input fits within dispatch limits
-                    if input.len() <= engine.max_dispatch_input_size() {
-                        return compress_parallel_gpu_bulk(
-                            input,
-                            pipeline,
-                            options,
-                            num_threads,
-                            engine,
-                        );
-                    }
-                    // Input too large for single dispatch: fall back to streaming
                     if let Some(ring) = engine.create_lz77_ring(block_size) {
                         return compress_streaming_gpu(
                             input,
@@ -397,61 +386,6 @@ fn compress_parallel_gpu_batched(
         }
 
         // Collect remaining handles
-        for (idx, handle) in handles {
-            results[idx] = Some(handle.join().unwrap_or(Err(PzError::InvalidInput)));
-        }
-
-        results.into_iter().map(|r| r.unwrap()).collect::<Vec<_>>()
-    });
-
-    assemble_multiblock_output(input, pipeline, block_size, &compressed_blocks)
-}
-
-/// Single-dispatch GPU LZ77 for all blocks, then parallel CPU entropy encoding.
-///
-/// Instead of dispatching per block (N round-trips), this dispatches the
-/// local hash-table kernel once across the entire input, does one readback,
-/// then splits the match array by block boundaries on the CPU. This
-/// eliminates per-block submission overhead, bind group creation, and PCIe
-/// round-trips.
-#[cfg(feature = "webgpu")]
-fn compress_parallel_gpu_bulk(
-    input: &[u8],
-    pipeline: Pipeline,
-    options: &CompressOptions,
-    num_threads: usize,
-    engine: &crate::webgpu::WebGpuEngine,
-) -> PzResult<Vec<u8>> {
-    let block_size = options.block_size;
-    let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
-    let num_blocks = blocks.len();
-
-    // Single GPU dispatch + readback for all blocks
-    let match_vecs = engine.find_matches_bulk(input, block_size)?;
-
-    // Parallel CPU entropy encoding
-    let compressed_blocks: Vec<PzResult<Vec<u8>>> = std::thread::scope(|scope| {
-        let max_concurrent = num_threads.min(num_blocks);
-        let mut handles: Vec<(usize, std::thread::ScopedJoinHandle<PzResult<Vec<u8>>>)> =
-            Vec::with_capacity(max_concurrent);
-        let mut results: Vec<Option<PzResult<Vec<u8>>>> = (0..num_blocks).map(|_| None).collect();
-
-        for (block_idx, matches) in match_vecs.into_iter().enumerate() {
-            // Drain finished handles to maintain concurrency limit
-            while handles.len() >= max_concurrent {
-                let (idx, handle) = handles.remove(0);
-                results[idx] = Some(handle.join().unwrap_or(Err(PzError::InvalidInput)));
-            }
-
-            let block_input = blocks[block_idx];
-            handles.push((
-                block_idx,
-                scope.spawn(move || {
-                    entropy_encode_lz77_block(&matches, block_input.len(), pipeline, options)
-                }),
-            ));
-        }
-
         for (idx, handle) in handles {
             results[idx] = Some(handle.join().unwrap_or(Err(PzError::InvalidInput)));
         }

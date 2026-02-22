@@ -16,8 +16,6 @@ pub(crate) use crate::gpu_common::BufferRing;
 pub(crate) struct Lz77BufferSlot {
     pub(crate) input_buf: wgpu::Buffer,
     pub(crate) params_buf: wgpu::Buffer,
-    /// Separate params for the resolve pass (different dispatch width).
-    pub(crate) params_resolve_buf: wgpu::Buffer,
     pub(crate) raw_match_buf: wgpu::Buffer,
     pub(crate) resolved_buf: wgpu::Buffer,
     pub(crate) staging_buf: wgpu::Buffer,
@@ -27,33 +25,19 @@ pub(crate) struct Lz77BufferSlot {
 impl WebGpuEngine {
     // --- LZ77 Match Finding ---
 
-    /// Find LZ77 matches for the entire input using the GPU.
+    /// Find LZ77 matches for the entire input using the GPU cooperative-stitch kernel.
     ///
-    /// Uses the per-workgroup shared-memory hash table kernel (lz77_local.wgsl)
-    /// for high throughput. Each workgroup processes an independent 4KB block
-    /// with its own hash table in shared memory, followed by lazy resolution.
-    ///
-    /// For higher quality (larger match window), use [`find_matches_coop()`].
+    /// Uses a 2-pass approach: cooperative match finding (each thread in a
+    /// 64-thread workgroup searches a distinct offset band, shares top-K
+    /// discoveries via shared memory, then all threads re-test discovered
+    /// offsets), followed by lazy resolution. 25-35% faster than the brute-force
+    /// lazy kernel on dedicated GPUs with comparable compression quality.
     pub fn find_matches(&self, input: &[u8]) -> PzResult<Vec<Match>> {
         if input.is_empty() {
             return Ok(Vec::new());
         }
 
-        self.find_matches_local_impl(input)
-    }
-
-    /// Find LZ77 matches using the per-workgroup shared-memory hash table kernel.
-    ///
-    /// Each workgroup processes an independent 4KB block using a 4096-slot
-    /// hash table in workgroup-local memory (16KB). This gives O(1) hash
-    /// lookups per position instead of 1788 brute-force probes (coop) or
-    /// global atomic contention (hash). Match window is limited to 4KB.
-    pub fn find_matches_local(&self, input: &[u8]) -> PzResult<Vec<Match>> {
-        if input.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        self.find_matches_local_impl(input)
+        self.find_matches_coop_impl(input)
     }
 
     /// Find LZ77 matches using the cooperative-stitch kernel.
@@ -63,332 +47,12 @@ impl WebGpuEngine {
     /// memory, then all threads re-test all discovered offsets from their own
     /// positions. Covers [1, 33792] effective lookback with 1788 probes
     /// per thread (vs 4896 for brute-force scan of the same range).
-    ///
-    /// Higher quality (32KB window) but lower throughput than [`find_matches_local()`].
     pub fn find_matches_coop(&self, input: &[u8]) -> PzResult<Vec<Match>> {
         if input.is_empty() {
             return Ok(Vec::new());
         }
 
         self.find_matches_coop_impl(input)
-    }
-
-    /// Block size for the per-workgroup local hash table kernel (must match BLOCK_SIZE in lz77_local.wgsl).
-    const LZ77_LOCAL_BLOCK_SIZE: u32 = 4096;
-
-    /// Single-dispatch LZ77 for the full input, split into per-block match vectors.
-    ///
-    /// Instead of dispatching per pipeline block (N round-trips), this does:
-    /// 1. One GPU dispatch on the entire input (all blocks at once)
-    /// 2. One readback of the full GpuMatch array
-    /// 3. CPU-side split by `block_size` boundaries + per-block deduplication
-    ///
-    /// This eliminates per-block submission overhead, bind group creation,
-    /// and PCIe round-trips. The local kernel already processes independent
-    /// 4KB sub-blocks internally, so pipeline block boundaries are respected.
-    pub fn find_matches_bulk(&self, input: &[u8], block_size: usize) -> PzResult<Vec<Vec<Match>>> {
-        if input.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let input_len = input.len();
-        let padded = Self::pad_input_bytes(input);
-        let match_buf_size = (input_len * std::mem::size_of::<GpuMatch>()) as u64;
-
-        let input_buf =
-            self.create_buffer_init("lz77_bulk_input", &padded, wgpu::BufferUsages::STORAGE);
-
-        // Pass 1 dispatch: one workgroup per 4KB block across entire input
-        let num_blocks = (input_len as u32).div_ceil(Self::LZ77_LOCAL_BLOCK_SIZE);
-        let dw_find = self.dispatch_width(num_blocks, 64);
-        let params_find = [input_len as u32, 0, 0, dw_find];
-        let params_find_buf = self.create_buffer_init(
-            "lz77_bulk_params_find",
-            bytemuck::cast_slice(&params_find),
-            wgpu::BufferUsages::UNIFORM,
-        );
-
-        // Pass 2 dispatch: one thread per position (resolve_lazy)
-        let wgs_resolve = (input_len as u32).div_ceil(64);
-        let dw_resolve = self.dispatch_width(wgs_resolve, 64);
-        let params_resolve = [input_len as u32, 0, 0, dw_resolve];
-        let params_resolve_buf = self.create_buffer_init(
-            "lz77_bulk_params_resolve",
-            bytemuck::cast_slice(&params_resolve),
-            wgpu::BufferUsages::UNIFORM,
-        );
-
-        let raw_match_buf = self.create_buffer(
-            "bulk_raw_matches",
-            match_buf_size,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        );
-
-        let resolved_buf = self.create_buffer(
-            "bulk_resolved",
-            match_buf_size,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        );
-
-        let staging_buf = self.create_buffer(
-            "lz77_bulk_staging",
-            match_buf_size,
-            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        );
-
-        // Pass 1 bind group: find_matches_local
-        let find_bg_layout = self.pipeline_lz77_local_find().get_bind_group_layout(0);
-        let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lz77_bulk_find_bg"),
-            layout: &find_bg_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: params_find_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: raw_match_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Pass 2 bind group: resolve_lazy
-        let resolve_bg_layout = self.pipeline_lz77_coop_resolve().get_bind_group_layout(0);
-        let resolve_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lz77_bulk_resolve_bg"),
-            layout: &resolve_bg_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: params_resolve_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: resolved_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: raw_match_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Single command encoder for both passes + staging copy
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("lz77_bulk_submit"),
-            });
-        self.record_dispatch(
-            &mut encoder,
-            self.pipeline_lz77_local_find(),
-            &find_bg,
-            num_blocks,
-            "lz77_bulk_find",
-        )?;
-        self.record_dispatch(
-            &mut encoder,
-            self.pipeline_lz77_coop_resolve(),
-            &resolve_bg,
-            wgs_resolve,
-            "lz77_bulk_resolve",
-        )?;
-        encoder.copy_buffer_to_buffer(&resolved_buf, 0, &staging_buf, 0, match_buf_size);
-        self.profiler_resolve(&mut encoder);
-        self.queue.submit(Some(encoder.finish()));
-
-        self.poll_wait();
-
-        // Single readback
-        let slice = staging_buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).unwrap();
-        });
-        self.poll_wait();
-        rx.recv().unwrap().map_err(|_| PzError::Unsupported)?;
-
-        let raw = slice.get_mapped_range().to_vec();
-        staging_buf.unmap();
-        let gpu_matches: Vec<GpuMatch> = bytemuck::cast_slice(&raw).to_vec();
-
-        // Split by pipeline block boundaries and dedupe each independently
-        let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
-        let mut results = Vec::with_capacity(blocks.len());
-        let mut offset = 0;
-        for block in &blocks {
-            let end = offset + block.len();
-            let block_matches = &gpu_matches[offset..end];
-            results.push(dedupe_gpu_matches(block_matches, block));
-            offset = end;
-        }
-
-        Ok(results)
-    }
-
-    /// Internal: per-workgroup local hash table match finding.
-    fn find_matches_local_impl(&self, input: &[u8]) -> PzResult<Vec<Match>> {
-        let input_len = input.len();
-        let padded = Self::pad_input_bytes(input);
-        let match_buf_size = (input_len * std::mem::size_of::<GpuMatch>()) as u64;
-
-        let input_buf =
-            self.create_buffer_init("lz77_local_input", &padded, wgpu::BufferUsages::STORAGE);
-
-        // Pass 1 dispatch: one workgroup per 4KB block
-        let num_blocks = (input_len as u32).div_ceil(Self::LZ77_LOCAL_BLOCK_SIZE);
-        let dw_find = self.dispatch_width(num_blocks, 64);
-        let params_find = [input_len as u32, 0, 0, dw_find];
-        let params_find_buf = self.create_buffer_init(
-            "lz77_local_params_find",
-            bytemuck::cast_slice(&params_find),
-            wgpu::BufferUsages::UNIFORM,
-        );
-
-        // Pass 2 dispatch: one thread per position (resolve_lazy)
-        let wgs_resolve = (input_len as u32).div_ceil(64);
-        let dw_resolve = self.dispatch_width(wgs_resolve, 64);
-        let params_resolve = [input_len as u32, 0, 0, dw_resolve];
-        let params_resolve_buf = self.create_buffer_init(
-            "lz77_local_params_resolve",
-            bytemuck::cast_slice(&params_resolve),
-            wgpu::BufferUsages::UNIFORM,
-        );
-
-        let raw_match_buf = self.create_buffer(
-            "local_raw_matches",
-            match_buf_size,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        );
-
-        let resolved_buf = self.create_buffer(
-            "local_resolved",
-            match_buf_size,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        );
-
-        let staging_buf = self.create_buffer(
-            "lz77_local_staging",
-            match_buf_size,
-            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        );
-
-        // Pass 1 bind group: find_matches_local
-        let find_bg_layout = self.pipeline_lz77_local_find().get_bind_group_layout(0);
-        let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lz77_local_find_bg"),
-            layout: &find_bg_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: params_find_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: raw_match_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Pass 2 bind group: resolve_lazy (reuse from coop kernel)
-        let resolve_bg_layout = self.pipeline_lz77_coop_resolve().get_bind_group_layout(0);
-        let resolve_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lz77_local_resolve_bg"),
-            layout: &resolve_bg_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: params_resolve_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: resolved_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: raw_match_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        if self.profiler.is_some() {
-            // Separate encoders for profiling (AMD timestamp workaround)
-            self.dispatch(
-                self.pipeline_lz77_local_find(),
-                &find_bg,
-                num_blocks,
-                "lz77_local_find",
-            )?;
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("lz77_local_resolve"),
-                });
-            self.record_dispatch(
-                &mut encoder,
-                self.pipeline_lz77_coop_resolve(),
-                &resolve_bg,
-                wgs_resolve,
-                "lz77_local_resolve",
-            )?;
-            encoder.copy_buffer_to_buffer(&resolved_buf, 0, &staging_buf, 0, match_buf_size);
-            self.profiler_resolve(&mut encoder);
-            self.queue.submit(Some(encoder.finish()));
-        } else {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("lz77_local_submit"),
-                });
-            self.record_dispatch(
-                &mut encoder,
-                self.pipeline_lz77_local_find(),
-                &find_bg,
-                num_blocks,
-                "lz77_local_find",
-            )?;
-            self.record_dispatch(
-                &mut encoder,
-                self.pipeline_lz77_coop_resolve(),
-                &resolve_bg,
-                wgs_resolve,
-                "lz77_local_resolve",
-            )?;
-            encoder.copy_buffer_to_buffer(&resolved_buf, 0, &staging_buf, 0, match_buf_size);
-            self.profiler_resolve(&mut encoder);
-            self.queue.submit(Some(encoder.finish()));
-        }
-
-        self.poll_wait();
-        if self.profiling {
-            eprintln!("[pz-gpu] lz77_local (find+resolve): submitted");
-        }
-
-        // Readback (same as coop/lazy path)
-        self.complete_find_matches_lazy(
-            PendingLz77 {
-                staging_buf,
-                input_len,
-            },
-            input,
-        )
     }
 
     /// Internal: cooperative-stitch match finding with submit/complete pattern.
@@ -577,8 +241,8 @@ impl WebGpuEngine {
     ///
     /// This is the building block for zero-copy GPU pipeline composition.
     ///
-    /// Uses the per-workgroup local hash table kernel for fast matching,
-    /// keeping results in GPU memory instead of downloading to CPU.
+    /// Uses the same cooperative-stitch kernel as [`find_matches()`] but
+    /// keeps results in GPU memory instead of downloading to CPU.
     pub fn find_matches_to_device(&self, input: &[u8]) -> PzResult<GpuMatchBuf> {
         if input.is_empty() {
             let buf = self.create_buffer(
@@ -601,23 +265,11 @@ impl WebGpuEngine {
         let input_buf =
             self.create_buffer_init("lz77_tod_input", &padded, wgpu::BufferUsages::STORAGE);
 
-        // Pass 1 params: one workgroup per BLOCK_SIZE block
-        let num_blocks = (input_len as u32).div_ceil(Self::LZ77_LOCAL_BLOCK_SIZE);
-        let dw_find = self.dispatch_width(num_blocks, 64);
-        let params_find = [input_len as u32, 0, 0, dw_find];
-        let params_find_buf = self.create_buffer_init(
-            "lz77_tod_params_find",
-            bytemuck::cast_slice(&params_find),
-            wgpu::BufferUsages::UNIFORM,
-        );
-
-        // Pass 2 params: one thread per position
-        let wgs_resolve = (input_len as u32).div_ceil(64);
-        let dw_resolve = self.dispatch_width(wgs_resolve, 64);
-        let params_resolve = [input_len as u32, 0, 0, dw_resolve];
-        let params_resolve_buf = self.create_buffer_init(
-            "lz77_tod_params_resolve",
-            bytemuck::cast_slice(&params_resolve),
+        let workgroups = (input_len as u32).div_ceil(64);
+        let params = [input_len as u32, 0, 0, self.dispatch_width(workgroups, 64)];
+        let params_buf = self.create_buffer_init(
+            "lz77_tod_params",
+            bytemuck::cast_slice(&params),
             wgpu::BufferUsages::UNIFORM,
         );
 
@@ -635,8 +287,8 @@ impl WebGpuEngine {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
 
-        // --- Pass 1 bind group: find_matches_local ---
-        let find_bg_layout = self.pipeline_lz77_local_find().get_bind_group_layout(0);
+        // --- Pass 1 bind group: find_matches_coop ---
+        let find_bg_layout = self.pipeline_lz77_coop_find().get_bind_group_layout(0);
         let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_tod_find_bg"),
             layout: &find_bg_layout,
@@ -647,7 +299,7 @@ impl WebGpuEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: params_find_buf.as_entire_binding(),
+                    resource: params_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -656,7 +308,7 @@ impl WebGpuEngine {
             ],
         });
 
-        // --- Pass 2 bind group: resolve_lazy ---
+        // --- Pass 2 bind group: resolve_lazy (coop) ---
         let resolve_bg_layout = self.pipeline_lz77_coop_resolve().get_bind_group_layout(0);
         let resolve_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lz77_tod_resolve_bg"),
@@ -668,7 +320,7 @@ impl WebGpuEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: params_resolve_buf.as_entire_binding(),
+                    resource: params_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -694,16 +346,16 @@ impl WebGpuEngine {
             });
         self.record_dispatch(
             &mut encoder,
-            self.pipeline_lz77_local_find(),
+            self.pipeline_lz77_coop_find(),
             &find_bg,
-            num_blocks,
+            workgroups,
             "lz77_tod_find",
         )?;
         self.record_dispatch(
             &mut encoder,
             self.pipeline_lz77_coop_resolve(),
             &resolve_bg,
-            wgs_resolve,
+            workgroups,
             "lz77_tod_resolve",
         )?;
         self.profiler_resolve(&mut encoder);
@@ -1317,11 +969,6 @@ impl WebGpuEngine {
             16, // 4 x u32
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         );
-        let params_resolve_buf = self.create_buffer(
-            "slot_params_resolve",
-            16, // 4 x u32
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        );
         let raw_match_buf = self.create_buffer(
             "slot_raw_matches",
             match_buf_size,
@@ -1341,7 +988,6 @@ impl WebGpuEngine {
         Lz77BufferSlot {
             input_buf,
             params_buf,
-            params_resolve_buf,
             raw_match_buf,
             resolved_buf,
             staging_buf,
@@ -1373,11 +1019,10 @@ impl WebGpuEngine {
         Some(BufferRing::new(slots))
     }
 
-    /// Submit LZ77 matching work to a pre-allocated buffer slot.
+    /// Submit LZ77 lazy matching work to a pre-allocated buffer slot.
     ///
-    /// Uses the per-workgroup local hash table kernel (pass 1) followed by
-    /// resolve_lazy (pass 2). Writes input data, encodes both compute passes
-    /// and a staging copy into one command buffer, and submits without blocking.
+    /// Writes input data, encodes 2 compute passes and a staging copy
+    /// into one command buffer, and submits without blocking.
     /// Call `complete_lz77_from_slot()` after `device.poll(Wait)` to
     /// read back results.
     pub(crate) fn submit_lz77_to_slot(&self, input: &[u8], slot: &Lz77BufferSlot) -> PzResult<()> {
@@ -1395,25 +1040,13 @@ impl WebGpuEngine {
         // Write input data to the slot's buffers (non-blocking GPU-side enqueue)
         self.queue.write_buffer(&slot.input_buf, 0, &padded);
 
-        // Pass 1: local hash table — one workgroup per BLOCK_SIZE block
-        let num_blocks = (input_len as u32).div_ceil(Self::LZ77_LOCAL_BLOCK_SIZE);
-        let dw_find = self.dispatch_width(num_blocks, 64);
-        let params_find = [input_len as u32, 0, 0, dw_find];
+        let workgroups = (input_len as u32).div_ceil(64);
+        let params = [input_len as u32, 0, 0, self.dispatch_width(workgroups, 64)];
         self.queue
-            .write_buffer(&slot.params_buf, 0, bytemuck::cast_slice(&params_find));
+            .write_buffer(&slot.params_buf, 0, bytemuck::cast_slice(&params));
 
-        // Pass 2: resolve_lazy — one thread per position
-        let wgs_resolve = (input_len as u32).div_ceil(64);
-        let dw_resolve = self.dispatch_width(wgs_resolve, 64);
-        let params_resolve = [input_len as u32, 0, 0, dw_resolve];
-        self.queue.write_buffer(
-            &slot.params_resolve_buf,
-            0,
-            bytemuck::cast_slice(&params_resolve),
-        );
-
-        // Pass 1: find_matches_local (per-workgroup shared-memory hash table)
-        let find_bg_layout = self.pipeline_lz77_local_find().get_bind_group_layout(0);
+        // Pass 1: find_matches_coop (cooperative-stitch search)
+        let find_bg_layout = self.pipeline_lz77_coop_find().get_bind_group_layout(0);
         let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("slot_find_bg"),
             layout: &find_bg_layout,
@@ -1433,7 +1066,7 @@ impl WebGpuEngine {
             ],
         });
 
-        // Pass 2: resolve_lazy (reused from coop kernel)
+        // Pass 2: resolve_lazy (coop)
         let resolve_bg_layout = self.pipeline_lz77_coop_resolve().get_bind_group_layout(0);
         let resolve_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("slot_resolve_bg"),
@@ -1445,7 +1078,7 @@ impl WebGpuEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: slot.params_resolve_buf.as_entire_binding(),
+                    resource: slot.params_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -1462,20 +1095,20 @@ impl WebGpuEngine {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("slot_lz77_local"),
+                label: Some("slot_lz77_coop"),
             });
         self.record_dispatch(
             &mut encoder,
-            self.pipeline_lz77_local_find(),
+            self.pipeline_lz77_coop_find(),
             &find_bg,
-            num_blocks,
+            workgroups,
             "slot_find",
         )?;
         self.record_dispatch(
             &mut encoder,
             self.pipeline_lz77_coop_resolve(),
             &resolve_bg,
-            wgs_resolve,
+            workgroups,
             "slot_resolve",
         )?;
         encoder.copy_buffer_to_buffer(&slot.resolved_buf, 0, &slot.staging_buf, 0, match_buf_size);
