@@ -374,6 +374,7 @@ fn pack_flags(flags: &[bool]) -> Vec<u8> {
 /// # Panics (debug only)
 /// Panics if `bytes` is too short to hold `count` flags.
 /// Callers must validate length before calling.
+#[cfg(test)]
 fn unpack_flags(bytes: &[u8], count: usize) -> Vec<bool> {
     debug_assert!(
         bytes.len() >= count.div_ceil(8),
@@ -687,7 +688,6 @@ pub fn decode(
         return Err(PzError::InvalidInput);
     }
 
-    let flag_bits = unpack_flags(flags, num_tokens as usize);
     let mut lit_pos = 0usize;
     let mut match_idx = 0usize;
     let mut off_extra_reader = BitReader::new(offset_extra);
@@ -695,7 +695,21 @@ pub fn decode(
     let mut repeats = RepeatOffsets::new();
     let mut output = Vec::with_capacity(original_len);
 
-    for &is_literal in &flag_bits {
+    // Iterate packed flag bytes directly instead of allocating a Vec<bool>.
+    let num_tokens = num_tokens as usize;
+    let mut flag_byte_idx = 0usize;
+    let mut flag_bit_mask = 0x80u8;
+    let mut token_idx = 0usize;
+
+    while token_idx < num_tokens {
+        let is_literal = flags[flag_byte_idx] & flag_bit_mask != 0;
+        flag_bit_mask >>= 1;
+        if flag_bit_mask == 0 {
+            flag_bit_mask = 0x80;
+            flag_byte_idx += 1;
+        }
+        token_idx += 1;
+
         if is_literal {
             if lit_pos >= literals.len() {
                 return Err(PzError::InvalidInput);
@@ -731,9 +745,18 @@ pub fn decode(
             }
 
             let copy_start = output.len() - offset;
-            for j in 0..length {
-                let byte = output[copy_start + j];
-                output.push(byte);
+            if offset >= length {
+                // Non-overlapping: one bulk copy (compiles to memcpy).
+                output.extend_from_within(copy_start..copy_start + length);
+            } else {
+                // Overlapping: copy in offset-sized chunks to amortize.
+                let mut remaining = length;
+                while remaining > 0 {
+                    let chunk = remaining.min(offset);
+                    let start = output.len() - offset;
+                    output.extend_from_within(start..start + chunk);
+                    remaining -= chunk;
+                }
             }
         }
     }
