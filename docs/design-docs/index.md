@@ -68,6 +68,20 @@ LZ77 GPU kernel implementation details. Hash-table kernel, batch kernel, top-K k
 
 ---
 
+### [nvcomp-analysis.md](nvcomp-analysis.md)
+**Status:** ✅ Active
+**Last reviewed:** 2026-02-22
+
+NVIDIA nvcomp architecture analysis: how they achieve 90-320 GB/s, and which patterns apply to libpz.
+
+**Key topics:**
+- Throughput comparison (nvcomp A100 vs libpz Radeon Pro 5500M)
+- 6 architectural patterns: massive batching, block-independent LZ, segmented ANS, persistent buffers, minimize transfers, hardware-aware kernels
+- Why there's a gap (hardware 100x, batch size 10-100x, API abstraction)
+- Actionable recommendations ranked by impact
+
+---
+
 ## Research and Experiments
 
 ### [experiments.md](experiments.md)
