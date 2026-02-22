@@ -803,7 +803,12 @@ impl WebGpuEngine {
             wgpu::BufferUsages::UNIFORM,
         );
 
-        let pipeline = self.pipeline_rans_decode_for_lanes(num_lanes);
+        let use_packed = num_lanes <= 64 && 64 % num_lanes == 0;
+        let pipeline = if use_packed {
+            self.pipeline_rans_decode_packed()
+        } else {
+            self.pipeline_rans_decode_for_lanes(num_lanes)
+        };
         let bg_layout = pipeline.get_bind_group_layout(0);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rans_decode_bg"),
@@ -836,7 +841,12 @@ impl WebGpuEngine {
             ],
         });
 
-        let workgroups_x = u32::try_from(num_chunks).map_err(|_| PzError::Unsupported)?;
+        let workgroups_x = if use_packed {
+            let chunks_per_wg = 64 / num_lanes;
+            u32::try_from(num_chunks.div_ceil(chunks_per_wg)).map_err(|_| PzError::Unsupported)?
+        } else {
+            u32::try_from(num_chunks).map_err(|_| PzError::Unsupported)?
+        };
         self.dispatch(pipeline, &bg, workgroups_x, "rans_decode_chunked")?;
 
         Ok(output)
@@ -1518,7 +1528,12 @@ impl WebGpuEngine {
             wgpu::BufferUsages::UNIFORM,
         );
 
-        let pipeline = self.pipeline_rans_decode_for_lanes(num_lanes);
+        let use_packed = num_lanes <= 64 && 64 % num_lanes == 0;
+        let pipeline = if use_packed {
+            self.pipeline_rans_decode_packed()
+        } else {
+            self.pipeline_rans_decode_for_lanes(num_lanes)
+        };
         let bg_layout = pipeline.get_bind_group_layout(0);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rans_decode_bg_packed"),
@@ -1551,7 +1566,12 @@ impl WebGpuEngine {
             ],
         });
 
-        let workgroups_x = u32::try_from(num_chunks).map_err(|_| PzError::Unsupported)?;
+        let workgroups_x = if use_packed {
+            let chunks_per_wg = 64 / num_lanes;
+            u32::try_from(num_chunks.div_ceil(chunks_per_wg)).map_err(|_| PzError::Unsupported)?
+        } else {
+            u32::try_from(num_chunks).map_err(|_| PzError::Unsupported)?
+        };
         self.dispatch(pipeline, &bg, workgroups_x, "rans_decode_chunked_packed")?;
         Ok(output)
     }
