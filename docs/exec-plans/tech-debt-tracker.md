@@ -43,27 +43,12 @@ Catalog of known issues, gaps, and technical debt in libpz. Items are prioritize
 
 ### P1: High Priority
 
-#### Optimal Parsing Design Doc Missing
-**Status:** Not started
-**Impact:** Documentation (hard to understand/maintain optimal.rs)
-**Estimated effort:** 1 day
+#### Optimal Parsing Design Doc
+**Status:** Complete
+**Impact:** Documentation
+**Completed:** 2026-02-22
 
-**Description:**
-`src/optimal.rs` implements backward DP for optimal LZ77 parsing but lacks design documentation:
-- How the cost model works
-- Why backward DP (vs forward greedy)
-- GPU top-K match table → CPU DP handoff
-- Parameter tuning (cost weights)
-
-**References:**
-- QUALITY.md rates optimal.rs as D for documentation
-- Code is correct (tests pass) but opaque
-
-**Action items:**
-1. Create docs/design-docs/optimal-parsing.md
-2. Explain backward DP algorithm with diagram
-3. Document cost model parameters
-4. Link to academic references (if any)
+Created `docs/design-docs/optimal-parsing.md` covering backward DP algorithm, cost model, GPU top-K handoff, and tuning parameters.
 
 ---
 

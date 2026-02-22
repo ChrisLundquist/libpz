@@ -41,12 +41,9 @@ Each module is graded on five dimensions:
   - Break-even: ~256KB blocks
 - **Performance:** ✅ Beats gzip on 256KB+ blocks
   - Throughput: 150-200 MB/s (CPU), 300-500 MB/s (GPU batched)
-- **Documentation:** ⚠️ B - Missing optimal parsing explanation
-  - API docs complete
-  - GPU kernels documented
-  - Optimal parsing (backward DP) needs design doc
+- **Documentation:** ✅ A - API docs, GPU kernels, optimal parsing design doc
 
-**Gaps:** Optimal parsing design doc
+**Gaps:** None
 
 ---
 
@@ -194,11 +191,10 @@ Each module is graded on five dimensions:
 - **GPU:** ✅ Partial (top-K on GPU, DP on CPU)
 - **Performance:** ✅ 4-6% better compression than greedy
   - Throughput: 30-50% of greedy speed (expected trade-off)
-- **Documentation:** ❌ D - Missing design doc
+- **Documentation:** ✅ B - Design doc: `docs/design-docs/optimal-parsing.md`
 
 **Gaps:**
-- No design doc explaining backward DP algorithm
-- Cost model tuning not documented
+- Repeat offset modeling not in cost model (documented as future enhancement)
 
 ---
 
@@ -381,7 +377,7 @@ See `exec-plans/tech-debt-tracker.md` for the full prioritized list of known gap
 - **Total tests:** 700+ passing, 0 failing
 - **Overall quality:** 12/12 milestones complete
 - **GPU readiness:** 80% (LZ77, Huffman encode fully GPU-accelerated)
-- **Documentation coverage:** 90% (missing optimal parsing, some FFI docs)
+- **Documentation coverage:** 95% (missing some FFI docs)
 
 ---
 

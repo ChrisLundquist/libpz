@@ -1,6 +1,6 @@
 # Design Documentation Index
 
-**Last Updated:** 2026-02-14
+**Last Updated:** 2026-02-22
 
 ## Purpose
 
@@ -96,20 +96,21 @@ Development research log. Early design decisions and exploration.
 
 ---
 
+### [optimal-parsing.md](optimal-parsing.md)
+**Status:** ✅ Active
+**Last reviewed:** 2026-02-22
+
+Backward DP optimal parsing: algorithm, cost model, GPU top-K handoff.
+
+**Key topics:**
+- Backward DP algorithm (O(n*K) time, O(n) space)
+- Cost model: literal overhead, match overhead, distance-aware LzSeq costs
+- GPU top-K match finding → CPU DP handoff
+- MatchTable layout and tuning parameters
+
+---
+
 ## Needed Documentation
-
-### optimal-parsing.md (Missing - P1)
-**Status:** ❌ Not started
-
-Design documentation for `src/optimal.rs`. Should explain:
-- Backward DP algorithm
-- Cost model (why these weights?)
-- GPU top-K → CPU DP handoff
-- Parameter tuning guidance
-
-**Owner:** Unassigned
-**Priority:** P1 (high)
-**Effort:** 1 day
 
 ---
 
