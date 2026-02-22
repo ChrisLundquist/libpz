@@ -144,6 +144,10 @@ fn entropy_encode(
             let _ = (input_len, options);
             stage_rans_encode_with_options(block, options)
         }
+        Pipeline::LzSeqH => {
+            let _ = (input_len, options);
+            stage_huffman_encode(block)
+        }
         Pipeline::Lzf => {
             let _ = (input_len, options);
             stage_fse_encode(block)
@@ -177,6 +181,7 @@ fn entropy_decode(
         Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R | Pipeline::LzSeqR => {
             stage_rans_decode(block)
         }
+        Pipeline::LzSeqH => stage_huffman_decode(block),
         Pipeline::Lzf => stage_fse_decode(block),
         Pipeline::Lzfi => {
             #[cfg(feature = "webgpu")]

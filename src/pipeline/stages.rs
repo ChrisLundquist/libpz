@@ -183,6 +183,17 @@ pub(crate) fn stage_huffman_encode(mut block: StageBlock) -> PzResult<StageBlock
         pre_entropy_len,
         &block.metadata.demux_meta,
         |stream, output| {
+            // Handle empty streams: emit empty huffman data with zero frequency table
+            if stream.is_empty() {
+                output.extend_from_slice(&0u32.to_le_bytes()); // huffman_data.len() = 0
+                output.extend_from_slice(&0u32.to_le_bytes()); // total_bits = 0
+                                                               // Emit empty frequency table (256 zeros)
+                for _ in 0..256 {
+                    output.extend_from_slice(&0u32.to_le_bytes());
+                }
+                return Ok(());
+            }
+
             let tree = HuffmanTree::from_data(stream).ok_or(PzError::InvalidInput)?;
             let (huffman_data, total_bits) = tree.encode(stream)?;
             let freq_table = tree.serialize_frequencies();
@@ -274,12 +285,23 @@ pub(crate) fn stage_huffman_encode_webgpu(
 pub(crate) fn stage_huffman_decode(mut block: StageBlock) -> PzResult<StageBlock> {
     let (streams, pre_entropy_len, meta) = decode_multistream(&block.data, |data| {
         // Per-stream: [stream_data_len: u32][total_bits: u32][freq_table: 256×u32][huffman_data]
-        if data.len() < 1032 {
+        if data.len() < 8 {
             return Err(PzError::InvalidInput);
         }
         let stream_data_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
         let total_bits = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
 
+        // Handle empty streams: freq table still exists but all zeros
+        if stream_data_len == 0 && total_bits == 0 {
+            if data.len() < 1032 {
+                return Err(PzError::InvalidInput);
+            }
+            return Ok((Vec::new(), 1032));
+        }
+
+        if data.len() < 1032 {
+            return Err(PzError::InvalidInput);
+        }
         let mut freq_table = crate::frequency::FrequencyTable::new();
         for i in 0..256 {
             let off = 8 + i * 4;
@@ -908,7 +930,7 @@ pub(crate) fn pipeline_stage_count(pipeline: Pipeline) -> usize {
         Pipeline::Bbw => 4,
         Pipeline::Lzr => 2,
         Pipeline::Lzf | Pipeline::Lzfi => 2,
-        Pipeline::LzssR | Pipeline::Lz78R | Pipeline::LzSeqR => 2,
+        Pipeline::LzssR | Pipeline::Lz78R | Pipeline::LzSeqR | Pipeline::LzSeqH => 2,
     }
 }
 
@@ -962,6 +984,8 @@ pub(crate) fn run_compress_stage(
             }
             stage_rans_encode_with_options(block, options)
         }
+        (Pipeline::LzSeqH, 0) => stage_demux_compress(block, &LzDemuxer::LzSeq, options),
+        (Pipeline::LzSeqH, 1) => stage_huffman_encode(block),
         _ => Err(PzError::Unsupported),
     }
 }
@@ -1056,6 +1080,9 @@ pub(crate) fn run_decompress_stage(
             stage_rans_decode(block)
         }
         (Pipeline::LzSeqR, 1) => stage_demux_decompress(block, &LzDemuxer::LzSeq),
+        // LzSeqH: Huffman decode(0) → LzSeq decompress(1)
+        (Pipeline::LzSeqH, 0) => stage_huffman_decode(block),
+        (Pipeline::LzSeqH, 1) => stage_demux_decompress(block, &LzDemuxer::LzSeq),
         _ => Err(PzError::Unsupported),
     }
 }

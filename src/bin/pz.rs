@@ -77,6 +77,7 @@ fn list_pipelines() {
         ("lzssr", "6", "LZSS + rANS (experimental)"),
         ("lz78r", "7", "LZ78 + rANS (experimental)"),
         ("lzseqr", "8", "LzSeq + rANS (zstd-style code+extra-bits)"),
+        ("lzseqh", "9", "LzSeq + Huffman (fast decode)"),
     ];
     for (name, id, desc) in pipelines {
         println!("  {name:10} {id:>2}  {desc}");
@@ -210,6 +211,7 @@ fn parse_args() -> Opts {
                     "lzssr" | "6" => Pipeline::LzssR,
                     "lz78r" | "7" => Pipeline::Lz78R,
                     "lzseqr" | "8" => Pipeline::LzSeqR,
+                    "lzseqh" | "9" => Pipeline::LzSeqH,
                     other => {
                         eprintln!("pz: unknown pipeline '{other}'");
                         eprintln!("pz: run 'pz --list-pipelines' to see available pipelines");

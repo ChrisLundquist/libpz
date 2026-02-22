@@ -345,10 +345,35 @@ impl<'a> BitReader<'a> {
     }
 
     fn refill(&mut self) {
-        while self.bits_available <= 56 && self.byte_pos < self.data.len() {
-            self.container |= (self.data[self.byte_pos] as u64) << self.bits_available;
-            self.byte_pos += 1;
-            self.bits_available += 8;
+        // Fast path: bulk-load when at least 8 bytes remain in buffer.
+        // Loads a full u64, masks to only the bytes that fit without
+        // overflow, then shifts into position.
+        if self.bits_available <= 56 && self.byte_pos < self.data.len() {
+            if self.byte_pos + 8 <= self.data.len() {
+                let chunk = u64::from_le_bytes(
+                    self.data[self.byte_pos..self.byte_pos + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                // Only load whole bytes that fit (bits_available may not be
+                // byte-aligned after reading variable-width extra bits).
+                let full_bytes = ((64 - self.bits_available) / 8) as usize;
+                let keep_mask = if full_bytes >= 8 {
+                    u64::MAX
+                } else {
+                    (1u64 << (full_bytes * 8)) - 1
+                };
+                self.container |= (chunk & keep_mask) << self.bits_available;
+                self.byte_pos += full_bytes;
+                self.bits_available += full_bytes as u32 * 8;
+            } else {
+                // Tail: fewer than 8 bytes remain, load byte-by-byte.
+                while self.bits_available <= 56 && self.byte_pos < self.data.len() {
+                    self.container |= (self.data[self.byte_pos] as u64) << self.bits_available;
+                    self.byte_pos += 1;
+                    self.bits_available += 8;
+                }
+            }
         }
     }
 }
@@ -680,11 +705,13 @@ pub fn decode(
     }
 
     // Validate stream lengths to avoid panics on malformed input.
-    let required_flag_bytes = (num_tokens as usize).div_ceil(8);
+    let num_tokens = num_tokens as usize;
+    let num_matches = num_matches as usize;
+    let required_flag_bytes = num_tokens.div_ceil(8);
     if flags.len() < required_flag_bytes {
         return Err(PzError::InvalidInput);
     }
-    if offset_codes.len() < num_matches as usize || length_codes.len() < num_matches as usize {
+    if offset_codes.len() < num_matches || length_codes.len() < num_matches {
         return Err(PzError::InvalidInput);
     }
 
@@ -696,7 +723,6 @@ pub fn decode(
     let mut output = Vec::with_capacity(original_len);
 
     // Iterate packed flag bytes directly instead of allocating a Vec<bool>.
-    let num_tokens = num_tokens as usize;
     let mut flag_byte_idx = 0usize;
     let mut flag_bit_mask = 0x80u8;
     let mut token_idx = 0usize;
@@ -717,7 +743,7 @@ pub fn decode(
             output.push(literals[lit_pos]);
             lit_pos += 1;
         } else {
-            if match_idx >= num_matches as usize {
+            if match_idx >= num_matches {
                 return Err(PzError::InvalidInput);
             }
             let oc = offset_codes[match_idx];
@@ -994,6 +1020,32 @@ mod tests {
         assert!(input.len() > 32768);
         let output = round_trip(&input).unwrap();
         assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_round_trip_150kb_mixed() {
+        // Semi-random 150KB: mix of text patterns and noise
+        let mut data = Vec::with_capacity(150 * 1024);
+        let phrases: &[&[u8]] = &[
+            b"compression algorithms are fascinating ",
+            b"data structures enable efficient storage ",
+            b"entropy coding reduces redundancy ",
+            b"hash tables provide fast lookup ",
+        ];
+        let mut state: u32 = 0xDEADBEEF;
+        while data.len() < 150 * 1024 {
+            let phrase = phrases[(state as usize / 7) % phrases.len()];
+            data.extend_from_slice(phrase);
+            for _ in 0..32 {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                data.push(state as u8);
+            }
+        }
+        data.truncate(150 * 1024);
+        let output = round_trip(&data).unwrap();
+        assert_eq!(output, data);
     }
 
     #[test]
