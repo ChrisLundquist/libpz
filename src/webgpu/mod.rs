@@ -59,6 +59,9 @@ const LZ77_LAZY_KERNEL_SOURCE: &str = include_str!("../../kernels/lz77_lazy.wgsl
 /// Embedded WGSL kernel source: cooperative-stitch LZ77 match finding.
 const LZ77_COOP_KERNEL_SOURCE: &str = include_str!("../../kernels/lz77_coop.wgsl");
 
+/// Embedded WGSL kernel source: per-workgroup shared-memory hash table LZ77.
+const LZ77_LOCAL_KERNEL_SOURCE: &str = include_str!("../../kernels/lz77_local.wgsl");
+
 /// Embedded WGSL kernel source: GPU rank assignment for BWT prefix-doubling.
 const BWT_RANK_KERNEL_SOURCE: &str = include_str!("../../kernels/bwt_rank.wgsl");
 
@@ -209,6 +212,11 @@ struct Lz77CoopPipelines {
     resolve: wgpu::ComputePipeline,
 }
 
+/// LZ77 per-workgroup shared-memory hash table pipeline (1 pipeline from lz77_local.wgsl).
+struct Lz77LocalPipelines {
+    find: wgpu::ComputePipeline,
+}
+
 /// BWT rank pipelines (4 pipelines from bwt_rank.wgsl).
 struct BwtRankPipelines {
     rank_compare: wgpu::ComputePipeline,
@@ -285,6 +293,7 @@ pub struct WebGpuEngine {
     #[allow(dead_code)]
     lz77_lazy: OnceLock<Lz77LazyPipelines>,
     lz77_coop: OnceLock<Lz77CoopPipelines>,
+    lz77_local: OnceLock<Lz77LocalPipelines>,
     bwt_rank: OnceLock<BwtRankPipelines>,
     bwt_radix: OnceLock<BwtRadixPipelines>,
     huffman: OnceLock<HuffmanPipelines>,
@@ -440,6 +449,7 @@ impl WebGpuEngine {
             lz77_hash: OnceLock::new(),
             lz77_lazy: OnceLock::new(),
             lz77_coop: OnceLock::new(),
+            lz77_local: OnceLock::new(),
             bwt_rank: OnceLock::new(),
             bwt_radix: OnceLock::new(),
             huffman: OnceLock::new(),
@@ -968,6 +978,27 @@ impl WebGpuEngine {
 
     fn pipeline_lz77_coop_resolve(&self) -> &wgpu::ComputePipeline {
         &self.lz77_coop_pipelines().resolve
+    }
+
+    fn pipeline_lz77_local_find(&self) -> &wgpu::ComputePipeline {
+        &self
+            .lz77_local
+            .get_or_init(|| {
+                let t0 = std::time::Instant::now();
+                let group = Lz77LocalPipelines {
+                    find: self.make_pipeline(
+                        "lz77_local",
+                        LZ77_LOCAL_KERNEL_SOURCE,
+                        "find_matches_local",
+                    ),
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile lz77_local.wgsl: {ms:.3} ms");
+                }
+                group
+            })
+            .find
     }
 
     fn bwt_rank_pipelines(&self) -> &BwtRankPipelines {

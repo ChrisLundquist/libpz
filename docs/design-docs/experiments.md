@@ -2,7 +2,7 @@
 
 Documentation of optimization attempts, successful iterations, and abandoned approaches.
 
-**Last updated:** 2026-02-14
+**Last updated:** 2026-02-22
 
 ## Successful Experiments
 
@@ -178,7 +178,61 @@ Documentation of optimization attempts, successful iterations, and abandoned app
 - Test on repetitive data early to catch catastrophic quality loss
 - Profiling alone can't detect quality issues (need compression ratio validation)
 
-### 2. Blelloch Prefix Sum for Huffman
+### 2. Per-Workgroup Shared-Memory Hash Table (lz77_local.wgsl)
+
+**Period:** Feb 2026
+**Introduced:** Committed then reverted (see git log for "lz77_local")
+
+**What was tried:**
+- nvcomp-inspired per-block independent hash tables in `var<workgroup>` shared memory
+- Each workgroup processes a 4KB block with a 4096-slot hash table (16KB, full WebGPU budget)
+- Three-phase: INIT (zero-fill) → BUILD (atomicStore all positions) → FIND (hash lookup + compare)
+- Single entry per slot, last-writer-wins (`atomicStore` semantics)
+- Reused `resolve_lazy` from lz77_coop.wgsl for pass 2
+
+**Speed results (3-14x faster kernel):**
+
+| Dataset | Local ms | Coop ms | Speedup |
+|---------|----------|---------|---------|
+| synthetic_4MB | 106 | 328 | 3.1x |
+| random_64KB | 4.9 | 15.9 | 3.3x |
+| mixed_128KB | 4.9 | 70.3 | 14.4x |
+
+**Why it failed — CATASTROPHIC quality loss:**
+
+| Dataset | Local tokens | Coop tokens | GPU ratio | CPU ratio |
+|---------|-------------|-------------|-----------|-----------|
+| synthetic_4MB | 4,194,058 (all literals) | 33,022 | 103% (EXPANSION) | 0.7% |
+| mixed_128KB | 131,063 (all literals) | 2,364 | 84% | 11.9% |
+
+The kernel found **essentially zero matches**. End-to-end pipeline EXPANDED data.
+
+**Root cause — same as Failed Experiment #1 (hash-table kernel):**
+- Separate BUILD/FIND phases with `atomicStore` (last-writer-wins)
+- BUILD writes all positions; hash table stores only late positions per slot
+- FIND at early positions: candidate is later → `candidate < pos` fails → no match
+- FIND at late positions: finds own position or nothing useful
+- LZ4 fixes this by building the hash table **sequentially** (lookup then update) — inherently serial, can't parallelize
+
+**Additional finding — single mega-dispatch vs ring buffer:**
+
+| Approach | 4MB time | Throughput |
+|----------|----------|-----------|
+| Ring buffer (32 per-block dispatches) | 94.8 ms | **44.2 MB/s** |
+| Single dispatch (full input) | 109.7 ms | 38.2 MB/s |
+| Bulk dispatch (single + CPU split) | 139.7 ms | 30.0 MB/s |
+
+The ring buffer's GPU/CPU overlap (compute slot N while reading slot N-1) beats
+reducing submission count. Single mega-dispatch serializes compute→readback, losing overlap.
+
+**Lessons learned:**
+1. **Parallel hash build is fundamentally incompatible with LZ77** — lookup-then-update is serial
+2. **This is the same root cause as Failed Experiment #1** — we rediscovered it with a different kernel design (shared memory instead of global atomics), confirming the issue is architectural, not implementation-specific
+3. **Host overhead dominates GPU LZ77 throughput** — even 14x faster kernel barely moves overall throughput (38 MB/s vs 44 MB/s ring)
+4. **Ring buffer overlap > fewer dispatches** — interleaving compute and readback beats batching
+5. **4KB window too small regardless** — even with correct matching, 4KB window produces significantly worse compression than 32KB coop window
+
+### 3. Blelloch Prefix Sum for Huffman
 
 **Period:** Feb 2026  
 **Introduced:** Commit `b4bf45d`  
@@ -205,7 +259,7 @@ Documentation of optimization attempts, successful iterations, and abandoned app
 - Small working sets often cache better on CPU L3
 - Know the break-even point (typically ~64KB for GPU worthiness)
 
-### 3. WHT/Haar Spectral Compression
+### 4. WHT/Haar Spectral Compression
 
 **Period:** Feb 2026  
 **Attempt:** Commit `d3ddeda`  
