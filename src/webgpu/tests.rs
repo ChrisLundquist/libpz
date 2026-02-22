@@ -2499,3 +2499,49 @@ fn test_gpu_lzseq_pipeline_round_trip() {
 
     assert_eq!(decompressed, input, "pipeline GPU round-trip mismatch");
 }
+
+#[test]
+fn test_gpu_lzseq_rans_encode_pipeline() {
+    use crate::pipeline;
+
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Large enough input so streams exceed rans_interleaved_min_bytes → GPU rANS path
+    let input: Vec<u8> = b"the quick brown fox jumps over the lazy dog. "
+        .iter()
+        .cycle()
+        .take(256 * 1024)
+        .copied()
+        .collect();
+
+    let options = pipeline::CompressOptions {
+        backend: pipeline::Backend::WebGpu,
+        webgpu_engine: Some(engine.clone()),
+        threads: 1,
+        // Lower threshold so individual streams hit the GPU rANS path
+        rans_interleaved_min_bytes: 4096,
+        ..pipeline::CompressOptions::default()
+    };
+
+    let compressed =
+        pipeline::compress_with_options(&input, pipeline::Pipeline::LzSeqR, &options).unwrap();
+    let decompressed = pipeline::decompress(&compressed).unwrap();
+
+    assert_eq!(decompressed, input, "GPU rANS pipeline round-trip mismatch");
+
+    // Also test with small input that forces CPU fallback for small streams
+    let small_input: Vec<u8> = b"ABCD".iter().cycle().take(4096).copied().collect();
+    let compressed_small =
+        pipeline::compress_with_options(&small_input, pipeline::Pipeline::LzSeqR, &options)
+            .unwrap();
+    let decompressed_small = pipeline::decompress(&compressed_small).unwrap();
+
+    assert_eq!(
+        decompressed_small, small_input,
+        "GPU rANS pipeline small-input round-trip mismatch"
+    );
+}
