@@ -677,6 +677,111 @@ pub fn rans_decode_4way(
     Some(output)
 }
 
+/// Like [`rans_decode_4way`] but writes into a provided buffer instead of allocating.
+///
+/// Returns `Some(())` on success, `None` on invalid input.
+/// `output` must have length `>= original_len`.
+#[allow(clippy::too_many_arguments)]
+pub fn rans_decode_4way_into(
+    word_streams: &[&[u16]; 4],
+    initial_states: &[u32; 4],
+    freq: &[u16; 256],
+    cum: &[u16; 256],
+    lookup: &[u8],
+    scale_bits: u32,
+    original_len: usize,
+    output: &mut [u8],
+) -> Option<()> {
+    let scale_mask = (1u32 << scale_bits) - 1;
+    let rans_l: u32 = 1 << 16;
+    let io_bits: u32 = 16;
+    let lookup_len = lookup.len();
+
+    let mut states = *initial_states;
+    let mut word_pos = [0usize; 4];
+    let mut out_pos = 0;
+
+    let full_quads = original_len / 4;
+    let remainder = original_len % 4;
+
+    for _ in 0..full_quads {
+        let slot0 = states[0] & scale_mask;
+        let slot1 = states[1] & scale_mask;
+        let slot2 = states[2] & scale_mask;
+        let slot3 = states[3] & scale_mask;
+
+        if (slot0 as usize | slot1 as usize | slot2 as usize | slot3 as usize) >= lookup_len {
+            return None;
+        }
+
+        let s0 = lookup[slot0 as usize];
+        let s1 = lookup[slot1 as usize];
+        let s2 = lookup[slot2 as usize];
+        let s3 = lookup[slot3 as usize];
+
+        let f0 = freq[s0 as usize] as u32;
+        let f1 = freq[s1 as usize] as u32;
+        let f2 = freq[s2 as usize] as u32;
+        let f3 = freq[s3 as usize] as u32;
+
+        let c0 = cum[s0 as usize] as u32;
+        let c1 = cum[s1 as usize] as u32;
+        let c2 = cum[s2 as usize] as u32;
+        let c3 = cum[s3 as usize] as u32;
+
+        states[0] = f0 * (states[0] >> scale_bits) + slot0 - c0;
+        states[1] = f1 * (states[1] >> scale_bits) + slot1 - c1;
+        states[2] = f2 * (states[2] >> scale_bits) + slot2 - c2;
+        states[3] = f3 * (states[3] >> scale_bits) + slot3 - c3;
+
+        if states[0] < rans_l && word_pos[0] < word_streams[0].len() {
+            states[0] = (states[0] << io_bits) | word_streams[0][word_pos[0]] as u32;
+            word_pos[0] += 1;
+        }
+        if states[1] < rans_l && word_pos[1] < word_streams[1].len() {
+            states[1] = (states[1] << io_bits) | word_streams[1][word_pos[1]] as u32;
+            word_pos[1] += 1;
+        }
+        if states[2] < rans_l && word_pos[2] < word_streams[2].len() {
+            states[2] = (states[2] << io_bits) | word_streams[2][word_pos[2]] as u32;
+            word_pos[2] += 1;
+        }
+        if states[3] < rans_l && word_pos[3] < word_streams[3].len() {
+            states[3] = (states[3] << io_bits) | word_streams[3][word_pos[3]] as u32;
+            word_pos[3] += 1;
+        }
+
+        output[out_pos] = s0;
+        output[out_pos + 1] = s1;
+        output[out_pos + 2] = s2;
+        output[out_pos + 3] = s3;
+        out_pos += 4;
+    }
+
+    for r in 0..remainder {
+        let lane = r;
+        let slot = states[lane] & scale_mask;
+        if slot as usize >= lookup_len {
+            return None;
+        }
+        let s = lookup[slot as usize];
+        let f = freq[s as usize] as u32;
+        let c = cum[s as usize] as u32;
+
+        states[lane] = f * (states[lane] >> scale_bits) + slot - c;
+
+        if states[lane] < rans_l && word_pos[lane] < word_streams[lane].len() {
+            states[lane] = (states[lane] << io_bits) | word_streams[lane][word_pos[lane]] as u32;
+            word_pos[lane] += 1;
+        }
+
+        output[out_pos] = s;
+        out_pos += 1;
+    }
+
+    Some(())
+}
+
 // ---------------------------------------------------------------------------
 // Batched 4-way FSE decode
 // ---------------------------------------------------------------------------
