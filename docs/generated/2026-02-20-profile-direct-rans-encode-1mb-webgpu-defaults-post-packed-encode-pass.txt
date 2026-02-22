@@ -1,0 +1,5 @@
+   Compiling pz v0.1.0 (/Users/clundquist/code/libpz)
+    Finished `profiling` profile [optimized + debuginfo] target(s) in 11.75s
+     Running `target/profiling/examples/profile --stage rans --size 1048576 --iterations 300`
+profiling stage rans encode: 1048576 bytes, 300 iterations
+done: 1.4s, 207.1 MB/s

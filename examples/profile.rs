@@ -369,13 +369,15 @@ fn profile_rans_stage_gpu(
                 .zip(independent_blocks.iter())
                 .map(|((payload, _), block)| (payload.as_slice(), block.len()))
                 .collect();
-            for _ in 0..iterations {
-                let _ = std::hint::black_box(
-                    engine
-                        .rans_decode_chunked_payload_gpu_batched_shared_table(&decode_inputs, data)
-                        .unwrap(),
-                );
-            }
+            let _ = std::hint::black_box(
+                engine
+                    .rans_decode_chunked_payload_gpu_batched_shared_table_repeated(
+                        &decode_inputs,
+                        data,
+                        iterations,
+                    )
+                    .unwrap(),
+            );
         } else {
             let (enc, used_chunked) = match engine.rans_encode_chunked_payload_gpu(
                 data,

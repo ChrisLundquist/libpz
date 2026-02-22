@@ -20,6 +20,16 @@ Implementation for this probe:
   - added packed shared-table decode submission path in `src/webgpu/rans.rs`:
     - packs split payload words/states/chunk metadata into one decode dispatch/readback cycle when block count is high enough.
     - currently gated to `>= 8` non-empty payloads so smaller split sets keep the prior per-block decode path.
+- Additional follow-up pass:
+  - added split decode prep reuse path:
+    - `rans_decode_chunked_payload_gpu_batched_shared_table_repeated(...)` now reuses shared-table decode setup and packed split decode preparation across repeated runs.
+    - profiling split decode loop in `examples/profile.rs` now uses the repeated API.
+- Additional follow-up pass:
+  - reduced split shared-table encode setup overhead:
+    - `rans_encode_chunked_payload_gpu_batched_impl(...)` now builds one shared table buffer per batch call when `shared_norm` is provided, instead of rebuilding identical tables per input.
+- Additional follow-up pass:
+  - added packed shared-table split encode submission path (gated):
+    - when non-empty split inputs are high enough (`>= 8`), encode now packs independent blocks into one dispatch/readback cycle and reconstructs per-block chunked payloads.
 
 No wire format changes were made in this probe.
 
@@ -158,6 +168,36 @@ Follow-up decode measurements (1MB, 300 iterations):
 1. Before: `docs/generated/2026-02-20-samply-rans-decode-split64k-1mb-top35.txt`
 2. After: `docs/generated/2026-02-20-samply-rans-decode-split64k-1mb-hotspot-pass-top35.txt`
 
+## Prep Reuse Follow-up Pass
+
+Follow-up implementation (roadmap item: amortize split decode prep across iterations):
+
+1. Refactored packed shared-table split decode into prepare + execute phases in `src/webgpu/rans.rs`.
+2. Added `rans_decode_chunked_payload_gpu_batched_shared_table_repeated(...)` and routed profile split decode through it.
+3. Added GPU round-trip coverage for repeated shared-table decode in `src/webgpu/tests.rs`.
+4. Detailed notes: `docs/generated/2026-02-20-rans-webgpu-split-decode-prep-reuse-pass.md`.
+
+Measurement status:
+
+1. Non-approved sandbox runs produced `*prep-cache-pass.txt` artifacts.
+2. Those captures appear to have fallen back to CPU path (missing WebGPU path banners), so they are not used as GPU gate evidence.
+
+## Encode Shared-Table Reuse Follow-up Pass
+
+Implementation details:
+
+1. Added encode helper path that accepts a prebuilt shared table buffer.
+2. Updated batched shared-table encode to reuse one table buffer across all inputs in the batch call.
+3. Detailed notes: `docs/generated/2026-02-20-rans-webgpu-split-encode-shared-table-reuse-pass.md`.
+
+## Encode Packed Submission Follow-up Pass
+
+Implementation details:
+
+1. Added packed shared-table split encode path in `src/webgpu/rans.rs`.
+2. Added parity coverage forcing this path in `src/webgpu/tests.rs`.
+3. Detailed notes: `docs/generated/2026-02-20-rans-webgpu-split-encode-packed-pass.md`.
+
 ## Interpretation
 
 1. Independent-block splitting is still below the non-split default path on this host/device.
@@ -169,7 +209,7 @@ Follow-up decode measurements (1MB, 300 iterations):
 
 ## Next Implementation Targets
 
-1. Add split decode prep caching so payload parse/pack work is amortized across iterations instead of rebuilt every call.
-2. Extend packed submission to split encode path (single metadata/input staging + consolidated readback) so both directions share the same model.
+1. Re-run split decode profiling for the prep-reuse pass on stable WebGPU hardware to quantify true GPU delta.
+2. Tune packed encode/decode gate thresholds from stable-GPU measurements (block count and payload size break-even).
 3. Add a low-noise benchmark mode for split decode (longer runs or isolated host) before changing scheduler defaults.
 4. Keep block splitting as a scheduler-level option, with thresholds tied to block count/device break-even data.
