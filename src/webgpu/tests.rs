@@ -2376,3 +2376,126 @@ fn test_rans_chunked_parity_matrix_gpu_cpu() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// GPU LzSeq demux tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_gpu_lzseq_encode_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Test patterns of varying characteristics
+    let patterns: Vec<(&str, Vec<u8>)> = vec![
+        ("all_same", vec![b'A'; 128 * 1024]),
+        ("repeating", {
+            let pattern = b"the quick brown fox jumps over the lazy dog. ";
+            pattern.iter().cycle().take(128 * 1024).copied().collect()
+        }),
+        (
+            "binary_cycle",
+            (0..128 * 1024).map(|i| (i % 256) as u8).collect(),
+        ),
+        ("short_repeat", {
+            let pattern = b"ABCD";
+            pattern.iter().cycle().take(128 * 1024).copied().collect()
+        }),
+    ];
+
+    for (label, input) in &patterns {
+        let enc = engine
+            .lzseq_encode_gpu(input)
+            .unwrap_or_else(|e| panic!("GPU encode failed for {label}: {e:?}"));
+
+        assert!(enc.num_tokens > 0, "{label}: should have tokens");
+        assert_eq!(
+            enc.num_tokens,
+            enc.num_matches + enc.literals.len() as u32,
+            "{label}: num_tokens should equal num_matches + num_literals"
+        );
+
+        // Round-trip via CPU decoder
+        let decoded = crate::lzseq::decode(
+            &enc.flags,
+            &enc.literals,
+            &enc.offset_codes,
+            &enc.offset_extra,
+            &enc.length_codes,
+            &enc.length_extra,
+            enc.num_tokens,
+            enc.num_matches,
+            input.len(),
+        )
+        .unwrap_or_else(|e| panic!("CPU decode failed for {label}: {e:?}"));
+
+        assert_eq!(decoded, *input, "{label}: round-trip mismatch");
+    }
+}
+
+#[test]
+fn test_gpu_lzseq_all_literals() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Random-ish data that won't compress (no matches)
+    let input: Vec<u8> = (0..64 * 1024).map(|i| ((i * 7 + 13) % 251) as u8).collect();
+
+    let enc = engine.lzseq_encode_gpu(&input).unwrap();
+
+    // With poor-quality matches, most should be literals
+    // (GPU might still find some short matches, so don't assert num_matches == 0)
+    assert!(enc.num_tokens > 0);
+
+    let decoded = crate::lzseq::decode(
+        &enc.flags,
+        &enc.literals,
+        &enc.offset_codes,
+        &enc.offset_extra,
+        &enc.length_codes,
+        &enc.length_extra,
+        enc.num_tokens,
+        enc.num_matches,
+        input.len(),
+    )
+    .unwrap();
+
+    assert_eq!(decoded, input, "all-literals round-trip mismatch");
+}
+
+#[test]
+fn test_gpu_lzseq_pipeline_round_trip() {
+    use crate::pipeline;
+
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = b"hello world hello world hello world! "
+        .iter()
+        .cycle()
+        .take(128 * 1024)
+        .copied()
+        .collect();
+
+    let options = pipeline::CompressOptions {
+        backend: pipeline::Backend::WebGpu,
+        webgpu_engine: Some(engine),
+        threads: 1,
+        ..pipeline::CompressOptions::default()
+    };
+
+    let compressed =
+        pipeline::compress_with_options(&input, pipeline::Pipeline::LzSeqR, &options).unwrap();
+    let decompressed = pipeline::decompress(&compressed).unwrap();
+
+    assert_eq!(decompressed, input, "pipeline GPU round-trip mismatch");
+}

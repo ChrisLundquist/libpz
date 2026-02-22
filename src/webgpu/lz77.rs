@@ -250,7 +250,12 @@ impl WebGpuEngine {
                 std::mem::size_of::<GpuMatch>() as u64,
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             );
-            return Ok(GpuMatchBuf { buf, input_len: 0 });
+            let input_buf = self.create_buffer("lz77_empty_input", 4, wgpu::BufferUsages::STORAGE);
+            return Ok(GpuMatchBuf {
+                buf,
+                input_len: 0,
+                input_buf,
+            });
         }
 
         let input_len = input.len();
@@ -364,6 +369,7 @@ impl WebGpuEngine {
         Ok(GpuMatchBuf {
             buf: resolved_buf,
             input_len,
+            input_buf,
         })
     }
 

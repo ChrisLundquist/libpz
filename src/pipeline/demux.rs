@@ -184,35 +184,27 @@ impl StreamDemuxer for LzDemuxer {
                 })
             }
             LzDemuxer::LzSeq => {
+                // GPU path: match finding + demux on-device
+                #[cfg(feature = "webgpu")]
+                if let Backend::WebGpu = options.backend {
+                    if let Some(ref engine) = options.webgpu_engine {
+                        if input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
+                            && input.len() <= engine.max_dispatch_input_size()
+                        {
+                            let enc = engine.lzseq_encode_gpu(input)?;
+                            return Ok(seq_encoded_to_demux(enc));
+                        }
+                    }
+                }
+
+                // CPU path
                 let config = lzseq::SeqConfig {
                     max_window: options
                         .seq_window_size
                         .unwrap_or_else(|| lzseq::SeqConfig::default().max_window),
                 };
                 let enc = lzseq::encode_with_config(input, &config)?;
-                // Pre-entropy len: sum of all stream sizes (approximate wire cost)
-                let pre_entropy_len = enc.flags.len()
-                    + enc.literals.len()
-                    + enc.offset_codes.len()
-                    + enc.offset_extra.len()
-                    + enc.length_codes.len()
-                    + enc.length_extra.len();
-                // Meta: [num_tokens: u32 LE][num_matches: u32 LE]
-                let mut meta = Vec::with_capacity(8);
-                meta.extend_from_slice(&enc.num_tokens.to_le_bytes());
-                meta.extend_from_slice(&enc.num_matches.to_le_bytes());
-                Ok(DemuxOutput {
-                    streams: vec![
-                        enc.flags,
-                        enc.literals,
-                        enc.offset_codes,
-                        enc.offset_extra,
-                        enc.length_codes,
-                        enc.length_extra,
-                    ],
-                    pre_entropy_len,
-                    meta,
-                })
+                Ok(seq_encoded_to_demux(enc))
             }
         }
     }
@@ -357,5 +349,30 @@ impl StreamDemuxer for LzDemuxer {
                 Ok(decoded)
             }
         }
+    }
+}
+
+/// Convert a SeqEncoded into a DemuxOutput.
+fn seq_encoded_to_demux(enc: lzseq::SeqEncoded) -> DemuxOutput {
+    let pre_entropy_len = enc.flags.len()
+        + enc.literals.len()
+        + enc.offset_codes.len()
+        + enc.offset_extra.len()
+        + enc.length_codes.len()
+        + enc.length_extra.len();
+    let mut meta = Vec::with_capacity(8);
+    meta.extend_from_slice(&enc.num_tokens.to_le_bytes());
+    meta.extend_from_slice(&enc.num_matches.to_le_bytes());
+    DemuxOutput {
+        streams: vec![
+            enc.flags,
+            enc.literals,
+            enc.offset_codes,
+            enc.offset_extra,
+            enc.length_codes,
+            enc.length_extra,
+        ],
+        pre_entropy_len,
+        meta,
     }
 }
