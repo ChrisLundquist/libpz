@@ -261,6 +261,7 @@ struct RansEncodePipelines {
     encode_wg4: wgpu::ComputePipeline,
     encode_wg8: wgpu::ComputePipeline,
     encode_wg64: wgpu::ComputePipeline,
+    encode_packed: wgpu::ComputePipeline,
 }
 
 /// LzSeq demux pipeline (1 pipeline from lzseq_demux.wgsl).
@@ -1240,6 +1241,11 @@ impl WebGpuEngine {
                     RANS_ENCODE_KERNEL_SOURCE,
                     "rans_encode_chunk",
                 ),
+                encode_packed: self.make_pipeline(
+                    "rans_encode_packed",
+                    RANS_ENCODE_KERNEL_SOURCE,
+                    "rans_encode_chunk_packed",
+                ),
             };
             if self.profiling {
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1254,6 +1260,38 @@ impl WebGpuEngine {
         } else {
             &group.encode_wg64
         }
+    }
+
+    fn pipeline_rans_encode_packed(&self) -> &wgpu::ComputePipeline {
+        &self
+            .rans_encode
+            .get_or_init(|| {
+                // This path shouldn't normally be hit since pipeline_rans_encode_for_lanes
+                // initializes the same OnceLock, but we need it for completeness.
+                RansEncodePipelines {
+                    encode_wg4: self.make_pipeline(
+                        "rans_encode_wg4",
+                        RANS_ENCODE_KERNEL_SOURCE,
+                        "rans_encode_chunk_wg4",
+                    ),
+                    encode_wg8: self.make_pipeline(
+                        "rans_encode_wg8",
+                        RANS_ENCODE_KERNEL_SOURCE,
+                        "rans_encode_chunk_wg8",
+                    ),
+                    encode_wg64: self.make_pipeline(
+                        "rans_encode_wg64",
+                        RANS_ENCODE_KERNEL_SOURCE,
+                        "rans_encode_chunk",
+                    ),
+                    encode_packed: self.make_pipeline(
+                        "rans_encode_packed",
+                        RANS_ENCODE_KERNEL_SOURCE,
+                        "rans_encode_chunk_packed",
+                    ),
+                }
+            })
+            .encode_packed
     }
 
     pub(crate) fn pipeline_lzseq_demux(&self) -> &wgpu::ComputePipeline {

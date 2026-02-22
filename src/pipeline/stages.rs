@@ -471,7 +471,7 @@ pub(crate) fn stage_rans_encode_webgpu(
             &gpu_inputs,
             options.rans_interleaved_states,
             rans::DEFAULT_SCALE_BITS,
-            1024,
+            256,
         )?
     } else {
         Vec::new()
