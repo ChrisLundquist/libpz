@@ -31,11 +31,15 @@ const COST_SCALE: u32 = 256;
 // ---------------------------------------------------------------------------
 
 /// A match candidate: one possible (offset, length) pair at a position.
+///
+/// Uses u32 fields to support both standard LZ77 (≤32KB offset, u16 length)
+/// and LzSeq (≤1MB offset, u16 length). Existing u16-based callers
+/// widen transparently.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct MatchCandidate {
-    pub offset: u16,
-    pub length: u16,
+    pub offset: u32,
+    pub length: u32,
 }
 
 /// Per-position match table: K candidates per input position.
@@ -157,6 +161,39 @@ impl CostModel {
         self.match_overhead
             .saturating_add(self.literal_cost[next_byte as usize])
     }
+
+    /// Distance-aware cost of emitting a match token (in scaled bits).
+    ///
+    /// Uses the LzSeq code+extra-bits cost model: closer matches are cheaper
+    /// because they need fewer extra bits. Falls back to `match_token` for
+    /// standard LZ77 pipelines where all matches have uniform 4-byte overhead.
+    ///
+    /// Cost = offset_code entropy (~4 bits) + offset_extra bits
+    ///      + length_code entropy (~4 bits) + length_extra bits
+    ///      + next_byte entropy
+    ///
+    /// Note: Uses raw `encode_offset` (not repeat-shifted). Does not model
+    /// repeat offset savings — a future enhancement could track repeat state
+    /// in the DP for even better LzSeq optimal parsing.
+    #[inline]
+    pub fn match_cost(&self, offset: u32, length: u16, next_byte: u8) -> u32 {
+        if offset == 0 {
+            return self.match_token(next_byte);
+        }
+        let (oc, oeb, _) = crate::lzseq::encode_offset(offset);
+        let (_lc, leb, _) = crate::lzseq::encode_length(length);
+        // Code bytes: each is a small value (0-31), ~4 bits after entropy coding
+        let code_cost = 4 * COST_SCALE * 2; // 2 code bytes × ~4 bits each
+                                            // Extra bits: raw (not entropy coded, ~1:1)
+        let extra_cost = (oeb as u32 + leb as u32) * COST_SCALE;
+        // Suppress near-zero offset codes — offset code 0 and 1 are extremely
+        // common and compress to ~2 bits instead of 4.
+        let code_discount = if oc <= 1 { 2 * COST_SCALE } else { 0 };
+        code_cost
+            .saturating_sub(code_discount)
+            .saturating_add(extra_cost)
+            .saturating_add(self.literal_cost[next_byte as usize])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +221,10 @@ pub(crate) fn build_match_table_cpu_with_limit(
         let top_k = finder.find_top_k(input, pos, k);
         let slot = table.at_mut(pos);
         for (i, &(length, offset)) in top_k.iter().enumerate() {
-            slot[i] = MatchCandidate { offset, length };
+            slot[i] = MatchCandidate {
+                offset: offset as u32,
+                length: length as u32,
+            };
         }
         finder.insert(input, pos);
     }
@@ -200,6 +240,13 @@ pub(crate) fn build_match_table_cpu_with_limit(
 ///
 /// Returns a `Vec<Match>` representing the optimal sequence of
 /// literals and matches, compatible with `lz77::decompress()`.
+///
+/// NOTE: This parser outputs LZ77 `Match` structs with u16 offset/length.
+/// It uses distance-aware `match_cost()` which models the LzSeq code+extra-bits
+/// encoding cost (closer matches are cheaper). This also improves decisions for
+/// LZ77 pipelines since shorter offsets genuinely cost less to encode.
+/// For LzSeq with windows >32KB, a wider parser producing u32 offsets would
+/// be needed.
 pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -> Vec<Match> {
     let n = input.len();
     if n == 0 {
@@ -225,7 +272,7 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
 
         // Option 2: each match candidate at this position
         for cand in table.at(i) {
-            if cand.length < MIN_MATCH {
+            if cand.length < MIN_MATCH as u32 {
                 break; // candidates are sorted by length desc; rest are empty
             }
             let match_end = i + cand.length as usize; // position of 'next' byte
@@ -234,14 +281,16 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
             }
             let next_pos = match_end + 1;
             // Token: Match { offset, length, next:input[match_end] }
-            // Covers (length + 1) input bytes with one 5-byte token
+            // Covers (length + 1) input bytes with one 5-byte token.
+            // Uses distance-aware match_cost: shorter offsets are cheaper
+            // (fewer extra bits), improving parse decisions for all pipelines.
             let mcost = cost_model
-                .match_token(input[match_end])
+                .match_cost(cand.offset, cand.length as u16, input[match_end])
                 .saturating_add(cost[next_pos]);
             if mcost < cost[i] {
                 cost[i] = mcost;
-                choice_len[i] = cand.length;
-                choice_offset[i] = cand.offset;
+                choice_len[i] = cand.length as u16;
+                choice_offset[i] = cand.offset as u16;
             }
         }
     }

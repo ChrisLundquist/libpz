@@ -1,6 +1,6 @@
 # Quality Status
 
-**Last Updated:** 2026-02-14
+**Last Updated:** 2026-02-22
 **Owner:** Engineering team
 
 ## Purpose
@@ -41,12 +41,9 @@ Each module is graded on five dimensions:
   - Break-even: ~256KB blocks
 - **Performance:** ✅ Beats gzip on 256KB+ blocks
   - Throughput: 150-200 MB/s (CPU), 300-500 MB/s (GPU batched)
-- **Documentation:** ⚠️ B - Missing optimal parsing explanation
-  - API docs complete
-  - GPU kernels documented
-  - Optimal parsing (backward DP) needs design doc
+- **Documentation:** ✅ A - API docs, GPU kernels, optimal parsing design doc
 
-**Gaps:** Optimal parsing design doc
+**Gaps:** None
 
 ---
 
@@ -158,6 +155,32 @@ Each module is graded on five dimensions:
 
 ---
 
+### lzseq (Sequence Encoding — zstd-style)
+**Overall Grade:** ⚠️ B
+
+- **Correctness:** ✅ All validation tests pass
+- **Test Coverage:** ✅ 90%+ lines covered
+  - Code table exhaustive round-trip (encode/decode offset/length for all valid values)
+  - BitWriter/BitReader round-trip
+  - Encode/decode round-trip on varied inputs (empty, small, large, repetitive, random)
+  - Repeat offset coverage (structured data, 30%+ repeat rate)
+  - Distance-dependent MIN_MATCH filtering
+  - Decode hardening (truncated streams, overflow detection)
+- **GPU:** ❌ CPU-only (GPU pipeline planned as Phase 6)
+- **Performance:** ✅ Best compression ratio of all libpz pipelines
+  - Ratio: 32.0% on Canterbury corpus (vs 40.7% LzssR, 28.6% gzip)
+  - Encode: ~17-19 MB/s (CPU lazy matching)
+  - Decode: ~23 MB/s (CPU)
+- **Documentation:** ✅ Module doc with code tables, repeat offset design, stream layout
+
+**Gaps:**
+- Fuzz infrastructure in `fuzz/` (12 targets); 24h campaign pending
+- Optimal parser not yet adapted for LzSeq (uses LZ77 `match_cost` approximation)
+- GPU pipeline (Phase 6) not started
+- Repeat match checking uses scalar byte-by-byte comparison (no SIMD)
+
+---
+
 ### optimal (Optimal LZ77 Parsing)
 **Overall Grade:** ⚠️ B
 
@@ -168,11 +191,10 @@ Each module is graded on five dimensions:
 - **GPU:** ✅ Partial (top-K on GPU, DP on CPU)
 - **Performance:** ✅ 4-6% better compression than greedy
   - Throughput: 30-50% of greedy speed (expected trade-off)
-- **Documentation:** ❌ D - Missing design doc
+- **Documentation:** ✅ B - Design doc: `docs/design-docs/optimal-parsing.md`
 
 **Gaps:**
-- No design doc explaining backward DP algorithm
-- Cost model tuning not documented
+- Repeat offset modeling not in cost model (documented as future enhancement)
 
 ---
 
@@ -214,6 +236,21 @@ Each module is graded on five dimensions:
 - **Documentation:** ✅ Complete
 
 **Gaps:** rANS SIMD decode not wired
+
+---
+
+### lzseqr (LzSeq + rANS)
+**Overall Grade:** ⚠️ B
+
+- **Correctness:** ✅ All validation tests pass
+- **Multi-stream:** ✅ 6-stream demux (flags, literals, offset_codes, offset_extra, length_codes, length_extra)
+- **GPU:** ❌ CPU-only (GPU on-device pipeline planned)
+- **Performance:** ✅ Best compression ratio of any libpz pipeline (32.0%)
+  - 8.7pp better than LzssR, 3.4pp behind gzip
+  - Encode: ~17-19 MB/s, Decode: ~23 MB/s
+- **Documentation:** ✅ Complete
+
+**Gaps:** GPU pipeline (on-device match → code split → rANS → pack)
 
 ---
 
@@ -337,11 +374,11 @@ See `exec-plans/tech-debt-tracker.md` for the full prioritized list of known gap
 
 ## Summary Statistics
 
-- **Total tests:** 651 passing, 0 failing
-- **Overall quality:** 11/12 milestones complete
+- **Total tests:** 700+ passing, 0 failing
+- **Overall quality:** 12/12 milestones complete
 - **GPU readiness:** 80% (LZ77, Huffman encode fully GPU-accelerated)
-- **Documentation coverage:** 90% (missing optimal parsing, some FFI docs)
+- **Documentation coverage:** 95% (missing some FFI docs)
 
 ---
 
-**Next quality review:** After M5.3 (fuzz testing) completion
+**Next quality review:** After 24h fuzz campaign results

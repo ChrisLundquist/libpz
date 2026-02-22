@@ -134,3 +134,20 @@ fn rans_decode_chunk(
     let chunk_id = wid.x + wid.y * nwork.x;
     rans_decode_chunk_impl(chunk_id, lid.x, params.x, params.y, params.z);
 }
+
+// Wave-packed: each workgroup processes 64/num_lanes chunks.
+// Threads within the workgroup map to (chunk_offset, lane) pairs,
+// filling the full 64-wide RDNA wave instead of wasting lanes.
+@compute @workgroup_size(64)
+fn rans_decode_chunk_packed(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwork: vec3<u32>
+) {
+    let num_lanes = params.y;
+    let chunks_per_wg = 64u / num_lanes;
+    let wg_base = (wid.x + wid.y * nwork.x) * chunks_per_wg;
+    let chunk_id = wg_base + lid.x / num_lanes;
+    let lane_id = lid.x % num_lanes;
+    rans_decode_chunk_impl(chunk_id, lane_id, params.x, num_lanes, params.z);
+}

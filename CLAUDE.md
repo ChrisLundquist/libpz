@@ -39,7 +39,7 @@ Specialized agents in `.claude/agents/` run on cheaper models and keep verbose o
 ## Project layout
 
 - `src/lib.rs` — crate root, `PzError`/`PzResult` types
-- `src/{algorithm}.rs` — one file per composable algorithm (bwt, crc32, deflate, fse, huffman, lz77, lz78, lzss, mtf, rans, rle)
+- `src/{algorithm}.rs` — one file per composable algorithm (bwt, crc32, deflate, fse, huffman, lz77, lz78, lzseq, lzss, mtf, rans, rle)
 - `src/analysis.rs` — data profiling (entropy, match density, run ratio, autocorrelation)
 - `src/optimal.rs` — optimal parsing (GPU top-K + backward DP)
 - `src/simd.rs` — SIMD decode paths for rANS

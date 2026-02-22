@@ -526,6 +526,78 @@ fn rans_decode_interleaved(
     Ok(output)
 }
 
+/// Like [`rans_decode_interleaved`] but writes into a pre-allocated output buffer.
+fn rans_decode_interleaved_into(
+    word_streams: &[&[u16]],
+    initial_states: &[u32],
+    norm: &NormalizedFreqs,
+    lookup: &[u8],
+    original_len: usize,
+    output: &mut [u8],
+) -> PzResult<()> {
+    let num_states = initial_states.len();
+    if word_streams.len() != num_states || num_states == 0 {
+        return Err(PzError::InvalidInput);
+    }
+
+    // Fast path: 4-way batched decode
+    if num_states == 4 {
+        let streams_arr: [&[u16]; 4] = [
+            word_streams[0],
+            word_streams[1],
+            word_streams[2],
+            word_streams[3],
+        ];
+        let states_arr: [u32; 4] = [
+            initial_states[0],
+            initial_states[1],
+            initial_states[2],
+            initial_states[3],
+        ];
+        return crate::simd::rans_decode_4way_into(
+            &streams_arr,
+            &states_arr,
+            &norm.freq,
+            &norm.cum,
+            lookup,
+            norm.scale_bits as u32,
+            original_len,
+            output,
+        )
+        .ok_or(PzError::InvalidInput);
+    }
+
+    // Generic N-way path
+    let scale_bits = norm.scale_bits as u32;
+    let scale_mask = (1u32 << scale_bits) - 1;
+
+    let mut states: Vec<u32> = initial_states.to_vec();
+    let mut word_positions: Vec<usize> = vec![0; num_states];
+
+    for (i, out) in output.iter_mut().enumerate() {
+        let lane = i % num_states;
+        let slot = states[lane] & scale_mask;
+        if slot as usize >= lookup.len() {
+            return Err(PzError::InvalidInput);
+        }
+        let s = lookup[slot as usize];
+        let freq = norm.freq[s as usize] as u32;
+        let cum = norm.cum[s as usize] as u32;
+
+        states[lane] = freq * (states[lane] >> scale_bits) + slot - cum;
+
+        if states[lane] < RANS_L && word_positions[lane] < word_streams[lane].len() {
+            states[lane] =
+                (states[lane] << IO_BITS) | word_streams[lane][word_positions[lane]] as u32;
+            word_positions[lane] += 1;
+        }
+
+        *out = s;
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Serialization helpers
 // ---------------------------------------------------------------------------
@@ -1087,22 +1159,27 @@ pub fn decode_chunked(input: &[u8]) -> PzResult<Vec<u8>> {
         cursor += 2;
     }
 
-    // --- Per-Chunk Data ---
-    let mut decoded_output = Vec::new();
+    // --- Pre-allocate output and reusable per-chunk buffers ---
+    let total_len: usize = chunk_original_lens.iter().sum();
+    let mut decoded_output = vec![0u8; total_len];
+    let mut output_offset = 0;
+
+    let mut initial_states = vec![0u32; num_states];
+    let mut word_counts = vec![0usize; num_states];
+    let mut word_slices: Vec<WordSlice<'_>> = Vec::with_capacity(num_states);
 
     for &original_len in &chunk_original_lens {
         // [final_states: N × u32]
         if input.len() < cursor + num_states * 4 {
             return Err(PzError::InvalidInput);
         }
-        let mut initial_states = Vec::with_capacity(num_states);
-        for _ in 0..num_states {
-            initial_states.push(u32::from_le_bytes([
+        for state in initial_states.iter_mut() {
+            *state = u32::from_le_bytes([
                 input[cursor],
                 input[cursor + 1],
                 input[cursor + 2],
                 input[cursor + 3],
-            ]));
+            ]);
             cursor += 4;
         }
 
@@ -1110,19 +1187,18 @@ pub fn decode_chunked(input: &[u8]) -> PzResult<Vec<u8>> {
         if input.len() < cursor + num_states * 4 {
             return Err(PzError::InvalidInput);
         }
-        let mut word_counts = Vec::with_capacity(num_states);
-        for _ in 0..num_states {
-            word_counts.push(u32::from_le_bytes([
+        for wc in word_counts.iter_mut() {
+            *wc = u32::from_le_bytes([
                 input[cursor],
                 input[cursor + 1],
                 input[cursor + 2],
                 input[cursor + 3],
-            ]) as usize);
+            ]) as usize;
             cursor += 4;
         }
 
         // Word streams
-        let mut word_slices = Vec::with_capacity(num_states);
+        word_slices.clear();
         for &count in &word_counts {
             if input.len() < cursor + count * 2 {
                 return Err(PzError::InvalidInput);
@@ -1132,10 +1208,16 @@ pub fn decode_chunked(input: &[u8]) -> PzResult<Vec<u8>> {
         }
         let word_streams: Vec<&[u16]> = word_slices.iter().map(|ws| &**ws).collect();
 
-        // Decode this chunk
-        let decoded_chunk =
-            rans_decode_interleaved(&word_streams, &initial_states, &norm, &lookup, original_len)?;
-        decoded_output.extend(decoded_chunk);
+        // Decode directly into output buffer
+        rans_decode_interleaved_into(
+            &word_streams,
+            &initial_states,
+            &norm,
+            &lookup,
+            original_len,
+            &mut decoded_output[output_offset..output_offset + original_len],
+        )?;
+        output_offset += original_len;
     }
 
     Ok(decoded_output)

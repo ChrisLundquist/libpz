@@ -1,6 +1,6 @@
 # Technical Debt Tracker
 
-**Last Updated:** 2026-02-16
+**Last Updated:** 2026-02-22
 **Owner:** Engineering team
 
 ## Purpose
@@ -18,55 +18,37 @@ Catalog of known issues, gaps, and technical debt in libpz. Items are prioritize
 
 ### P0: Critical
 
-#### M5.3: Fuzz Testing Not Started
-**Status:** Not started
-**Impact:** Correctness (cannot verify random input handling)
+#### M5.3: Fuzz Testing Infrastructure
+**Status:** Complete (infrastructure); 24h campaign pending
+**Impact:** Correctness (random input handling validation)
 **Milestone:** M5.3
-**Estimated effort:** 2-3 days
 
-**Description:**
-No fuzz testing infrastructure. Should use `cargo-fuzz` to test:
-- Random inputs 0-1MB
-- Verify round-trip property (encode → decode → original)
-- Check error handling on malformed compressed data
-- Test all pipelines and standalone algorithms
+**Completed:**
+- `fuzz/` directory with `cargo-fuzz` Cargo.toml
+- 12 fuzz targets covering all algorithms and pipelines:
+  - `fuzz_pipeline_roundtrip` — all 9 pipelines compress/decompress roundtrip
+  - `fuzz_decompress` — arbitrary bytes to decompress (crash resistance)
+  - `fuzz_bwt`, `fuzz_rans`, `fuzz_fse`, `fuzz_huffman` — entropy coding roundtrips
+  - `fuzz_lz77`, `fuzz_lz78`, `fuzz_lzss`, `fuzz_lzseq` — LZ family roundtrips
+  - `fuzz_rle`, `fuzz_mtf` — simple codec roundtrips
+- Each target tests encode→decode roundtrip AND arbitrary-bytes decode crash resistance
+- Requires: `rustup toolchain install nightly && cargo install cargo-fuzz`
+- Run: `cd fuzz && cargo +nightly fuzz run <target> -- -max_len=65536`
 
-**References:**
-- ARCHITECTURE.md mentions M5.3 as only incomplete milestone
-- validation.rs has corpus tests but no property tests
-
-**Action items:**
-1. Add `cargo-fuzz` to dev dependencies
-2. Create fuzz targets for each algorithm
-3. Create fuzz targets for each pipeline
-4. Run 24h fuzz campaign on CI
-5. Document findings in design-docs/
+**Remaining:**
+1. Run 24h fuzz campaign on CI
+2. Document any findings
 
 ---
 
 ### P1: High Priority
 
-#### Optimal Parsing Design Doc Missing
-**Status:** Not started
-**Impact:** Documentation (hard to understand/maintain optimal.rs)
-**Estimated effort:** 1 day
+#### Optimal Parsing Design Doc
+**Status:** Complete
+**Impact:** Documentation
+**Completed:** 2026-02-22
 
-**Description:**
-`src/optimal.rs` implements backward DP for optimal LZ77 parsing but lacks design documentation:
-- How the cost model works
-- Why backward DP (vs forward greedy)
-- GPU top-K match table → CPU DP handoff
-- Parameter tuning (cost weights)
-
-**References:**
-- QUALITY.md rates optimal.rs as D for documentation
-- Code is correct (tests pass) but opaque
-
-**Action items:**
-1. Create docs/design-docs/optimal-parsing.md
-2. Explain backward DP algorithm with diagram
-3. Document cost model parameters
-4. Link to academic references (if any)
+Created `docs/design-docs/optimal-parsing.md` covering backward DP algorithm, cost model, GPU top-K handoff, and tuning parameters.
 
 ---
 

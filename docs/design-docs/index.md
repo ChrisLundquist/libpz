@@ -1,6 +1,6 @@
 # Design Documentation Index
 
-**Last Updated:** 2026-02-14
+**Last Updated:** 2026-02-22
 
 ## Purpose
 
@@ -68,6 +68,20 @@ LZ77 GPU kernel implementation details. Hash-table kernel, batch kernel, top-K k
 
 ---
 
+### [nvcomp-analysis.md](nvcomp-analysis.md)
+**Status:** ✅ Active
+**Last reviewed:** 2026-02-22
+
+NVIDIA nvcomp architecture analysis: how they achieve 90-320 GB/s, and which patterns apply to libpz.
+
+**Key topics:**
+- Throughput comparison (nvcomp A100 vs libpz Radeon Pro 5500M)
+- 6 architectural patterns: massive batching, block-independent LZ, segmented ANS, persistent buffers, minimize transfers, hardware-aware kernels
+- Why there's a gap (hardware 100x, batch size 10-100x, API abstraction)
+- Actionable recommendations ranked by impact
+
+---
+
 ## Research and Experiments
 
 ### [experiments.md](experiments.md)
@@ -96,20 +110,21 @@ Development research log. Early design decisions and exploration.
 
 ---
 
+### [optimal-parsing.md](optimal-parsing.md)
+**Status:** ✅ Active
+**Last reviewed:** 2026-02-22
+
+Backward DP optimal parsing: algorithm, cost model, GPU top-K handoff.
+
+**Key topics:**
+- Backward DP algorithm (O(n*K) time, O(n) space)
+- Cost model: literal overhead, match overhead, distance-aware LzSeq costs
+- GPU top-K match finding → CPU DP handoff
+- MatchTable layout and tuning parameters
+
+---
+
 ## Needed Documentation
-
-### optimal-parsing.md (Missing - P1)
-**Status:** ❌ Not started
-
-Design documentation for `src/optimal.rs`. Should explain:
-- Backward DP algorithm
-- Cost model (why these weights?)
-- GPU top-K → CPU DP handoff
-- Parameter tuning guidance
-
-**Owner:** Unassigned
-**Priority:** P1 (high)
-**Effort:** 1 day
 
 ---
 

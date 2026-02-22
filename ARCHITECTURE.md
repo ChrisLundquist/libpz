@@ -3,18 +3,16 @@
 Detailed implementation notes, benchmarks, and roadmap for libpz.
 For day-to-day development instructions, see `CLAUDE.md`.
 
-## Completed milestones (11/12)
-- **Algorithms:** LZ77 (brute, hashchain, lazy, parallel), Huffman, BWT (SA-IS), MTF, RLE, FSE, rANS
-- **Pipelines:** Deflate (LZ77+Huffman), Bw (BWT+MTF+RLE+FSE), Lzr (LZ77+rANS), Lzf (LZ77+FSE) — Deflate, Lzr, and Lzf use multi-stream entropy coding for ~16-18% better compression
-- **Auto-selection:** Heuristic (`select_pipeline`) and trial-based (`select_pipeline_trial`) pipeline selection using data analysis (entropy, match density, run ratio, autocorrelation)
+## Completed milestones (12/12)
+- **Algorithms:** LZ77 (brute, hashchain, lazy, parallel), LzSeq (code+extra-bits, repeat offsets, 128KB window), Huffman, BWT (SA-IS), MTF, RLE, FSE, rANS
+- **Pipelines:** Deflate (LZ77+Huffman), Bw (BWT+MTF+RLE+FSE), Lzr (LZ77+rANS), Lzf (LZ77+FSE), LzSeqR (LzSeq+rANS) — Deflate, Lzr, and Lzf use multi-stream entropy coding for ~16-18% better compression; LzSeqR uses zstd-style code+extra-bits encoding with 6-stream demux
+- **Auto-selection:** Heuristic (`select_pipeline`) and trial-based (`select_pipeline_trial`) pipeline selection using data analysis (entropy, match density, run ratio, autocorrelation); LzSeqR included in trial candidates
 - **Data analysis:** `src/analysis.rs` — statistical profiling (Shannon entropy, autocorrelation, run ratio, match density, distribution shape) with sampling support
 - **Optimal parsing:** GPU top-K match table → CPU backward DP (4-6% better compression)
 - **Multi-threading:** Block-parallel and pipeline-parallel via V2 container format; within-block parallel LZ77 match finding (`compress_lazy_parallel`)
 - **GPU kernels:** LZ77 hash-table (fast), LZ77 batch/per-position (legacy), LZ77 top-K, BWT radix sort + parallel rank assignment, Huffman encode (two-pass with Blelloch prefix sum), GPU Deflate chaining (LZ77→Huffman on device)
 - **Tooling:** CLI (`pz` with `-a`/`--auto` and `--trial` flags), C FFI, Criterion benchmarks, CI (3 OS)
-
-### Not started
-- M5.3: Fuzz testing (`cargo-fuzz`)
+- **Fuzz testing (M5.3):** `cargo-fuzz` infrastructure with 12 targets covering all algorithms and pipelines (roundtrip + crash resistance)
 
 ### Partially complete
 - **rANS SIMD decode paths** — N-way interleaved rANS decode in `src/simd.rs` (SSE2 4-way, AVX2 8-way). The scalar interleaved encoder/decoder is implemented; SIMD intrinsics for the hot decode loop are not yet wired.

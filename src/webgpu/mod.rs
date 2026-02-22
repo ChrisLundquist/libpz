@@ -40,6 +40,7 @@ mod bwt;
 mod fse;
 mod huffman;
 pub(crate) mod lz77;
+pub(crate) mod lzseq;
 pub(crate) mod rans;
 
 #[cfg(test)]
@@ -81,6 +82,9 @@ const RANS_DECODE_KERNEL_SOURCE: &str = include_str!("../../kernels/rans_decode.
 
 /// Embedded WGSL kernel source: GPU chunked rANS encode.
 const RANS_ENCODE_KERNEL_SOURCE: &str = include_str!("../../kernels/rans_encode.wgsl");
+
+/// Embedded WGSL kernel source: GPU LzSeq demux (match buffer → 6 streams).
+const LZSEQ_DEMUX_KERNEL_SOURCE: &str = include_str!("../../kernels/lzseq_demux.wgsl");
 
 /// Number of candidates per position in the top-K kernel (must match K in lz77_topk.wgsl).
 const TOPK_K: usize = 4;
@@ -250,6 +254,7 @@ struct RansDecodePipelines {
     decode_wg4: wgpu::ComputePipeline,
     decode_wg8: wgpu::ComputePipeline,
     decode_wg64: wgpu::ComputePipeline,
+    decode_packed: wgpu::ComputePipeline,
 }
 
 /// rANS encode pipelines (lane-specialized entries from rans_encode.wgsl).
@@ -257,6 +262,12 @@ struct RansEncodePipelines {
     encode_wg4: wgpu::ComputePipeline,
     encode_wg8: wgpu::ComputePipeline,
     encode_wg64: wgpu::ComputePipeline,
+    encode_packed: wgpu::ComputePipeline,
+}
+
+/// LzSeq demux pipeline (1 pipeline from lzseq_demux.wgsl).
+struct LzSeqPipelines {
+    demux: wgpu::ComputePipeline,
 }
 
 /// WebGPU compute engine.
@@ -282,6 +293,7 @@ pub struct WebGpuEngine {
     lz77_decode: OnceLock<Lz77DecodePipelines>,
     rans_decode: OnceLock<RansDecodePipelines>,
     rans_encode: OnceLock<RansEncodePipelines>,
+    lzseq_demux: OnceLock<LzSeqPipelines>,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum compute workgroup size.
@@ -436,6 +448,7 @@ impl WebGpuEngine {
             lz77_decode: OnceLock::new(),
             rans_decode: OnceLock::new(),
             rans_encode: OnceLock::new(),
+            lzseq_demux: OnceLock::new(),
             device_name,
             max_work_group_size,
             max_workgroups_per_dim,
@@ -1194,6 +1207,11 @@ impl WebGpuEngine {
                     RANS_DECODE_KERNEL_SOURCE,
                     "rans_decode_chunk",
                 ),
+                decode_packed: self.make_pipeline(
+                    "rans_decode_packed",
+                    RANS_DECODE_KERNEL_SOURCE,
+                    "rans_decode_chunk_packed",
+                ),
             };
             if self.profiling {
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1208,6 +1226,34 @@ impl WebGpuEngine {
         } else {
             &group.decode_wg64
         }
+    }
+
+    fn pipeline_rans_decode_packed(&self) -> &wgpu::ComputePipeline {
+        &self
+            .rans_decode
+            .get_or_init(|| RansDecodePipelines {
+                decode_wg4: self.make_pipeline(
+                    "rans_decode_wg4",
+                    RANS_DECODE_KERNEL_SOURCE,
+                    "rans_decode_chunk_wg4",
+                ),
+                decode_wg8: self.make_pipeline(
+                    "rans_decode_wg8",
+                    RANS_DECODE_KERNEL_SOURCE,
+                    "rans_decode_chunk_wg8",
+                ),
+                decode_wg64: self.make_pipeline(
+                    "rans_decode_wg64",
+                    RANS_DECODE_KERNEL_SOURCE,
+                    "rans_decode_chunk",
+                ),
+                decode_packed: self.make_pipeline(
+                    "rans_decode_packed",
+                    RANS_DECODE_KERNEL_SOURCE,
+                    "rans_decode_chunk_packed",
+                ),
+            })
+            .decode_packed
     }
 
     fn pipeline_rans_encode_for_lanes(&self, num_lanes: usize) -> &wgpu::ComputePipeline {
@@ -1229,6 +1275,11 @@ impl WebGpuEngine {
                     RANS_ENCODE_KERNEL_SOURCE,
                     "rans_encode_chunk",
                 ),
+                encode_packed: self.make_pipeline(
+                    "rans_encode_packed",
+                    RANS_ENCODE_KERNEL_SOURCE,
+                    "rans_encode_chunk_packed",
+                ),
             };
             if self.profiling {
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1243,6 +1294,59 @@ impl WebGpuEngine {
         } else {
             &group.encode_wg64
         }
+    }
+
+    fn pipeline_rans_encode_packed(&self) -> &wgpu::ComputePipeline {
+        &self
+            .rans_encode
+            .get_or_init(|| {
+                // This path shouldn't normally be hit since pipeline_rans_encode_for_lanes
+                // initializes the same OnceLock, but we need it for completeness.
+                RansEncodePipelines {
+                    encode_wg4: self.make_pipeline(
+                        "rans_encode_wg4",
+                        RANS_ENCODE_KERNEL_SOURCE,
+                        "rans_encode_chunk_wg4",
+                    ),
+                    encode_wg8: self.make_pipeline(
+                        "rans_encode_wg8",
+                        RANS_ENCODE_KERNEL_SOURCE,
+                        "rans_encode_chunk_wg8",
+                    ),
+                    encode_wg64: self.make_pipeline(
+                        "rans_encode_wg64",
+                        RANS_ENCODE_KERNEL_SOURCE,
+                        "rans_encode_chunk",
+                    ),
+                    encode_packed: self.make_pipeline(
+                        "rans_encode_packed",
+                        RANS_ENCODE_KERNEL_SOURCE,
+                        "rans_encode_chunk_packed",
+                    ),
+                }
+            })
+            .encode_packed
+    }
+
+    pub(crate) fn pipeline_lzseq_demux(&self) -> &wgpu::ComputePipeline {
+        &self
+            .lzseq_demux
+            .get_or_init(|| {
+                let t0 = std::time::Instant::now();
+                let group = LzSeqPipelines {
+                    demux: self.make_pipeline(
+                        "lzseq_demux",
+                        LZSEQ_DEMUX_KERNEL_SOURCE,
+                        "lzseq_demux",
+                    ),
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile lzseq_demux.wgsl: {ms:.3} ms");
+                }
+                group
+            })
+            .demux
     }
 }
 
@@ -1335,6 +1439,8 @@ impl DeviceBuf {
 pub struct GpuMatchBuf {
     pub(crate) buf: wgpu::Buffer,
     pub(crate) input_len: usize,
+    /// The original input bytes on-device (reusable by downstream kernels).
+    pub(crate) input_buf: wgpu::Buffer,
 }
 
 impl GpuMatchBuf {

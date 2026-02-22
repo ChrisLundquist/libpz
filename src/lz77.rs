@@ -179,6 +179,13 @@ const MAX_INSERT_LEN: usize = 128;
 /// A match this long is unlikely to be beaten by the next position.
 const LAZY_SKIP_THRESHOLD: u16 = 32;
 
+/// Wide match result with u32 offset for finders with windows > 32KB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WideMatch {
+    pub offset: u32,
+    pub length: u16,
+}
+
 /// Hash-chain based match finder.
 ///
 /// Maintains a hash table mapping 3-byte prefixes to positions,
@@ -186,7 +193,7 @@ const LAZY_SKIP_THRESHOLD: u16 = 32;
 pub(crate) struct HashChainFinder {
     /// head[hash] = most recent position with this hash, or 0
     head: Vec<u32>,
-    /// prev[pos % MAX_WINDOW] = previous position in the chain
+    /// prev[pos % max_window] = previous position in the chain
     prev: Vec<u32>,
     /// Cached SIMD dispatcher — resolved once, avoids per-call feature detection.
     dispatcher: crate::simd::Dispatcher,
@@ -196,6 +203,11 @@ pub(crate) struct HashChainFinder {
     max_match_len: usize,
     /// Maximum number of chain links to walk for each match search.
     max_chain: usize,
+    /// Sliding window size. Defaults to MAX_WINDOW (32KB).
+    /// Larger values enable longer-distance matches (requires `find_match_wide`).
+    max_window: usize,
+    /// Bitmask for modular indexing into `prev` (max_window - 1).
+    window_mask: usize,
 }
 
 impl HashChainFinder {
@@ -217,22 +229,43 @@ impl HashChainFinder {
             dispatcher: crate::simd::Dispatcher::new(),
             max_match_len: max_match_len as usize,
             max_chain: max_chain.clamp(1, MAX_CHAIN),
+            max_window: MAX_WINDOW,
+            window_mask: WINDOW_MASK,
         }
     }
 
-    /// Find the best match at `pos` in `input`, looking back up to MAX_WINDOW bytes.
+    /// Create a match finder with a custom window size.
     ///
-    /// Uses SIMD-accelerated byte comparison (SSE2: 16 bytes/cycle,
-    /// AVX2: 32 bytes/cycle) for the inner match extension loop.
-    pub(crate) fn find_match(&self, input: &[u8], pos: usize) -> Match {
+    /// `max_window` must be a power of 2. The `prev` array scales with
+    /// the window size (4 bytes per position). Use `find_match_wide()` to
+    /// get u32 offsets for windows > 32KB.
+    ///
+    /// Memory: 128KB window = 512KB prev array, 256KB = 1MB, etc.
+    pub(crate) fn with_window(max_window: usize, max_match_len: u16) -> Self {
+        debug_assert!(
+            max_window.is_power_of_two(),
+            "max_window must be power of 2"
+        );
+        Self {
+            head: vec![0; HASH_SIZE],
+            prev: vec![0; max_window],
+            dispatcher: crate::simd::Dispatcher::new(),
+            max_match_len: max_match_len as usize,
+            max_chain: MAX_CHAIN,
+            max_window,
+            window_mask: max_window - 1,
+        }
+    }
+
+    /// Core match-finding loop. Returns (best_offset, best_length) as raw u32.
+    ///
+    /// Does not cap offset/length or ensure room for a literal `next` byte.
+    /// Callers post-process the result for their specific needs.
+    #[inline]
+    fn find_best(&self, input: &[u8], pos: usize, max_lookback: usize) -> (u32, u32) {
         let remaining = input.len() - pos;
         if remaining < 3 {
-            // Not enough bytes for a match prefix
-            return Match {
-                offset: 0,
-                length: 0,
-                next: if pos < input.len() { input[pos] } else { 0 },
-            };
+            return (0, 0);
         }
 
         let h = hash3(input, pos);
@@ -240,7 +273,7 @@ impl HashChainFinder {
         let mut best_offset: u32 = 0;
         let mut best_length: u32 = 0;
         let mut best_probe_byte: u8 = 0;
-        let min_pos = pos.saturating_sub(MAX_WINDOW);
+        let min_pos = pos.saturating_sub(max_lookback);
         let mut chain_count = 0;
         let pos_suffix = &input[pos..];
         let cmp_limit = remaining.min(self.max_match_len);
@@ -252,7 +285,7 @@ impl HashChainFinder {
                 let probe = best_length as usize;
                 debug_assert!(probe < remaining);
                 if input[chain_pos + probe] != best_probe_byte {
-                    let prev_pos = self.prev[chain_pos & WINDOW_MASK] as usize;
+                    let prev_pos = self.prev[chain_pos & self.window_mask] as usize;
                     if prev_pos >= chain_pos || prev_pos < min_pos {
                         break;
                     }
@@ -276,15 +309,14 @@ impl HashChainFinder {
             if match_len > best_length && match_len >= MIN_MATCH as u32 {
                 best_length = match_len;
                 best_offset = (pos - chain_pos) as u32;
-                // Can't do better while still leaving room for the required literal.
-                if best_length as usize + 1 >= remaining {
+                if best_length as usize >= cmp_limit {
                     break;
                 }
                 best_probe_byte = input[pos + best_length as usize];
             }
 
             // Follow chain
-            let prev_pos = self.prev[chain_pos & WINDOW_MASK] as usize;
+            let prev_pos = self.prev[chain_pos & self.window_mask] as usize;
             if prev_pos >= chain_pos || prev_pos < min_pos {
                 break;
             }
@@ -292,7 +324,31 @@ impl HashChainFinder {
             chain_count += 1;
         }
 
-        // Ensure room for the literal `next` byte
+        (best_offset, best_length)
+    }
+
+    /// Find the best match at `pos` in `input`, looking back up to MAX_WINDOW bytes.
+    ///
+    /// Uses SIMD-accelerated byte comparison (SSE2: 16 bytes/cycle,
+    /// AVX2: 32 bytes/cycle) for the inner match extension loop.
+    ///
+    /// Returns a `Match` with u16 offset (safe for windows up to 32KB).
+    /// For wider windows, use `find_match_wide()`.
+    pub(crate) fn find_match(&self, input: &[u8], pos: usize) -> Match {
+        let remaining = input.len() - pos;
+        if remaining < 3 {
+            return Match {
+                offset: 0,
+                length: 0,
+                next: if pos < input.len() { input[pos] } else { 0 },
+            };
+        }
+
+        // Cap lookback to u16::MAX so offset fits in Match.offset (u16).
+        let max_lookback = self.max_window.min(u16::MAX as usize);
+        let (best_offset, mut best_length) = self.find_best(input, pos, max_lookback);
+
+        // Ensure room for the literal `next` byte (required by LZ77 triple format)
         while best_length as usize >= remaining && best_length > 0 {
             best_length -= 1;
         }
@@ -315,6 +371,21 @@ impl HashChainFinder {
         }
     }
 
+    /// Find the best match with u32 offset, for wide-window finders.
+    ///
+    /// Unlike `find_match()`, this:
+    /// - Returns a u32 offset (supports windows > 32KB)
+    /// - Does NOT reduce length to leave room for a literal `next` byte
+    ///   (suitable for LZSS/LzSeq formats that separate literals from matches)
+    pub(crate) fn find_match_wide(&self, input: &[u8], pos: usize) -> WideMatch {
+        let (best_offset, best_length) = self.find_best(input, pos, self.max_window);
+
+        WideMatch {
+            offset: best_offset,
+            length: best_length.min(u16::MAX as u32) as u16,
+        }
+    }
+
     /// Insert position `pos` into the hash chain.
     #[inline(always)]
     pub(crate) fn insert(&mut self, input: &[u8], pos: usize) {
@@ -322,7 +393,7 @@ impl HashChainFinder {
             return;
         }
         let h = hash3(input, pos);
-        self.prev[pos & WINDOW_MASK] = self.head[h];
+        self.prev[pos & self.window_mask] = self.head[h];
         self.head[h] = pos as u32;
     }
 
@@ -341,7 +412,7 @@ impl HashChainFinder {
 
         let h = hash3(input, pos);
         let mut chain_pos = self.head[h] as usize;
-        let min_pos = pos.saturating_sub(MAX_WINDOW);
+        let min_pos = pos.saturating_sub(self.max_window);
         let mut chain_count = 0;
 
         // For each distinct length, keep the match with the smallest offset.
@@ -376,7 +447,7 @@ impl HashChainFinder {
             }
 
             // Follow chain
-            let prev_pos = self.prev[chain_pos & WINDOW_MASK] as usize;
+            let prev_pos = self.prev[chain_pos & self.window_mask] as usize;
             if prev_pos >= chain_pos || prev_pos < min_pos {
                 break;
             }

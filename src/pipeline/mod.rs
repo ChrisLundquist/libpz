@@ -16,12 +16,14 @@
 //! | `Lzfi`        | LZSS → interleaved FSE           | fast CPU decode |
 //! | `LzssR`       | LZSS → rANS                      | experimental    |
 //! | `Lz78R`       | LZ78 → rANS                      | experimental    |
+//! | `LzSeqR`      | LzSeq → rANS                     | zstd-style      |
+//! | `LzSeqH`      | LzSeq → Huffman                  | fast decode     |
 //!
 //! **Container format (V2, multi-block):**
 //! Each compressed stream starts with a header:
 //! - Magic bytes: `PZ` (2 bytes)
 //! - Version: 2 (1 byte)
-//! - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 5=Lzfi, 6=LzssR, 7=Lz78R (1 byte)
+//! - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 5=Lzfi, 6=LzssR, 7=Lz78R, 8=LzSeqR, 9=LzSeqH (1 byte)
 //! - Original length: u32 little-endian (4 bytes)
 //! - num_blocks: u32 little-endian (4 bytes)
 //! - Block table: \[compressed_len: u32, original_len: u32\] \* num_blocks
@@ -122,6 +124,13 @@ pub struct CompressOptions {
     /// When enabled, the same worker pool executes both stage-0 transform
     /// tasks and stage-1 entropy tasks from a shared work queue.
     pub unified_scheduler: bool,
+    /// LzSeq sliding window size in bytes. Must be a power of 2.
+    ///
+    /// `None` = use the default (128KB). Only affects the `LzSeqR`/`LzSeqH` pipelines;
+    /// other pipelines ignore this. Larger windows find longer-range matches
+    /// at the cost of more memory (4 bytes per window position for the
+    /// hash-chain `prev` array).
+    pub seq_window_size: Option<usize>,
 }
 
 impl Default for CompressOptions {
@@ -138,6 +147,7 @@ impl Default for CompressOptions {
             rans_interleaved_min_bytes: 64 * 1024,
             rans_interleaved_states: crate::rans::DEFAULT_INTERLEAVE,
             unified_scheduler: false,
+            seq_window_size: None,
         }
     }
 }
@@ -218,6 +228,10 @@ pub enum Pipeline {
     LzssR = 6,
     /// LZ78 + rANS (incremental trie + rANS, experimental)
     Lz78R = 7,
+    /// LzSeq + rANS (code+extra-bits sequence encoding, zstd-style)
+    LzSeqR = 8,
+    /// LzSeq + Huffman (fast decode, simpler entropy coding)
+    LzSeqH = 9,
 }
 
 impl TryFrom<u8> for Pipeline {
@@ -233,6 +247,8 @@ impl TryFrom<u8> for Pipeline {
             5 => Ok(Self::Lzfi),
             6 => Ok(Self::LzssR),
             7 => Ok(Self::Lz78R),
+            8 => Ok(Self::LzSeqR),
+            9 => Ok(Self::LzSeqH),
             _ => Err(PzError::Unsupported),
         }
     }
@@ -480,6 +496,8 @@ pub fn select_pipeline_trial(
         Pipeline::Lzfi,
         Pipeline::LzssR,
         Pipeline::Lz78R,
+        Pipeline::LzSeqR,
+        Pipeline::LzSeqH,
     ];
     let mut best_pipeline = Pipeline::Deflate;
     let mut best_size = usize::MAX;
@@ -520,7 +538,13 @@ pub(crate) fn write_header(output: &mut Vec<u8>, pipeline: Pipeline, orig_len: u
 fn gpu_adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> CompressOptions {
     let is_lz_pipeline = matches!(
         pipeline,
-        Pipeline::Deflate | Pipeline::Lzr | Pipeline::Lzf | Pipeline::Lzfi | Pipeline::LzssR
+        Pipeline::Deflate
+            | Pipeline::Lzr
+            | Pipeline::Lzf
+            | Pipeline::Lzfi
+            | Pipeline::LzssR
+            | Pipeline::LzSeqR
+            | Pipeline::LzSeqH
     );
     let is_gpu = {
         #[allow(unused_mut)]

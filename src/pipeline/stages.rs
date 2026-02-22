@@ -183,6 +183,17 @@ pub(crate) fn stage_huffman_encode(mut block: StageBlock) -> PzResult<StageBlock
         pre_entropy_len,
         &block.metadata.demux_meta,
         |stream, output| {
+            // Handle empty streams: emit empty huffman data with zero frequency table
+            if stream.is_empty() {
+                output.extend_from_slice(&0u32.to_le_bytes()); // huffman_data.len() = 0
+                output.extend_from_slice(&0u32.to_le_bytes()); // total_bits = 0
+                                                               // Emit empty frequency table (256 zeros)
+                for _ in 0..256 {
+                    output.extend_from_slice(&0u32.to_le_bytes());
+                }
+                return Ok(());
+            }
+
             let tree = HuffmanTree::from_data(stream).ok_or(PzError::InvalidInput)?;
             let (huffman_data, total_bits) = tree.encode(stream)?;
             let freq_table = tree.serialize_frequencies();
@@ -274,12 +285,23 @@ pub(crate) fn stage_huffman_encode_webgpu(
 pub(crate) fn stage_huffman_decode(mut block: StageBlock) -> PzResult<StageBlock> {
     let (streams, pre_entropy_len, meta) = decode_multistream(&block.data, |data| {
         // Per-stream: [stream_data_len: u32][total_bits: u32][freq_table: 256×u32][huffman_data]
-        if data.len() < 1032 {
+        if data.len() < 8 {
             return Err(PzError::InvalidInput);
         }
         let stream_data_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
         let total_bits = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
 
+        // Handle empty streams: freq table still exists but all zeros
+        if stream_data_len == 0 && total_bits == 0 {
+            if data.len() < 1032 {
+                return Err(PzError::InvalidInput);
+            }
+            return Ok((Vec::new(), 1032));
+        }
+
+        if data.len() < 1032 {
+            return Err(PzError::InvalidInput);
+        }
         let mut freq_table = crate::frequency::FrequencyTable::new();
         for i in 0..256 {
             let off = 8 + i * 4;
@@ -429,6 +451,92 @@ pub(crate) fn stage_rans_decode_webgpu(
     block.metadata.demux_meta = meta;
     block.streams = Some(streams);
     block.data.clear();
+    Ok(block)
+}
+
+/// GPU batched rANS encoding stage (WebGPU): encode all streams in a single
+/// batched GPU dispatch with ring-buffered submit/readback overlap.
+///
+/// Per-stream framing: [orig_len: u32] [compressed_len: u32 | flags] [rans_data]
+///
+/// Streams below `rans_interleaved_min_bytes` fall back to CPU basic rANS.
+/// The output wire format is identical to [`stage_rans_encode_with_options()`],
+/// so the same decoder works for both CPU and GPU encoded data.
+#[cfg(feature = "webgpu")]
+pub(crate) fn stage_rans_encode_webgpu(
+    mut block: StageBlock,
+    engine: &crate::webgpu::WebGpuEngine,
+    options: &CompressOptions,
+) -> PzResult<StageBlock> {
+    let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
+    let pre_entropy_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
+    let meta = &block.metadata.demux_meta;
+
+    // Phase 1: batch-encode all GPU-eligible streams in one call.
+    // The batched API uses a ring buffer internally to overlap GPU
+    // compute with readback across streams.
+    let min_bytes = options.rans_interleaved_min_bytes;
+    let mut gpu_inputs: Vec<&[u8]> = Vec::new();
+    let mut gpu_indices: Vec<usize> = Vec::new();
+    for (i, stream) in streams.iter().enumerate() {
+        if stream.len() >= min_bytes {
+            gpu_inputs.push(stream);
+            gpu_indices.push(i);
+        }
+    }
+
+    let batch_results = if !gpu_inputs.is_empty() {
+        engine.rans_encode_chunked_payload_gpu_batched(
+            &gpu_inputs,
+            options.rans_interleaved_states,
+            rans::DEFAULT_SCALE_BITS,
+            256,
+        )?
+    } else {
+        Vec::new()
+    };
+
+    // Index batch results by original stream position.
+    let mut gpu_results: Vec<Option<Vec<u8>>> = vec![None; streams.len()];
+    for ((data, _used_chunked), &stream_idx) in batch_results.into_iter().zip(&gpu_indices) {
+        gpu_results[stream_idx] = Some(data);
+    }
+
+    // Phase 2: assemble the multi-stream container.
+    let mut output = Vec::new();
+    output.push(streams.len() as u8);
+    output.extend_from_slice(&(pre_entropy_len as u32).to_le_bytes());
+    output.extend_from_slice(&(meta.len() as u16).to_le_bytes());
+    output.extend_from_slice(meta);
+
+    for (i, stream) in streams.iter().enumerate() {
+        // GPU path: always interleaved (engine uses encode_interleaved_n
+        // even when chunked encoding is not possible).
+        // CPU path: basic rANS for small streams.
+        let (rans_data, is_interleaved) = if let Some(data) = gpu_results[i].take() {
+            (data, true)
+        } else {
+            (rans::encode(stream), false)
+        };
+
+        if rans_data.len() >= (1usize << 31) {
+            return Err(PzError::InvalidInput);
+        }
+
+        let flagged_len = if is_interleaved {
+            (rans_data.len() as u32) | RANS_INTERLEAVED_FLAG
+        } else {
+            rans_data.len() as u32
+        };
+        output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+        output.extend_from_slice(&flagged_len.to_le_bytes());
+        output.extend_from_slice(&rans_data);
+    }
+
+    block.data = output;
     Ok(block)
 }
 
@@ -822,7 +930,7 @@ pub(crate) fn pipeline_stage_count(pipeline: Pipeline) -> usize {
         Pipeline::Bbw => 4,
         Pipeline::Lzr => 2,
         Pipeline::Lzf | Pipeline::Lzfi => 2,
-        Pipeline::LzssR | Pipeline::Lz78R => 2,
+        Pipeline::LzssR | Pipeline::Lz78R | Pipeline::LzSeqR | Pipeline::LzSeqH => 2,
     }
 }
 
@@ -864,6 +972,20 @@ pub(crate) fn run_compress_stage(
         (Pipeline::LzssR, 1) => stage_rans_encode_with_options(block, options),
         (Pipeline::Lz78R, 0) => stage_demux_compress(block, &LzDemuxer::Lz78, options),
         (Pipeline::Lz78R, 1) => stage_rans_encode_with_options(block, options),
+        (Pipeline::LzSeqR, 0) => stage_demux_compress(block, &LzDemuxer::LzSeq, options),
+        (Pipeline::LzSeqR, 1) => {
+            #[cfg(feature = "webgpu")]
+            {
+                if let super::Backend::WebGpu = options.backend {
+                    if let Some(ref engine) = options.webgpu_engine {
+                        return stage_rans_encode_webgpu(block, engine, options);
+                    }
+                }
+            }
+            stage_rans_encode_with_options(block, options)
+        }
+        (Pipeline::LzSeqH, 0) => stage_demux_compress(block, &LzDemuxer::LzSeq, options),
+        (Pipeline::LzSeqH, 1) => stage_huffman_encode(block),
         _ => Err(PzError::Unsupported),
     }
 }
@@ -945,6 +1067,22 @@ pub(crate) fn run_decompress_stage(
             stage_rans_decode(block)
         }
         (Pipeline::Lz78R, 1) => stage_demux_decompress(block, &LzDemuxer::Lz78),
+        // LzSeqR: rANS decode(0) → LzSeq decompress(1)
+        (Pipeline::LzSeqR, 0) => {
+            #[cfg(feature = "webgpu")]
+            {
+                if let super::Backend::WebGpu = options.backend {
+                    if let Some(ref engine) = options.webgpu_engine {
+                        return stage_rans_decode_webgpu(block, engine);
+                    }
+                }
+            }
+            stage_rans_decode(block)
+        }
+        (Pipeline::LzSeqR, 1) => stage_demux_decompress(block, &LzDemuxer::LzSeq),
+        // LzSeqH: Huffman decode(0) → LzSeq decompress(1)
+        (Pipeline::LzSeqH, 0) => stage_huffman_decode(block),
+        (Pipeline::LzSeqH, 1) => stage_demux_decompress(block, &LzDemuxer::LzSeq),
         _ => Err(PzError::Unsupported),
     }
 }

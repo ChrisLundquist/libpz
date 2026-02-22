@@ -1,0 +1,80 @@
+[package]
+name = "pz-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.pz]
+path = ".."
+default-features = false
+
+# --- Fuzz targets ---
+
+[[bin]]
+name = "fuzz_pipeline_roundtrip"
+path = "fuzz_targets/fuzz_pipeline_roundtrip.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decompress"
+path = "fuzz_targets/fuzz_decompress.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_bwt"
+path = "fuzz_targets/fuzz_bwt.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_rans"
+path = "fuzz_targets/fuzz_rans.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_fse"
+path = "fuzz_targets/fuzz_fse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_lzseq"
+path = "fuzz_targets/fuzz_lzseq.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_huffman"
+path = "fuzz_targets/fuzz_huffman.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_lz77"
+path = "fuzz_targets/fuzz_lz77.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_lz78"
+path = "fuzz_targets/fuzz_lz78.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_lzss"
+path = "fuzz_targets/fuzz_lzss.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_rle"
+path = "fuzz_targets/fuzz_rle.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_mtf"
+path = "fuzz_targets/fuzz_mtf.rs"
+doc = false
+
+[workspace]
+members = ["."]
