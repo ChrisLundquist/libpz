@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # analyze-ratio.sh — Bit-budget analysis for pz compressed output.
 #
-# Decomposes a compressed .pz file into estimated cost categories:
-#   header overhead, entropy table overhead, match bits, literal bits.
+# Decomposes a compressed .pz file into cost categories:
+#   header overhead, payload, and gap vs gzip reference.
 # Compares against gzip to show the ratio gap.
 #
 # Usage:

@@ -335,9 +335,14 @@ for file in "${FILES[@]}"; do
     t_gz_ns=$((t_gz_ns + gz_comp_ns))
 
     # --- zlib-ng compress ---
+    # minigzip-ng reads from stdin; we avoid bash -c by using input redirection
     if [[ "$HAS_ZLIBBNG" == true ]]; then
         zng_out="$BENCH_TMPDIR/$name.zng"
-        zng_comp_ns=$(avg_ns bash -c "minigzip-ng < '$file' > '$zng_out'")
+        # Create a wrapper function to safely handle file input
+        zng_compress() {
+            minigzip-ng < "$file" > "$zng_out"
+        }
+        zng_comp_ns=$(avg_ns zng_compress)
         zng_size=$(stat -c%s "$zng_out" 2>/dev/null || stat -f%z "$zng_out" 2>/dev/null)
         rm -f "$zng_out"
         t_zng=$((t_zng + zng_size))
@@ -345,9 +350,13 @@ for file in "${FILES[@]}"; do
     fi
 
     # --- lz4 compress ---
+    # lz4 -c reads file directly, safe to pass filename without bash -c
     if [[ "$HAS_LZ4" == true ]]; then
         lz4_out="$BENCH_TMPDIR/$name.lz4"
-        lz4_comp_ns=$(avg_ns bash -c "lz4 -q -c '$file' > '$lz4_out'")
+        lz4_compress() {
+            lz4 -q -c "$file" > "$lz4_out"
+        }
+        lz4_comp_ns=$(avg_ns lz4_compress)
         lz4_size=$(stat -c%s "$lz4_out" 2>/dev/null || stat -f%z "$lz4_out" 2>/dev/null)
         rm -f "$lz4_out"
         t_lz4=$((t_lz4 + lz4_size))
@@ -355,9 +364,13 @@ for file in "${FILES[@]}"; do
     fi
 
     # --- zstd compress ---
+    # zstd -c reads file directly, safe to pass filename without bash -c
     if [[ "$HAS_ZSTD" == true ]]; then
         zst_out="$BENCH_TMPDIR/$name.zst"
-        zst_comp_ns=$(avg_ns bash -c "zstd -q --single-thread -c '$file' > '$zst_out'")
+        zst_compress() {
+            zstd -q --single-thread -c "$file" > "$zst_out"
+        }
+        zst_comp_ns=$(avg_ns zst_compress)
         zst_size=$(stat -c%s "$zst_out" 2>/dev/null || stat -f%z "$zst_out" 2>/dev/null)
         rm -f "$zst_out"
         t_zst=$((t_zst + zst_size))
@@ -552,8 +565,8 @@ if [[ "$PARETO" == true ]]; then
     echo "  Ratio = compressed/original (lower is better)"
     echo "  Throughput = MB/s compression speed (higher is better)"
     echo ""
-    printf "  %-14s %8s %12s %12s\n" "Codec" "Ratio" "Throughput" "Size"
-    printf "  %s\n" "──────────────────────────────────────────────────"
+    printf "  %-18s %8s %12s %12s\n" "Codec" "Ratio" "Throughput" "Size"
+    printf "  %s\n" "────────────────────────────────────────────────────────"
 
     # Build list of (ratio_pct * 10 as integer, label, throughput, size) for sorting
     # ratio_pct * 10 avoids floating point in bash sort
@@ -587,7 +600,7 @@ if [[ "$PARETO" == true ]]; then
     # Sort by ratio integer (field 1), print formatted
     printf '%s\n' "${pareto_rows[@]}" | sort -t'|' -k1,1n | while IFS='|' read -r ratio_int label throughput size; do
         ratio_pct=$(awk "BEGIN { printf \"%.1f%%\", $ratio_int / 10.0; exit }" < /dev/null)
-        printf "  %-14s %8s %12s %12s\n" "$label" "$ratio_pct" "$throughput" "$size"
+        printf "  %-18s %8s %12s %12s\n" "$label" "$ratio_pct" "$throughput" "$size"
     done
 
     echo ""
