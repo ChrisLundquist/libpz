@@ -315,6 +315,34 @@ pub(crate) fn build_match_table_cpu_with_limit(
     table
 }
 
+/// Like `build_match_table_cpu_with_limit` but with configurable window and chain depth.
+///
+/// Used by `encode_optimal` to respect `SeqConfig::max_window` and `SeqConfig::max_chain`.
+pub(crate) fn build_match_table_cpu_with_config(
+    input: &[u8],
+    k: usize,
+    max_match_len: u16,
+    max_window: usize,
+    max_chain: usize,
+) -> MatchTable {
+    let mut table = MatchTable::new(input.len(), k);
+    let mut finder = HashChainFinder::with_window_and_chain(max_window, max_match_len, max_chain);
+
+    for pos in 0..input.len() {
+        let top_k = finder.find_top_k(input, pos, k);
+        let slot = table.at_mut(pos);
+        for (i, &(length, offset)) in top_k.iter().enumerate() {
+            slot[i] = MatchCandidate {
+                offset: offset as u32,
+                length: length as u32,
+            };
+        }
+        finder.insert(input, pos);
+    }
+
+    table
+}
+
 // ---------------------------------------------------------------------------
 // Repeat offset annotation
 // ---------------------------------------------------------------------------
@@ -350,6 +378,11 @@ pub(crate) fn build_repeat_annotations(input: &[u8], table: &MatchTable) -> Vec<
 /// Returns a flat Vec indexed as `scores[pos * table.k + candidate_idx]`.
 /// A positive score means the candidate's offset appears frequently in nearby
 /// matches and is worth a small discount even if it doesn't save bits now.
+///
+/// **Complexity:** O(n * K^2 * LOOK_AHEAD) where K is the number of candidates
+/// per position and LOOK_AHEAD is the lookahead window. For each of n positions,
+/// we iterate K candidates, and for each candidate, we scan LOOK_AHEAD positions
+/// checking K candidates at each. This is acceptable given typical K=4 and LOOK_AHEAD=16.
 pub(crate) fn build_future_repeat_scores(input: &[u8], table: &MatchTable) -> Vec<u32> {
     let n = input.len();
     let k = table.k;

@@ -368,7 +368,7 @@ fn init_gpu(opts: &Opts) -> GpuState {
 fn build_cli_options(opts: &Opts) -> (CompressOptions, DecompressOptions) {
     let gpu = init_gpu(opts);
 
-    let compress_options = CompressOptions {
+    let mut compress_options = CompressOptions {
         backend: gpu.backend,
         threads: opts.threads,
         parse_strategy: opts.parse_strategy,
@@ -380,6 +380,11 @@ fn build_cli_options(opts: &Opts) -> (CompressOptions, DecompressOptions) {
         webgpu_engine: gpu.webgpu_engine.clone(),
         ..Default::default()
     };
+
+    // For --quality mode (Optimal), use a larger window for better compression
+    if opts.parse_strategy == ParseStrategy::Optimal {
+        compress_options.seq_window_size = Some(256 * 1024);
+    }
 
     let decompress_options = DecompressOptions {
         backend: gpu.backend,

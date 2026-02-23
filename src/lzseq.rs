@@ -630,8 +630,13 @@ fn encode_match_sequence(
                 &mut length_codes,
                 &mut length_extra_writer,
             );
-            // The 'next' byte in a match token is the byte following the match
-            // (already included in the next token by the DP forward trace).
+            // Emit the 'next' byte as a separate literal token.
+            // The DP forward trace produces Match structs where each match covers
+            // `length` bytes plus a "next" byte. The cost model accounts for the
+            // next byte in the match cost, but the actual token stream must emit
+            // the next byte as a literal to avoid data loss.
+            flags_vec.push(true);
+            literals.push(m.next);
         }
     }
 
@@ -675,9 +680,16 @@ pub fn encode_optimal(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncoded> 
     }
 
     // Build match table and run repeat-offset-aware optimal parse.
-    let max_match = DEFAULT_MAX_MATCH;
-    let table =
-        crate::optimal::build_match_table_cpu_with_limit(input, crate::optimal::K, max_match);
+    // Use DEFLATE_MAX_MATCH (258) for reasonable performance.
+    // Searching for extremely long matches (u16::MAX) is prohibitively slow.
+    let max_match = crate::lz77::DEFLATE_MAX_MATCH;
+    let table = crate::optimal::build_match_table_cpu_with_config(
+        input,
+        crate::optimal::K,
+        max_match,
+        config.max_window,
+        config.max_chain,
+    );
     let matches = crate::optimal::optimal_parse_lzseq(input, &table)?;
 
     // Encode the optimal match sequence into LzSeq token streams.
