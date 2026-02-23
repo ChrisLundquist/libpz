@@ -218,7 +218,20 @@ impl WebGpuEngine {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
 
-        // Pass 2: write codes
+        // Pass 2: write codes (now chunk-based, one thread per output u32 word)
+        let wc_workgroups = (output_uints as u32).div_ceil(64);
+        let wc_params = [
+            n as u32,
+            total_bits as u32,
+            0,
+            self.dispatch_width(wc_workgroups, 64),
+        ];
+        let wc_params_buf = self.create_buffer_init(
+            "huff_wc_params",
+            bytemuck::cast_slice(&wc_params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
         let bg2_layout = self.pipeline_write_codes().get_bind_group_layout(0);
         let bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("huff_pass2_bg"),
@@ -242,12 +255,17 @@ impl WebGpuEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: params_buf.as_entire_binding(),
+                    resource: wc_params_buf.as_entire_binding(),
                 },
             ],
         });
 
-        self.dispatch(self.pipeline_write_codes(), &bg2, workgroups, "huff_pass2")?;
+        self.dispatch(
+            self.pipeline_write_codes(),
+            &bg2,
+            wc_workgroups,
+            "huff_pass2",
+        )?;
 
         // Download output
         let raw_output = self.read_buffer(&output_buf, (output_uints * 4) as u64);
@@ -369,7 +387,20 @@ impl WebGpuEngine {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
 
-        // Pass 2: write codes (bit_lengths_buf now contains offsets)
+        // Pass 2: write codes (bit_lengths_buf now contains offsets, one thread per output u32 word)
+        let wc_workgroups = (output_uints as u32).div_ceil(64);
+        let wc_params = [
+            n as u32,
+            total_bits as u32,
+            0,
+            self.dispatch_width(wc_workgroups, 64),
+        ];
+        let wc_params_buf = self.create_buffer_init(
+            "huff_gs_wc_params",
+            bytemuck::cast_slice(&wc_params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
         let bg2_layout = self.pipeline_write_codes().get_bind_group_layout(0);
         let bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("huff_gs_pass2_bg"),
@@ -393,7 +424,7 @@ impl WebGpuEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: params_buf.as_entire_binding(),
+                    resource: wc_params_buf.as_entire_binding(),
                 },
             ],
         });
@@ -401,7 +432,7 @@ impl WebGpuEngine {
         self.dispatch(
             self.pipeline_write_codes(),
             &bg2,
-            workgroups,
+            wc_workgroups,
             "huff_gs_pass2",
         )?;
 
@@ -523,7 +554,20 @@ impl WebGpuEngine {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
 
-        // Pass 2: write codes (bit_lengths_buf now contains offsets, input is on-device)
+        // Pass 2: write codes (bit_lengths_buf now contains offsets, input is on-device, one thread per output u32 word)
+        let wc_workgroups = (output_uints as u32).div_ceil(64);
+        let wc_params = [
+            n as u32,
+            total_bits as u32,
+            0,
+            self.dispatch_width(wc_workgroups, 64),
+        ];
+        let wc_params_buf = self.create_buffer_init(
+            "huff_od_wc_params",
+            bytemuck::cast_slice(&wc_params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
         let bg2_layout = self.pipeline_write_codes().get_bind_group_layout(0);
         let bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("huff_od_pass2_bg"),
@@ -547,7 +591,7 @@ impl WebGpuEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: params_buf.as_entire_binding(),
+                    resource: wc_params_buf.as_entire_binding(),
                 },
             ],
         });
@@ -555,7 +599,7 @@ impl WebGpuEngine {
         self.dispatch(
             self.pipeline_write_codes(),
             &bg2,
-            workgroups,
+            wc_workgroups,
             "huff_od_pass2",
         )?;
 
@@ -813,7 +857,20 @@ impl WebGpuEngine {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
 
-        // Pass 3: write codes (bit_lengths_buf now contains offsets)
+        // Pass 3: write codes (bit_lengths_buf now contains offsets, one thread per output u32 word)
+        let wc_workgroups = (output_uints as u32).div_ceil(64);
+        let wc_params = [
+            n as u32,
+            total_bits as u32,
+            0,
+            self.dispatch_width(wc_workgroups, 64),
+        ];
+        let wc_params_buf = self.create_buffer_init(
+            "huff_fod_wc_params",
+            bytemuck::cast_slice(&wc_params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
         let bg2_layout = self.pipeline_write_codes().get_bind_group_layout(0);
         let bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("huff_fod_pass2_bg"),
@@ -837,7 +894,7 @@ impl WebGpuEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: params_buf.as_entire_binding(),
+                    resource: wc_params_buf.as_entire_binding(),
                 },
             ],
         });
@@ -845,7 +902,7 @@ impl WebGpuEngine {
         self.dispatch(
             self.pipeline_write_codes(),
             &bg2,
-            workgroups,
+            wc_workgroups,
             "huff_fod_pass2",
         )?;
 
@@ -866,5 +923,123 @@ impl WebGpuEngine {
         }
 
         Ok((output_bytes, total_bits))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to get or skip tests if no GPU available.
+    fn get_engine() -> Option<WebGpuEngine> {
+        WebGpuEngine::new().ok()
+    }
+
+    #[test]
+    fn test_huffman_gpu_encode_chunked_matches_cpu() {
+        // Verify that write_codes_chunked produces output that round-trips correctly.
+        let engine = match get_engine() {
+            Some(e) => e,
+            None => return, // skip if no GPU available
+        };
+
+        for input_size in [1024usize, 32768, 131072] {
+            let input: Vec<u8> = (0..input_size)
+                .map(|i| (i % 128) as u8) // 128 distinct symbols
+                .collect();
+
+            let cpu_tree = crate::huffman::HuffmanTree::from_data(&input)
+                .expect("Huffman tree build must succeed");
+            let (cpu_encoded, cpu_bits) = cpu_tree
+                .encode(&input)
+                .expect("CPU Huffman encode must succeed");
+
+            // GPU encode via gpu_scan (uses write_codes_chunked)
+            let (gpu_encoded_bytes, gpu_bits) = engine
+                .huffman_encode_gpu_scan(&input, &cpu_tree.code_lut())
+                .expect("GPU Huffman encode must succeed");
+
+            // Both should decode to the original input
+            let cpu_decoded = cpu_tree
+                .decode(&cpu_encoded, cpu_bits)
+                .unwrap_or_else(|e| panic!("CPU decode failed for size {}: {:?}", input_size, e));
+            let gpu_decoded = cpu_tree
+                .decode(&gpu_encoded_bytes, gpu_bits)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "CPU decode of GPU-encoded failed for size {}: {:?}",
+                        input_size, e
+                    )
+                });
+
+            assert_eq!(
+                cpu_decoded, input,
+                "CPU Huffman round-trip failed for size {}",
+                input_size
+            );
+            assert_eq!(
+                gpu_decoded, input,
+                "GPU Huffman chunked round-trip failed for size {}",
+                input_size
+            );
+        }
+    }
+
+    #[test]
+    fn test_huffman_gpu_encode_chunked_boundary_symbols() {
+        // Deliberately construct input where many codewords straddle u32
+        // boundaries to stress the boundary-symbol atomic path.
+        let engine = match get_engine() {
+            Some(e) => e,
+            None => return,
+        };
+
+        // Input with 3 distinct symbols: each gets a ~10-bit code (long codes
+        // mean more boundary crossings per 32-bit word).
+        let input: Vec<u8> = (0..65536)
+            .map(|i| match i % 3 {
+                0 => 0u8,
+                1 => 1,
+                _ => 2,
+            })
+            .collect();
+
+        let tree = crate::huffman::HuffmanTree::from_data(&input)
+            .expect("Huffman tree build must succeed");
+
+        let (gpu_encoded_bytes, gpu_bits) = engine
+            .huffman_encode_gpu_scan(&input, &tree.code_lut())
+            .expect("GPU Huffman encode must succeed for boundary-stress input");
+
+        let decoded = tree
+            .decode(&gpu_encoded_bytes, gpu_bits)
+            .expect("decode of boundary-stress GPU output must succeed");
+        assert_eq!(
+            decoded, input,
+            "boundary-symbol stress test round-trip mismatch"
+        );
+    }
+
+    #[test]
+    fn test_huffman_gpu_encode_chunked_single_symbol() {
+        // Edge case: all bytes are the same symbol. Huffman assigns a 1-bit code.
+        // All writes land in distinct u32 words with no boundary crossings.
+        let engine = match get_engine() {
+            Some(e) => e,
+            None => return,
+        };
+
+        let input = vec![42u8; 8192];
+        let tree = crate::huffman::HuffmanTree::from_data(&input)
+            .expect("Huffman tree build must succeed");
+
+        let (gpu_encoded_bytes, gpu_bits) = engine
+            .huffman_encode_gpu_scan(&input, &tree.code_lut())
+            .expect("GPU Huffman encode must succeed for single-symbol input");
+
+        let decoded = tree
+            .decode(&gpu_encoded_bytes, gpu_bits)
+            .expect("decode of single-symbol GPU output must succeed");
+        assert_eq!(decoded, input, "single-symbol round-trip mismatch");
     }
 }

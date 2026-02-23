@@ -51,49 +51,96 @@ fn read_wc_symbol(pos: u32) -> u32 {
     return (wc_symbols[word_idx] >> (byte_idx * 8u)) & 0xFFu;
 }
 
+// Chunk-based packing: each thread owns exclusive output u32 words.
+// CHUNK_WORDS: each thread covers this many output u32 words exclusively.
+// Set to 1 so each thread owns exactly one output word, eliminating intra-word contention.
+const CHUNK_WORDS: u32 = 1u;
+
 @compute @workgroup_size(64)
 fn write_codes(@builtin(global_invocation_id) gid: vec3<u32>) {
     let g = gid.x + gid.y * wc_params.w;
+    let num_output_words = (wc_params.y + 31u) / 32u; // total output u32 words
     let num_symbols = wc_params.x;
-    if (g >= num_symbols) {
+
+    if (g >= num_output_words) {
         return;
     }
 
-    let sym = read_wc_symbol(g);
-    let entry = wc_code_lut[sym];
-    let bits = entry >> 24u;
-    let codeword = entry & 0x00FFFFFFu;
-    let start_bit = bit_offsets[g];
+    // Bit range this thread owns: [g*32, (g+1)*32)
+    let my_bit_start = g * 32u;
+    let my_bit_end = my_bit_start + 32u;
 
-    if (bits == 0u) {
-        return;
+    var local_word: u32 = 0u;
+    var has_boundary_low = false;  // straddles into next word
+
+    // Scan all symbols to find those whose bits intersect [my_bit_start, my_bit_end).
+    // This is O(N) per thread, giving O(N*W) total work where W = num_output_words.
+    // For blocks where N/W is large (dense codewords, typical), this is efficient.
+    // Optimization: use bit_offsets[] to binary-search for the first symbol
+    // in range, then scan forward while bit_offsets[sym] < my_bit_end.
+    // For the initial implementation, use a linear scan bounded by num_symbols.
+
+    var sym_idx: u32 = 0u;
+    loop {
+        if (sym_idx >= num_symbols) { break; }
+
+        let start_bit = bit_offsets[sym_idx];
+        if (start_bit >= my_bit_end) {
+            // All remaining symbols start at or after our range; done.
+            break;
+        }
+
+        let sym = read_wc_symbol(sym_idx);
+        let entry = wc_code_lut[sym];
+        let bits = entry >> 24u;
+        let codeword = entry & 0x00FFFFFFu;
+
+        if (bits > 0u) {
+            let end_bit = start_bit + bits - 1u;
+
+            if (end_bit >= my_bit_start && start_bit < my_bit_end) {
+                // Symbol intersects our range.
+                let first_word = start_bit / 32u;
+                let last_word = end_bit / 32u;
+
+                if (first_word == last_word) {
+                    // Entire codeword fits within one word — it must be ours.
+                    let first_shift = 31u - (start_bit % 32u);
+                    let shifted = codeword << (first_shift - (bits - 1u));
+                    local_word = local_word | shifted;
+                } else {
+                    // Boundary symbol.
+                    if (first_word == g) {
+                        // We own the high part (bits that land in our word).
+                        let bits_in_first = 32u - (start_bit % 32u);
+                        let high_part = codeword >> (bits - bits_in_first);
+                        // Place high_part at the MSB side of our word
+                        let shift = 31u - (start_bit % 32u);
+                        local_word = local_word | (high_part << (shift - (bits_in_first - 1u)));
+                    }
+                    if (last_word == g) {
+                        // We own the low part (bits that overhang into our word).
+                        let remaining = bits - (32u - (start_bit % 32u));
+                        let low_part = (codeword << (32u - remaining)) & 0xFFFFFFFFu;
+                        atomicOr(&wc_output[g], low_part);
+                        // Mark that we issued an atomic — we must not stomp it later.
+                        has_boundary_low = true;
+                    }
+                }
+            }
+        }
+
+        sym_idx = sym_idx + 1u;
     }
 
-    // Write all bits of the codeword using at most 2 atomicOr ops.
-    // Bits are stored MSB-first: start_bit is the position of the MSB.
-    let end_bit = start_bit + bits - 1u;
-    let first_word = start_bit / 32u;
-    let last_word = end_bit / 32u;
-
-    // Position of MSB within the first u32 word (bit 31 = leftmost)
-    let first_shift = 31u - (start_bit % 32u);
-    // Reverse the codeword so MSB is at position `first_shift`
-    // codeword has `bits` valid bits in the low end, MSB at bit (bits-1)
-    let reversed = codeword << (first_shift - (bits - 1u));
-
-    if (first_word == last_word) {
-        // All bits fit in a single u32 word
-        atomicOr(&wc_output[first_word], reversed);
+    // Write the accumulated local word.
+    // If we only have non-boundary bits, a plain store suffices and avoids
+    // all atomic overhead for the common case.
+    if (!has_boundary_low) {
+        wc_output[g] = local_word;
     } else {
-        // Bits span two u32 words
-        let bits_in_first = first_shift + 1u;
-        // High part: top `bits_in_first` bits go into first_word
-        let high_mask = codeword >> (bits - bits_in_first);
-        atomicOr(&wc_output[first_word], high_mask);
-        // Low part: remaining bits go into last_word, aligned to MSB
-        let remaining = bits - bits_in_first;
-        let low_mask = (codeword << (32u - remaining)) & 0xFFFFFFFFu;
-        atomicOr(&wc_output[last_word], low_mask);
+        // Merge local_word with the already-atomically-written boundary bits.
+        atomicOr(&wc_output[g], local_word);
     }
 }
 

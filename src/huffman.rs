@@ -222,6 +222,20 @@ impl HuffmanTree {
 
     /// Encode input bytes using this Huffman tree.
     ///
+    /// Return the code lookup table for use with GPU encoding.
+    ///
+    /// Each entry is a u32 where bits [31:24] are the code length (in bits)
+    /// and bits [23:0] are the codeword value (MSB-first). This format matches
+    /// the GPU kernel's expectations.
+    pub fn code_lut(&self) -> [u32; 256] {
+        let mut result = [0u32; 256];
+        for (i, &(codeword, code_bits)) in self.lookup.iter().enumerate() {
+            // Encode as: length in top 8 bits, codeword in bottom 24 bits
+            result[i] = ((code_bits as u32) << 24) | (codeword & 0x00FFFFFF);
+        }
+        result
+    }
+
     /// Returns a tuple of (encoded_bytes, total_bits_encoded).
     ///
     /// Uses a 64-bit accumulator to pack entire codewords per symbol
