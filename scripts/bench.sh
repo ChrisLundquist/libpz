@@ -21,6 +21,7 @@ FEATURES=""
 GPU_FLAG=""
 THREADS=""
 VERBOSE=false
+PARETO=false
 
 usage() {
     cat <<'EOF'
@@ -35,6 +36,8 @@ Options:
                          (default: deflate,lzr,lzf)
   -t, --threads N        Pass thread count to pz (-t N; 0=auto, 1=single-threaded)
   --all                  Benchmark all available pipelines
+  --pareto               Single-thread Pareto table: all pipelines + all competitors,
+                         sorted by ratio. Implies --all and -t 1.
   --webgpu               Build with WebGPU feature and pass --gpu to pz
   --features FEAT        Cargo features to enable (e.g. webgpu)
   -v, --verbose          Show detailed output (default: quiet, summary only)
@@ -96,6 +99,13 @@ while [[ $# -gt 0 ]]; do
             ;;
         --all)
             PIPELINES=(deflate bw bbw lzr lzf lzfi lzseqr lzseqh)
+            shift
+            ;;
+        --pareto)
+            PARETO=true
+            PIPELINES=(deflate bw bbw lzr lzf lzfi lzseqr lzseqh)
+            # Force single-thread for apples-to-apples comparison
+            THREADS="1"
             shift
             ;;
         --webgpu)
@@ -532,4 +542,54 @@ if [[ "$VERBOSE" == false ]]; then
 
     echo ""
     echo "Run with --verbose for per-file breakdown"
+fi
+
+# === PARETO TABLE (only when --pareto flag is set) ===
+if [[ "$PARETO" == true ]]; then
+    echo ""
+    echo "=== PARETO COMPARISON TABLE (single-thread, sorted by ratio) ==="
+    echo ""
+    echo "  Ratio = compressed/original (lower is better)"
+    echo "  Throughput = MB/s compression speed (higher is better)"
+    echo ""
+    printf "  %-14s %8s %12s %12s\n" "Codec" "Ratio" "Throughput" "Size"
+    printf "  %s\n" "──────────────────────────────────────────────────"
+
+    # Build list of (ratio_pct * 10 as integer, label, throughput, size) for sorting
+    # ratio_pct * 10 avoids floating point in bash sort
+    declare -a pareto_rows
+
+    # gzip row
+    gz_ratio_int=$(awk "BEGIN { printf \"%d\", ($t_gz / $t_orig) * 1000; exit }" < /dev/null)
+    pareto_rows+=("$gz_ratio_int|gzip (default)|$(fmt_throughput $t_orig $t_gz_ns) MB/s|$(fmt_bytes $t_gz)")
+
+    # competitor rows
+    if [[ "$HAS_ZLIBBNG" == true ]]; then
+        zng_ratio_int=$(awk "BEGIN { printf \"%d\", ($t_zng / $t_orig) * 1000; exit }" < /dev/null)
+        pareto_rows+=("$zng_ratio_int|zlib-ng (default)|$(fmt_throughput $t_orig $t_zng_ns) MB/s|$(fmt_bytes $t_zng)")
+    fi
+    if [[ "$HAS_LZ4" == true ]]; then
+        lz4_ratio_int=$(awk "BEGIN { printf \"%d\", ($t_lz4 / $t_orig) * 1000; exit }" < /dev/null)
+        pareto_rows+=("$lz4_ratio_int|lz4 (default)|$(fmt_throughput $t_orig $t_lz4_ns) MB/s|$(fmt_bytes $t_lz4)")
+    fi
+    if [[ "$HAS_ZSTD" == true ]]; then
+        zst_ratio_int=$(awk "BEGIN { printf \"%d\", ($t_zst / $t_orig) * 1000; exit }" < /dev/null)
+        pareto_rows+=("$zst_ratio_int|zstd (default)|$(fmt_throughput $t_orig $t_zst_ns) MB/s|$(fmt_bytes $t_zst)")
+    fi
+
+    # pz pipeline rows
+    for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
+        p="${PIPELINES[$pi]}"
+        pz_ratio_int=$(awk "BEGIN { printf \"%d\", (${t_pz_size[$pi]} / $t_orig) * 1000; exit }" < /dev/null)
+        pareto_rows+=("$pz_ratio_int|pz-$p|$(fmt_throughput $t_orig ${t_pz_ns[$pi]}) MB/s|$(fmt_bytes ${t_pz_size[$pi]})")
+    done
+
+    # Sort by ratio integer (field 1), print formatted
+    printf '%s\n' "${pareto_rows[@]}" | sort -t'|' -k1,1n | while IFS='|' read -r ratio_int label throughput size; do
+        ratio_pct=$(awk "BEGIN { printf \"%.1f%%\", $ratio_int / 10.0; exit }" < /dev/null)
+        printf "  %-14s %8s %12s %12s\n" "$label" "$ratio_pct" "$throughput" "$size"
+    done
+
+    echo ""
+    echo "  Pareto-dominant = lower ratio AND higher throughput than any competitor row above it."
 fi
