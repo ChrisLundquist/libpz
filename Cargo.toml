@@ -109,6 +109,10 @@ harness = false
 name = "stages_deflate_webgpu_chained"
 harness = false
 
+[[bench]]
+name = "rans_decode_bench"
+harness = false
+
 [profile.profiling]
 inherits = "release"
 debug = true

@@ -543,6 +543,65 @@ mod avx2 {
 }
 
 // ---------------------------------------------------------------------------
+// rANS SSE2 state transition
+// ---------------------------------------------------------------------------
+
+/// SSE2-accelerated rANS state transition for 4 lanes.
+///
+/// Computes: new_state[i] = freq[i] * (state[i] >> scale_bits) + slot[i] - cum[i]
+/// for i in 0..4, using SSE2 `_mm_mul_epu32` for the multiply step.
+///
+/// # Safety
+/// Requires SSE2 (always available on x86_64). All arrays must have length >= 4.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+pub unsafe fn rans_state_transition_sse2(
+    states: &mut [u32; 4],
+    freqs: &[u32; 4],
+    slots: &[u32; 4],
+    cums: &[u32; 4],
+    scale_bits: u32,
+) {
+    use std::arch::x86_64::*;
+
+    // Shift states right by scale_bits (scalar — no SIMD shift by variable amount in SSE2)
+    let s0 = states[0] >> scale_bits;
+    let s1 = states[1] >> scale_bits;
+    let s2 = states[2] >> scale_bits;
+    let s3 = states[3] >> scale_bits;
+
+    // Pack into SSE2 registers: interleave pairs for _mm_mul_epu32
+    // _mm_mul_epu32 multiplies the low 32 bits of each 64-bit lane.
+    // To get products for all 4 u32 pairs, run two multiplies:
+    //   lo_pair: lanes 0,2 -> products at 64-bit positions 0,1
+    //   hi_pair: lanes 1,3 -> products at 64-bit positions 0,1
+    let freq_lo = _mm_set_epi32(0, freqs[2] as i32, 0, freqs[0] as i32); // [f0, 0, f2, 0]
+    let state_lo = _mm_set_epi32(0, s2 as i32, 0, s0 as i32);
+    let prod_lo = _mm_mul_epu32(freq_lo, state_lo); // [f0*s0, f2*s2] as u64
+
+    let freq_hi = _mm_set_epi32(0, freqs[3] as i32, 0, freqs[1] as i32);
+    let state_hi = _mm_set_epi32(0, s3 as i32, 0, s1 as i32);
+    let prod_hi = _mm_mul_epu32(freq_hi, state_hi); // [f1*s1, f3*s3] as u64
+
+    // Extract low 32 bits of each product (the multiply result fits in u32 for
+    // valid rANS states: freq <= 1<<14, state>>scale_bits <= 1<<16, product <= 1<<30)
+    states[0] = (_mm_cvtsi128_si64(prod_lo) as u32)
+        .wrapping_add(slots[0])
+        .wrapping_sub(cums[0]);
+    states[1] = (_mm_cvtsi128_si64(prod_hi) as u32)
+        .wrapping_add(slots[1])
+        .wrapping_sub(cums[1]);
+    let prod_lo_hi = _mm_srli_si128(prod_lo, 8);
+    states[2] = (_mm_cvtsi128_si64(prod_lo_hi) as u32)
+        .wrapping_add(slots[2])
+        .wrapping_sub(cums[2]);
+    let prod_hi_hi = _mm_srli_si128(prod_hi, 8);
+    states[3] = (_mm_cvtsi128_si64(prod_hi_hi) as u32)
+        .wrapping_add(slots[3])
+        .wrapping_sub(cums[3]);
+}
+
+// ---------------------------------------------------------------------------
 // rANS 4-way interleaved decode (batched — 4 lanes per iteration)
 // ---------------------------------------------------------------------------
 
@@ -780,6 +839,133 @@ pub fn rans_decode_4way_into(
     }
 
     Some(())
+}
+
+/// 4-way rANS decode using SSE2 for the state transition multiply step.
+///
+/// Same signature and behavior as [`rans_decode_4way`] but uses SSE2 intrinsics
+/// for the `freq * (state >> scale_bits)` multiply operations. The gather step
+/// (symbol lookup) remains scalar as there is no gather on SSE2.
+///
+/// # Safety
+/// Requires SSE2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+pub unsafe fn rans_decode_4way_sse2(
+    word_streams: &[&[u16]; 4],
+    initial_states: &[u32; 4],
+    freq: &[u16; 256],
+    cum: &[u16; 256],
+    lookup: &[u8],
+    scale_bits: u32,
+    original_len: usize,
+) -> Option<Vec<u8>> {
+    let scale_mask = (1u32 << scale_bits) - 1;
+    let rans_l: u32 = 1 << 16;
+    let io_bits: u32 = 16;
+    let lookup_len = lookup.len();
+
+    let mut states = *initial_states;
+    let mut word_pos = [0usize; 4];
+    let mut output = vec![0u8; original_len];
+    let mut out_pos = 0;
+
+    // Process in batches of 4 (one symbol per lane per iteration).
+    let full_quads = original_len / 4;
+    let remainder = original_len % 4;
+
+    for _ in 0..full_quads {
+        // Step 1: Extract slots from all 4 states
+        let slot0 = states[0] & scale_mask;
+        let slot1 = states[1] & scale_mask;
+        let slot2 = states[2] & scale_mask;
+        let slot3 = states[3] & scale_mask;
+
+        // Bounds check all 4 at once
+        if (slot0 as usize | slot1 as usize | slot2 as usize | slot3 as usize) >= lookup_len {
+            return None;
+        }
+
+        // Step 2: Scalar gather — lookup symbols, frequencies, cumulative
+        let s0 = lookup[slot0 as usize];
+        let s1 = lookup[slot1 as usize];
+        let s2 = lookup[slot2 as usize];
+        let s3 = lookup[slot3 as usize];
+
+        let f0 = freq[s0 as usize] as u32;
+        let f1 = freq[s1 as usize] as u32;
+        let f2 = freq[s2 as usize] as u32;
+        let f3 = freq[s3 as usize] as u32;
+
+        let c0 = cum[s0 as usize] as u32;
+        let c1 = cum[s1 as usize] as u32;
+        let c2 = cum[s2 as usize] as u32;
+        let c3 = cum[s3 as usize] as u32;
+
+        // Step 3: State transition using SSE2 for multiply step
+        let freqs_arr = [f0, f1, f2, f3];
+        let slots_arr = [slot0, slot1, slot2, slot3];
+        let cums_arr = [c0, c1, c2, c3];
+        rans_state_transition_sse2(&mut states, &freqs_arr, &slots_arr, &cums_arr, scale_bits);
+
+        // Step 4: Renormalize all 4 lanes
+        if states[0] < rans_l && word_pos[0] < word_streams[0].len() {
+            states[0] = (states[0] << io_bits) | word_streams[0][word_pos[0]] as u32;
+            word_pos[0] += 1;
+        }
+        if states[1] < rans_l && word_pos[1] < word_streams[1].len() {
+            states[1] = (states[1] << io_bits) | word_streams[1][word_pos[1]] as u32;
+            word_pos[1] += 1;
+        }
+        if states[2] < rans_l && word_pos[2] < word_streams[2].len() {
+            states[2] = (states[2] << io_bits) | word_streams[2][word_pos[2]] as u32;
+            word_pos[2] += 1;
+        }
+        if states[3] < rans_l && word_pos[3] < word_streams[3].len() {
+            states[3] = (states[3] << io_bits) | word_streams[3][word_pos[3]] as u32;
+            word_pos[3] += 1;
+        }
+
+        // Step 5: Write output symbols
+        output[out_pos] = s0;
+        output[out_pos + 1] = s1;
+        output[out_pos + 2] = s2;
+        output[out_pos + 3] = s3;
+        out_pos += 4;
+    }
+
+    // Handle remaining symbols (< 4)
+    for r in 0..remainder {
+        let lane = r;
+        let slot = states[lane] & scale_mask;
+        if slot as usize >= lookup_len {
+            return None;
+        }
+        let s = lookup[slot as usize];
+        let f = freq[s as usize] as u32;
+        let c = cum[s as usize] as u32;
+
+        // SSE2 transition for single lane
+        let mut state_arr = [states[lane], 0, 0, 0];
+        rans_state_transition_sse2(
+            &mut state_arr,
+            &[f, 0, 0, 0],
+            &[slot, 0, 0, 0],
+            &[c, 0, 0, 0],
+            scale_bits,
+        );
+        states[lane] = state_arr[0];
+
+        if states[lane] < rans_l && word_pos[lane] < word_streams[lane].len() {
+            states[lane] = (states[lane] << io_bits) | word_streams[lane][word_pos[lane]] as u32;
+            word_pos[lane] += 1;
+        }
+
+        output[out_pos] = s;
+        out_pos += 1;
+    }
+
+    Some(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -1108,5 +1294,136 @@ mod tests {
         assert_eq!(d.compare_bytes(&[], &[1, 2, 3], MAX_COMPARE_LEN), 0);
         assert_eq!(d.compare_bytes(&[1, 2, 3], &[], MAX_COMPARE_LEN), 0);
         assert_eq!(d.compare_bytes(&[], &[], MAX_COMPARE_LEN), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // rANS 4-way SIMD decode tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rans_decode_4way_sse2_matches_scalar() {
+        // Encode a known sequence with the CPU rANS encoder, then decode
+        // both paths and assert byte-for-byte identical output.
+        use crate::rans;
+
+        let input: Vec<u8> = (0..1024).map(|i| (i % 26 + b'a' as usize) as u8).collect();
+        let freq_table = crate::frequency::get_frequency(&input);
+        let norm = rans::normalize_frequencies(&freq_table, rans::DEFAULT_SCALE_BITS).unwrap();
+        let (word_streams, final_states) = rans::rans_encode_interleaved(&input, &norm, 4);
+
+        let lookup = rans::build_symbol_lookup(&norm);
+        let streams_arr: [&[u16]; 4] = [
+            &word_streams[0],
+            &word_streams[1],
+            &word_streams[2],
+            &word_streams[3],
+        ];
+        let states_arr: [u32; 4] = [
+            final_states[0],
+            final_states[1],
+            final_states[2],
+            final_states[3],
+        ];
+
+        // Scalar path
+        let scalar_out = rans_decode_4way(
+            &streams_arr,
+            &states_arr,
+            &norm.freq,
+            &norm.cum,
+            &lookup,
+            norm.scale_bits as u32,
+            input.len(),
+        )
+        .unwrap();
+
+        // SSE2 path (x86_64 only)
+        #[cfg(target_arch = "x86_64")]
+        {
+            let sse2_out = unsafe {
+                rans_decode_4way_sse2(
+                    &streams_arr,
+                    &states_arr,
+                    &norm.freq,
+                    &norm.cum,
+                    &lookup,
+                    norm.scale_bits as u32,
+                    input.len(),
+                )
+            }
+            .unwrap();
+            assert_eq!(
+                scalar_out, sse2_out,
+                "SSE2 and scalar rANS decode must produce identical output"
+            );
+        }
+
+        assert_eq!(scalar_out, input);
+    }
+
+    #[test]
+    fn test_rans_decode_4way_sse2_round_trips_varied_distributions() {
+        // Test with skewed distributions (few high-freq symbols) and flat
+        // distributions (all 256 symbols equally likely), as these exercise
+        // different freq/cum table patterns.
+        use crate::rans;
+
+        for seed in [0u8, 42, 128, 255] {
+            let input: Vec<u8> = (0..4096)
+                .map(|i| {
+                    let val = ((i as u64)
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(seed as u64))
+                        >> 56;
+                    val as u8
+                })
+                .collect();
+            let freq_table = crate::frequency::get_frequency(&input);
+            let norm = rans::normalize_frequencies(&freq_table, rans::DEFAULT_SCALE_BITS).unwrap();
+            let (word_streams, final_states) = rans::rans_encode_interleaved(&input, &norm, 4);
+
+            let lookup = rans::build_symbol_lookup(&norm);
+            let streams_arr: [&[u16]; 4] = [
+                &word_streams[0],
+                &word_streams[1],
+                &word_streams[2],
+                &word_streams[3],
+            ];
+            let states_arr: [u32; 4] = [
+                final_states[0],
+                final_states[1],
+                final_states[2],
+                final_states[3],
+            ];
+
+            let scalar_out = rans_decode_4way(
+                &streams_arr,
+                &states_arr,
+                &norm.freq,
+                &norm.cum,
+                &lookup,
+                norm.scale_bits as u32,
+                input.len(),
+            )
+            .unwrap();
+            assert_eq!(scalar_out, input, "round-trip failed for seed {}", seed);
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                let sse2_out = unsafe {
+                    rans_decode_4way_sse2(
+                        &streams_arr,
+                        &states_arr,
+                        &norm.freq,
+                        &norm.cum,
+                        &lookup,
+                        norm.scale_bits as u32,
+                        input.len(),
+                    )
+                }
+                .unwrap();
+                assert_eq!(sse2_out, input, "SSE2 round-trip failed for seed {}", seed);
+            }
+        }
     }
 }

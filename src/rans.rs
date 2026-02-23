@@ -478,6 +478,26 @@ fn rans_decode_interleaved(
             initial_states[2],
             initial_states[3],
         ];
+
+        // Dispatch to SSE2 path if available on x86_64
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("sse2") {
+            // SAFETY: is_x86_feature_detected verified SSE2 is available
+            return unsafe {
+                crate::simd::rans_decode_4way_sse2(
+                    &streams_arr,
+                    &states_arr,
+                    &norm.freq,
+                    &norm.cum,
+                    lookup,
+                    norm.scale_bits as u32,
+                    original_len,
+                )
+            }
+            .ok_or(PzError::InvalidInput);
+        }
+
+        // Fallback to scalar path
         return crate::simd::rans_decode_4way(
             &streams_arr,
             &states_arr,
@@ -540,7 +560,8 @@ fn rans_decode_interleaved_into(
         return Err(PzError::InvalidInput);
     }
 
-    // Fast path: 4-way batched decode
+    // Fast path: 4-way batched decode (note: _into variant not yet SSE2-optimized,
+    // keeping scalar implementation for now)
     if num_states == 4 {
         let streams_arr: [&[u16]; 4] = [
             word_streams[0],
