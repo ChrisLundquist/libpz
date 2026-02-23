@@ -1,0 +1,198 @@
+--- alice29.txt ---
+=== Bit-Budget Analysis ===
+
+  File:       alice29.txt
+  Original:   152089 bytes
+  Pipeline:   lzseqr (LZ-based)
+
+  Cost Category           bits/byte  % of orig
+  ──────────────────────────────────────────────
+  pz total                3.343 bpb     41.79%
+    .pz header+framing    0.001 bpb      0.02%
+    payload               3.342 bpb     41.77%
+
+  gzip total (ref)        2.863 bpb     35.79%
+
+  gap vs gzip             0.480 bpb      5.99%
+
+  pz-lzseqr spends 0.480 extra bits/byte vs gzip — top ratio sink.
+--- asyoulik.txt ---
+=== Bit-Budget Analysis ===
+
+  File:       asyoulik.txt
+  Original:   125179 bytes
+  Pipeline:   lzseqr (LZ-based)
+
+  Cost Category           bits/byte  % of orig
+  ──────────────────────────────────────────────
+  pz total                3.611 bpb     45.14%
+    .pz header+framing    0.002 bpb      0.02%
+    payload               3.609 bpb     45.12%
+
+  gzip total (ref)        3.127 bpb     39.09%
+
+  gap vs gzip             0.484 bpb      6.05%
+
+  pz-lzseqr spends 0.484 extra bits/byte vs gzip — top ratio sink.
+--- cp.html ---
+=== Bit-Budget Analysis ===
+
+  File:       cp.html
+  Original:   24603 bytes
+  Pipeline:   lzseqr (LZ-based)
+
+  Cost Category           bits/byte  % of orig
+  ──────────────────────────────────────────────
+  pz total                3.648 bpb     45.60%
+    .pz header+framing    0.008 bpb      0.10%
+    payload               3.640 bpb     45.50%
+
+  gzip total (ref)        2.598 bpb     32.48%
+
+  gap vs gzip             1.050 bpb     13.12%
+
+  pz-lzseqr spends 1.050 extra bits/byte vs gzip — top ratio sink.
+--- fields.c ---
+=== Bit-Budget Analysis ===
+
+  File:       fields.c
+  Original:   11150 bytes
+  Pipeline:   lzseqr (LZ-based)
+
+  Cost Category           bits/byte  % of orig
+  ──────────────────────────────────────────────
+  pz total                4.551 bpb     56.89%
+    .pz header+framing    0.017 bpb      0.22%
+    payload               4.534 bpb     56.67%
+
+  gzip total (ref)        2.262 bpb     28.27%
+
+  gap vs gzip             2.290 bpb     28.62%
+
+  pz-lzseqr spends 2.290 extra bits/byte vs gzip — top ratio sink.
+--- grammar.lsp ---
+=== Bit-Budget Analysis ===
+
+  File:       grammar.lsp
+  Original:   3721 bytes
+  Pipeline:   lzseqr (LZ-based)
+
+  Cost Category           bits/byte  % of orig
+  ──────────────────────────────────────────────
+  pz total                9.286 bpb    116.07%
+    .pz header+framing    0.052 bpb      0.64%
+    payload               9.234 bpb    115.43%
+
+  gzip total (ref)        2.698 bpb     33.73%
+
+  gap vs gzip             6.587 bpb     82.34%
+
+  pz-lzseqr spends 6.587 extra bits/byte vs gzip — top ratio sink.
+--- kennedy.xls ---
+=== Bit-Budget Analysis ===
+
+  File:       kennedy.xls
+  Original:   1029744 bytes
+  Pipeline:   lzseqr (LZ-based)
+
+  Cost Category           bits/byte  % of orig
+  ──────────────────────────────────────────────
+  pz total                1.033 bpb     12.92%
+    .pz header+framing    0.000 bpb      0.00%
+    payload               1.033 bpb     12.91%
+
+  gzip total (ref)        1.585 bpb     19.81%
+
+  gap vs gzip            -0.552 bpb     -6.90%
+
+  pz-lzseqr matches or beats gzip on this file.
+--- lcet10.txt ---
+=== Bit-Budget Analysis ===
+
+  File:       lcet10.txt
+  Original:   426754 bytes
+  Pipeline:   lzseqr (LZ-based)
+
+  Cost Category           bits/byte  % of orig
+  ──────────────────────────────────────────────
+  pz total                3.095 bpb     38.69%
+    .pz header+framing    0.001 bpb      0.01%
+    payload               3.095 bpb     38.68%
+
+  gzip total (ref)        2.717 bpb     33.96%
+
+  gap vs gzip             0.378 bpb      4.73%
+
+  pz-lzseqr spends 0.378 extra bits/byte vs gzip — top ratio sink.
+--- plrabn12.txt ---
+=== Bit-Budget Analysis ===
+
+  File:       plrabn12.txt
+  Original:   481861 bytes
+  Pipeline:   lzseqr (LZ-based)
+
+  Cost Category           bits/byte  % of orig
+  ──────────────────────────────────────────────
+  pz total                3.718 bpb     46.47%
+    .pz header+framing    0.001 bpb      0.01%
+    payload               3.717 bpb     46.46%
+
+  gzip total (ref)        3.242 bpb     40.53%
+
+  gap vs gzip             0.475 bpb      5.94%
+
+  pz-lzseqr spends 0.475 extra bits/byte vs gzip — top ratio sink.
+--- ptt5 ---
+=== Bit-Budget Analysis ===
+
+  File:       ptt5
+  Original:   513216 bytes
+  Pipeline:   lzseqr (LZ-based)
+
+  Cost Category           bits/byte  % of orig
+  ──────────────────────────────────────────────
+  pz total                0.869 bpb     10.86%
+    .pz header+framing    0.000 bpb      0.01%
+    payload               0.868 bpb     10.85%
+
+  gzip total (ref)        0.881 bpb     11.01%
+
+  gap vs gzip            -0.012 bpb     -0.15%
+
+  pz-lzseqr matches or beats gzip on this file.
+--- sum ---
+=== Bit-Budget Analysis ===
+
+  File:       sum
+  Original:   38240 bytes
+  Pipeline:   lzseqr (LZ-based)
+
+  Cost Category           bits/byte  % of orig
+  ──────────────────────────────────────────────
+  pz total                3.172 bpb     39.65%
+    .pz header+framing    0.005 bpb      0.06%
+    payload               3.167 bpb     39.58%
+
+  gzip total (ref)        2.723 bpb     34.04%
+
+  gap vs gzip             0.449 bpb      5.61%
+
+  pz-lzseqr spends 0.449 extra bits/byte vs gzip — top ratio sink.
+--- xargs.1 ---
+=== Bit-Budget Analysis ===
+
+  File:       xargs.1
+  Original:   4227 bytes
+  Pipeline:   lzseqr (LZ-based)
+
+  Cost Category           bits/byte  % of orig
+  ──────────────────────────────────────────────
+  pz total                9.143 bpb    114.29%
+    .pz header+framing    0.045 bpb      0.57%
+    payload               9.098 bpb    113.72%
+
+  gzip total (ref)        3.340 bpb     41.76%
+
+  gap vs gzip             5.803 bpb     72.53%
+
+  pz-lzseqr spends 5.803 extra bits/byte vs gzip — top ratio sink.

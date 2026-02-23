@@ -1,0 +1,58 @@
+=== BENCHMARK SUMMARY ===
+
+Configuration:
+  Files:      14 files (13.32 MB total)
+  Iterations: 3 per operation
+  Pipelines:  deflate bw bbw lzr lzf lzfi lzseqr lzseqh
+  Threads:    1
+
+Compression Results:
+  Pipeline           Size    Ratio       Time Throughput
+  ────────────────────────────────────────────────────────────
+  gzip            3.81 MB    28.6%  2292.4 ms   5.8 MB/s
+  lz4             6.70 MB    50.3%   514.9 ms  25.9 MB/s
+  zstd            3.69 MB    27.7%   603.7 ms  22.1 MB/s
+  pz-deflate      5.54 MB    41.6%  1072.6 ms  12.4 MB/s
+  pz-bw           4.35 MB    32.7%  3528.6 ms   3.8 MB/s
+  pz-bbw          4.70 MB    35.3%  3693.7 ms   3.6 MB/s
+  pz-lzr          5.41 MB    40.6%   902.4 ms  14.8 MB/s
+  pz-lzf          5.56 MB    41.7%  1044.6 ms  12.8 MB/s
+  pz-lzfi         7.10 MB    53.3%  1243.3 ms  10.7 MB/s
+  pz-lzseqr       4.27 MB    32.0%  1181.4 ms  11.3 MB/s
+  pz-lzseqh       4.51 MB    33.9%  1177.6 ms  11.3 MB/s
+
+Decompression Results:
+  Pipeline         Time Throughput
+  ────────────────────────────────────
+  gzip         424.5 ms  31.4 MB/s
+  pz-deflate   745.1 ms  17.9 MB/s
+  pz-bw       1123.1 ms  11.9 MB/s
+  pz-bbw      1070.8 ms  12.4 MB/s
+  pz-lzr       698.2 ms  19.1 MB/s
+  pz-lzf       758.7 ms  17.6 MB/s
+  pz-lzfi      789.7 ms  16.9 MB/s
+  pz-lzseqr    700.6 ms  19.0 MB/s
+  pz-lzseqh    735.3 ms  18.1 MB/s
+
+Run with --verbose for per-file breakdown
+
+=== PARETO COMPARISON TABLE (single-thread, sorted by ratio) ===
+
+  Ratio = compressed/original (lower is better)
+  Throughput = MB/s compression speed (higher is better)
+
+  Codec             Ratio   Throughput         Size
+  ──────────────────────────────────────────────────
+  zstd (default)    27.6%    22.1 MB/s      3.69 MB
+  gzip (default)    28.5%     5.8 MB/s      3.81 MB
+  pz-lzseqr         32.0%    11.3 MB/s      4.27 MB
+  pz-bw             32.6%     3.8 MB/s      4.35 MB
+  pz-lzseqh         33.8%    11.3 MB/s      4.51 MB
+  pz-bbw            35.2%     3.6 MB/s      4.70 MB
+  pz-lzr            40.5%    14.8 MB/s      5.41 MB
+  pz-deflate        41.5%    12.4 MB/s      5.54 MB
+  pz-lzf            41.6%    12.8 MB/s      5.56 MB
+  lz4 (default)     50.3%    25.9 MB/s      6.70 MB
+  pz-lzfi           53.3%    10.7 MB/s      7.10 MB
+
+  Pareto-dominant = lower ratio AND higher throughput than any competitor row above it.
