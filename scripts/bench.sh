@@ -191,6 +191,26 @@ if ! command -v gzip &>/dev/null; then
     exit 1
 fi
 
+# Check competitor tool availability (optional — skip gracefully if missing)
+HAS_ZLIBBNG=false
+HAS_LZ4=false
+HAS_ZSTD=false
+if command -v minigzip-ng &>/dev/null; then
+    HAS_ZLIBBNG=true
+elif [[ "$VERBOSE" == true ]]; then
+    echo "INFO: minigzip-ng not found (install: brew install zlib-ng); skipping zlib-ng"
+fi
+if command -v lz4 &>/dev/null; then
+    HAS_LZ4=true
+elif [[ "$VERBOSE" == true ]]; then
+    echo "INFO: lz4 not found (install: brew install lz4); skipping lz4"
+fi
+if command -v zstd &>/dev/null; then
+    HAS_ZSTD=true
+elif [[ "$VERBOSE" == true ]]; then
+    echo "INFO: zstd not found (install: brew install zstd); skipping zstd"
+fi
+
 BENCH_TMPDIR=$(mktemp -d)
 trap 'rm -rf "$BENCH_TMPDIR"' EXIT
 
@@ -274,6 +294,10 @@ fi
 
 # Accumulators: gzip
 t_orig=0; t_gz=0; t_gz_ns=0
+# Competitor accumulators
+t_zng=0; t_zng_ns=0
+t_lz4=0; t_lz4_ns=0
+t_zst=0; t_zst_ns=0
 # Accumulators: per-pipeline (parallel arrays)
 declare -a t_pz_size t_pz_ns
 for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
@@ -299,6 +323,36 @@ for file in "${FILES[@]}"; do
     t_orig=$((t_orig + orig_size))
     t_gz=$((t_gz + gz_size))
     t_gz_ns=$((t_gz_ns + gz_comp_ns))
+
+    # --- zlib-ng compress ---
+    if [[ "$HAS_ZLIBBNG" == true ]]; then
+        zng_out="$BENCH_TMPDIR/$name.zng"
+        zng_comp_ns=$(avg_ns bash -c "minigzip-ng < '$file' > '$zng_out'")
+        zng_size=$(stat -c%s "$zng_out" 2>/dev/null || stat -f%z "$zng_out" 2>/dev/null)
+        rm -f "$zng_out"
+        t_zng=$((t_zng + zng_size))
+        t_zng_ns=$((t_zng_ns + zng_comp_ns))
+    fi
+
+    # --- lz4 compress ---
+    if [[ "$HAS_LZ4" == true ]]; then
+        lz4_out="$BENCH_TMPDIR/$name.lz4"
+        lz4_comp_ns=$(avg_ns bash -c "lz4 -q -c '$file' > '$lz4_out'")
+        lz4_size=$(stat -c%s "$lz4_out" 2>/dev/null || stat -f%z "$lz4_out" 2>/dev/null)
+        rm -f "$lz4_out"
+        t_lz4=$((t_lz4 + lz4_size))
+        t_lz4_ns=$((t_lz4_ns + lz4_comp_ns))
+    fi
+
+    # --- zstd compress ---
+    if [[ "$HAS_ZSTD" == true ]]; then
+        zst_out="$BENCH_TMPDIR/$name.zst"
+        zst_comp_ns=$(avg_ns bash -c "zstd -q --single-thread -c '$file' > '$zst_out'")
+        zst_size=$(stat -c%s "$zst_out" 2>/dev/null || stat -f%z "$zst_out" 2>/dev/null)
+        rm -f "$zst_out"
+        t_zst=$((t_zst + zst_size))
+        t_zst_ns=$((t_zst_ns + zst_comp_ns))
+    fi
 
     # --- pz pipelines ---
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
@@ -443,6 +497,18 @@ if [[ "$VERBOSE" == false ]]; then
     printf "  %s\n" "────────────────────────────────────────────────────────────"
     printf "  %-10s %12s %8s %10s %10s\n" "gzip" "$(fmt_bytes $t_gz)" \
         "$(fmt_ratio $t_gz $t_orig)" "$(fmt_ms $t_gz_ns) ms" "$(fmt_throughput $t_orig $t_gz_ns) MB/s"
+    if [[ "$HAS_ZLIBBNG" == true ]]; then
+        printf "  %-10s %12s %8s %10s %10s\n" "zlib-ng" "$(fmt_bytes $t_zng)" \
+            "$(fmt_ratio $t_zng $t_orig)" "$(fmt_ms $t_zng_ns) ms" "$(fmt_throughput $t_orig $t_zng_ns) MB/s"
+    fi
+    if [[ "$HAS_LZ4" == true ]]; then
+        printf "  %-10s %12s %8s %10s %10s\n" "lz4" "$(fmt_bytes $t_lz4)" \
+            "$(fmt_ratio $t_lz4 $t_orig)" "$(fmt_ms $t_lz4_ns) ms" "$(fmt_throughput $t_orig $t_lz4_ns) MB/s"
+    fi
+    if [[ "$HAS_ZSTD" == true ]]; then
+        printf "  %-10s %12s %8s %10s %10s\n" "zstd" "$(fmt_bytes $t_zst)" \
+            "$(fmt_ratio $t_zst $t_orig)" "$(fmt_ms $t_zst_ns) ms" "$(fmt_throughput $t_orig $t_zst_ns) MB/s"
+    fi
 
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
