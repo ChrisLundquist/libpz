@@ -53,7 +53,7 @@ pub struct SeqConfig {
     /// a small speed cost (one extra byte of lookahead required per position).
     pub hash_prefix_len: u8,
     /// Maximum hash chain depth. Higher values improve ratio at the cost of speed.
-    /// Default: 64. Clamped to 1..=MAX_CHAIN internally.
+    /// Default: 64. Clamped to 1..=256 internally.
     pub max_chain: usize,
     /// When true, reduce chain depth on blocks with low match density.
     /// Speeds up encoding on incompressible data with minimal ratio cost.
@@ -478,24 +478,23 @@ fn unpack_flags(bytes: &[u8], count: usize) -> Vec<bool> {
 /// Exact thresholds per offset bit-cost (oeb = extra bits for offset code):
 /// | oeb | Offset range       | Match cost | Min profitable L |
 /// |-----|--------------------|-----------| ------------------|
-/// | 0   | 1                  | 2 bytes   | 3 (= MIN_MATCH)   |
-/// | 1   | 2                  | 2 bytes   | 3                 |
-/// | 2   | 3-4                | 2 bytes   | 3                 |
-/// | 3   | 5-8                | 2 bytes   | 3                 |
-/// | 4   | 9-16               | 3 bytes   | 4                 |
-/// | 5   | 17-32              | 3 bytes   | 4                 |
-/// | 6   | 33-64              | 3 bytes   | 4                 |
-/// | 7   | 65-128             | 3 bytes   | 4                 |
-/// | 8   | 129-256            | 3 bytes   | 4                 |
-/// | 9   | 257-512            | 4 bytes   | 5                 |
-/// | 10  | 513-1024           | 4 bytes   | 5                 |
-/// | 11  | 1025-2048          | 4 bytes   | 5                 |
-/// | 12  | 2049-4096          | 4 bytes   | 5                 |
-/// | 13  | 4097-8192          | 5 bytes   | 6                 |
-/// | 14  | 8193-16384         | 5 bytes   | 6                 |
-/// | 15  | 16385-32768        | 5 bytes   | 6                 |
-/// | 16  | 32769-65536        | 5 bytes   | 6                 |
-/// | 17  | 65537-131072       | 6 bytes   | 7                 |
+/// | 0   | 1-2                | 2 bytes   | 3 (= MIN_MATCH)   |
+/// | 1   | 3-4                | 2 bytes   | 3                 |
+/// | 2   | 5-8                | 2 bytes   | 3                 |
+/// | 3   | 9-16               | 2 bytes   | 3                 |
+/// | 4   | 17-32              | 3 bytes   | 4                 |
+/// | 5   | 33-64              | 3 bytes   | 4                 |
+/// | 6   | 65-128             | 3 bytes   | 4                 |
+/// | 7   | 129-256            | 3 bytes   | 4                 |
+/// | 8   | 257-512            | 4 bytes   | 5                 |
+/// | 9   | 513-1024           | 4 bytes   | 5                 |
+/// | 10  | 1025-2048          | 4 bytes   | 5                 |
+/// | 11  | 2049-4096          | 4 bytes   | 5                 |
+/// | 12  | 4097-8192          | 5 bytes   | 6                 |
+/// | 13  | 8193-16384         | 5 bytes   | 6                 |
+/// | 14  | 16385-32768        | 5 bytes   | 6                 |
+/// | 15  | 32769-65536        | 5 bytes   | 6                 |
+/// | 16  | 65537-131072       | 6 bytes   | 7                 |
 #[inline]
 pub(crate) fn min_profitable_length(offset: u32) -> u16 {
     if offset == 0 {

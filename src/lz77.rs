@@ -307,7 +307,6 @@ impl HashChainFinder {
     ///
     /// 4-byte hashing reduces hash collisions at the cost of needing 4 bytes
     /// of lookahead (positions near EOF fall back to hash3 internally).
-    #[allow(dead_code)]
     pub(crate) fn with_hash4(max_window: usize, max_match_len: u16, max_chain: usize) -> Self {
         debug_assert!(
             max_window.is_power_of_two(),
@@ -318,7 +317,7 @@ impl HashChainFinder {
             prev: vec![0; max_window],
             dispatcher: crate::simd::Dispatcher::new(),
             max_match_len: max_match_len as usize,
-            max_chain: max_chain.clamp(1, MAX_CHAIN),
+            max_chain: max_chain.clamp(1, MAX_CHAIN * 4),
             max_window,
             window_mask: max_window - 1,
             hash_prefix_len: 4,
