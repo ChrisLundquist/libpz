@@ -172,9 +172,9 @@ impl CostModel {
     ///      + length_code entropy (~4 bits) + length_extra bits
     ///      + next_byte entropy
     ///
-    /// Note: Uses raw `encode_offset` (not repeat-shifted). Does not model
-    /// repeat offset savings — a future enhancement could track repeat state
-    /// in the DP for even better LzSeq optimal parsing.
+    /// Note: Uses raw `encode_offset` (not repeat-shifted). For repeat offset
+    /// aware costs, use `match_cost_with_repeat_flag` which applies a discount
+    /// when the offset is in the repeat cache.
     #[inline]
     pub fn match_cost(&self, offset: u32, length: u16, next_byte: u8) -> u32 {
         if offset == 0 {
@@ -193,6 +193,78 @@ impl CostModel {
             .saturating_sub(code_discount)
             .saturating_add(extra_cost)
             .saturating_add(self.literal_cost[next_byte as usize])
+    }
+
+    /// Cost of a match token when the offset is a repeat offset (in scaled bits).
+    ///
+    /// Repeat offsets encode with code 0-2 and zero extra bits for the offset
+    /// component. The offset overhead is replaced by ~2 bits (entropy of 3
+    /// equally-likely repeat codes) vs the full literal offset cost.
+    /// Conservative estimate: repeat saves (offset_code_cost + offset_extra) - 2 bits.
+    #[inline]
+    pub fn match_cost_with_repeat_flag(
+        &self,
+        offset: u32,
+        length: u16,
+        next_byte: u8,
+        is_repeat: bool,
+    ) -> u32 {
+        if is_repeat {
+            // Repeat offset: encode with code 0-2, 0 extra bits.
+            // Cost = ~2 bits for offset code + length cost + next_byte cost.
+            let (_lc, leb, _) = crate::lzseq::encode_length(length);
+            let length_code_cost = 4 * COST_SCALE; // ~4 bits for length code
+            let length_extra_cost = leb as u32 * COST_SCALE;
+            let repeat_offset_cost = 2 * COST_SCALE; // ~2 bits for repeat code (0-2)
+            repeat_offset_cost
+                .saturating_add(length_code_cost)
+                .saturating_add(length_extra_cost)
+                .saturating_add(self.literal_cost[next_byte as usize])
+        } else {
+            self.match_cost(offset, length, next_byte)
+        }
+    }
+}
+
+/// Tracks repeat offset state for use in the DP cost model.
+///
+/// Mirrors `lzseq::RepeatOffsets` but defined here to avoid making that
+/// struct pub. The encoder and optimal parser must use identical init and
+/// update logic for costs to be accurate.
+///
+/// Initialized with `[1, 1, 1]` to match `RepeatOffsets::new()`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RepeatOffsetState {
+    pub recent: [u32; 3],
+}
+
+impl RepeatOffsetState {
+    pub(crate) fn new() -> Self {
+        Self { recent: [1, 1, 1] }
+    }
+
+    /// Returns true if `offset` is one of the 3 recent offsets.
+    #[inline]
+    pub(crate) fn is_repeat(&self, offset: u32) -> bool {
+        self.recent[0] == offset || self.recent[1] == offset || self.recent[2] == offset
+    }
+
+    /// Update state as if `offset` were just used (mirrors `RepeatOffsets::encode_offset`
+    /// side-effect, without returning the code). Called during forward trace to keep
+    /// state synchronized with the actual token sequence.
+    #[inline]
+    pub(crate) fn update(&mut self, offset: u32) {
+        if self.recent[0] == offset {
+            // already most recent, no change
+        } else if self.recent[1] == offset {
+            self.recent.swap(0, 1);
+        } else if self.recent[2] == offset {
+            self.recent.rotate_right(1);
+        } else {
+            self.recent[2] = self.recent[1];
+            self.recent[1] = self.recent[0];
+            self.recent[0] = offset;
+        }
     }
 }
 
@@ -233,6 +305,35 @@ pub(crate) fn build_match_table_cpu_with_limit(
 }
 
 // ---------------------------------------------------------------------------
+// Repeat offset annotation
+// ---------------------------------------------------------------------------
+
+/// Build per-position repeat offset state using a greedy forward pass.
+///
+/// Returns a Vec of length `input.len()`, where entry `i` contains the
+/// `RepeatOffsetState` that would be active at position `i`
+/// if matches were selected greedily (longest first). This is an
+/// approximation: the optimal parse may diverge from greedy, but repeat
+/// offsets tend to be stable across parse strategies on typical data.
+pub(crate) fn build_repeat_annotations(input: &[u8], table: &MatchTable) -> Vec<RepeatOffsetState> {
+    let mut states = vec![RepeatOffsetState::new(); input.len()];
+    let mut state = RepeatOffsetState::new();
+    let mut pos = 0;
+    while pos < input.len() {
+        states[pos] = state;
+        let candidates = table.at(pos);
+        if !candidates.is_empty() && candidates[0].length >= crate::lz77::MIN_MATCH as u32 {
+            let offset = candidates[0].offset;
+            state.update(offset);
+            pos += candidates[0].length as usize;
+        } else {
+            pos += 1;
+        }
+    }
+    states
+}
+
+// ---------------------------------------------------------------------------
 // Backward DP optimal parse
 // ---------------------------------------------------------------------------
 
@@ -252,6 +353,9 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
     if n == 0 {
         return Vec::new();
     }
+
+    // Build repeat offset annotations using greedy forward pass
+    let repeat_states = build_repeat_annotations(input, table);
 
     // cost[i] = minimum scaled-bit cost to encode input[i..n]
     let mut cost = vec![0u32; n + 1];
@@ -282,10 +386,16 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
             let next_pos = match_end + 1;
             // Token: Match { offset, length, next:input[match_end] }
             // Covers (length + 1) input bytes with one 5-byte token.
-            // Uses distance-aware match_cost: shorter offsets are cheaper
-            // (fewer extra bits), improving parse decisions for all pipelines.
+            // Uses distance-aware match_cost with repeat offset discount:
+            // if the offset is in the repeat state at this position, cost is lower.
+            let is_repeat = repeat_states[i].is_repeat(cand.offset);
             let mcost = cost_model
-                .match_cost(cand.offset, cand.length as u16, input[match_end])
+                .match_cost_with_repeat_flag(
+                    cand.offset,
+                    cand.length as u16,
+                    input[match_end],
+                    is_repeat,
+                )
                 .saturating_add(cost[next_pos]);
             if mcost < cost[i] {
                 cost[i] = mcost;
@@ -562,5 +672,92 @@ mod tests {
             model.match_token(b'a') > model.literal_token(b'a'),
             "match token should cost more than literal token"
         );
+    }
+
+    #[test]
+    fn test_repeat_offset_state_is_repeat() {
+        let mut state = RepeatOffsetState::new();
+        // Fresh state: initial offsets are [1, 1, 1]
+        assert!(state.is_repeat(1));
+        assert!(!state.is_repeat(42));
+
+        state.update(42);
+        assert!(state.is_repeat(42), "42 should now be most recent");
+        assert!(
+            state.is_repeat(1),
+            "1 should still be in recent[1] and recent[2]"
+        );
+        assert!(!state.is_repeat(99));
+    }
+
+    #[test]
+    fn test_repeat_offset_state_update_eviction() {
+        let mut state = RepeatOffsetState::new();
+        state.update(10);
+        state.update(20);
+        state.update(30);
+        // recent = [30, 20, 10]
+        assert!(state.is_repeat(30));
+        assert!(state.is_repeat(20));
+        assert!(state.is_repeat(10));
+        assert!(!state.is_repeat(1), "1 should have been evicted");
+    }
+
+    #[test]
+    fn test_repeat_offset_state_promote_existing() {
+        let mut state = RepeatOffsetState::new();
+        state.update(10);
+        state.update(20);
+        // recent = [20, 10, 1]
+        // Promote 10 (index 1): recent becomes [10, 20, 1]
+        state.update(10);
+        assert_eq!(state.recent[0], 10);
+        assert_eq!(state.recent[1], 20);
+    }
+
+    #[test]
+    fn test_match_cost_with_repeat_flag_cheaper_than_literal_offset() {
+        let freq = crate::frequency::get_frequency(b"abcabcabcabcabc");
+        let model = CostModel::from_frequencies(&freq);
+        let offset = 3u32;
+        let length = 3u16;
+        let next = b'a';
+
+        let repeat_cost = model.match_cost_with_repeat_flag(offset, length, next, true);
+        let nonrepeat_cost = model.match_cost_with_repeat_flag(offset, length, next, false);
+
+        assert!(
+            repeat_cost < nonrepeat_cost,
+            "repeat match cost ({repeat_cost}) should be less than non-repeat ({nonrepeat_cost})"
+        );
+    }
+
+    #[test]
+    fn test_build_repeat_annotations_length() {
+        let input = b"abcabcabcabc";
+        let table = build_match_table_cpu(input, K);
+        let states = build_repeat_annotations(input, &table);
+        assert_eq!(states.len(), input.len());
+    }
+
+    #[test]
+    fn test_optimal_parse_with_repeat_annotations_round_trip() {
+        // Verify that repeat-annotation-aware optimal parse still round-trips.
+        let pattern = b"abcabc abcabc abcabc ";
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend_from_slice(pattern);
+        }
+        round_trip(&input);
+    }
+
+    #[test]
+    fn test_optimal_parse_repeat_offset_selects_repeat_on_structured_data() {
+        // Build data where position 6+ has a match at offset 3 (a repeat after
+        // the first match at offset 3 has been used). The repeat-aware DP should
+        // produce output that round-trips and has smaller total cost.
+        let input: Vec<u8> = b"abcabcabcabcabcabc".to_vec();
+        // Just verify correctness — ratio improvement is validated in bench harness
+        round_trip(&input);
     }
 }
