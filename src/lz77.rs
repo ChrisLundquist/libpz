@@ -263,6 +263,7 @@ impl HashChainFinder {
     /// get u32 offsets for windows > 32KB.
     ///
     /// Memory: 128KB window = 512KB prev array, 256KB = 1MB, etc.
+    #[allow(dead_code)]
     pub(crate) fn with_window(max_window: usize, max_match_len: u16) -> Self {
         debug_assert!(
             max_window.is_power_of_two(),
@@ -274,6 +275,28 @@ impl HashChainFinder {
             dispatcher: crate::simd::Dispatcher::new(),
             max_match_len: max_match_len as usize,
             max_chain: MAX_CHAIN,
+            max_window,
+            window_mask: max_window - 1,
+            hash_prefix_len: 3,
+        }
+    }
+
+    /// Create a match finder with a custom window size and chain depth.
+    pub(crate) fn with_window_and_chain(
+        max_window: usize,
+        max_match_len: u16,
+        max_chain: usize,
+    ) -> Self {
+        debug_assert!(
+            max_window.is_power_of_two(),
+            "max_window must be power of 2"
+        );
+        Self {
+            head: vec![0; HASH_SIZE],
+            prev: vec![0; max_window],
+            dispatcher: crate::simd::Dispatcher::new(),
+            max_match_len: max_match_len as usize,
+            max_chain: max_chain.clamp(1, MAX_CHAIN * 4),
             max_window,
             window_mask: max_window - 1,
             hash_prefix_len: 3,

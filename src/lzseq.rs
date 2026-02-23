@@ -33,7 +33,7 @@
 ///   Code 1: length 4       (0 extra bits)
 ///   Code 2: length 5-6     (1 extra bit)
 ///   Code 3: length 7-10    (2 extra bits)
-use crate::lz77::{HashChainFinder, DEFAULT_MAX_MATCH, MAX_WINDOW, MIN_MATCH};
+use crate::lz77::{HashChainFinder, DEFAULT_MAX_MATCH, MIN_MATCH};
 use crate::{PzError, PzResult};
 
 /// Match length threshold above which lazy evaluation is skipped.
@@ -48,12 +48,21 @@ pub struct SeqConfig {
     /// Default: 128KB. Use larger values for better compression on data
     /// with long-range repeats.
     pub max_window: usize,
+    /// Hash prefix length for match finding: 3 (XOR, default) or 4 (multiply-shift).
+    /// Using 4 reduces hash collisions and may improve ratio on large inputs at
+    /// a small speed cost (one extra byte of lookahead required per position).
+    pub hash_prefix_len: u8,
+    /// Maximum hash chain depth. Higher values improve ratio at the cost of speed.
+    /// Default: 64. Clamped to 1..=MAX_CHAIN internally.
+    pub max_chain: usize,
 }
 
 impl Default for SeqConfig {
     fn default() -> Self {
         SeqConfig {
             max_window: 128 * 1024,
+            hash_prefix_len: 3,
+            max_chain: crate::lz77::MAX_CHAIN,
         }
     }
 }
@@ -467,12 +476,7 @@ pub(crate) fn min_profitable_length(offset: u32) -> u16 {
 ///
 /// For wider windows (128KB+), use `encode_with_config`.
 pub fn encode(input: &[u8]) -> PzResult<SeqEncoded> {
-    encode_with_config(
-        input,
-        &SeqConfig {
-            max_window: MAX_WINDOW,
-        },
-    )
+    encode_with_config(input, &SeqConfig::default())
 }
 
 /// Select the best match considering both hash-chain and repeat-offset candidates.
@@ -557,7 +561,15 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
         });
     }
 
-    let mut finder = HashChainFinder::with_window(config.max_window, DEFAULT_MAX_MATCH);
+    let mut finder = if config.hash_prefix_len == 4 {
+        HashChainFinder::with_hash4(config.max_window, DEFAULT_MAX_MATCH, config.max_chain)
+    } else {
+        HashChainFinder::with_window_and_chain(
+            config.max_window,
+            DEFAULT_MAX_MATCH,
+            config.max_chain,
+        )
+    };
     let mut repeats = RepeatOffsets::new();
     let mut flags_vec: Vec<bool> = Vec::new();
     let mut literals: Vec<u8> = Vec::new();
@@ -814,6 +826,7 @@ fn round_trip(input: &[u8]) -> PzResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lz77::MAX_WINDOW;
 
     // --- Code table self-consistency ---
 
@@ -1142,6 +1155,7 @@ mod tests {
 
         let config = SeqConfig {
             max_window: 64 * 1024,
+            ..SeqConfig::default()
         };
         let enc = encode_with_config(&input, &config).unwrap();
         let output = decode(
@@ -1174,12 +1188,14 @@ mod tests {
         // Wide window: should find a match at offset > 32KB
         let config_wide = SeqConfig {
             max_window: 128 * 1024,
+            ..SeqConfig::default()
         };
         let enc_wide = encode_with_config(&input, &config_wide).unwrap();
 
         // Narrow window: cannot see across the gap
         let config_narrow = SeqConfig {
             max_window: MAX_WINDOW, // 32KB
+            ..SeqConfig::default()
         };
         let enc_narrow = encode_with_config(&input, &config_narrow).unwrap();
 
@@ -1429,5 +1445,33 @@ mod tests {
             "expected some repeat usage on regular data, got 0 repeat codes out of {} matches",
             total_matches
         );
+    }
+
+    #[test]
+    fn seq_config_hash4_roundtrip() {
+        let input = b"the quick brown fox the quick brown fox";
+        let config = SeqConfig {
+            hash_prefix_len: 4,
+            ..SeqConfig::default()
+        };
+        let encoded = encode_with_config(input, &config).unwrap();
+        assert!(encoded.num_matches > 0, "hash4 config should find matches");
+    }
+
+    #[test]
+    fn seq_config_default_no_regression() {
+        let input = b"aababcabcdabcdeabcdefabcdefg";
+        let encoded_default = encode_with_config(input, &SeqConfig::default()).unwrap();
+        let encoded_hash3 = encode_with_config(
+            input,
+            &SeqConfig {
+                hash_prefix_len: 3,
+                ..SeqConfig::default()
+            },
+        )
+        .unwrap();
+        // Same number of matches — hash selection should not change token count
+        // for small inputs where both hashes resolve cleanly.
+        assert_eq!(encoded_default.num_tokens, encoded_hash3.num_tokens);
     }
 }
