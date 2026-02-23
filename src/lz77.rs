@@ -249,7 +249,7 @@ impl HashChainFinder {
             prev: vec![0; MAX_WINDOW],
             dispatcher: crate::simd::Dispatcher::new(),
             max_match_len: max_match_len as usize,
-            max_chain: max_chain.clamp(1, MAX_CHAIN),
+            max_chain: max_chain.clamp(1, MAX_CHAIN * 4),
             max_window: MAX_WINDOW,
             window_mask: WINDOW_MASK,
             hash_prefix_len: 3,
@@ -333,6 +333,12 @@ impl HashChainFinder {
         } else {
             hash3(data, pos)
         }
+    }
+
+    /// Dynamically adjust chain depth. Used by adaptive encoding loops.
+    /// Clamps to 1..=MAX_CHAIN*4.
+    pub(crate) fn set_max_chain(&mut self, max_chain: usize) {
+        self.max_chain = max_chain.clamp(1, MAX_CHAIN * 4);
     }
 
     /// Core match-finding loop. Returns (best_offset, best_length) as raw u32.
@@ -1209,5 +1215,42 @@ mod tests {
         let compressed = compress_lazy_with_limit(&input, DEFAULT_MAX_MATCH).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input, "sequential bytes round trip failed");
+    }
+
+    #[test]
+    fn with_tuning_deep_chain() {
+        let data = b"abcabcabcabcabcabcabc";
+        let mut finder = HashChainFinder::with_tuning(258, 128);
+        for i in 0..3 {
+            finder.insert(data, i);
+        }
+        let m = finder.find_match(data, 3);
+        // At position 3, we have the first repeat of "abc" after positions 0-2
+        assert!(
+            m.length >= 3,
+            "deep chain finder should find match at pos 3"
+        );
+    }
+
+    #[test]
+    fn with_tuning_chain_depth_1() {
+        let data = b"aaaaaaaaaa";
+        let mut finder = HashChainFinder::with_tuning(258, 1);
+        for i in 0..data.len() {
+            finder.insert(data, i);
+        }
+        let m = finder.find_match(data, 5);
+        // Chain depth 1 may miss some matches but must not panic or return invalid offset
+        assert!(m.offset as usize <= 5 || m.length == 0);
+    }
+
+    #[test]
+    fn with_tuning_chain_depth_256_no_panic() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+        let mut finder = HashChainFinder::with_tuning(u16::MAX, 256);
+        for i in 0..data.len() {
+            finder.insert(&data, i);
+            let _ = finder.find_match(&data, i);
+        }
     }
 }

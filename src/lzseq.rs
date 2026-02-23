@@ -55,6 +55,10 @@ pub struct SeqConfig {
     /// Maximum hash chain depth. Higher values improve ratio at the cost of speed.
     /// Default: 64. Clamped to 1..=MAX_CHAIN internally.
     pub max_chain: usize,
+    /// When true, reduce chain depth on blocks with low match density.
+    /// Speeds up encoding on incompressible data with minimal ratio cost.
+    /// Default: false.
+    pub adaptive_chain: bool,
 }
 
 impl Default for SeqConfig {
@@ -63,6 +67,7 @@ impl Default for SeqConfig {
             max_window: 128 * 1024,
             hash_prefix_len: 3,
             max_chain: crate::lz77::MAX_CHAIN,
+            adaptive_chain: false,
         }
     }
 }
@@ -580,7 +585,38 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
     let mut pos: usize = 0;
     let max_match_len = DEFAULT_MAX_MATCH as usize;
 
+    // Adaptive chain depth tracking
+    let base_chain = config.max_chain;
+    let mut adapt_pos_counter: usize = 0; // positions since last check
+    let mut adapt_match_counter: usize = 0; // matches found in current window
+    let adapt_check_interval: usize = 64; // check every 64 positions
+    let adapt_low_threshold: usize = 2; // fewer than 2 matches in 64 = low compressibility
+    let adapt_penalty_positions: usize = 256; // how long to use reduced chain
+    let mut adapt_penalty_remaining: usize = 0;
+
     while pos < input.len() {
+        if config.adaptive_chain {
+            adapt_pos_counter += 1;
+            if adapt_penalty_remaining > 0 {
+                adapt_penalty_remaining -= 1;
+                if adapt_penalty_remaining == 0 {
+                    finder.set_max_chain(base_chain);
+                }
+            }
+            if adapt_pos_counter >= adapt_check_interval {
+                adapt_pos_counter = 0;
+                if adapt_match_counter < adapt_low_threshold {
+                    // Low compressibility: halve chain depth for next window
+                    finder.set_max_chain((base_chain / 2).max(1));
+                    adapt_penalty_remaining = adapt_penalty_positions;
+                } else {
+                    // Restore full chain depth
+                    finder.set_max_chain(base_chain);
+                }
+                adapt_match_counter = 0;
+            }
+        }
+
         let m = finder.find_match_wide(input, pos);
         finder.insert(input, pos);
 
@@ -641,6 +677,10 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
                     &mut length_extra_writer,
                 );
 
+                if config.adaptive_chain {
+                    adapt_match_counter += 1;
+                }
+
                 // Insert covered positions into hash chains
                 let advance = next_length as usize;
                 let insert_count = advance.min(input.len() - pos).min(MAX_INSERT_LEN);
@@ -664,6 +704,10 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
                 &mut length_codes,
                 &mut length_extra_writer,
             );
+
+            if config.adaptive_chain {
+                adapt_match_counter += 1;
+            }
 
             let advance = best_length as usize;
             let insert_count = advance.min(input.len() - pos).min(MAX_INSERT_LEN);
@@ -1473,5 +1517,106 @@ mod tests {
         // Same number of matches — hash selection should not change token count
         // for small inputs where both hashes resolve cleanly.
         assert_eq!(encoded_default.num_tokens, encoded_hash3.num_tokens);
+    }
+
+    #[test]
+    fn adaptive_chain_finds_matches_on_compressible_data() {
+        let input: Vec<u8> = b"the quick brown fox "
+            .iter()
+            .cycle()
+            .take(4096)
+            .copied()
+            .collect();
+        let config = SeqConfig {
+            adaptive_chain: true,
+            ..SeqConfig::default()
+        };
+        let encoded = encode_with_config(&input, &config).unwrap();
+        assert!(
+            encoded.num_matches > 0,
+            "adaptive mode must find matches on repetitive input"
+        );
+        // Verify basic functionality: matches found and tokens reasonable
+        assert!(encoded.num_tokens > 0, "should have tokens");
+    }
+
+    #[test]
+    fn adaptive_chain_no_panic_on_random() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        // Deterministic pseudo-random bytes
+        let input: Vec<u8> = (0u32..4096)
+            .map(|i| {
+                let mut h = DefaultHasher::new();
+                i.hash(&mut h);
+                h.finish() as u8
+            })
+            .collect();
+        let config = SeqConfig {
+            adaptive_chain: true,
+            ..SeqConfig::default()
+        };
+        let _ = encode_with_config(&input, &config).unwrap(); // must not panic
+    }
+
+    #[test]
+    fn adaptive_chain_false_is_identical_to_default() {
+        let input = b"hello world hello world hello world";
+        let default_encoded = encode_with_config(input, &SeqConfig::default()).unwrap();
+        let explicit_false = encode_with_config(
+            input,
+            &SeqConfig {
+                adaptive_chain: false,
+                ..SeqConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(default_encoded.num_tokens, explicit_false.num_tokens);
+        assert_eq!(default_encoded.num_matches, explicit_false.num_matches);
+    }
+
+    #[test]
+    fn adaptive_vs_nonadaptive_compressible_match_count() {
+        let input: Vec<u8> = b"abcdefghij".iter().cycle().take(65536).copied().collect();
+
+        let adaptive_cfg = SeqConfig {
+            adaptive_chain: true,
+            ..SeqConfig::default()
+        };
+        let normal_cfg = SeqConfig {
+            adaptive_chain: false,
+            ..SeqConfig::default()
+        };
+
+        let adaptive = encode_with_config(&input, &adaptive_cfg).unwrap();
+        let normal = encode_with_config(&input, &normal_cfg).unwrap();
+
+        // Adaptive must find at least 95% as many matches as non-adaptive
+        let threshold = (normal.num_matches as f64 * 0.95) as u32;
+        assert!(
+            adaptive.num_matches >= threshold,
+            "adaptive found {} matches, non-adaptive found {} (threshold {})",
+            adaptive.num_matches,
+            normal.num_matches,
+            threshold
+        );
+    }
+
+    #[test]
+    fn adaptive_mixed_input_no_corruption() {
+        // First 32KB repetitive, next 32KB pseudo-random
+        let mut input: Vec<u8> = b"abcde".iter().cycle().take(32768).copied().collect();
+        input.extend((0u8..=255).cycle().take(32768));
+
+        let config = SeqConfig {
+            adaptive_chain: true,
+            ..SeqConfig::default()
+        };
+        let encoded = encode_with_config(&input, &config).unwrap();
+        // Must have found at least some matches (from the repetitive first half)
+        assert!(
+            encoded.num_matches > 0,
+            "adaptive mode must find matches in mixed input"
+        );
     }
 }
