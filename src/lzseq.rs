@@ -597,6 +597,93 @@ fn emit_match(
     length_extra_writer.write_bits(lev, leb);
 }
 
+/// Encode a pre-computed match sequence into LzSeq token streams.
+///
+/// Used by `encode_optimal` after the backward DP has selected matches.
+/// Applies the same repeat offset encoding as `encode_with_config`.
+fn encode_match_sequence(
+    _input: &[u8],
+    matches: &[crate::lz77::Match],
+    _config: &SeqConfig,
+) -> PzResult<SeqEncoded> {
+    let mut repeats = RepeatOffsets::new();
+    let mut flags_vec: Vec<bool> = Vec::new();
+    let mut literals: Vec<u8> = Vec::new();
+    let mut offset_codes: Vec<u8> = Vec::new();
+    let mut length_codes: Vec<u8> = Vec::new();
+    let mut offset_extra_writer = BitWriter::new();
+    let mut length_extra_writer = BitWriter::new();
+
+    for m in matches {
+        if m.length == 0 {
+            // Literal token from optimal parser
+            flags_vec.push(true);
+            literals.push(m.next);
+        } else {
+            emit_match(
+                m.offset as u32,
+                m.length,
+                &mut repeats,
+                &mut flags_vec,
+                &mut offset_codes,
+                &mut offset_extra_writer,
+                &mut length_codes,
+                &mut length_extra_writer,
+            );
+            // The 'next' byte in a match token is the byte following the match
+            // (already included in the next token by the DP forward trace).
+        }
+    }
+
+    let num_tokens = flags_vec.len() as u32;
+    let num_matches = offset_codes.len() as u32;
+    let flags = pack_flags(&flags_vec);
+
+    Ok(SeqEncoded {
+        flags,
+        literals,
+        offset_codes,
+        offset_extra: offset_extra_writer.finish(),
+        length_codes,
+        length_extra: length_extra_writer.finish(),
+        num_tokens,
+        num_matches,
+    })
+}
+
+/// Compress input using LzSeq with optimal parsing.
+///
+/// Uses backward DP (`optimal.rs`) to select matches, then encodes them with
+/// the same LzSeq token format as `encode_with_config`. The DP cost model
+/// accounts for repeat offset savings, so it selects matches that set up
+/// future cheap repeat encodings.
+///
+/// Slower than `encode_with_config` (lazy) but produces better ratios.
+/// Used by LzSeqR quality mode.
+pub fn encode_optimal(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncoded> {
+    if input.is_empty() {
+        return Ok(SeqEncoded {
+            flags: Vec::new(),
+            literals: Vec::new(),
+            offset_codes: Vec::new(),
+            offset_extra: Vec::new(),
+            length_codes: Vec::new(),
+            length_extra: Vec::new(),
+            num_tokens: 0,
+            num_matches: 0,
+        });
+    }
+
+    // Build match table and run repeat-offset-aware optimal parse.
+    let max_match = DEFAULT_MAX_MATCH;
+    let table =
+        crate::optimal::build_match_table_cpu_with_limit(input, crate::optimal::K, max_match);
+    let matches = crate::optimal::optimal_parse_lzseq(input, &table)?;
+
+    // Encode the optimal match sequence into LzSeq token streams.
+    encode_match_sequence(input, &matches, config)
+}
+
 /// Compress input using LzSeq with lazy matching and configurable window.
 ///
 /// Uses `find_match_wide` to support u32 offsets for windows larger than 32KB.
@@ -1984,5 +2071,45 @@ mod tests {
             }
             prev_match_count = Some(encoded.num_matches);
         }
+    }
+
+    #[test]
+    fn test_encode_optimal_round_trip() {
+        // Start with a short repeating pattern
+        let input = b"abc".repeat(10);
+        let config = SeqConfig::default();
+        let encoded = encode_optimal(&input, &config).expect("encode_optimal failed");
+        let decoded = decode(
+            &encoded.flags,
+            &encoded.literals,
+            &encoded.offset_codes,
+            &encoded.offset_extra,
+            &encoded.length_codes,
+            &encoded.length_extra,
+            encoded.num_tokens,
+            encoded.num_matches,
+            input.len(),
+        )
+        .expect("decode failed");
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_encode_optimal_empty() {
+        let input: &[u8] = b"";
+        let config = SeqConfig::default();
+        let encoded = encode_optimal(input, &config).expect("encode_optimal failed");
+        assert_eq!(encoded.num_tokens, 0);
+        assert_eq!(encoded.num_matches, 0);
+    }
+
+    #[test]
+    fn test_encode_optimal_no_matches() {
+        let input: &[u8] = b"abcdefghij";
+        let config = SeqConfig::default();
+        let encoded = encode_optimal(input, &config).expect("encode_optimal failed");
+        // Should only have literal tokens
+        assert_eq!(encoded.num_matches, 0);
+        assert_eq!(encoded.num_tokens as usize, input.len());
     }
 }

@@ -74,6 +74,21 @@ pub enum ParseStrategy {
     Optimal,
 }
 
+/// Compression quality preset for LzSeq pipelines.
+///
+/// Maps to `parse_strategy` and hash chain depth. Higher quality = better ratio
+/// at the cost of more CPU time. Only affects LzSeqR and LzSeqH.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QualityLevel {
+    /// Speed mode: lazy matching, shallow chain depth.
+    Speed,
+    /// Default mode: optimal parsing with standard chain depth.
+    #[default]
+    Default,
+    /// Quality mode: optimal parsing with deep hash chains.
+    Quality,
+}
+
 /// Default block size for multi-threaded compression (256KB).
 const DEFAULT_BLOCK_SIZE: usize = 256 * 1024;
 
@@ -149,6 +164,27 @@ impl Default for CompressOptions {
             unified_scheduler: false,
             seq_window_size: None,
         }
+    }
+}
+
+impl CompressOptions {
+    /// Build options for the given quality level (LzSeq pipelines).
+    pub fn for_quality(level: QualityLevel) -> Self {
+        let mut opts = CompressOptions::default();
+        match level {
+            QualityLevel::Speed => {
+                opts.parse_strategy = ParseStrategy::Lazy;
+            }
+            QualityLevel::Default => {
+                opts.parse_strategy = ParseStrategy::Optimal;
+            }
+            QualityLevel::Quality => {
+                opts.parse_strategy = ParseStrategy::Optimal;
+                // Deep chain: use a larger window for quality mode
+                opts.seq_window_size = Some(256 * 1024);
+            }
+        }
+        opts
     }
 }
 

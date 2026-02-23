@@ -204,7 +204,10 @@ impl StreamDemuxer for LzDemuxer {
                         .unwrap_or_else(|| lzseq::SeqConfig::default().max_window),
                     ..lzseq::SeqConfig::default()
                 };
-                let enc = lzseq::encode_with_config(input, &config)?;
+                let enc = match options.parse_strategy {
+                    ParseStrategy::Optimal => lzseq::encode_optimal(input, &config)?,
+                    _ => lzseq::encode_with_config(input, &config)?,
+                };
                 Ok(seq_encoded_to_demux(enc))
             }
         }

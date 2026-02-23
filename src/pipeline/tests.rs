@@ -1700,3 +1700,79 @@ mod gpu_batched_tests {
         assert_eq!(decompressed, input);
     }
 }
+
+// --- LzSeqR optimal parsing tests (Task 6) ---
+
+#[test]
+fn test_lzseq_r_optimal_round_trip_short() {
+    let input = b"abc".repeat(30);
+    let opts = CompressOptions {
+        parse_strategy: ParseStrategy::Optimal,
+        ..CompressOptions::default()
+    };
+    let compressed = compress_with_options(&input, Pipeline::LzSeqR, &opts).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input.as_slice());
+}
+
+#[test]
+fn test_lzseq_r_optimal_round_trip_large() {
+    // Larger data to exercise optimal parsing
+    let pattern = b"compression and decompression with optimal parsing ";
+    let input: Vec<u8> = pattern.iter().cycle().take(64 * 1024).copied().collect();
+    let opts = CompressOptions {
+        parse_strategy: ParseStrategy::Optimal,
+        ..CompressOptions::default()
+    };
+    let compressed = compress_with_options(&input, Pipeline::LzSeqR, &opts).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_lzseq_r_quality_level_default_is_optimal() {
+    let opts = CompressOptions::for_quality(QualityLevel::Default);
+    assert_eq!(opts.parse_strategy, ParseStrategy::Optimal);
+}
+
+#[test]
+fn test_lzseq_r_quality_level_speed_is_lazy() {
+    let opts = CompressOptions::for_quality(QualityLevel::Speed);
+    assert_eq!(opts.parse_strategy, ParseStrategy::Lazy);
+}
+
+#[test]
+fn test_lzseq_r_quality_level_quality_uses_larger_window() {
+    let opts = CompressOptions::for_quality(QualityLevel::Quality);
+    assert_eq!(opts.parse_strategy, ParseStrategy::Optimal);
+    assert!(
+        opts.seq_window_size.unwrap_or(0) > 128 * 1024,
+        "quality mode should use a window larger than 128KB"
+    );
+}
+
+#[test]
+fn test_lzseq_r_optimal_better_than_lazy_on_structured_data() {
+    // On structured data, optimal parsing should produce smaller or equal output than lazy.
+    let pattern = b"aaaaaabcbcbcbcbcbcbcbcbcbc";
+    let input: Vec<u8> = pattern.iter().cycle().take(64 * 1024).copied().collect();
+
+    let lazy_opts = CompressOptions::for_quality(QualityLevel::Speed);
+    let optimal_opts = CompressOptions::for_quality(QualityLevel::Default);
+
+    let lazy_compressed = compress_with_options(&input, Pipeline::LzSeqR, &lazy_opts).unwrap();
+    let optimal_compressed =
+        compress_with_options(&input, Pipeline::LzSeqR, &optimal_opts).unwrap();
+
+    // Both must round-trip
+    assert_eq!(decompress(&lazy_compressed).unwrap(), input);
+    assert_eq!(decompress(&optimal_compressed).unwrap(), input);
+
+    // Optimal should not be worse on structured data
+    assert!(
+        optimal_compressed.len() <= lazy_compressed.len(),
+        "optimal ({} bytes) should not exceed lazy ({} bytes) on structured data",
+        optimal_compressed.len(),
+        lazy_compressed.len()
+    );
+}

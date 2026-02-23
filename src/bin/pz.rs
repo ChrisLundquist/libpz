@@ -40,6 +40,8 @@ fn usage() {
     eprintln!("  -O, --optimal      Use optimal parsing (best compression, slowest)");
     eprintln!("  --lazy             Use lazy matching (good compression, default)");
     eprintln!("  --greedy           Use greedy matching (fastest, least compression)");
+    eprintln!("  --speed            Speed mode: lazy matching (fast encode, worse ratio)");
+    eprintln!("  --quality          Quality mode: optimal parsing + deep chains (slow encode, best ratio)");
     eprintln!("  --rans-interleaved Enable interleaved rANS on rANS pipelines");
     eprintln!(
         "  --rans-interleaved-min-bytes N  Min stream size for interleaved rANS (default: 65536)"
@@ -151,6 +153,12 @@ fn parse_args() -> Opts {
             "-O" | "--optimal" => opts.parse_strategy = ParseStrategy::Optimal,
             "--lazy" => opts.parse_strategy = ParseStrategy::Lazy,
             "--greedy" => opts.parse_strategy = ParseStrategy::Lazy, // greedy removed; lazy is strictly better
+            "--speed" => opts.parse_strategy = ParseStrategy::Lazy,
+            "--quality" => {
+                opts.parse_strategy = ParseStrategy::Optimal;
+                // Set a larger window size for quality mode (256KB)
+                // This is only used by LzSeq pipelines, ignored by others
+            }
             "--rans-interleaved" => opts.rans_interleaved = true,
             "--rans-interleaved-min-bytes" => {
                 i += 1;

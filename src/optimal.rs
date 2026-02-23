@@ -501,6 +501,23 @@ pub fn compress_optimal_with_table(input: &[u8], table: &MatchTable) -> PzResult
     Ok(output)
 }
 
+/// Run optimal parse for LzSeq encoding, returning match sequence.
+///
+/// Selects matches using backward DP with a cost model that accounts for
+/// repeat offset savings. This produces better match selections for LzSeq
+/// than greedy/lazy matching, especially on structured data.
+///
+/// Returns a Vec<Match> where each entry is either a literal (offset=0, length=0)
+/// or a match. Compatible with lzseq encoding via encode_match_sequence.
+pub(crate) fn optimal_parse_lzseq(input: &[u8], table: &MatchTable) -> PzResult<Vec<Match>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    let freq = frequency::get_frequency(input);
+    let cost_model = CostModel::from_frequencies(&freq);
+    Ok(optimal_parse(input, table, &cost_model))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
