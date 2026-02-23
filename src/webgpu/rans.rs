@@ -2405,4 +2405,126 @@ impl WebGpuEngine {
             Some(&norm),
         )
     }
+
+    /// GPU-accelerated rANS encode for multiple independent byte streams.
+    ///
+    /// Each stream is encoded independently with its own frequency table.
+    /// Designed for the LzSeq 6-stream output from `demux.rs`:
+    ///   [flags, literals, offset_codes, offset_extra, length_codes, length_extra]
+    ///
+    /// Returns a `Vec` of encoded byte blobs in the same order as `streams`.
+    /// Falls back to CPU encode for any stream that is empty or below the
+    /// minimum GPU dispatch size.
+    ///
+    /// # Arguments
+    /// - `streams`: the 6 independent byte streams from LzSeq demux
+    /// - `num_lanes`: interleave width for rANS (4 for SSE2 compat, 8+ for GPU)
+    /// - `chunk_size`: chunk granularity for GPU dispatch (use 65536 = 64KB)
+    /// - `scale_bits`: rANS frequency table precision
+    pub fn rans_encode_6streams_gpu(
+        &self,
+        streams: &[Vec<u8>],
+        num_lanes: usize,
+        chunk_size: usize,
+        scale_bits: u8,
+    ) -> PzResult<Vec<Vec<u8>>> {
+        streams
+            .iter()
+            .map(|stream| {
+                if stream.len() < crate::webgpu::MIN_GPU_INPUT_SIZE {
+                    // CPU fallback for small streams
+                    return Ok(crate::rans::encode_interleaved_n(
+                        stream, num_lanes, scale_bits,
+                    ));
+                }
+                // Derive per-stream frequency table
+                let freq_table = crate::frequency::get_frequency(stream);
+                let norm = normalize_frequencies(&freq_table, scale_bits)?;
+                let tables_buf =
+                    self.create_rans_encode_tables_buffer(&norm, "rans_6stream_tables");
+                let (words_dev, states_dev) = self.rans_encode_chunked_gpu_with_tables(
+                    stream,
+                    num_lanes,
+                    chunk_size,
+                    scale_bits,
+                    &tables_buf,
+                )?;
+                // Readback and serialize into the standard interleaved wire format
+                let (words_raw, states_raw) =
+                    self.read_two_buffers(&words_dev.buf, &states_dev.buf)?;
+                self.rans_encode_6stream_serialize(
+                    &words_raw,
+                    &states_raw,
+                    &norm,
+                    num_lanes,
+                    stream.len(),
+                )
+            })
+            .collect()
+    }
+
+    /// Serialize GPU-encoded rANS output into the standard interleaved wire format.
+    ///
+    /// This helper converts the GPU's lane-based output (words_dev, states_dev)
+    /// into the same format as `rans::encode_interleaved_n`, ensuring CPU decode
+    /// compatibility.
+    fn rans_encode_6stream_serialize(
+        &self,
+        words_raw: &[u8],
+        states_raw: &[u8],
+        norm: &rans::NormalizedFreqs,
+        num_lanes: usize,
+        input_len: usize,
+    ) -> PzResult<Vec<u8>> {
+        // The GPU encode layout is identical to the chunked payload layout, but for
+        // a single chunk (no chunking needed for the 6-stream case in practice).
+        // We decode it as a single-chunk output.
+
+        let words_u32: &[u32] = bytemuck::cast_slice(words_raw);
+        let words_u16: &[u16] = bytemuck::cast_slice(words_u32);
+        let states_u32: &[u32] = bytemuck::cast_slice(states_raw);
+
+        // Single chunk: state layout is [state_0..state_N-1, count_0..count_N-1]
+        if states_u32.len() < num_lanes * 2 {
+            return Err(PzError::InvalidInput);
+        }
+
+        let final_states: Vec<u32> = states_u32[..num_lanes].to_vec();
+        let counts: Vec<usize> = states_u32[num_lanes..num_lanes * 2]
+            .iter()
+            .map(|&c| c as usize)
+            .collect();
+
+        // Serialize in the standard interleaved format:
+        // [scale_bits: u8] [freq_table: 512] [num_states: u8]
+        // [final_states: N × u32 LE] [num_words: N × u32 LE]
+        // [stream_0_words] [stream_1_words] ...
+        let total_words: usize = counts.iter().sum();
+        let header_size = 1 + rans::NUM_SYMBOLS * 2 + 1 + num_lanes * 4 + num_lanes * 4;
+        let mut output = Vec::with_capacity(header_size + total_words * 2);
+
+        output.push(norm.scale_bits);
+        serialize_freq_table(norm, &mut output);
+        output.push(num_lanes as u8);
+
+        for &state in &final_states {
+            output.extend_from_slice(&state.to_le_bytes());
+        }
+        for &count in &counts {
+            output.extend_from_slice(&(count as u32).to_le_bytes());
+        }
+
+        // Extract and append word streams
+        let per_lane_max = input_len.div_ceil(num_lanes) * 2 + 4;
+        for (lane, &count) in counts.iter().enumerate().take(num_lanes) {
+            let stream_start = lane * per_lane_max + (per_lane_max - count);
+            let stream_end = stream_start + count;
+            let words = words_u16
+                .get(stream_start..stream_end)
+                .ok_or(PzError::InvalidInput)?;
+            append_u16_words_le(&mut output, words);
+        }
+
+        Ok(output)
+    }
 }
