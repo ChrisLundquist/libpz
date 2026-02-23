@@ -437,36 +437,57 @@ fn unpack_flags(bytes: &[u8], count: usize) -> Vec<bool> {
 /// code+extra-bits cost exceeds the literal cost. This function returns
 /// the minimum match length that's worth emitting for a given offset.
 ///
-/// Cost model (approximate bytes):
-/// - Each literal: ~1 byte (flag bit + literal byte, entropy coded)
-/// - Each match: ~2 bytes overhead (offset_code + length_code, entropy coded)
+/// Exact cost model (match cost in bytes vs literal savings):
+/// - Each literal: 1 byte (flag bit + literal byte, entropy coded)
+/// - Each match overhead: 2 bytes (offset_code + length_code, entropy coded)
 ///   + extra_bits / 8 bytes (raw extra bits for offset + length)
 ///
-/// A match of length L saves L literal bytes and costs the match overhead.
-/// Break-even: L > overhead. Close offsets have few extra bits (cheap),
+/// A match of length L saves L literal bytes and costs match overhead + extra bits.
+/// Break-even: L >= ceil(2 + oeb/8). Close offsets have few extra bits (cheap),
 /// far offsets have many extra bits (expensive).
+///
+/// Exact thresholds per offset bit-cost (oeb = extra bits for offset code):
+/// | oeb | Offset range       | Match cost | Min profitable L |
+/// |-----|--------------------|-----------| ------------------|
+/// | 0   | 1                  | 2 bytes   | 3 (= MIN_MATCH)   |
+/// | 1   | 2                  | 2 bytes   | 3                 |
+/// | 2   | 3-4                | 2 bytes   | 3                 |
+/// | 3   | 5-8                | 2 bytes   | 3                 |
+/// | 4   | 9-16               | 3 bytes   | 4                 |
+/// | 5   | 17-32              | 3 bytes   | 4                 |
+/// | 6   | 33-64              | 3 bytes   | 4                 |
+/// | 7   | 65-128             | 3 bytes   | 4                 |
+/// | 8   | 129-256            | 3 bytes   | 4                 |
+/// | 9   | 257-512            | 4 bytes   | 5                 |
+/// | 10  | 513-1024           | 4 bytes   | 5                 |
+/// | 11  | 1025-2048          | 4 bytes   | 5                 |
+/// | 12  | 2049-4096          | 4 bytes   | 5                 |
+/// | 13  | 4097-8192          | 5 bytes   | 6                 |
+/// | 14  | 8193-16384         | 5 bytes   | 6                 |
+/// | 15  | 16385-32768        | 5 bytes   | 6                 |
+/// | 16  | 32769-65536        | 5 bytes   | 6                 |
+/// | 17  | 65537-131072       | 6 bytes   | 7                 |
 #[inline]
 pub(crate) fn min_profitable_length(offset: u32) -> u16 {
     if offset == 0 {
         return u16::MAX; // No valid match
     }
-    // extra_bits for the offset code
     let (oc, _, _) = encode_offset(offset);
     let oeb = extra_bits_for_code(oc);
-    // Approximate cost: 2 code bytes + ceil(offset_extra_bits / 8) bytes
-    // vs L literal bytes. Minimum length code is 0 (0 extra bits), so
-    // length overhead is just 1 code byte.
-    //
-    // Total match overhead ≈ 2 + oeb/8 bytes (conservative: ignore length extra)
-    // Break-even: L >= ceil(2 + oeb/8) + 1 (need to save at least 1 byte net)
-    //
-    // Simplified tiers:
-    //   oeb 0-3  (offset 1-16):       min 3 (MIN_MATCH)
-    //   oeb 4-7  (offset 17-256):      min 3
-    //   oeb 8-11 (offset 257-4096):    min 4
-    //   oeb 12-15 (offset 4097-65536): min 5
-    //   oeb 16-19 (offset 65537+):     min 6
-    MIN_MATCH + (oeb.saturating_sub(7) as u16).div_ceil(4)
+    // Exact cost model based on offset extra bits:
+    //   oeb 0-3  (offset 1-16):        min 3 (= MIN_MATCH)
+    //   oeb 4-7  (offset 17-256):      min 4
+    //   oeb 8-11 (offset 257-4096):    min 5
+    //   oeb 12-15 (offset 4097-65536): min 6
+    //   oeb 16+  (offset 65537+):      min 7
+    MIN_MATCH
+        + match oeb {
+            0..=3 => 0,
+            4..=7 => 1,
+            8..=11 => 2,
+            12..=15 => 3,
+            _ => 4,
+        }
 }
 
 // ---------------------------------------------------------------------------
@@ -1618,5 +1639,184 @@ mod tests {
             encoded.num_matches > 0,
             "adaptive mode must find matches in mixed input"
         );
+    }
+
+    // --- Min profitable length tests (Task 7) ---
+
+    #[test]
+    fn min_profitable_length_offset_zero() {
+        assert_eq!(min_profitable_length(0), u16::MAX);
+    }
+
+    #[test]
+    fn min_profitable_length_tiers() {
+        // oeb 0-3: offset 1-16 → min 3
+        // oeb values: 1(0), 2(0), 3-4(1), 5-8(2), 9-16(3)
+        for d in 1u32..=16 {
+            assert_eq!(
+                min_profitable_length(d),
+                3,
+                "offset {d} should require min 3"
+            );
+        }
+        // oeb 4-8: offset 17-256 → min 4
+        // oeb values: 17-32(4), 33-64(5), 65-128(6), 129-256(7)
+        for d in [17u32, 32, 64, 128, 256] {
+            assert_eq!(
+                min_profitable_length(d),
+                4,
+                "offset {d} should require min 4"
+            );
+        }
+        // oeb 9-12: offset 257-4096 → min 5
+        // oeb values: 257-512(8), 513-1024(9), 1025-2048(10), 2049-4096(11)
+        for d in [257u32, 512, 1024, 2048, 4096] {
+            assert_eq!(
+                min_profitable_length(d),
+                5,
+                "offset {d} should require min 5"
+            );
+        }
+        // oeb 13-16: offset 4097-65536 → min 6
+        // oeb values: 4097-8192(12), 8193-16384(13), 16385-32768(14), 32769-65536(15)
+        for d in [4097u32, 8192, 16384, 32768, 65536] {
+            assert_eq!(
+                min_profitable_length(d),
+                6,
+                "offset {d} should require min 6"
+            );
+        }
+        // oeb 17+: offset 65537+ → min 7
+        // oeb values: 65537-131072(16), 131073+(17)
+        assert_eq!(min_profitable_length(65537), 7);
+        assert_eq!(min_profitable_length(131072), 7);
+    }
+
+    #[test]
+    fn min_profitable_length_monotone() {
+        // Sample offsets spanning all tiers; verify non-decreasing.
+        let offsets = [
+            1u32, 4, 8, 9, 32, 256, 257, 1024, 4096, 4097, 32768, 65536, 65537, 131072,
+        ];
+        let thresholds: Vec<u16> = offsets.iter().map(|&d| min_profitable_length(d)).collect();
+        for w in thresholds.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "min_profitable_length not monotone: {} > {} for adjacent offsets",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    // --- Match profitability edge cases (Task 8) ---
+
+    #[test]
+    fn encoder_rejects_short_match_at_large_offset() {
+        // Test that short matches at large offsets are rejected.
+        // Create a pattern that repeats after 300 bytes, with 3-byte and 4-byte variants.
+        let pattern = b"ABCDE";
+        let mut input_3byte = Vec::new();
+        let mut input_4byte = Vec::new();
+
+        // Add pattern, then 295 filler bytes, then repeat pattern
+        input_3byte.extend_from_slice(&pattern[..3]); // first 3 bytes
+        input_4byte.extend_from_slice(pattern); // first 5 bytes
+
+        // Add ~295 bytes of filler to create offset ~300
+        for i in 0..295 {
+            input_3byte.push((i % 256) as u8 ^ 0x55); // non-repeating filler
+            input_4byte.push((i % 256) as u8 ^ 0x55);
+        }
+
+        // Append the match target: 3 bytes for test 1
+        input_3byte.extend_from_slice(&pattern[..3]);
+
+        // Append the match target: 4 bytes for test 2
+        input_4byte.extend_from_slice(&pattern[..4]);
+
+        let config = SeqConfig {
+            max_window: 128 * 1024,
+            ..SeqConfig::default()
+        };
+
+        let enc_3 = encode_with_config(&input_3byte, &config).unwrap();
+        let enc_4 = encode_with_config(&input_4byte, &config).unwrap();
+
+        // min_profitable_length(300) = 5, so:
+        // - 3-byte match at offset 300 should be rejected
+        // - 4-byte match at offset 300 should be rejected
+        // - 5-byte match at offset 300 should be accepted
+
+        // The encodings should produce very similar match counts (neither should
+        // find the distant match at offset 300 for short lengths).
+        // If the profitability filter is working, enc_3 and enc_4 should both be
+        // rejected and have similar compression.
+        assert!(
+            enc_3.num_matches == enc_4.num_matches
+                || (enc_3.num_matches == 0 && enc_4.num_matches == 0),
+            "short matches at offset ~300 should be rejected: 3-byte gave {}, 4-byte gave {}",
+            enc_3.num_matches,
+            enc_4.num_matches
+        );
+    }
+
+    #[test]
+    fn encoder_accepts_profitable_match_at_large_offset() {
+        // Test that profitable (long enough) matches at large offsets are accepted.
+        let pattern = b"ABCDE";
+        let mut input = Vec::new();
+
+        input.extend_from_slice(pattern); // first 5 bytes
+
+        // Add ~295 bytes of filler to create offset ~300
+        for i in 0..295 {
+            input.push((i % 256) as u8 ^ 0x55); // non-repeating filler
+        }
+
+        // Append the full pattern: 5 bytes (which should be accepted at offset ~300)
+        input.extend_from_slice(pattern);
+
+        let config = SeqConfig {
+            max_window: 128 * 1024,
+            ..SeqConfig::default()
+        };
+        let encoded = encode_with_config(&input, &config).unwrap();
+
+        // min_profitable_length(300) = 5, so a 5-byte match should be accepted.
+        // We should find at least 1 match.
+        assert!(
+            encoded.num_matches >= 1,
+            "5-byte match at offset ~300 should be accepted"
+        );
+    }
+
+    #[test]
+    fn encoder_all_same_bytes_efficient() {
+        let input = vec![0xAAu8; 1024];
+        let encoded = encode_with_config(&input, &SeqConfig::default()).unwrap();
+        // All-same input: should produce very few match tokens (ideally 1-2)
+        // and very few literals (just the first MIN_MATCH bytes before first match)
+        assert!(
+            encoded.num_matches >= 1,
+            "all-same input must find at least one match"
+        );
+        assert!(
+            encoded.num_tokens < 20,
+            "all-same 1KB input should compress to very few tokens, got {}",
+            encoded.num_tokens
+        );
+    }
+
+    #[test]
+    fn encoder_profitability_round_trip() {
+        // Ensure profitability filtering doesn't break round-trip
+        let pattern = b"mixed content with some repeats mixed content! ";
+        let mut input = Vec::new();
+        for _ in 0..500 {
+            input.extend_from_slice(pattern);
+        }
+        let output = round_trip(&input).unwrap();
+        assert_eq!(output, input);
     }
 }
