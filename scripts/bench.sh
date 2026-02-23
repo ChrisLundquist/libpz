@@ -95,7 +95,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --all)
-            PIPELINES=(deflate bw bbw lzr lzf lzfi)
+            PIPELINES=(deflate bw bbw lzr lzf lzfi lzseqr lzseqh)
             shift
             ;;
         --webgpu)
