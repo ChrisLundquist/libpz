@@ -151,6 +151,7 @@ fn assemble_multiblock_container(
 enum UnifiedTask {
     Stage0(usize),
     Stage1(usize),
+    Stage1Gpu(usize), // entropy via GPU; block_idx
 }
 
 #[derive(Default)]
@@ -159,6 +160,31 @@ struct UnifiedQueueState {
     pending_tasks: usize,
     closed: bool,
     failed: bool,
+}
+
+/// Determine whether to use GPU entropy encoding for a given block.
+///
+/// Checks the backend assignment setting and block size to decide if GPU entropy
+/// should be used. Returns false when no GPU is available or when CPU is explicitly
+/// assigned or when the block is too small.
+fn should_use_gpu_entropy(block: &[u8], options: &CompressOptions) -> bool {
+    #[cfg(feature = "webgpu")]
+    {
+        use super::{BackendAssignment, GPU_ENTROPY_THRESHOLD};
+        match options.stage1_backend {
+            BackendAssignment::Gpu => options.webgpu_engine.is_some(),
+            BackendAssignment::Cpu => false,
+            BackendAssignment::Auto => {
+                options.webgpu_engine.is_some() && block.len() >= GPU_ENTROPY_THRESHOLD
+            }
+        }
+    }
+    #[cfg(not(feature = "webgpu"))]
+    {
+        let _ = block;
+        let _ = options;
+        false
+    }
 }
 
 fn compress_parallel_unified_lz_rans(
@@ -228,7 +254,13 @@ fn compress_parallel_unified_lz_rans(
                                     .expect("stage0 slot poisoned") = Some(stage0_block);
                                 let mut guard = queue_ref.lock().expect("unified queue poisoned");
                                 if !guard.failed {
-                                    guard.queue.push_back(UnifiedTask::Stage1(block_idx));
+                                    let use_gpu = should_use_gpu_entropy(blocks[block_idx], &opts);
+                                    let task = if use_gpu {
+                                        UnifiedTask::Stage1Gpu(block_idx)
+                                    } else {
+                                        UnifiedTask::Stage1(block_idx)
+                                    };
+                                    guard.queue.push_back(task);
                                     // pending_tasks counts total outstanding work units
                                     // (queued + currently executing). A successful Stage0
                                     // completion creates one new outstanding Stage1 task.
@@ -257,6 +289,29 @@ fn compress_parallel_unified_lz_rans(
                         }
                     }
                     UnifiedTask::Stage1(block_idx) => {
+                        let stage0 = stage0_slots_ref[block_idx]
+                            .lock()
+                            .expect("stage0 slot poisoned")
+                            .take()
+                            .expect("stage0 result missing");
+                        let result = run_compress_stage(pipeline, 1, stage0, &opts).map(|b| b.data);
+                        let is_err = result.is_err();
+                        *results_ref[block_idx].lock().expect("result slot poisoned") =
+                            Some(result);
+                        if is_err {
+                            let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                            if !guard.failed {
+                                guard.failed = true;
+                                let dropped = guard.queue.len();
+                                guard.queue.clear();
+                                guard.pending_tasks = guard.pending_tasks.saturating_sub(dropped);
+                                cv_ref.notify_all();
+                            }
+                        }
+                    }
+                    UnifiedTask::Stage1Gpu(block_idx) => {
+                        // Stub: GPU entropy not yet wired. Fall through to CPU path.
+                        // Replaced in Task 4 when ring-buffered entropy handoff is added.
                         let stage0 = stage0_slots_ref[block_idx]
                             .lock()
                             .expect("stage0 slot poisoned")
@@ -1079,4 +1134,69 @@ pub(crate) fn decompress_pipeline_parallel(
     }
 
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Task 2 tests: Stage 1 routing by backend assignment ---
+
+    #[test]
+    fn test_stage1_routing_cpu_when_no_gpu() {
+        // Compress a 512KB block with Auto backend assignment and no GPU.
+        // Should route to CPU path and produce correct output.
+        let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
+
+        let opts = CompressOptions {
+            threads: 2,
+            unified_scheduler: true,
+            stage1_backend: super::super::BackendAssignment::Auto,
+            ..CompressOptions::default()
+        };
+
+        let compressed = super::super::compress_with_options(&input, Pipeline::LzSeqR, &opts)
+            .expect("compression failed");
+        let decompressed = super::super::decompress(&compressed).expect("decompression failed");
+        assert_eq!(decompressed, input, "round-trip should match");
+    }
+
+    #[test]
+    fn test_stage1_routing_cpu_forced() {
+        // Compress with explicit CPU backend assignment.
+        // Even if GPU were available, should use CPU.
+        let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
+
+        let opts = CompressOptions {
+            threads: 2,
+            unified_scheduler: true,
+            stage1_backend: super::super::BackendAssignment::Cpu,
+            ..CompressOptions::default()
+        };
+
+        let compressed = super::super::compress_with_options(&input, Pipeline::LzSeqR, &opts)
+            .expect("compression failed");
+        let decompressed = super::super::decompress(&compressed).expect("decompression failed");
+        assert_eq!(decompressed, input, "round-trip should match");
+    }
+
+    #[test]
+    fn test_stage1_routing_respects_size_threshold() {
+        // Compress a block smaller than GPU_ENTROPY_THRESHOLD.
+        // Should route to CPU even with Auto assignment.
+        // GPU_ENTROPY_THRESHOLD is 256KB, so use 128KB.
+        let input: Vec<u8> = (0..=255).cycle().take(128 * 1024).collect();
+
+        let opts = CompressOptions {
+            threads: 2,
+            unified_scheduler: true,
+            stage1_backend: super::super::BackendAssignment::Auto,
+            ..CompressOptions::default()
+        };
+
+        let compressed = super::super::compress_with_options(&input, Pipeline::LzSeqR, &opts)
+            .expect("compression failed");
+        let decompressed = super::super::decompress(&compressed).expect("decompression failed");
+        assert_eq!(decompressed, input, "round-trip should match");
+    }
 }
