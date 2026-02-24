@@ -1199,4 +1199,97 @@ mod tests {
         let decompressed = super::super::decompress(&compressed).expect("decompression failed");
         assert_eq!(decompressed, input, "round-trip should match");
     }
+
+    // --- Task 3 tests: Round-trip correctness and threshold boundary ---
+
+    #[test]
+    fn test_heterogeneous_routing_roundtrip_lzseqr_cpu_only() {
+        // Compress and decompress a 1MB synthetic payload (alternating byte pattern)
+        // using LzSeqR with CPU-only backend assignment.
+        // Assert decompressed output equals input.
+        let mut input = Vec::new();
+        for i in 0..1024 * 1024 {
+            input.push((i % 256) as u8);
+        }
+
+        let opts = CompressOptions {
+            threads: 2,
+            unified_scheduler: true,
+            stage1_backend: super::super::BackendAssignment::Cpu,
+            ..CompressOptions::default()
+        };
+
+        let compressed =
+            super::super::compress_with_options(&input, Pipeline::LzSeqR, &opts).unwrap();
+        let decompressed = super::super::decompress(&compressed).unwrap();
+        assert_eq!(
+            decompressed, input,
+            "1MB round-trip with CPU-only backend should match"
+        );
+    }
+
+    #[test]
+    fn test_heterogeneous_routing_roundtrip_lzseqr_auto_no_gpu() {
+        // Compress and decompress using Auto backend with no GPU engine.
+        // Should behave identically to CPU-only.
+        // Assert no panic and output is correct.
+        let mut input = Vec::new();
+        for i in 0..1024 * 1024 {
+            input.push((i % 256) as u8);
+        }
+
+        let opts = CompressOptions {
+            threads: 2,
+            unified_scheduler: true,
+            stage1_backend: super::super::BackendAssignment::Auto,
+            #[cfg(feature = "webgpu")]
+            webgpu_engine: None,
+            ..CompressOptions::default()
+        };
+
+        let compressed =
+            super::super::compress_with_options(&input, Pipeline::LzSeqR, &opts).unwrap();
+        let decompressed = super::super::decompress(&compressed).unwrap();
+        assert_eq!(
+            decompressed, input,
+            "1MB round-trip with Auto (no GPU) should match"
+        );
+    }
+
+    #[test]
+    fn test_backend_assignment_threshold_boundary() {
+        // Test at and below the GPU_ENTROPY_THRESHOLD boundary.
+        // GPU_ENTROPY_THRESHOLD is 256KB.
+
+        // Test exactly at threshold (256KB)
+        let input_at_threshold: Vec<u8> = (0..=255).cycle().take(256 * 1024).collect();
+        let opts = CompressOptions {
+            threads: 2,
+            unified_scheduler: true,
+            stage1_backend: super::super::BackendAssignment::Auto,
+            ..CompressOptions::default()
+        };
+
+        let compressed =
+            super::super::compress_with_options(&input_at_threshold, Pipeline::LzSeqR, &opts)
+                .expect("compression at threshold failed");
+        let decompressed =
+            super::super::decompress(&compressed).expect("decompression at threshold failed");
+        assert_eq!(
+            decompressed, input_at_threshold,
+            "round-trip at threshold should match"
+        );
+
+        // Test just below threshold (256KB - 1 byte)
+        let input_below_threshold: Vec<u8> = (0..=255).cycle().take(256 * 1024 - 1).collect();
+        let compressed =
+            super::super::compress_with_options(&input_below_threshold, Pipeline::LzSeqR, &opts)
+                .expect("compression below threshold failed");
+        let decompressed =
+            super::super::decompress(&compressed).expect("decompression below threshold failed");
+        assert_eq!(
+            decompressed, input_below_threshold,
+            "round-trip below threshold should match"
+        );
+    }
 }
