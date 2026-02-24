@@ -220,8 +220,6 @@ impl HuffmanTree {
         table
     }
 
-    /// Encode input bytes using this Huffman tree.
-    ///
     /// Return the code lookup table for use with GPU encoding.
     ///
     /// Each entry is a u32 where bits [31:24] are the code length (in bits)

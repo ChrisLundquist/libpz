@@ -43,7 +43,7 @@ fn compute_bit_lengths(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(1) var<storage, read> wc_code_lut: array<u32>;
 @group(0) @binding(2) var<storage, read> bit_offsets: array<u32>;
 @group(0) @binding(3) var<storage, read_write> wc_output: array<atomic<u32>>;
-@group(0) @binding(4) var<uniform> wc_params: vec4<u32>; // x=num_symbols
+@group(0) @binding(4) var<uniform> wc_params: vec4<u32>; // x=num_symbols, y=total_bits, w=dispatch_width
 
 fn read_wc_symbol(pos: u32) -> u32 {
     let word_idx = pos / 4u;
@@ -66,9 +66,9 @@ fn write_codes(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // Bit range this thread owns: [g*32, (g+1)*32)
-    let my_bit_start = g * 32u;
-    let my_bit_end = my_bit_start + 32u;
+    // Bit range this thread owns: [g*CHUNK_WORDS*32, (g+1)*CHUNK_WORDS*32)
+    let my_bit_start = g * (CHUNK_WORDS * 32u);
+    let my_bit_end = my_bit_start + (CHUNK_WORDS * 32u);
 
     var local_word: u32 = 0u;
     var has_boundary_low = false;  // straddles into next word
@@ -137,7 +137,7 @@ fn write_codes(@builtin(global_invocation_id) gid: vec3<u32>) {
     // If we only have non-boundary bits, a plain store suffices and avoids
     // all atomic overhead for the common case.
     if (!has_boundary_low) {
-        wc_output[g] = local_word;
+        atomicStore(&wc_output[g], local_word);
     } else {
         // Merge local_word with the already-atomically-written boundary bits.
         atomicOr(&wc_output[g], local_word);
