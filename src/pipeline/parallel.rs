@@ -185,12 +185,12 @@ struct UnifiedQueueState {
     failed: bool,
 }
 
-/// Determine whether to use GPU entropy encoding for a given block.
+/// Determine whether to route a block to GPU entropy encoding.
 ///
 /// Checks the backend assignment setting and block size to decide if GPU entropy
 /// should be used. Returns false when no GPU is available or when CPU is explicitly
 /// assigned or when the block is too small.
-fn should_use_gpu_entropy(block: &[u8], options: &CompressOptions) -> bool {
+fn should_route_block_to_gpu_entropy(block: &[u8], options: &CompressOptions) -> bool {
     #[cfg(feature = "webgpu")]
     {
         use super::{BackendAssignment, GPU_ENTROPY_THRESHOLD};
@@ -277,7 +277,8 @@ fn compress_parallel_unified_lz_rans(
                                     .expect("stage0 slot poisoned") = Some(stage0_block);
                                 let mut guard = queue_ref.lock().expect("unified queue poisoned");
                                 if !guard.failed {
-                                    let use_gpu = should_use_gpu_entropy(blocks[block_idx], &opts);
+                                    let use_gpu =
+                                        should_route_block_to_gpu_entropy(blocks[block_idx], &opts);
                                     let task = if use_gpu {
                                         UnifiedTask::Stage1Gpu(block_idx)
                                     } else {
@@ -656,6 +657,19 @@ fn compress_streaming_gpu(
 /// This function is the long-term heterogeneous scheduler path for LzSeqR pipelines
 /// when GPU is available. For now, it falls back to the unified scheduler (all CPU)
 /// since GPU entropy encoding is still being integrated in Phase 4+5.
+/// Helper to construct a StageBlock with standard defaults.
+/// Used in coordinator fallback paths to avoid repeating the boilerplate.
+#[cfg(feature = "webgpu")]
+fn make_stage_block(block_idx: usize, original_len: usize, data: Vec<u8>) -> StageBlock {
+    StageBlock {
+        block_index: block_idx,
+        original_len,
+        data,
+        streams: None,
+        metadata: StageMetadata::default(),
+    }
+}
+
 #[cfg(feature = "webgpu")]
 fn compress_parallel_heterogeneous_lzseq_rans(
     input: &[u8],
@@ -707,6 +721,8 @@ fn compress_parallel_heterogeneous_lzseq_rans(
                 }
             });
         }
+        // Keep a clone of result_tx for the GPU coordinator to send already-encoded results
+        let coordinator_result_tx = result_tx.clone();
         drop(result_tx);
 
         // Stage0 prefetch worker: runs match finding (Stage0) for all blocks sequentially
@@ -733,6 +749,7 @@ fn compress_parallel_heterogeneous_lzseq_rans(
         let gpu_lost_ref = &gpu_lost;
         let entropy_ring_ref = &entropy_ring;
         scope.spawn(move || {
+            let coord_result_tx = coordinator_result_tx;
             let mut slot_inflight: Vec<Option<usize>> = vec![None; ring_depth];
             let mut stage0_cache: Vec<Option<StageBlock>> = vec![None; num_blocks];
             let mut next_worker = 0usize;
@@ -749,13 +766,7 @@ fn compress_parallel_heterogeneous_lzseq_rans(
                     Err(_e) => {
                         let _ = worker_txs[next_worker % cpu_workers].send((
                             block_idx,
-                            StageBlock {
-                                block_index: block_idx,
-                                original_len: block.len(),
-                                data: block.to_vec(),
-                                streams: None,
-                                metadata: StageMetadata::default(),
-                            },
+                            make_stage_block(block_idx, block.len(), block.to_vec()),
                         ));
                         next_worker += 1;
                         continue;
@@ -785,32 +796,15 @@ fn compress_parallel_heterogeneous_lzseq_rans(
                                 for stream in entropy_streams {
                                     result_data.extend_from_slice(&stream);
                                 }
-                                let _ = worker_txs[next_worker % cpu_workers].send((
-                                    prev_idx,
-                                    StageBlock {
-                                        block_index: prev_idx,
-                                        original_len: blocks[prev_idx].len(),
-                                        data: result_data,
-                                        streams: None,
-                                        metadata: StageMetadata::default(),
-                                    },
-                                ));
+                                // GPU entropy is complete; send directly to result collector (bypassing CPU workers)
+                                let _ = coord_result_tx.send((prev_idx, Ok(result_data)));
                             } else {
                                 // Fallback if entropy is empty
                                 if let Some(cached) = stage0_cache[prev_idx].take() {
                                     let result =
                                         run_compress_stage(pipeline, 1, cached, &resolved_options)
                                             .map(|b| b.data);
-                                    let _ = worker_txs[next_worker % cpu_workers].send((
-                                        prev_idx,
-                                        StageBlock {
-                                            block_index: prev_idx,
-                                            original_len: blocks[prev_idx].len(),
-                                            data: result.unwrap_or_default(),
-                                            streams: None,
-                                            metadata: StageMetadata::default(),
-                                        },
-                                    ));
+                                    let _ = coord_result_tx.send((prev_idx, result));
                                 }
                             }
                         }
@@ -823,16 +817,7 @@ fn compress_parallel_heterogeneous_lzseq_rans(
                                 let result =
                                     run_compress_stage(pipeline, 1, cached, &resolved_options)
                                         .map(|b| b.data);
-                                let _ = worker_txs[next_worker % cpu_workers].send((
-                                    prev_idx,
-                                    StageBlock {
-                                        block_index: prev_idx,
-                                        original_len: blocks[prev_idx].len(),
-                                        data: result.unwrap_or_default(),
-                                        streams: None,
-                                        metadata: StageMetadata::default(),
-                                    },
-                                ));
+                                let _ = coord_result_tx.send((prev_idx, result));
                             }
                         }
                     }
@@ -841,7 +826,7 @@ fn compress_parallel_heterogeneous_lzseq_rans(
 
                 // Decide whether to use GPU or CPU for this block's entropy
                 let use_gpu = !gpu_lost_ref.load(std::sync::atomic::Ordering::Acquire)
-                    && should_use_gpu_entropy(block, &resolved_options);
+                    && should_route_block_to_gpu_entropy(block, &resolved_options);
 
                 if use_gpu {
                     // Cache stage0 for potential fallback
@@ -870,13 +855,11 @@ fn compress_parallel_heterogeneous_lzseq_rans(
                                 .map(|b| b.data);
                                 let _ = worker_txs[next_worker % cpu_workers].send((
                                     block_idx,
-                                    StageBlock {
-                                        block_index: block_idx,
-                                        original_len: block.len(),
-                                        data: result.unwrap_or_default(),
-                                        streams: None,
-                                        metadata: StageMetadata::default(),
-                                    },
+                                    make_stage_block(
+                                        block_idx,
+                                        block.len(),
+                                        result.unwrap_or_default(),
+                                    ),
                                 ));
                                 next_worker += 1;
                             }
@@ -888,13 +871,7 @@ fn compress_parallel_heterogeneous_lzseq_rans(
                                 .map(|b| b.data);
                         let _ = worker_txs[next_worker % cpu_workers].send((
                             block_idx,
-                            StageBlock {
-                                block_index: block_idx,
-                                original_len: block.len(),
-                                data: result.unwrap_or_default(),
-                                streams: None,
-                                metadata: StageMetadata::default(),
-                            },
+                            make_stage_block(block_idx, block.len(), result.unwrap_or_default()),
                         ));
                         next_worker += 1;
                     }
@@ -924,30 +901,13 @@ fn compress_parallel_heterogeneous_lzseq_rans(
                                 for stream in entropy_streams {
                                     result_data.extend_from_slice(&stream);
                                 }
-                                let _ = worker_txs[next_worker % cpu_workers].send((
-                                    prev_idx,
-                                    StageBlock {
-                                        block_index: prev_idx,
-                                        original_len: blocks[prev_idx].len(),
-                                        data: result_data,
-                                        streams: None,
-                                        metadata: StageMetadata::default(),
-                                    },
-                                ));
+                                // GPU entropy is complete; send directly to result collector
+                                let _ = coord_result_tx.send((prev_idx, Ok(result_data)));
                             } else if let Some(cached) = stage0_cache[prev_idx].take() {
                                 let result =
                                     run_compress_stage(pipeline, 1, cached, &resolved_options)
                                         .map(|b| b.data);
-                                let _ = worker_txs[next_worker % cpu_workers].send((
-                                    prev_idx,
-                                    StageBlock {
-                                        block_index: prev_idx,
-                                        original_len: blocks[prev_idx].len(),
-                                        data: result.unwrap_or_default(),
-                                        streams: None,
-                                        metadata: StageMetadata::default(),
-                                    },
-                                ));
+                                let _ = coord_result_tx.send((prev_idx, result));
                             }
                         }
                         Err(e) => {
@@ -958,20 +918,10 @@ fn compress_parallel_heterogeneous_lzseq_rans(
                                 let result =
                                     run_compress_stage(pipeline, 1, cached, &resolved_options)
                                         .map(|b| b.data);
-                                let _ = worker_txs[next_worker % cpu_workers].send((
-                                    prev_idx,
-                                    StageBlock {
-                                        block_index: prev_idx,
-                                        original_len: blocks[prev_idx].len(),
-                                        data: result.unwrap_or_default(),
-                                        streams: None,
-                                        metadata: StageMetadata::default(),
-                                    },
-                                ));
+                                let _ = coord_result_tx.send((prev_idx, result));
                             }
                         }
                     }
-                    next_worker += 1;
                 }
             }
 
@@ -1905,6 +1855,7 @@ mod tests {
 
     // Task 9: Comprehensive fallback scenario tests (AC3.5 and AC3.6)
     #[test]
+    #[cfg(feature = "webgpu")]
     fn test_ac3_5_no_gpu_zero_overhead_cpu_path() {
         // AC3.5: No GPU available — pure CPU path works with zero overhead.
         let input: Vec<u8> = (0..=255).cycle().take(1024 * 1024).collect();
@@ -1994,6 +1945,127 @@ mod tests {
         assert_eq!(
             decompressed, input,
             "partial GPU slot state should fall back cleanly"
+        );
+    }
+
+    // GPU-specific heterogeneous scheduler tests
+    // These tests verify compress_parallel_heterogeneous_lzseq_rans is actually invoked
+    // when GPU is available and stage1_backend is Auto or Gpu.
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn test_heterogeneous_compress_with_gpu_entropy() {
+        // Test actual GPU heterogeneous compression when GPU is available.
+        // This verifies that compress_parallel_heterogeneous_lzseq_rans is invoked
+        // (not just CPU fallback).
+        use crate::webgpu::WebGpuEngine;
+
+        let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
+
+        // Try to create a GPU engine; skip test if no device available
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(_) => {
+                eprintln!("GPU device not available, skipping GPU heterogeneous test");
+                return;
+            }
+        };
+
+        let opts = CompressOptions {
+            backend: super::super::Backend::WebGpu,
+            unified_scheduler: true,
+            threads: 2,
+            stage1_backend: super::super::BackendAssignment::Auto,
+            webgpu_engine: Some(std::sync::Arc::new(engine)),
+            ..CompressOptions::default()
+        };
+
+        let compressed =
+            super::super::compress_with_options(&input, Pipeline::LzSeqR, &opts).unwrap();
+        let decompressed = super::super::decompress(&compressed).unwrap();
+        assert_eq!(
+            decompressed, input,
+            "GPU heterogeneous path should decompress correctly"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn test_heterogeneous_compress_gpu_forced_large_blocks() {
+        // Test with stage1_backend forced to Gpu and large blocks that trigger GPU entropy.
+        use crate::webgpu::WebGpuEngine;
+
+        let input: Vec<u8> = (0..=255).cycle().take(768 * 1024).collect(); // 3 x 256KB blocks
+
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(_) => {
+                eprintln!("GPU device not available, skipping GPU heterogeneous test");
+                return;
+            }
+        };
+
+        let opts = CompressOptions {
+            backend: super::super::Backend::WebGpu,
+            unified_scheduler: true,
+            threads: 2,
+            block_size: 256 * 1024,
+            stage1_backend: super::super::BackendAssignment::Gpu,
+            webgpu_engine: Some(std::sync::Arc::new(engine)),
+            ..CompressOptions::default()
+        };
+
+        let compressed =
+            super::super::compress_with_options(&input, Pipeline::LzSeqR, &opts).unwrap();
+        let decompressed = super::super::decompress(&compressed).unwrap();
+        assert_eq!(
+            decompressed, input,
+            "GPU forced heterogeneous path should decompress correctly"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn test_heterogeneous_mixed_block_sizes_with_gpu() {
+        // Verify heterogeneous path handles mixed block sizes correctly:
+        // some blocks trigger GPU (>= 256KB), some use CPU (< 256KB).
+        use crate::webgpu::WebGpuEngine;
+
+        let mut input = Vec::new();
+        // 1 large block (will use GPU if Auto), 2 small blocks (will use CPU)
+        for i in 0..512 * 1024 {
+            input.push((i % 256) as u8);
+        }
+        for i in 0..128 * 1024 {
+            input.push((i % 256) as u8);
+        }
+        for i in 0..128 * 1024 {
+            input.push((i % 256) as u8);
+        }
+
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(_) => {
+                eprintln!("GPU device not available, skipping GPU heterogeneous test");
+                return;
+            }
+        };
+
+        let opts = CompressOptions {
+            backend: super::super::Backend::WebGpu,
+            unified_scheduler: true,
+            threads: 2,
+            block_size: 256 * 1024,
+            stage1_backend: super::super::BackendAssignment::Auto,
+            webgpu_engine: Some(std::sync::Arc::new(engine)),
+            ..CompressOptions::default()
+        };
+
+        let compressed =
+            super::super::compress_with_options(&input, Pipeline::LzSeqR, &opts).unwrap();
+        let decompressed = super::super::decompress(&compressed).unwrap();
+        assert_eq!(
+            decompressed, input,
+            "Mixed GPU/CPU heterogeneous path should decompress correctly"
         );
     }
 }

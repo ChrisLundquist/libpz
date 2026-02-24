@@ -118,14 +118,10 @@ const DEFAULT_BLOCK_SIZE: usize = 256 * 1024;
 /// which also improves throughput on streaming GPU paths.
 const DEFAULT_GPU_BLOCK_SIZE: usize = 128 * 1024;
 
-/// Minimum total pre-entropy bytes for GPU entropy encoding to be worthwhile.
-/// Below this threshold, PCIe transfer overhead exceeds compute savings.
-/// 256KB = 262144 bytes (aligns with AC3.2 threshold).
-pub const GPU_ENTROPY_MIN_BYTES: usize = 262_144;
-
 /// Minimum block size for GPU entropy to win over CPU (empirical from Phase 4).
-#[allow(dead_code)] // Used in Task 2's should_use_gpu_entropy
-pub(crate) const GPU_ENTROPY_THRESHOLD: usize = 256 * 1024;
+/// Applies to both individual blocks and total stream byte count.
+/// 256KB = 262144 bytes (aligns with AC3.2 threshold).
+pub const GPU_ENTROPY_THRESHOLD: usize = 256 * 1024;
 
 /// Options controlling pipeline compression behavior.
 #[derive(Debug, Clone)]
@@ -813,7 +809,7 @@ fn bbwt_encode_with_backend(
 /// Choose whether to use GPU entropy encoding for a set of streams.
 ///
 /// Returns true when the GPU engine is available and the total stream
-/// bytes exceed the 256KB threshold.
+/// bytes exceed the GPU_ENTROPY_THRESHOLD.
 pub fn should_use_gpu_entropy(streams: &[Vec<u8>], options: &CompressOptions) -> bool {
     #[cfg(feature = "webgpu")]
     {
@@ -824,7 +820,7 @@ pub fn should_use_gpu_entropy(streams: &[Vec<u8>], options: &CompressOptions) ->
             return false;
         }
         let total: usize = streams.iter().map(|s| s.len()).sum();
-        total >= GPU_ENTROPY_MIN_BYTES
+        total >= GPU_ENTROPY_THRESHOLD
     }
     #[cfg(not(feature = "webgpu"))]
     {

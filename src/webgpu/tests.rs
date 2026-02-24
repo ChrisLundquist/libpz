@@ -2612,7 +2612,7 @@ fn test_cpu_encode_gpu_decode_lzseq_streams() {
 
 #[test]
 fn test_gpu_entropy_threshold_cpu_fallback_below_256kb() {
-    // Streams whose total size is below GPU_ENTROPY_MIN_BYTES (256KB)
+    // Streams whose total size is below GPU_ENTROPY_THRESHOLD (256KB)
     // must silently use the CPU path — no GPU initialization or error.
     let small_streams: Vec<Vec<u8>> = vec![
         vec![0u8; 1024], // 1KB each

@@ -17,12 +17,13 @@ use crate::rans::{
 /// Reusing pre-allocated slots across blocks avoids per-block buffer creation
 /// overhead and enables overlapped GPU entropy with CPU match finding:
 /// while the GPU encodes entropy on slot N, the CPU finds matches for block N+1.
-#[allow(dead_code)]
 pub(crate) struct EntropyHandoffSlot {
     /// Pre-allocated GPU buffers for the 6 LzSeq streams.
     /// Each inner Vec holds a GPU buffer for one stream.
     pub streams_bufs: [Option<wgpu::Buffer>; 6],
     /// Pre-allocated staging buffer for readback of encoded entropy results.
+    /// Will be used in the full implementation of entropy encoding.
+    #[allow(dead_code)]
     pub staging_buf: wgpu::Buffer,
     /// Capacity in bytes (worst-case total for all 6 streams).
     pub capacity: usize,
@@ -2550,7 +2551,6 @@ impl WebGpuEngine {
     ///
     /// Each slot can hold up to `capacity` bytes across its 6 stream buffers.
     /// Returns `None` if GPU memory is insufficient.
-    #[allow(dead_code)]
     pub(crate) fn create_entropy_ring(
         &self,
         capacity: usize,
@@ -2565,7 +2565,6 @@ impl WebGpuEngine {
     }
 
     /// Allocate a single entropy handoff slot.
-    #[allow(dead_code)]
     fn alloc_entropy_slot(&self, capacity: usize) -> Option<EntropyHandoffSlot> {
         if capacity == 0 {
             return None;
@@ -2604,7 +2603,6 @@ impl WebGpuEngine {
     ///
     /// The streams are copied to GPU storage buffers. Returns `Ok(())` if the
     /// submit was successful (GPU compute is now in flight).
-    #[allow(dead_code)]
     pub(crate) fn submit_entropy_to_slot(
         &self,
         streams: &[Vec<u8>],
@@ -2642,7 +2640,6 @@ impl WebGpuEngine {
     ///
     /// Reads back the encoded entropy streams and returns them as a Vec of byte buffers
     /// (one per stream). On error (device lost, etc.), returns Err for fallback.
-    #[allow(dead_code)]
     pub(crate) fn complete_entropy_from_slot(
         &self,
         _slot: &EntropyHandoffSlot,
