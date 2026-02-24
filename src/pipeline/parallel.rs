@@ -647,16 +647,6 @@ fn compress_streaming_gpu(
     assemble_multiblock_output(input, pipeline, block_size, &compressed_blocks)
 }
 
-/// Ring-buffered heterogeneous compression for LzSeqR with GPU entropy dispatch.
-///
-/// Executes Stage0 (LzSeq match finding) on the CPU and dispatches entropy encoding
-/// to GPU for large blocks while smaller blocks run CPU entropy. Uses a ring of
-/// pre-allocated GPU buffer slots to overlap work: while GPU encodes block N,
-/// CPU finds matches for block N+1.
-///
-/// This function is the long-term heterogeneous scheduler path for LzSeqR pipelines
-/// when GPU is available. For now, it falls back to the unified scheduler (all CPU)
-/// since GPU entropy encoding is still being integrated in Phase 4+5.
 /// Helper to construct a StageBlock with standard defaults.
 /// Used in coordinator fallback paths to avoid repeating the boilerplate.
 #[cfg(feature = "webgpu")]
@@ -670,6 +660,16 @@ fn make_stage_block(block_idx: usize, original_len: usize, data: Vec<u8>) -> Sta
     }
 }
 
+/// Ring-buffered heterogeneous compression for LzSeqR with GPU entropy dispatch.
+///
+/// Executes Stage0 (LzSeq match finding) on the CPU and dispatches entropy encoding
+/// to GPU for large blocks while smaller blocks run CPU entropy. Uses a ring of
+/// pre-allocated GPU buffer slots to overlap work: while GPU encodes block N,
+/// CPU finds matches for block N+1.
+///
+/// This function is the long-term heterogeneous scheduler path for LzSeqR pipelines
+/// when GPU is available. For now, it falls back to the unified scheduler (all CPU)
+/// since GPU entropy encoding is still being integrated in Phase 4+5.
 #[cfg(feature = "webgpu")]
 fn compress_parallel_heterogeneous_lzseq_rans(
     input: &[u8],
