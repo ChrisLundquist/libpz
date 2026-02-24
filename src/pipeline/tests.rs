@@ -1780,3 +1780,30 @@ fn test_lzseq_r_optimal_better_than_lazy_on_structured_data() {
         "optimal round-trip"
     );
 }
+
+// --- BackendAssignment tests (Task 1) ---
+
+#[test]
+fn test_backend_assignment_default_is_auto() {
+    let opts = CompressOptions::default();
+    assert_eq!(opts.stage0_backend, BackendAssignment::Auto);
+    assert_eq!(opts.stage1_backend, BackendAssignment::Auto);
+}
+
+#[test]
+fn test_backend_assignment_cpu_variant_always_available() {
+    // This test ensures the Cpu variant compiles and is always available,
+    // regardless of feature flags
+    let cpu_assign = BackendAssignment::Cpu;
+    assert_eq!(cpu_assign, BackendAssignment::Cpu);
+
+    // Create options with explicit CPU assignment
+    let opts = CompressOptions {
+        stage0_backend: BackendAssignment::Cpu,
+        stage1_backend: BackendAssignment::Cpu,
+        ..CompressOptions::default()
+    };
+
+    assert_eq!(opts.stage0_backend, BackendAssignment::Cpu);
+    assert_eq!(opts.stage1_backend, BackendAssignment::Cpu);
+}

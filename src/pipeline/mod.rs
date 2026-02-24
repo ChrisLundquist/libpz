@@ -59,6 +59,23 @@ pub enum Backend {
     WebGpu,
 }
 
+/// Per-stage compute backend override.
+///
+/// Controls which backend executes a specific pipeline stage.
+/// `Auto` lets the scheduler decide based on block size and GPU availability.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BackendAssignment {
+    /// Scheduler chooses: GPU entropy for blocks >= GPU_ENTROPY_THRESHOLD,
+    /// CPU for smaller blocks or when no GPU is available.
+    #[default]
+    Auto,
+    /// Force CPU execution for this stage (always available, zero-overhead).
+    Cpu,
+    /// Force GPU execution for this stage (requires `webgpu` feature and a device).
+    #[cfg(feature = "webgpu")]
+    Gpu,
+}
+
 /// LZ77 match selection strategy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ParseStrategy {
@@ -106,6 +123,10 @@ const DEFAULT_GPU_BLOCK_SIZE: usize = 128 * 1024;
 /// 256KB = 262144 bytes (aligns with AC3.2 threshold).
 pub const GPU_ENTROPY_MIN_BYTES: usize = 262_144;
 
+/// Minimum block size for GPU entropy to win over CPU (empirical from Phase 4).
+#[allow(dead_code)] // Used in Task 2's should_use_gpu_entropy
+pub(crate) const GPU_ENTROPY_THRESHOLD: usize = 256 * 1024;
+
 /// Options controlling pipeline compression behavior.
 #[derive(Debug, Clone)]
 pub struct CompressOptions {
@@ -151,6 +172,13 @@ pub struct CompressOptions {
     /// at the cost of more memory (4 bytes per window position for the
     /// hash-chain `prev` array).
     pub seq_window_size: Option<usize>,
+    /// Backend assignment for stage 0 (match finding / transform).
+    /// Match finding is always CPU — LZ77's sequential dependency rules out GPU.
+    /// For BWT-based pipelines, Auto routes to GPU.
+    pub stage0_backend: BackendAssignment,
+    /// Backend assignment for stage 1 (entropy coding).
+    /// Auto routes to GPU when block size >= GPU_ENTROPY_THRESHOLD and GPU available.
+    pub stage1_backend: BackendAssignment,
 }
 
 impl Default for CompressOptions {
@@ -168,6 +196,8 @@ impl Default for CompressOptions {
             rans_interleaved_states: crate::rans::DEFAULT_INTERLEAVE,
             unified_scheduler: false,
             seq_window_size: None,
+            stage0_backend: BackendAssignment::Auto,
+            stage1_backend: BackendAssignment::Auto,
         }
     }
 }
