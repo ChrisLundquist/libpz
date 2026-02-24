@@ -21,6 +21,7 @@ use super::{CompressOptions, Pipeline};
 /// Each stage transforms `data` in place (replacing it with output)
 /// and may attach metadata. The `block_index` preserves ordering
 /// for final reassembly.
+#[derive(Clone)]
 pub(crate) struct StageBlock {
     /// Monotonically increasing index for ordered reassembly.
     /// Not read at runtime (FIFO channels preserve order), but useful for debugging.
@@ -39,7 +40,7 @@ pub(crate) struct StageBlock {
 }
 
 /// Metadata accumulated across pipeline stages.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct StageMetadata {
     /// BWT primary index (Bw pipeline, set by BWT stage).
     pub bwt_primary_index: Option<u32>,
