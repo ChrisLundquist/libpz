@@ -475,7 +475,6 @@ fn main() {
     let mut rans_chunk_bytes = DEFAULT_RANS_CHUNK_BYTES;
     let mut rans_gpu_batch = DEFAULT_RANS_GPU_BATCH;
     let mut rans_independent_block_bytes = 0usize;
-    let mut unified_scheduler = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -534,7 +533,6 @@ fn main() {
                     .parse()
                     .expect("invalid --rans-independent-block-bytes");
             }
-            "--unified-scheduler" => unified_scheduler = true,
             "--help" | "-h" => {
                 usage();
                 return;
@@ -583,7 +581,6 @@ fn main() {
             rans_interleaved,
             rans_interleaved_min_bytes,
             rans_interleaved_states,
-            unified_scheduler,
             ..CompressOptions::default()
         };
         let _ = pipeline::compress_with_options(&data, pipe, &opts).unwrap();

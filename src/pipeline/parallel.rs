@@ -1,8 +1,8 @@
 //! Multi-block parallel compression and decompression.
 //!
 //! CPU paths:
-//! - **Block-parallel**: sliding-window of threads, each running all stages via `compress_block()`.
-//! - **Unified scheduler**: shared work queue for LZ-based pipelines, enables GPU entropy routing.
+//! - **Unified scheduler**: shared work queue executing all pipeline stages from a single
+//!   worker pool. Supports N-stage pipelines (2-stage LZ, 4-stage BWT) and GPU entropy routing.
 //!
 //! GPU paths:
 //! - **Batched/streaming**: GPU LZ77 match finding with CPU entropy encoding.
@@ -12,7 +12,6 @@ use crate::{PzError, PzResult};
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 
-use super::blocks::compress_block;
 use super::stages::{run_compress_stage, StageBlock, StageMetadata};
 use super::{write_header, CompressOptions, DecompressOptions, Pipeline, BLOCK_HEADER_SIZE};
 
@@ -72,12 +71,10 @@ pub(crate) fn compress_parallel(
 
     // Split input into blocks
     let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
-    let num_blocks = blocks.len();
 
     // Heterogeneous GPU entropy path for LzSeqR (if GPU is available and enabled)
     #[cfg(feature = "webgpu")]
-    if options.unified_scheduler
-        && matches!(pipeline, Pipeline::LzSeqR)
+    if matches!(pipeline, Pipeline::LzSeqR)
         && options.stage1_backend != super::BackendAssignment::Cpu
     {
         if let super::Backend::WebGpu = options.backend {
@@ -97,50 +94,7 @@ pub(crate) fn compress_parallel(
     // Unified scheduler: a single worker pool executes all pipeline stages
     // from one shared queue. Workers pick up stage tasks for any block,
     // enabling work-stealing across both stages and blocks.
-    if options.unified_scheduler && num_blocks > 1 {
-        return compress_parallel_unified(input, pipeline, options, num_threads, &blocks);
-    }
-
-    // Compress blocks in parallel using scoped threads
-    let compressed_blocks: Vec<PzResult<Vec<u8>>> = std::thread::scope(|scope| {
-        // Launch threads in batches to cap concurrency
-        let max_concurrent = num_threads.min(num_blocks);
-        let mut handles: Vec<std::thread::ScopedJoinHandle<PzResult<Vec<u8>>>> =
-            Vec::with_capacity(max_concurrent);
-        let mut results: Vec<PzResult<Vec<u8>>> = Vec::with_capacity(num_blocks);
-
-        for block in &blocks {
-            if handles.len() >= max_concurrent {
-                // Wait for the earliest thread to finish
-                let handle = handles.remove(0);
-                results.push(handle.join().unwrap_or(Err(PzError::InvalidInput)));
-            }
-            let opts = options.clone();
-            handles.push(scope.spawn(move || compress_block(block, pipeline, &opts)));
-        }
-
-        // Collect remaining results
-        for handle in handles {
-            results.push(handle.join().unwrap_or(Err(PzError::InvalidInput)));
-        }
-
-        results
-    });
-
-    // Check for errors
-    let mut block_data_vec: Vec<Vec<u8>> = Vec::with_capacity(num_blocks);
-    for result in compressed_blocks {
-        block_data_vec.push(result?);
-    }
-
-    let orig_block_lens: Vec<usize> = blocks.iter().map(|b| b.len()).collect();
-    let block_slices: Vec<&[u8]> = block_data_vec.iter().map(|v| v.as_slice()).collect();
-    Ok(assemble_multiblock_container(
-        pipeline,
-        input.len(),
-        &orig_block_lens,
-        &block_slices,
-    ))
+    compress_parallel_unified(input, pipeline, options, num_threads, &blocks)
 }
 
 fn assemble_multiblock_container(
@@ -1218,7 +1172,7 @@ mod tests {
 
         let opts = CompressOptions {
             threads: 2,
-            unified_scheduler: true,
+
             stage1_backend: super::super::BackendAssignment::Auto,
             ..CompressOptions::default()
         };
@@ -1237,7 +1191,7 @@ mod tests {
 
         let opts = CompressOptions {
             threads: 2,
-            unified_scheduler: true,
+
             stage1_backend: super::super::BackendAssignment::Cpu,
             ..CompressOptions::default()
         };
@@ -1257,7 +1211,7 @@ mod tests {
 
         let opts = CompressOptions {
             threads: 2,
-            unified_scheduler: true,
+
             stage1_backend: super::super::BackendAssignment::Auto,
             ..CompressOptions::default()
         };
@@ -1282,7 +1236,7 @@ mod tests {
 
         let opts = CompressOptions {
             threads: 2,
-            unified_scheduler: true,
+
             stage1_backend: super::super::BackendAssignment::Cpu,
             ..CompressOptions::default()
         };
@@ -1308,7 +1262,7 @@ mod tests {
 
         let opts = CompressOptions {
             threads: 2,
-            unified_scheduler: true,
+
             stage1_backend: super::super::BackendAssignment::Auto,
             #[cfg(feature = "webgpu")]
             webgpu_engine: None,
@@ -1333,7 +1287,7 @@ mod tests {
         let input_at_threshold: Vec<u8> = (0..=255).cycle().take(256 * 1024).collect();
         let opts = CompressOptions {
             threads: 2,
-            unified_scheduler: true,
+
             stage1_backend: super::super::BackendAssignment::Auto,
             ..CompressOptions::default()
         };
@@ -1381,7 +1335,7 @@ mod tests {
         let opts = CompressOptions {
             block_size,
             threads: 4,
-            unified_scheduler: true,
+
             stage1_backend: super::super::BackendAssignment::Cpu,
             ..CompressOptions::default()
         };
@@ -1433,7 +1387,7 @@ mod tests {
         let opts = CompressOptions {
             block_size,
             threads: 4,
-            unified_scheduler: true,
+
             stage1_backend: super::super::BackendAssignment::Auto,
             ..CompressOptions::default()
         };
@@ -1463,7 +1417,7 @@ mod tests {
 
         let opts = CompressOptions {
             threads: 2,
-            unified_scheduler: true,
+
             stage1_backend: super::super::BackendAssignment::Cpu,
             ..CompressOptions::default()
         };
@@ -1487,7 +1441,7 @@ mod tests {
         let opts = CompressOptions {
             block_size: 256 * 1024,
             threads: 2,
-            unified_scheduler: true,
+
             stage1_backend: super::super::BackendAssignment::Auto,
             ..CompressOptions::default()
         };
@@ -1512,7 +1466,7 @@ mod tests {
         let opts = CompressOptions {
             block_size: 256 * 1024,
             threads: 4,
-            unified_scheduler: true,
+
             stage1_backend: super::super::BackendAssignment::Auto,
             ..CompressOptions::default()
         };
@@ -1535,7 +1489,7 @@ mod tests {
 
         let opts = CompressOptions {
             backend: super::super::Backend::Cpu,
-            unified_scheduler: true,
+
             threads: 4,
             ..CompressOptions::default()
         };
@@ -1556,7 +1510,7 @@ mod tests {
 
         let opts = CompressOptions {
             backend: super::super::Backend::Cpu,
-            unified_scheduler: true,
+
             threads: 2,
             stage1_backend: super::super::BackendAssignment::Cpu,
             ..CompressOptions::default()
@@ -1583,7 +1537,7 @@ mod tests {
         let opts = CompressOptions {
             block_size: 256 * 1024,
             threads: 4,
-            unified_scheduler: true,
+
             stage1_backend: super::super::BackendAssignment::Auto,
             ..CompressOptions::default()
         };
@@ -1607,7 +1561,7 @@ mod tests {
 
         let opts = CompressOptions {
             backend: super::super::Backend::Cpu,
-            unified_scheduler: true,
+
             threads: 4,
             webgpu_engine: None, // Explicitly no GPU
             ..CompressOptions::default()
@@ -1631,7 +1585,6 @@ mod tests {
             let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
 
             let opts = CompressOptions {
-                unified_scheduler: true,
                 threads: 2,
                 ..CompressOptions::default()
             };
@@ -1656,7 +1609,7 @@ mod tests {
         let opts = CompressOptions {
             block_size: 256 * 1024,
             threads: 4,
-            unified_scheduler: true,
+
             stage1_backend: super::super::BackendAssignment::Auto,
             ..CompressOptions::default()
         };
@@ -1679,7 +1632,7 @@ mod tests {
         let opts = CompressOptions {
             block_size: 256 * 1024,
             threads: 2,
-            unified_scheduler: true,
+
             stage1_backend: super::super::BackendAssignment::Auto,
             ..CompressOptions::default()
         };
@@ -1717,7 +1670,7 @@ mod tests {
 
         let opts = CompressOptions {
             backend: super::super::Backend::WebGpu,
-            unified_scheduler: true,
+
             threads: 2,
             stage1_backend: super::super::BackendAssignment::Auto,
             webgpu_engine: Some(std::sync::Arc::new(engine)),
@@ -1751,7 +1704,7 @@ mod tests {
 
         let opts = CompressOptions {
             backend: super::super::Backend::WebGpu,
-            unified_scheduler: true,
+
             threads: 2,
             block_size: 256 * 1024,
             stage1_backend: super::super::BackendAssignment::Gpu,
@@ -1797,7 +1750,7 @@ mod tests {
 
         let opts = CompressOptions {
             backend: super::super::Backend::WebGpu,
-            unified_scheduler: true,
+
             threads: 2,
             block_size: 256 * 1024,
             stage1_backend: super::super::BackendAssignment::Auto,

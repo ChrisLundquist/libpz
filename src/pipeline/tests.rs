@@ -825,7 +825,6 @@ fn test_lzr_unified_scheduler_multiblock_round_trip() {
     let opts = CompressOptions {
         threads: 4,
         block_size: 512,
-        unified_scheduler: true,
         ..CompressOptions::default()
     };
     let compressed = compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
