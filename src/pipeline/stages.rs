@@ -1,7 +1,6 @@
 //! Pipeline stage functions: individual compress/decompress transforms and
 //! the multi-stream entropy container format.
 
-use crate::bwt;
 use crate::fse;
 use crate::huffman::HuffmanTree;
 use crate::mtf;
@@ -413,48 +412,6 @@ pub(crate) fn stage_rans_decode(mut block: StageBlock) -> PzResult<StageBlock> {
     Ok(block)
 }
 
-/// rANS decoding stage with WebGPU interleaved decode fast path.
-///
-/// Uses GPU decode only for interleaved rANS payloads. Non-interleaved payloads
-/// continue to decode on CPU. If GPU interleaved decode is unsupported for the
-/// payload shape (e.g. lane count mismatch), falls back to CPU decode.
-#[cfg(feature = "webgpu")]
-pub(crate) fn stage_rans_decode_webgpu(
-    mut block: StageBlock,
-    engine: &crate::webgpu::WebGpuEngine,
-) -> PzResult<StageBlock> {
-    let (streams, pre_entropy_len, meta) = decode_multistream(&block.data, |data| {
-        if data.len() < 8 {
-            return Err(PzError::InvalidInput);
-        }
-        let orig_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        let comp_field = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        let is_interleaved = (comp_field & RANS_INTERLEAVED_FLAG) != 0;
-        let comp_len = (comp_field & !RANS_INTERLEAVED_FLAG) as usize;
-        if 8 + comp_len > data.len() {
-            return Err(PzError::InvalidInput);
-        }
-        let payload = &data[8..8 + comp_len];
-
-        let decoded = if is_interleaved {
-            match engine.rans_decode_interleaved_gpu(payload, orig_len) {
-                Ok(out) => out,
-                Err(PzError::Unsupported) => rans::decode_interleaved(payload, orig_len)?,
-                Err(e) => return Err(e),
-            }
-        } else {
-            rans::decode(payload, orig_len)?
-        };
-        Ok((decoded, 8 + comp_len))
-    })?;
-
-    block.metadata.pre_entropy_len = Some(pre_entropy_len);
-    block.metadata.demux_meta = meta;
-    block.streams = Some(streams);
-    block.data.clear();
-    Ok(block)
-}
-
 /// GPU batched rANS encoding stage (WebGPU): encode all streams in a single
 /// batched GPU dispatch with ring-buffered submit/readback overlap.
 ///
@@ -793,43 +750,6 @@ pub(crate) fn stage_fse_encode_bw(mut block: StageBlock) -> PzResult<StageBlock>
     Ok(block)
 }
 
-/// Bw decompress stage 0: parse metadata + FSE decode.
-pub(crate) fn stage_fse_decode_bw(mut block: StageBlock) -> PzResult<StageBlock> {
-    if block.data.len() < 8 {
-        return Err(PzError::InvalidInput);
-    }
-    let primary_index =
-        u32::from_le_bytes([block.data[0], block.data[1], block.data[2], block.data[3]]);
-    let rle_len =
-        u32::from_le_bytes([block.data[4], block.data[5], block.data[6], block.data[7]]) as usize;
-
-    block.metadata.bwt_primary_index = Some(primary_index);
-    block.data = fse::decode(&block.data[8..], rle_len)?;
-    Ok(block)
-}
-
-/// Bw decompress stage 1: RLE decode.
-pub(crate) fn stage_rle_decode(mut block: StageBlock) -> PzResult<StageBlock> {
-    block.data = rle::decode(&block.data)?;
-    Ok(block)
-}
-
-/// Bw decompress stage 2: MTF decode.
-pub(crate) fn stage_mtf_decode(mut block: StageBlock) -> PzResult<StageBlock> {
-    block.data = mtf::decode(&block.data);
-    Ok(block)
-}
-
-/// Bw decompress stage 3: BWT decode.
-pub(crate) fn stage_bwt_decode(mut block: StageBlock) -> PzResult<StageBlock> {
-    let primary_index = block
-        .metadata
-        .bwt_primary_index
-        .ok_or(PzError::InvalidInput)?;
-    block.data = bwt::decode(&block.data, primary_index)?;
-    Ok(block)
-}
-
 // ---------------------------------------------------------------------------
 // BBW pipeline stages (Bbw — bijective BWT)
 // ---------------------------------------------------------------------------
@@ -872,68 +792,9 @@ pub(crate) fn stage_fse_encode_bbw(mut block: StageBlock) -> PzResult<StageBlock
     Ok(block)
 }
 
-/// Bbw decompress stage 0: parse metadata + FSE decode.
-pub(crate) fn stage_fse_decode_bbw(mut block: StageBlock) -> PzResult<StageBlock> {
-    if block.data.len() < 2 {
-        return Err(PzError::InvalidInput);
-    }
-    let num_factors = u16::from_le_bytes([block.data[0], block.data[1]]) as usize;
-    let header_len = 2 + num_factors * 4 + 4; // num_factors(2) + factor_lengths(4*k) + rle_len(4)
-    if block.data.len() < header_len {
-        return Err(PzError::InvalidInput);
-    }
-
-    let mut factor_lengths = Vec::with_capacity(num_factors);
-    for i in 0..num_factors {
-        let offset = 2 + i * 4;
-        let fl = u32::from_le_bytes([
-            block.data[offset],
-            block.data[offset + 1],
-            block.data[offset + 2],
-            block.data[offset + 3],
-        ]) as usize;
-        factor_lengths.push(fl);
-    }
-
-    let rle_offset = 2 + num_factors * 4;
-    let rle_len = u32::from_le_bytes([
-        block.data[rle_offset],
-        block.data[rle_offset + 1],
-        block.data[rle_offset + 2],
-        block.data[rle_offset + 3],
-    ]) as usize;
-
-    block.metadata.bbwt_factor_lengths = Some(factor_lengths);
-    block.data = fse::decode(&block.data[header_len..], rle_len)?;
-    Ok(block)
-}
-
-/// Bbw decompress stage 3: bijective BWT decode.
-pub(crate) fn stage_bbwt_decode(mut block: StageBlock) -> PzResult<StageBlock> {
-    let factor_lengths = block
-        .metadata
-        .bbwt_factor_lengths
-        .take()
-        .ok_or(PzError::InvalidInput)?;
-    block.data = bwt::decode_bijective(&block.data, &factor_lengths)?;
-    Ok(block)
-}
-
 // ---------------------------------------------------------------------------
 // Stage dispatch — maps (pipeline, stage_idx) to the appropriate function
 // ---------------------------------------------------------------------------
-
-/// Number of compression stages in a pipeline.
-pub(crate) fn pipeline_stage_count(pipeline: Pipeline) -> usize {
-    match pipeline {
-        Pipeline::Deflate => 2,
-        Pipeline::Bw => 4,
-        Pipeline::Bbw => 4,
-        Pipeline::Lzr => 2,
-        Pipeline::Lzf | Pipeline::Lzfi => 2,
-        Pipeline::LzssR | Pipeline::Lz78R | Pipeline::LzSeqR | Pipeline::LzSeqH => 2,
-    }
-}
 
 /// Dispatch to the appropriate compression stage function.
 pub(crate) fn run_compress_stage(
@@ -987,103 +848,6 @@ pub(crate) fn run_compress_stage(
         }
         (Pipeline::LzSeqH, 0) => stage_demux_compress(block, &LzDemuxer::LzSeq, options),
         (Pipeline::LzSeqH, 1) => stage_huffman_encode(block),
-        _ => Err(PzError::Unsupported),
-    }
-}
-
-/// Dispatch to the appropriate decompression stage function.
-pub(crate) fn run_decompress_stage(
-    pipeline: Pipeline,
-    stage_idx: usize,
-    block: StageBlock,
-    options: &super::DecompressOptions,
-) -> PzResult<StageBlock> {
-    match (pipeline, stage_idx) {
-        // Deflate: Huffman decode(0) → LZ77 decompress(1)
-        (Pipeline::Deflate, 0) => stage_huffman_decode(block),
-        (Pipeline::Deflate, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
-        // Bw: FSE decode(0) → RLE decode(1) → MTF decode(2) → BWT decode(3)
-        (Pipeline::Bw, 0) => stage_fse_decode_bw(block),
-        (Pipeline::Bw, 1) => stage_rle_decode(block),
-        (Pipeline::Bw, 2) => stage_mtf_decode(block),
-        (Pipeline::Bw, 3) => stage_bwt_decode(block),
-        // Bbw: FSE decode(0) → RLE decode(1) → MTF decode(2) → BBWT decode(3)
-        (Pipeline::Bbw, 0) => stage_fse_decode_bbw(block),
-        (Pipeline::Bbw, 1) => stage_rle_decode(block),
-        (Pipeline::Bbw, 2) => stage_mtf_decode(block),
-        (Pipeline::Bbw, 3) => stage_bbwt_decode(block),
-        // Lzr: rANS decode(0) → LZ77 decompress(1)
-        (Pipeline::Lzr, 0) => {
-            #[cfg(feature = "webgpu")]
-            {
-                if let super::Backend::WebGpu = options.backend {
-                    if let Some(ref engine) = options.webgpu_engine {
-                        return stage_rans_decode_webgpu(block, engine);
-                    }
-                }
-            }
-            stage_rans_decode(block)
-        }
-        (Pipeline::Lzr, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
-        // Lzf: FSE decode(0) → LZ77 decompress(1)
-        (Pipeline::Lzf, 0) => stage_fse_decode(block),
-        (Pipeline::Lzf, 1) => stage_demux_decompress(block, &LzDemuxer::Lz77),
-        // Lzfi: interleaved FSE decode(0) → LZSS decompress(1)
-        (Pipeline::Lzfi, 0) => {
-            #[cfg(feature = "webgpu")]
-            {
-                if let super::Backend::WebGpu = options.backend {
-                    if let Some(ref engine) = options.webgpu_engine {
-                        return stage_fse_interleaved_decode_webgpu(block, engine);
-                    }
-                }
-            }
-            let _ = options;
-            stage_fse_interleaved_decode(block)
-        }
-        (Pipeline::Lzfi, 1) => stage_demux_decompress(block, &LzDemuxer::Lzss),
-        // LzssR: rANS decode(0) → LZSS decompress(1)
-        (Pipeline::LzssR, 0) => {
-            #[cfg(feature = "webgpu")]
-            {
-                if let super::Backend::WebGpu = options.backend {
-                    if let Some(ref engine) = options.webgpu_engine {
-                        return stage_rans_decode_webgpu(block, engine);
-                    }
-                }
-            }
-            stage_rans_decode(block)
-        }
-        (Pipeline::LzssR, 1) => stage_demux_decompress(block, &LzDemuxer::Lzss),
-        // Lz78R: rANS decode(0) → LZ78 decompress(1)
-        (Pipeline::Lz78R, 0) => {
-            #[cfg(feature = "webgpu")]
-            {
-                if let super::Backend::WebGpu = options.backend {
-                    if let Some(ref engine) = options.webgpu_engine {
-                        return stage_rans_decode_webgpu(block, engine);
-                    }
-                }
-            }
-            stage_rans_decode(block)
-        }
-        (Pipeline::Lz78R, 1) => stage_demux_decompress(block, &LzDemuxer::Lz78),
-        // LzSeqR: rANS decode(0) → LzSeq decompress(1)
-        (Pipeline::LzSeqR, 0) => {
-            #[cfg(feature = "webgpu")]
-            {
-                if let super::Backend::WebGpu = options.backend {
-                    if let Some(ref engine) = options.webgpu_engine {
-                        return stage_rans_decode_webgpu(block, engine);
-                    }
-                }
-            }
-            stage_rans_decode(block)
-        }
-        (Pipeline::LzSeqR, 1) => stage_demux_decompress(block, &LzDemuxer::LzSeq),
-        // LzSeqH: Huffman decode(0) → LzSeq decompress(1)
-        (Pipeline::LzSeqH, 0) => stage_huffman_decode(block),
-        (Pipeline::LzSeqH, 1) => stage_demux_decompress(block, &LzDemuxer::LzSeq),
         _ => Err(PzError::Unsupported),
     }
 }

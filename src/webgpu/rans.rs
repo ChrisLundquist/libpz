@@ -2624,7 +2624,9 @@ impl WebGpuEngine {
                 if stream.len() > slot.capacity {
                     return Err(PzError::InvalidInput);
                 }
-                self.queue.write_buffer(buf, 0, stream);
+                // Pad stream to 4-byte alignment for wgpu write_buffer alignment requirement
+                let padded = Self::pad_input_bytes(stream);
+                self.queue.write_buffer(buf, 0, &padded);
             }
         }
 

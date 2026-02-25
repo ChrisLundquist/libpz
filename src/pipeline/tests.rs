@@ -1,9 +1,9 @@
 use super::*;
 use demux::LzDemuxer;
 use stages::{
-    self, pipeline_stage_count, stage_demux_compress, stage_demux_decompress, stage_fse_decode,
-    stage_fse_encode, stage_huffman_decode, stage_huffman_encode, stage_rans_decode,
-    stage_rans_encode_with_options, StageBlock, StageMetadata,
+    self, stage_demux_compress, stage_demux_decompress, stage_fse_decode, stage_fse_encode,
+    stage_huffman_decode, stage_huffman_encode, stage_rans_decode, stage_rans_encode_with_options,
+    StageBlock, StageMetadata,
 };
 
 // --- Deflate pipeline tests ---
@@ -355,131 +355,6 @@ fn test_multiblock_large_input() {
         assert_eq!(compressed[2], VERSION);
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input, "large input failed for {:?}", pipeline);
-    }
-}
-
-// --- Pipeline-parallel specific tests ---
-
-#[test]
-fn test_pipeline_parallel_round_trip_all_pipelines() {
-    // Force pipeline-parallel path: need num_blocks >= stage_count.
-    // Bw has 4 stages, so we need >= 4 blocks. Use small block_size.
-    let pattern = b"Pipeline parallelism test data with repetitions. ";
-    let mut input = Vec::new();
-    for _ in 0..100 {
-        input.extend_from_slice(pattern);
-    }
-    // 5000 bytes / 512 byte blocks = ~10 blocks, enough for any pipeline
-    for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
-        let stage_count = pipeline_stage_count(pipeline);
-        let block_size = 512;
-        let num_blocks = input.len().div_ceil(block_size);
-        assert!(
-            num_blocks >= stage_count,
-            "test setup: need {} blocks >= {} stages for {:?}",
-            num_blocks,
-            stage_count,
-            pipeline
-        );
-
-        let compressed = compress_mt(&input, pipeline, 4, block_size).unwrap();
-        let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(
-            decompressed, input,
-            "pipeline-parallel round-trip failed for {:?}",
-            pipeline
-        );
-    }
-}
-
-#[test]
-fn test_pipeline_parallel_matches_single_threaded() {
-    // Verify pipeline-parallel produces output that single-threaded can decompress,
-    // and vice versa.
-    let pattern = b"Cross-check between single-threaded and pipeline-parallel. ";
-    let mut input = Vec::new();
-    for _ in 0..100 {
-        input.extend_from_slice(pattern);
-    }
-
-    for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
-        // Single-threaded compress
-        let compressed_st = compress(input.as_slice(), pipeline).unwrap();
-        let decompressed_st = decompress(&compressed_st).unwrap();
-        assert_eq!(decompressed_st, input);
-
-        // Multi-threaded (pipeline-parallel) compress
-        let compressed_mt = compress_mt(&input, pipeline, 4, 512).unwrap();
-        let decompressed_mt = decompress(&compressed_mt).unwrap();
-        assert_eq!(decompressed_mt, input);
-
-        // Both decompress to the same data
-        assert_eq!(
-            decompressed_st, decompressed_mt,
-            "single-threaded and pipeline-parallel disagree for {:?}",
-            pipeline
-        );
-    }
-}
-
-#[test]
-fn test_pipeline_parallel_many_small_blocks() {
-    // Stress test: many blocks flowing through the pipeline.
-    // 10KB input / 128 byte blocks = 80 blocks
-    let input: Vec<u8> = (0..10240).map(|i| (i % 251) as u8).collect();
-    let compressed = compress_mt(&input, Pipeline::Bw, 4, 128).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_pipeline_parallel_decompress_with_threads() {
-    // Compress with pipeline parallelism, then decompress with explicit threads.
-    let pattern = b"Decompress parallelism test. ";
-    let mut input = Vec::new();
-    for _ in 0..200 {
-        input.extend_from_slice(pattern);
-    }
-
-    for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
-        let compressed = compress_mt(&input, pipeline, 4, 512).unwrap();
-
-        // Decompress with various thread counts
-        for threads in [0, 1, 2, 4] {
-            let decompressed = decompress_with_threads(&compressed, threads).unwrap();
-            assert_eq!(
-                decompressed, input,
-                "decompress failed for {:?} threads={}",
-                pipeline, threads
-            );
-        }
-    }
-}
-
-#[test]
-fn test_pipeline_parallel_error_propagation() {
-    // Feed corrupt data that will fail during decompression stages.
-    // Create valid V2 header but corrupt block data.
-    let input = vec![b'A'; 2048];
-    let compressed = compress_mt(&input, Pipeline::Bw, 4, 512).unwrap();
-
-    // Corrupt the last byte of the block data
-    let mut corrupt = compressed.clone();
-    let last = corrupt.len() - 1;
-    corrupt[last] ^= 0xFF;
-
-    // Should fail (either error or wrong data)
-    let result = decompress(&corrupt);
-    // We just verify it doesn't hang/panic — either error or wrong data is acceptable
-    // for this corruption test.
-    match result {
-        Ok(_data) => {
-            // If it "succeeds", corruption wasn't detected
-            // (may not always be detected depending on where it lands)
-        }
-        Err(_) => {
-            // Expected: corruption detected
-        }
     }
 }
 
@@ -940,18 +815,6 @@ fn test_lzr_multistream_deinterleave_reinterleave() {
 }
 
 #[test]
-fn test_lzr_pipeline_parallel() {
-    let pattern = b"Lzr pipeline-parallel test data. ";
-    let mut input = Vec::new();
-    for _ in 0..300 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress_mt(&input, Pipeline::Lzr, 4, 512).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
 fn test_lzr_unified_scheduler_multiblock_round_trip() {
     let pattern = b"Lzr unified scheduler multiblock round-trip test. ";
     let mut input = Vec::new();
@@ -1099,18 +962,6 @@ fn test_lzf_multistream_deinterleave_reinterleave() {
     let block = stage_demux_decompress(block, &LzDemuxer::Lz77).unwrap();
     assert!(block.streams.is_none());
     assert_eq!(block.data, input);
-}
-
-#[test]
-fn test_lzf_pipeline_parallel() {
-    let pattern = b"Lzf pipeline-parallel test data. ";
-    let mut input = Vec::new();
-    for _ in 0..300 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress_mt(&input, Pipeline::Lzf, 4, 512).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
 }
 
 #[test]

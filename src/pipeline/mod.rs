@@ -39,11 +39,7 @@ use crate::lz77;
 use crate::{PzError, PzResult};
 
 pub(crate) use blocks::{compress_block, decompress_block};
-use parallel::{
-    compress_parallel, compress_pipeline_parallel, decompress_parallel,
-    decompress_pipeline_parallel,
-};
-use stages::pipeline_stage_count;
+use parallel::{compress_parallel, decompress_parallel};
 
 /// Compute backend selection for pipeline stages.
 ///
@@ -376,20 +372,7 @@ pub fn compress_with_options(
 
     // Multi-block compression: choose between pipeline-parallel and block-parallel.
     //
-    // Block parallelism (one thread per block, each block runs all stages) scales
-    // with available cores and is preferred when we have more threads than stages.
-    //
-    // Pipeline parallelism (one thread per stage, blocks flow through channels) is
-    // only beneficial when the stage count is high enough to saturate available
-    // threads (e.g., the 4-stage Bw pipeline on <=4 cores).
-    let num_blocks = input.len().div_ceil(block_size);
-    let stage_count = pipeline_stage_count(pipeline);
-
-    if num_blocks > 1 && stage_count >= num_threads {
-        compress_pipeline_parallel(input, pipeline, options)
-    } else {
-        compress_parallel(input, pipeline, options, num_threads)
-    }
+    compress_parallel(input, pipeline, options, num_threads)
 }
 
 /// Decompress data produced by `compress`.
@@ -467,12 +450,6 @@ pub fn decompress_with_options(input: &[u8], options: &DecompressOptions) -> PzR
         return Err(PzError::InvalidInput);
     }
 
-    let num_threads = resolve_thread_count(options.threads);
-    let stage_count = pipeline_stage_count(pipeline);
-
-    if num_threads > 1 && num_blocks > 1 && stage_count >= num_threads {
-        return decompress_pipeline_parallel(payload, pipeline, orig_len, num_blocks, options);
-    }
     decompress_parallel(payload, pipeline, orig_len, num_blocks, options)
 }
 
