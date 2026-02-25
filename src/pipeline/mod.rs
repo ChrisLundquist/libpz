@@ -59,6 +59,23 @@ pub enum Backend {
     WebGpu,
 }
 
+/// Per-stage compute backend override.
+///
+/// Controls which backend executes a specific pipeline stage.
+/// `Auto` lets the scheduler decide based on block size and GPU availability.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BackendAssignment {
+    /// Scheduler chooses: GPU entropy for blocks >= GPU_ENTROPY_THRESHOLD,
+    /// CPU for smaller blocks or when no GPU is available.
+    #[default]
+    Auto,
+    /// Force CPU execution for this stage (always available, zero-overhead).
+    Cpu,
+    /// Force GPU execution for this stage (requires `webgpu` feature and a device).
+    #[cfg(feature = "webgpu")]
+    Gpu,
+}
+
 /// LZ77 match selection strategy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ParseStrategy {
@@ -74,6 +91,21 @@ pub enum ParseStrategy {
     Optimal,
 }
 
+/// Compression quality preset for LzSeq pipelines.
+///
+/// Maps to `parse_strategy` and hash chain depth. Higher quality = better ratio
+/// at the cost of more CPU time. Only affects LzSeqR and LzSeqH.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QualityLevel {
+    /// Speed mode: lazy matching, shallow chain depth.
+    Speed,
+    /// Default mode: optimal parsing with standard chain depth.
+    #[default]
+    Default,
+    /// Quality mode: optimal parsing with deep hash chains.
+    Quality,
+}
+
 /// Default block size for multi-threaded compression (256KB).
 const DEFAULT_BLOCK_SIZE: usize = 256 * 1024;
 
@@ -85,6 +117,11 @@ const DEFAULT_BLOCK_SIZE: usize = 256 * 1024;
 /// Using smaller blocks creates more work items for GPU/CPU overlap pipelining,
 /// which also improves throughput on streaming GPU paths.
 const DEFAULT_GPU_BLOCK_SIZE: usize = 128 * 1024;
+
+/// Minimum block size for GPU entropy to win over CPU (empirical from Phase 4).
+/// Applies to both individual blocks and total stream byte count.
+/// 256KB = 262144 bytes (aligns with AC3.2 threshold).
+pub const GPU_ENTROPY_THRESHOLD: usize = 256 * 1024;
 
 /// Options controlling pipeline compression behavior.
 #[derive(Debug, Clone)]
@@ -131,6 +168,13 @@ pub struct CompressOptions {
     /// at the cost of more memory (4 bytes per window position for the
     /// hash-chain `prev` array).
     pub seq_window_size: Option<usize>,
+    /// Backend assignment for stage 0 (match finding / transform).
+    /// Match finding is always CPU — LZ77's sequential dependency rules out GPU.
+    /// For BWT-based pipelines, Auto routes to GPU.
+    pub stage0_backend: BackendAssignment,
+    /// Backend assignment for stage 1 (entropy coding).
+    /// Auto routes to GPU when block size >= GPU_ENTROPY_THRESHOLD and GPU available.
+    pub stage1_backend: BackendAssignment,
 }
 
 impl Default for CompressOptions {
@@ -148,7 +192,30 @@ impl Default for CompressOptions {
             rans_interleaved_states: crate::rans::DEFAULT_INTERLEAVE,
             unified_scheduler: false,
             seq_window_size: None,
+            stage0_backend: BackendAssignment::Auto,
+            stage1_backend: BackendAssignment::Auto,
         }
+    }
+}
+
+impl CompressOptions {
+    /// Build options for the given quality level (LzSeq pipelines).
+    pub fn for_quality(level: QualityLevel) -> Self {
+        let mut opts = CompressOptions::default();
+        match level {
+            QualityLevel::Speed => {
+                opts.parse_strategy = ParseStrategy::Lazy;
+            }
+            QualityLevel::Default => {
+                opts.parse_strategy = ParseStrategy::Optimal;
+            }
+            QualityLevel::Quality => {
+                opts.parse_strategy = ParseStrategy::Optimal;
+                // Deep chain: use a larger window for quality mode
+                opts.seq_window_size = Some(256 * 1024);
+            }
+        }
+        opts
     }
 }
 
@@ -737,6 +804,30 @@ fn bbwt_encode_with_backend(
     let _ = options;
 
     bwt::encode_bijective(input).ok_or(PzError::InvalidInput)
+}
+
+/// Choose whether to use GPU entropy encoding for a set of streams.
+///
+/// Returns true when the GPU engine is available and the total stream
+/// bytes exceed the GPU_ENTROPY_THRESHOLD.
+pub fn should_use_gpu_entropy(streams: &[Vec<u8>], options: &CompressOptions) -> bool {
+    #[cfg(feature = "webgpu")]
+    {
+        if options.backend != Backend::WebGpu {
+            return false;
+        }
+        if options.webgpu_engine.is_none() {
+            return false;
+        }
+        let total: usize = streams.iter().map(|s| s.len()).sum();
+        total >= GPU_ENTROPY_THRESHOLD
+    }
+    #[cfg(not(feature = "webgpu"))]
+    {
+        let _ = streams;
+        let _ = options;
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------

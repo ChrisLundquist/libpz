@@ -2545,3 +2545,129 @@ fn test_gpu_lzseq_rans_encode_pipeline() {
         "GPU rANS pipeline small-input round-trip mismatch"
     );
 }
+
+#[test]
+fn test_gpu_encode_cpu_decode_lzseq_streams() {
+    // Build a synthetic LzSeq DemuxOutput (6 streams) and verify that
+    // GPU encode -> CPU decode round-trips correctly for each stream.
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Synthetic streams: vary sizes and distributions to exercise
+    // the 256KB threshold and stream-size heterogeneity.
+    let streams: Vec<Vec<u8>> = vec![
+        // flags: mostly 0 and 1 (match/literal bits)
+        (0..32768).map(|i| (i % 2) as u8).collect(),
+        // literals: all 256 values
+        (0..32768).map(|i| (i % 256) as u8).collect(),
+        // offset_codes: zstd-style, concentrated in low values
+        (0..16384).map(|i| (i % 32) as u8).collect(),
+        // offset_extra: near-uniform
+        (0..16384).map(|i| (i % 256) as u8).collect(),
+        // length_codes: concentrated in 0-15
+        (0..16384).map(|i| (i % 16) as u8).collect(),
+        // length_extra: sparse
+        (0..8192).map(|i| (i % 64) as u8).collect(),
+    ];
+
+    let encoded_streams = engine
+        .rans_encode_6streams_gpu(&streams, 4, 65536, crate::rans::DEFAULT_SCALE_BITS)
+        .expect("GPU encode of 6 streams must succeed");
+
+    assert_eq!(encoded_streams.len(), 6, "must get 6 encoded streams back");
+
+    for (i, (original, encoded)) in streams.iter().zip(encoded_streams.iter()).enumerate() {
+        let decoded = crate::rans::decode_interleaved(encoded, original.len())
+            .unwrap_or_else(|e| panic!("CPU decode of stream {} failed: {:?}", i, e));
+        assert_eq!(
+            &decoded, original,
+            "stream {} GPU-encode -> CPU-decode round-trip mismatch",
+            i
+        );
+    }
+}
+
+#[test]
+fn test_cpu_encode_gpu_decode_lzseq_streams() {
+    // CPU encode -> GPU decode cross-path: encode on CPU, decode on GPU.
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..131072).map(|i| (i % 200) as u8).collect();
+    let encoded_cpu = crate::rans::encode_interleaved(&input);
+    let decoded_gpu = engine
+        .rans_decode_interleaved_gpu(&encoded_cpu, input.len())
+        .expect("GPU decode of CPU-encoded data must succeed");
+    assert_eq!(
+        decoded_gpu, input,
+        "CPU-encode -> GPU-decode round-trip mismatch"
+    );
+}
+
+#[test]
+fn test_gpu_entropy_threshold_cpu_fallback_below_256kb() {
+    // Streams whose total size is below GPU_ENTROPY_THRESHOLD (256KB)
+    // must silently use the CPU path — no GPU initialization or error.
+    let small_streams: Vec<Vec<u8>> = vec![
+        vec![0u8; 1024], // 1KB each
+        vec![1u8; 1024],
+        vec![2u8; 1024],
+        vec![3u8; 1024],
+        vec![4u8; 1024],
+        vec![5u8; 1024],
+    ]; // total: 6KB << 256KB
+
+    let options = crate::pipeline::CompressOptions {
+        backend: crate::pipeline::Backend::WebGpu,
+        #[cfg(feature = "webgpu")]
+        webgpu_engine: None, // simulates "no GPU"
+        threads: 1,
+        ..crate::pipeline::CompressOptions::default()
+    };
+    assert!(
+        !crate::pipeline::should_use_gpu_entropy(&small_streams, &options),
+        "must not use GPU entropy for streams totaling < 256KB"
+    );
+
+    // Also test with large streams that should use GPU if available
+    let large_streams: Vec<Vec<u8>> = vec![
+        vec![0u8; 100_000],
+        vec![1u8; 100_000],
+        vec![2u8; 100_000], // total: 300KB > 256KB
+    ];
+
+    let options_no_engine = crate::pipeline::CompressOptions {
+        backend: crate::pipeline::Backend::WebGpu,
+        #[cfg(feature = "webgpu")]
+        webgpu_engine: None,
+        threads: 1,
+        ..crate::pipeline::CompressOptions::default()
+    };
+    assert!(
+        !crate::pipeline::should_use_gpu_entropy(&large_streams, &options_no_engine),
+        "must not use GPU entropy when engine is None"
+    );
+
+    // If we have a GPU available, test with engine
+    #[cfg(feature = "webgpu")]
+    {
+        if let Ok(engine) = WebGpuEngine::new() {
+            let options_with_engine = crate::pipeline::CompressOptions {
+                backend: crate::pipeline::Backend::WebGpu,
+                webgpu_engine: Some(std::sync::Arc::new(engine)),
+                threads: 1,
+                ..crate::pipeline::CompressOptions::default()
+            };
+            assert!(
+                crate::pipeline::should_use_gpu_entropy(&large_streams, &options_with_engine),
+                "must use GPU entropy for streams totaling >= 256KB when GPU available"
+            );
+        }
+    }
+}
