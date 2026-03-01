@@ -64,6 +64,9 @@ fn assemble_multiblock_container(
 enum UnifiedTask {
     Stage(usize, usize),    // (stage_idx, block_idx) — CPU execution
     StageGpu(usize, usize), // (stage_idx, block_idx) — route to GPU coordinator
+    /// Fused GPU execution: run stages start..=end on the GPU coordinator
+    /// without intermediate queue round-trips. (stage_start, stage_end, block_idx)
+    FusedGpu(usize, usize, usize),
 }
 
 /// Number of compression stages for a pipeline in the unified scheduler.
@@ -154,6 +157,22 @@ fn should_route_block_to_gpu_stage0(
     }
 }
 
+/// Determine whether a pipeline can fuse all its stages on GPU.
+///
+/// Returns `Some((start, end))` when every stage in `start..=end` has a GPU
+/// implementation, allowing the GPU coordinator to run them sequentially
+/// without intermediate queue round-trips or CPU readback.
+#[cfg(feature = "webgpu")]
+fn gpu_fused_span(pipeline: Pipeline) -> Option<(usize, usize)> {
+    match pipeline {
+        // Both stages have GPU paths: LZ77 match-finding + rANS encode
+        Pipeline::Lzr => Some((0, 1)),
+        // Both stages have GPU paths: LzSeq fused match+demux + rANS encode
+        Pipeline::LzSeqR => Some((0, 1)),
+        _ => None,
+    }
+}
+
 /// Message sent from unified workers to the GPU coordinator thread.
 #[cfg(feature = "webgpu")]
 enum GpuRequest {
@@ -163,6 +182,9 @@ enum GpuRequest {
     /// Stage 1+: entropy encoding on GPU.
     /// (stage_idx, block_idx, stage_block)
     StageN(usize, usize, StageBlock),
+    /// Fused: run stages start..=end on GPU without queue round-trips.
+    /// (stage_start, stage_end, block_idx, input_data)
+    Fused(usize, usize, usize, Vec<u8>),
 }
 
 fn compress_parallel_unified(
@@ -196,14 +218,32 @@ fn compress_parallel_unified(
     #[cfg(not(feature = "webgpu"))]
     let has_gpu = false;
 
+    // Determine if this pipeline can fuse all GPU stages.
+    #[cfg(feature = "webgpu")]
+    let fused_span = if has_gpu {
+        gpu_fused_span(pipeline)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "webgpu"))]
+    let fused_span: Option<(usize, usize)> = None;
+
     // Build initial task queue with GPU routing for Stage 0 where applicable.
     let initial_tasks: VecDeque<UnifiedTask> = (0..num_blocks)
         .map(|i| {
             #[cfg(feature = "webgpu")]
             if has_gpu && should_route_block_to_gpu_stage0(blocks[i], pipeline, &resolved_options) {
+                // If the pipeline supports fusion and entropy also qualifies for GPU,
+                // fuse all stages into a single GPU coordinator dispatch.
+                if let Some((start, end)) = fused_span {
+                    if should_route_block_to_gpu_entropy(blocks[i], &resolved_options) {
+                        return UnifiedTask::FusedGpu(start, end, i);
+                    }
+                }
                 return UnifiedTask::StageGpu(0, i);
             }
             let _ = has_gpu;
+            let _ = fused_span;
             UnifiedTask::Stage(0, i)
         })
         .collect();
@@ -250,11 +290,13 @@ fn compress_parallel_unified(
                     // Batch-collect: drain additional pending requests.
                     let mut stage0_batch: Vec<(usize, Vec<u8>)> = Vec::new();
                     let mut stage_n_queue: Vec<(usize, usize, StageBlock)> = Vec::new();
+                    let mut fused_queue: Vec<(usize, usize, usize, Vec<u8>)> = Vec::new();
 
                     // Classify the first request.
                     match first {
                         GpuRequest::Stage0(b, data) => stage0_batch.push((b, data)),
                         GpuRequest::StageN(s, b, sb) => stage_n_queue.push((s, b, sb)),
+                        GpuRequest::Fused(s, e, b, data) => fused_queue.push((s, e, b, data)),
                     }
 
                     // Non-blocking drain of additional requests.
@@ -262,6 +304,9 @@ fn compress_parallel_unified(
                         match req {
                             GpuRequest::Stage0(b, data) => stage0_batch.push((b, data)),
                             GpuRequest::StageN(s, b, sb) => stage_n_queue.push((s, b, sb)),
+                            GpuRequest::Fused(s, e, b, data) => {
+                                fused_queue.push((s, e, b, data));
+                            }
                         }
                     }
 
@@ -365,6 +410,41 @@ fn compress_parallel_unified(
                             cv_ref,
                         );
                     }
+
+                    // Process fused requests: run stages start..=end sequentially
+                    // on GPU without intermediate queue round-trips.
+                    for (stage_start, stage_end, block_idx, data) in fused_queue {
+                        let block = StageBlock {
+                            block_index: block_idx,
+                            original_len: data.len(),
+                            data,
+                            streams: None,
+                            metadata: StageMetadata::default(),
+                        };
+                        let mut result: PzResult<StageBlock> = Ok(block);
+                        let mut final_stage = stage_start;
+                        for stage in stage_start..=stage_end {
+                            match result {
+                                Ok(sb) => {
+                                    result = run_compress_stage(pipeline, stage, sb, &opts);
+                                    final_stage = stage;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        complete_gpu_stage(
+                            result,
+                            final_stage,
+                            block_idx,
+                            last_stage,
+                            blocks,
+                            &opts,
+                            slots_ref,
+                            results_ref,
+                            queue_ref,
+                            cv_ref,
+                        );
+                    }
                 }
             });
         }
@@ -396,6 +476,24 @@ fn compress_parallel_unified(
 
                 let (stage_idx, block_idx) = match task {
                     UnifiedTask::Stage(s, b) => (s, b),
+                    UnifiedTask::FusedGpu(start, end, b) => {
+                        // Route to GPU coordinator for fused multi-stage execution
+                        #[cfg(feature = "webgpu")]
+                        if let Some(ref tx) = gpu_tx_clone {
+                            let request = GpuRequest::Fused(start, end, b, blocks[b].to_vec());
+                            match tx.try_send(request) {
+                                Ok(()) => continue,
+                                Err(
+                                    std::sync::mpsc::TrySendError::Full(_)
+                                    | std::sync::mpsc::TrySendError::Disconnected(_),
+                                ) => {
+                                    // Channel full or closed — fall through to CPU stage 0
+                                }
+                            }
+                        }
+                        // Fallback: execute first stage on CPU
+                        (start, b)
+                    }
                     UnifiedTask::StageGpu(s, b) => {
                         // Route to GPU coordinator — send and continue to next task
                         #[cfg(feature = "webgpu")]
