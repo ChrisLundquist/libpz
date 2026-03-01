@@ -158,8 +158,8 @@ fn should_route_block_to_gpu_stage0(
 #[cfg(feature = "webgpu")]
 enum GpuRequest {
     /// Stage 0: LZ77/LzSeq match-finding on GPU.
-    /// (stage_idx, block_idx, input_data)
-    Stage0(usize, usize, Vec<u8>),
+    /// (block_idx, input_data)
+    Stage0(usize, Vec<u8>),
     /// Stage 1+: entropy encoding on GPU.
     /// (stage_idx, block_idx, stage_block)
     StageN(usize, usize, StageBlock),
@@ -242,36 +242,129 @@ fn compress_parallel_unified(
             let opts = resolved_options.clone();
 
             scope.spawn(move || {
-                while let Ok(request) = rx.recv() {
-                    // Both Stage0 and StageN route through run_compress_stage,
-                    // which handles GPU dispatch for all pipelines.
-                    let (stage_idx, block_idx, block) = match request {
-                        GpuRequest::Stage0(s, b, data) => (
-                            s,
-                            b,
-                            StageBlock {
-                                block_index: b,
+                let engine = opts.webgpu_engine.as_ref().unwrap();
+                let uses_lz77_demux =
+                    matches!(pipeline, Pipeline::Deflate | Pipeline::Lzr | Pipeline::Lzf);
+
+                while let Ok(first) = rx.recv() {
+                    // Batch-collect: drain additional pending requests.
+                    let mut stage0_batch: Vec<(usize, Vec<u8>)> = Vec::new();
+                    let mut stage_n_queue: Vec<(usize, usize, StageBlock)> = Vec::new();
+
+                    // Classify the first request.
+                    match first {
+                        GpuRequest::Stage0(b, data) => stage0_batch.push((b, data)),
+                        GpuRequest::StageN(s, b, sb) => stage_n_queue.push((s, b, sb)),
+                    }
+
+                    // Non-blocking drain of additional requests.
+                    while let Ok(req) = rx.try_recv() {
+                        match req {
+                            GpuRequest::Stage0(b, data) => stage0_batch.push((b, data)),
+                            GpuRequest::StageN(s, b, sb) => stage_n_queue.push((s, b, sb)),
+                        }
+                    }
+
+                    // Process Stage 0 batch: use find_matches_batched for LZ77
+                    // pipelines to get ring-buffered GPU overlap.
+                    if !stage0_batch.is_empty() && uses_lz77_demux {
+                        let batch_blocks: Vec<&[u8]> =
+                            stage0_batch.iter().map(|(_, d)| d.as_slice()).collect();
+                        let batch_results = engine.find_matches_batched(&batch_blocks);
+                        match batch_results {
+                            Ok(all_matches) => {
+                                for (matches, &(block_idx, ref data)) in
+                                    all_matches.into_iter().zip(&stage0_batch)
+                                {
+                                    let demux = super::demux::demux_lz77_matches(matches);
+                                    let sb = StageBlock {
+                                        block_index: block_idx,
+                                        original_len: data.len(),
+                                        data: Vec::new(),
+                                        streams: Some(demux.streams),
+                                        metadata: StageMetadata {
+                                            pre_entropy_len: Some(demux.pre_entropy_len),
+                                            demux_meta: demux.meta,
+                                            ..StageMetadata::default()
+                                        },
+                                    };
+                                    complete_gpu_stage(
+                                        Ok(sb),
+                                        0,
+                                        block_idx,
+                                        last_stage,
+                                        blocks,
+                                        &opts,
+                                        slots_ref,
+                                        results_ref,
+                                        queue_ref,
+                                        cv_ref,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                // GPU batch failed — report error for each block.
+                                for (block_idx, _) in &stage0_batch {
+                                    complete_gpu_stage(
+                                        Err(PzError::InvalidInput),
+                                        0,
+                                        *block_idx,
+                                        last_stage,
+                                        blocks,
+                                        &opts,
+                                        slots_ref,
+                                        results_ref,
+                                        queue_ref,
+                                        cv_ref,
+                                    );
+                                }
+                                let _ = e;
+                            }
+                        }
+                    } else {
+                        // Non-LZ77 pipelines (LzSeq, LZSS): dispatch individually
+                        // through run_compress_stage which calls lzseq_encode_gpu etc.
+                        for (block_idx, data) in stage0_batch {
+                            let block = StageBlock {
+                                block_index: block_idx,
                                 original_len: data.len(),
                                 data,
                                 streams: None,
                                 metadata: StageMetadata::default(),
-                            },
-                        ),
-                        GpuRequest::StageN(s, b, sb) => (s, b, sb),
-                    };
-                    let result = run_compress_stage(pipeline, stage_idx, block, &opts);
-                    complete_gpu_stage(
-                        result,
-                        stage_idx,
-                        block_idx,
-                        last_stage,
-                        blocks,
-                        &opts,
-                        slots_ref,
-                        results_ref,
-                        queue_ref,
-                        cv_ref,
-                    );
+                            };
+                            let result = run_compress_stage(pipeline, 0, block, &opts);
+                            complete_gpu_stage(
+                                result,
+                                0,
+                                block_idx,
+                                last_stage,
+                                blocks,
+                                &opts,
+                                slots_ref,
+                                results_ref,
+                                queue_ref,
+                                cv_ref,
+                            );
+                        }
+                    }
+
+                    // Process Stage N requests individually — entropy GPU work
+                    // already has internal batching (rans_encode_chunked_payload_gpu_batched).
+                    for (stage_idx, block_idx, sb) in stage_n_queue {
+                        let result = run_compress_stage(pipeline, stage_idx, sb, &opts);
+                        complete_gpu_stage(
+                            result,
+                            stage_idx,
+                            block_idx,
+                            last_stage,
+                            blocks,
+                            &opts,
+                            slots_ref,
+                            results_ref,
+                            queue_ref,
+                            cv_ref,
+                        );
+                    }
                 }
             });
         }
@@ -308,7 +401,7 @@ fn compress_parallel_unified(
                         #[cfg(feature = "webgpu")]
                         if let Some(ref tx) = gpu_tx_clone {
                             let request = if s == 0 {
-                                GpuRequest::Stage0(s, b, blocks[b].to_vec())
+                                GpuRequest::Stage0(b, blocks[b].to_vec())
                             } else {
                                 let stage_block = slots_ref[b]
                                     .lock()

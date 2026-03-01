@@ -64,6 +64,28 @@ pub(crate) fn demuxer_for_pipeline(pipeline: super::Pipeline) -> Option<LzDemuxe
     }
 }
 
+/// Demux pre-computed LZ77 matches into (offsets, lengths, literals) streams.
+///
+/// This is the demux-only counterpart to `LzDemuxer::Lz77::compress_and_demux()`.
+/// Used by the GPU coordinator to demux matches returned from
+/// `find_matches_batched()` without re-running match-finding.
+pub(crate) fn demux_lz77_matches(matches: Vec<lz77::Match>) -> DemuxOutput {
+    let num_matches = matches.len();
+    let mut offsets = Vec::with_capacity(num_matches * 2);
+    let mut lengths = Vec::with_capacity(num_matches * 2);
+    let mut literals = Vec::with_capacity(num_matches);
+    for m in matches {
+        offsets.extend_from_slice(&m.offset.to_le_bytes());
+        lengths.extend_from_slice(&m.length.to_le_bytes());
+        literals.push(m.next);
+    }
+    DemuxOutput {
+        streams: vec![offsets, lengths, literals],
+        pre_entropy_len: num_matches * lz77::Match::SERIALIZED_SIZE,
+        meta: Vec::new(),
+    }
+}
+
 impl StreamDemuxer for LzDemuxer {
     fn stream_count(&self) -> usize {
         match self {
