@@ -190,10 +190,10 @@ if [[ -n "$BLOCK_SIZE" ]]; then
     if [[ "$EXPLAIN" == true ]]; then
         echo ""
         echo "Implementation notes:"
-        echo "  - Ring buffer path: compress_streaming_gpu() in src/pipeline/parallel.rs:226"
-        echo "  - Per-block alloc path: compress_parallel_gpu_batched() in src/pipeline/parallel.rs:137"
-        echo "  - Ring creation: create_lz77_ring() in src/webgpu/lz77.rs:997"
-        echo "  - Slot allocation: alloc_lz77_slot() in src/webgpu/lz77.rs:952"
+        echo "  - Unified scheduler: compress_parallel_unified() in src/pipeline/parallel.rs"
+        echo "  - GPU coordinator: batch-collects Stage 0 requests, uses find_matches_batched()"
+        echo "  - Ring creation: create_lz77_ring() in src/webgpu/lz77.rs"
+        echo "  - Slot allocation: alloc_lz77_slot() in src/webgpu/lz77.rs"
     fi
 
 else

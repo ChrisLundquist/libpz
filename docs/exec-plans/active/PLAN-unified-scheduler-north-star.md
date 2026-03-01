@@ -55,8 +55,7 @@ The tradeoff: smaller chunks = more parallelism but more framing overhead (per-c
 | GPU Huffman encode | `kernels/huffman_encode.wgsl` | Production |
 | GPU FSE encode/decode | `kernels/fse_encode.wgsl`, `fse_decode.wgsl` | Production |
 | CPU interleaved rANS | `src/rans.rs` (`encode_interleaved_n`, `decode_interleaved`) | PR #91 |
-| Unified scheduler prototype | `src/pipeline/parallel.rs` (`compress_parallel_unified_lz_rans`) | PR #91 |
-| GPU streaming pipeline | `src/pipeline/parallel.rs` (`compress_streaming_gpu`) | Production |
+| Unified scheduler (with GPU coordinator) | `src/pipeline/parallel.rs` (`compress_parallel_unified`) | Production (PR #101) |
 | GPU buffer ring | `src/webgpu/lz77.rs` (`BufferRing`) | Production |
 
 **Critical gap:** No GPU rANS kernels exist. This is the prerequisite for everything else.

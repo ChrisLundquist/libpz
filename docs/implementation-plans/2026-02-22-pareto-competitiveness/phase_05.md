@@ -1,5 +1,7 @@
 # Pareto-Competitiveness Implementation Plan — Phase 5: Heterogeneous Block Scheduling
 
+> **Note (2026-03-01):** This plan predates the unified GPU scheduler refactor (PR #101). The functions referenced throughout (`compress_streaming_gpu`, `compress_parallel_gpu_batched`, `compress_parallel_unified_lz_rans`, `compress_parallel_heterogeneous_lzseq_rans`) have been replaced by a single `compress_parallel_unified()` with a dedicated GPU coordinator thread. The `UnifiedTask` enum now has `Stage`, `StageGpu`, and `FusedGpu` variants. The core ideas (per-stage backend assignment, GPU entropy, CPU fallback) remain valid but the implementation approach needs to be adapted to the new architecture.
+
 **Goal:** Enable CPU+GPU cooperative block compression with per-stage backend assignment and zero-overhead CPU fallback.
 
 **Architecture:** Extend `parallel.rs` block loop with backend assignment per stage. CPU does match finding, GPU does entropy for large blocks. Ring-buffered handoff pattern from `webgpu/lz77.rs` generalized to entropy coding.
