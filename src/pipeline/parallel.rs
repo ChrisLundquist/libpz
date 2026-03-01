@@ -1,12 +1,12 @@
 //! Multi-block parallel compression and decompression.
 //!
-//! CPU paths:
-//! - **Unified scheduler**: shared work queue executing all pipeline stages from a single
-//!   worker pool. Supports N-stage pipelines (2-stage LZ, 4-stage BWT) and GPU entropy routing.
+//! **Unified scheduler**: a single shared work queue executes all pipeline stages from a
+//! worker pool. Supports N-stage pipelines (2-stage LZ, 4-stage BWT) and GPU dispatch
+//! via a dedicated GPU coordinator thread when a WebGPU device is available.
 //!
-//! GPU paths:
-//! - **Batched/streaming**: GPU LZ77 match finding with CPU entropy encoding.
-//! - **Heterogeneous LzSeqR**: CPU match finding with GPU/CPU entropy dispatch.
+//! GPU and CPU encoders are interchangeable: the same queue handles both, with the
+//! coordinator thread dispatching GPU work via `run_compress_stage` and feeding
+//! results back into the queue for subsequent stages.
 
 use crate::{PzError, PzResult};
 use std::collections::VecDeque;
@@ -16,6 +16,10 @@ use super::stages::{run_compress_stage, StageBlock, StageMetadata};
 use super::{write_header, CompressOptions, DecompressOptions, Pipeline, BLOCK_HEADER_SIZE};
 
 /// Multi-block parallel compression.
+///
+/// All pipelines flow through the unified scheduler. When a WebGPU device is
+/// available, a dedicated GPU coordinator thread handles ring-buffered GPU
+/// submissions while the CPU worker pool continues processing other blocks.
 ///
 /// Format after the 8-byte container header:
 /// - num_blocks: u32 LE
@@ -27,73 +31,8 @@ pub(crate) fn compress_parallel(
     options: &CompressOptions,
     num_threads: usize,
 ) -> PzResult<Vec<u8>> {
-    // Try streaming or batched GPU LZ77 path for LZ77-based pipelines
-    #[cfg(feature = "webgpu")]
-    let is_batchable = {
-        let is_lz77_pipeline = matches!(
-            pipeline,
-            Pipeline::Deflate | Pipeline::Lzr | Pipeline::Lzf | Pipeline::Lzfi
-        );
-        is_lz77_pipeline && options.parse_strategy != super::ParseStrategy::Optimal
-    };
-
-    #[cfg(feature = "webgpu")]
-    if is_batchable {
-        if let super::Backend::WebGpu = options.backend {
-            if let Some(ref engine) = options.webgpu_engine {
-                // Multi-block: use double-buffered streaming for GPU/CPU overlap
-                let block_size = options.block_size;
-                if input.len() > block_size {
-                    if let Some(ring) = engine.create_lz77_ring(block_size) {
-                        return compress_streaming_gpu(
-                            input,
-                            pipeline,
-                            options,
-                            num_threads,
-                            engine,
-                            ring,
-                        );
-                    }
-                }
-                // Single-block or insufficient GPU memory: use existing batched path
-                return compress_parallel_gpu_batched(
-                    input,
-                    pipeline,
-                    options,
-                    num_threads,
-                    engine,
-                );
-            }
-        }
-    }
-
     let block_size = options.block_size;
-
-    // Split input into blocks
     let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
-
-    // Heterogeneous GPU entropy path for LzSeqR (if GPU is available and enabled)
-    #[cfg(feature = "webgpu")]
-    if matches!(pipeline, Pipeline::LzSeqR)
-        && options.stage1_backend != super::BackendAssignment::Cpu
-    {
-        if let super::Backend::WebGpu = options.backend {
-            if let Some(ref engine) = options.webgpu_engine {
-                return compress_parallel_heterogeneous_lzseq_rans(
-                    input,
-                    pipeline,
-                    options,
-                    num_threads,
-                    &blocks,
-                    engine,
-                );
-            }
-        }
-    }
-
-    // Unified scheduler: a single worker pool executes all pipeline stages
-    // from one shared queue. Workers pick up stage tasks for any block,
-    // enabling work-stealing across both stages and blocks.
     compress_parallel_unified(input, pipeline, options, num_threads, &blocks)
 }
 
@@ -123,8 +62,11 @@ fn assemble_multiblock_container(
 
 #[derive(Copy, Clone)]
 enum UnifiedTask {
-    Stage(usize, usize),    // (stage_idx, block_idx)
-    StageGpu(usize, usize), // (stage_idx, block_idx) — GPU variant for entropy
+    Stage(usize, usize),    // (stage_idx, block_idx) — CPU execution
+    StageGpu(usize, usize), // (stage_idx, block_idx) — route to GPU coordinator
+    /// Fused GPU execution: run stages start..=end on the GPU coordinator
+    /// without intermediate queue round-trips. (stage_start, stage_end, block_idx)
+    FusedGpu(usize, usize, usize),
 }
 
 /// Number of compression stages for a pipeline in the unified scheduler.
@@ -168,6 +110,83 @@ fn should_route_block_to_gpu_entropy(block: &[u8], options: &CompressOptions) ->
     }
 }
 
+/// Determine whether to route a block's Stage 0 (LZ77/LzSeq match-finding) to GPU.
+///
+/// Returns true for LZ77-based and LzSeq-based pipelines when the GPU backend
+/// is active, the block meets size constraints, and the stage0_backend allows it.
+#[cfg(feature = "webgpu")]
+fn should_route_block_to_gpu_stage0(
+    block: &[u8],
+    pipeline: Pipeline,
+    options: &CompressOptions,
+) -> bool {
+    use super::BackendAssignment;
+
+    // Only LZ-based pipelines have GPU Stage 0 support
+    let is_gpu_stage0_pipeline = matches!(
+        pipeline,
+        Pipeline::Deflate
+            | Pipeline::Lzr
+            | Pipeline::Lzf
+            | Pipeline::Lzfi
+            | Pipeline::LzssR
+            | Pipeline::LzSeqR
+            | Pipeline::LzSeqH
+    );
+
+    if !is_gpu_stage0_pipeline {
+        return false;
+    }
+
+    // Optimal parse uses GPU top-K which runs through run_compress_stage already
+    if options.parse_strategy == super::ParseStrategy::Optimal {
+        return false;
+    }
+
+    match options.stage0_backend {
+        BackendAssignment::Gpu => options.webgpu_engine.is_some(),
+        BackendAssignment::Cpu => false,
+        BackendAssignment::Auto => {
+            if let Some(ref engine) = options.webgpu_engine {
+                block.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
+                    && block.len() <= engine.max_dispatch_input_size()
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// Determine whether a pipeline can fuse all its stages on GPU.
+///
+/// Returns `Some((start, end))` when every stage in `start..=end` has a GPU
+/// implementation, allowing the GPU coordinator to run them sequentially
+/// without intermediate queue round-trips or CPU readback.
+#[cfg(feature = "webgpu")]
+fn gpu_fused_span(pipeline: Pipeline) -> Option<(usize, usize)> {
+    match pipeline {
+        // Both stages have GPU paths: LZ77 match-finding + rANS encode
+        Pipeline::Lzr => Some((0, 1)),
+        // Both stages have GPU paths: LzSeq fused match+demux + rANS encode
+        Pipeline::LzSeqR => Some((0, 1)),
+        _ => None,
+    }
+}
+
+/// Message sent from unified workers to the GPU coordinator thread.
+#[cfg(feature = "webgpu")]
+enum GpuRequest {
+    /// Stage 0: LZ77/LzSeq match-finding on GPU.
+    /// (block_idx, input_data)
+    Stage0(usize, Vec<u8>),
+    /// Stage 1+: entropy encoding on GPU.
+    /// (stage_idx, block_idx, stage_block)
+    StageN(usize, usize, StageBlock),
+    /// Fused: run stages start..=end on GPU without queue round-trips.
+    /// (stage_start, stage_end, block_idx, input_data)
+    Fused(usize, usize, usize, Vec<u8>),
+}
+
 fn compress_parallel_unified(
     input: &[u8],
     pipeline: Pipeline,
@@ -192,21 +211,297 @@ fn compress_parallel_unified(
     let results: Vec<Mutex<Option<PzResult<Vec<u8>>>>> =
         (0..num_blocks).map(|_| Mutex::new(None)).collect();
 
+    // Determine if any GPU routing is possible for initial task enqueue.
+    #[cfg(feature = "webgpu")]
+    let has_gpu =
+        matches!(options.backend, super::Backend::WebGpu) && options.webgpu_engine.is_some();
+    #[cfg(not(feature = "webgpu"))]
+    let has_gpu = false;
+
+    // Determine if this pipeline can fuse all GPU stages.
+    #[cfg(feature = "webgpu")]
+    let fused_span = if has_gpu {
+        gpu_fused_span(pipeline)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "webgpu"))]
+    let fused_span: Option<(usize, usize)> = None;
+
+    // Build initial task queue with GPU routing for Stage 0 where applicable.
+    let initial_tasks: VecDeque<UnifiedTask> = (0..num_blocks)
+        .map(|i| {
+            #[cfg(feature = "webgpu")]
+            if has_gpu && should_route_block_to_gpu_stage0(blocks[i], pipeline, &resolved_options) {
+                // If the pipeline supports fusion and entropy also qualifies for GPU,
+                // fuse all stages into a single GPU coordinator dispatch.
+                if let Some((start, end)) = fused_span {
+                    if should_route_block_to_gpu_entropy(blocks[i], &resolved_options) {
+                        return UnifiedTask::FusedGpu(start, end, i);
+                    }
+                }
+                return UnifiedTask::StageGpu(0, i);
+            }
+            let _ = has_gpu;
+            let _ = fused_span;
+            UnifiedTask::Stage(0, i)
+        })
+        .collect();
+
     let queue = Mutex::new(UnifiedQueueState {
-        queue: (0..num_blocks).map(|i| UnifiedTask::Stage(0, i)).collect(),
+        queue: initial_tasks,
         pending_tasks: num_blocks,
         closed: false,
         failed: false,
     });
     let queue_cv = Condvar::new();
 
+    // GPU channel: created before the scope so workers can borrow the sender.
+    // The GPU coordinator receives from `gpu_rx`, workers send via `gpu_tx`.
+    #[cfg(feature = "webgpu")]
+    let (gpu_tx, gpu_rx) = if has_gpu {
+        let ring_depth = 4.min(num_blocks.max(1));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<GpuRequest>(ring_depth);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    #[cfg(not(feature = "webgpu"))]
+    let gpu_tx: Option<()> = None;
+
     std::thread::scope(|scope| {
+        // GPU coordinator thread: spawned only when GPU is available.
+        // Receives GPU work via a bounded channel, manages ring buffers,
+        // and feeds completed results back into the unified queue.
+        #[cfg(feature = "webgpu")]
+        if let Some(rx) = gpu_rx {
+            let queue_ref = &queue;
+            let cv_ref = &queue_cv;
+            let slots_ref = &intermediate_slots;
+            let results_ref = &results;
+            let opts = resolved_options.clone();
+
+            scope.spawn(move || {
+                let engine = opts.webgpu_engine.as_ref().unwrap();
+                let uses_lz77_demux =
+                    matches!(pipeline, Pipeline::Deflate | Pipeline::Lzr | Pipeline::Lzf);
+
+                while let Ok(first) = rx.recv() {
+                    // Batch-collect: drain additional pending requests.
+                    let mut stage0_batch: Vec<(usize, Vec<u8>)> = Vec::new();
+                    let mut stage_n_queue: Vec<(usize, usize, StageBlock)> = Vec::new();
+                    let mut fused_queue: Vec<(usize, usize, usize, Vec<u8>)> = Vec::new();
+
+                    // Classify the first request.
+                    match first {
+                        GpuRequest::Stage0(b, data) => stage0_batch.push((b, data)),
+                        GpuRequest::StageN(s, b, sb) => stage_n_queue.push((s, b, sb)),
+                        GpuRequest::Fused(s, e, b, data) => fused_queue.push((s, e, b, data)),
+                    }
+
+                    // Non-blocking drain of additional requests.
+                    while let Ok(req) = rx.try_recv() {
+                        match req {
+                            GpuRequest::Stage0(b, data) => stage0_batch.push((b, data)),
+                            GpuRequest::StageN(s, b, sb) => stage_n_queue.push((s, b, sb)),
+                            GpuRequest::Fused(s, e, b, data) => {
+                                fused_queue.push((s, e, b, data));
+                            }
+                        }
+                    }
+
+                    // Process Stage 0 batch: use find_matches_batched for LZ77
+                    // pipelines to get ring-buffered GPU overlap.
+                    if !stage0_batch.is_empty() && uses_lz77_demux {
+                        let batch_blocks: Vec<&[u8]> =
+                            stage0_batch.iter().map(|(_, d)| d.as_slice()).collect();
+                        let batch_results = engine.find_matches_batched(&batch_blocks);
+                        match batch_results {
+                            Ok(all_matches) => {
+                                for (matches, &(block_idx, ref data)) in
+                                    all_matches.into_iter().zip(&stage0_batch)
+                                {
+                                    let demux = super::demux::demux_lz77_matches(matches);
+                                    let sb = StageBlock {
+                                        block_index: block_idx,
+                                        original_len: data.len(),
+                                        data: Vec::new(),
+                                        streams: Some(demux.streams),
+                                        metadata: StageMetadata {
+                                            pre_entropy_len: Some(demux.pre_entropy_len),
+                                            demux_meta: demux.meta,
+                                            ..StageMetadata::default()
+                                        },
+                                    };
+                                    complete_gpu_stage(
+                                        Ok(sb),
+                                        0,
+                                        block_idx,
+                                        last_stage,
+                                        blocks,
+                                        &opts,
+                                        slots_ref,
+                                        results_ref,
+                                        queue_ref,
+                                        cv_ref,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                // GPU batch failed — fall back to CPU for each block.
+                                eprintln!(
+                                    "[pz-gpu] find_matches_batched failed: {e}; \
+                                     retrying {} blocks on CPU",
+                                    stage0_batch.len()
+                                );
+                                let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                                if !guard.failed {
+                                    for (block_idx, _) in &stage0_batch {
+                                        guard.queue.push_back(UnifiedTask::Stage(0, *block_idx));
+                                    }
+                                    cv_ref.notify_all();
+                                }
+                                drop(guard);
+                            }
+                        }
+                    } else {
+                        // Non-LZ77 pipelines (LzSeq, LZSS): dispatch individually
+                        // through run_compress_stage which calls lzseq_encode_gpu etc.
+                        for (block_idx, data) in stage0_batch {
+                            let block = StageBlock {
+                                block_index: block_idx,
+                                original_len: data.len(),
+                                data,
+                                streams: None,
+                                metadata: StageMetadata::default(),
+                            };
+                            let result = run_compress_stage(pipeline, 0, block, &opts);
+                            if result.is_err() {
+                                // GPU stage 0 failed — retry on CPU.
+                                eprintln!(
+                                    "[pz-gpu] stage 0 failed for block {block_idx}; \
+                                     retrying on CPU"
+                                );
+                                let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                                if !guard.failed {
+                                    guard.queue.push_back(UnifiedTask::Stage(0, block_idx));
+                                    cv_ref.notify_one();
+                                }
+                                drop(guard);
+                            } else {
+                                complete_gpu_stage(
+                                    result,
+                                    0,
+                                    block_idx,
+                                    last_stage,
+                                    blocks,
+                                    &opts,
+                                    slots_ref,
+                                    results_ref,
+                                    queue_ref,
+                                    cv_ref,
+                                );
+                            }
+                        }
+                    }
+
+                    // Process Stage N requests individually — entropy GPU work
+                    // already has internal batching (rans_encode_chunked_payload_gpu_batched).
+                    for (stage_idx, block_idx, sb) in stage_n_queue {
+                        let result = run_compress_stage(pipeline, stage_idx, sb, &opts);
+                        if result.is_err() {
+                            // GPU entropy failed — restart from stage 0 on CPU.
+                            // The intermediate StageBlock is consumed so we cannot
+                            // retry just this stage; re-enqueue from scratch.
+                            eprintln!(
+                                "[pz-gpu] stage {stage_idx} failed for block {block_idx}; \
+                                 retrying from stage 0 on CPU"
+                            );
+                            let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                            if !guard.failed {
+                                guard.queue.push_back(UnifiedTask::Stage(0, block_idx));
+                                cv_ref.notify_one();
+                            }
+                            drop(guard);
+                        } else {
+                            complete_gpu_stage(
+                                result,
+                                stage_idx,
+                                block_idx,
+                                last_stage,
+                                blocks,
+                                &opts,
+                                slots_ref,
+                                results_ref,
+                                queue_ref,
+                                cv_ref,
+                            );
+                        }
+                    }
+
+                    // Process fused requests: run stages start..=end sequentially
+                    // on GPU without intermediate queue round-trips.
+                    for (stage_start, stage_end, block_idx, data) in fused_queue {
+                        let block = StageBlock {
+                            block_index: block_idx,
+                            original_len: data.len(),
+                            data,
+                            streams: None,
+                            metadata: StageMetadata::default(),
+                        };
+                        let mut result: PzResult<StageBlock> = Ok(block);
+                        let mut final_stage = stage_start;
+                        for stage in stage_start..=stage_end {
+                            match result {
+                                Ok(sb) => {
+                                    result = run_compress_stage(pipeline, stage, sb, &opts);
+                                    final_stage = stage;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if result.is_err() {
+                            // GPU fused path failed — fall back to per-stage CPU.
+                            // Re-enqueue from stage 0 since intermediate data is consumed.
+                            eprintln!(
+                                "[pz-gpu] fused stages {stage_start}..={stage_end} failed \
+                                 for block {block_idx}; retrying on CPU"
+                            );
+                            let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                            if !guard.failed {
+                                guard.queue.push_back(UnifiedTask::Stage(0, block_idx));
+                                cv_ref.notify_one();
+                            }
+                            drop(guard);
+                        } else {
+                            complete_gpu_stage(
+                                result,
+                                final_stage,
+                                block_idx,
+                                last_stage,
+                                blocks,
+                                &opts,
+                                slots_ref,
+                                results_ref,
+                                queue_ref,
+                                cv_ref,
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
+        // CPU worker threads — each gets a clone of the GPU sender (if any).
+        // Clones are cheap (Arc internally) and avoid borrow issues with scoped threads.
         for _ in 0..worker_count {
             let queue_ref = &queue;
             let cv_ref = &queue_cv;
             let slots_ref = &intermediate_slots;
             let results_ref = &results;
             let opts = resolved_options.clone();
+            #[cfg(feature = "webgpu")]
+            let gpu_tx_clone = gpu_tx.clone();
 
             scope.spawn(move || loop {
                 let task = {
@@ -223,7 +518,62 @@ fn compress_parallel_unified(
                 };
 
                 let (stage_idx, block_idx) = match task {
-                    UnifiedTask::Stage(s, b) | UnifiedTask::StageGpu(s, b) => (s, b),
+                    UnifiedTask::Stage(s, b) => (s, b),
+                    UnifiedTask::FusedGpu(start, end, b) => {
+                        // Route to GPU coordinator for fused multi-stage execution
+                        #[cfg(feature = "webgpu")]
+                        if let Some(ref tx) = gpu_tx_clone {
+                            let request = GpuRequest::Fused(start, end, b, blocks[b].to_vec());
+                            match tx.try_send(request) {
+                                Ok(()) => continue,
+                                Err(
+                                    std::sync::mpsc::TrySendError::Full(_)
+                                    | std::sync::mpsc::TrySendError::Disconnected(_),
+                                ) => {
+                                    // Channel full or closed — fall through to CPU stage 0
+                                }
+                            }
+                        }
+                        // Fallback: execute first stage on CPU
+                        (start, b)
+                    }
+                    UnifiedTask::StageGpu(s, b) => {
+                        // Route to GPU coordinator — send and continue to next task
+                        #[cfg(feature = "webgpu")]
+                        if let Some(ref tx) = gpu_tx_clone {
+                            let request = if s == 0 {
+                                GpuRequest::Stage0(b, blocks[b].to_vec())
+                            } else {
+                                let stage_block = slots_ref[b]
+                                    .lock()
+                                    .expect("intermediate slot poisoned")
+                                    .take()
+                                    .expect("intermediate result missing");
+                                GpuRequest::StageN(s, b, stage_block)
+                            };
+                            match tx.try_send(request) {
+                                Ok(()) => continue,
+                                Err(
+                                    std::sync::mpsc::TrySendError::Full(req)
+                                    | std::sync::mpsc::TrySendError::Disconnected(req),
+                                ) => {
+                                    // Channel full or closed — fall through to CPU.
+                                    // Full: avoids deadlock where all workers block on
+                                    // send() and nobody processes CPU tasks the coordinator
+                                    // pushes back into the queue.
+                                    // Disconnected: GPU coordinator exited.
+                                    // Restore StageN's block to the intermediate slot
+                                    // so the CPU fallback path can .take() it.
+                                    if let GpuRequest::StageN(_, _, sb) = req {
+                                        *slots_ref[b].lock().expect("intermediate slot poisoned") =
+                                            Some(sb);
+                                    }
+                                }
+                            }
+                        }
+                        // Fallback: execute on CPU
+                        (s, b)
+                    }
                 };
 
                 // Build or retrieve the StageBlock for this stage.
@@ -299,6 +649,12 @@ fn compress_parallel_unified(
                 }
             });
         }
+
+        // Drop the original sender so it doesn't keep the channel open.
+        // Workers hold clones; when the last worker exits the scope,
+        // all clones drop, closing the channel and unblocking the
+        // GPU coordinator's recv().
+        drop(gpu_tx);
     });
 
     let mut block_data_vec = Vec::with_capacity(num_blocks);
@@ -320,750 +676,74 @@ fn compress_parallel_unified(
     ))
 }
 
-/// Batched GPU LZ77 compression for multi-block inputs.
+/// Handle the result of a GPU stage execution: store results or errors,
+/// enqueue the next stage, and manage queue lifecycle (pending_tasks, closed, failed).
 ///
-/// Pipelines GPU LZ77 matching and CPU entropy encoding: while CPU threads
-/// entropy-encode the current batch, the GPU is already processing the next
-/// batch. This overlaps GPU and CPU work, improving throughput on large inputs.
-///
-/// This is used for LZ-based pipelines (Deflate, Lzr, Lzf, Lzfi) when the
-/// WebGPU backend is active and there are multiple blocks.
-#[cfg(feature = "webgpu")]
-fn compress_parallel_gpu_batched(
-    input: &[u8],
-    pipeline: Pipeline,
-    options: &CompressOptions,
-    num_threads: usize,
-    engine: &crate::webgpu::WebGpuEngine,
-) -> PzResult<Vec<u8>> {
-    let block_size = options.block_size;
-    let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
-    let num_blocks = blocks.len();
-
-    // Pipeline GPU and CPU work: submit GPU batch N+1 while CPU processes batch N.
-    //
-    // For small inputs (≤1 batch), this degrades to the simple submit→wait→encode
-    // path with no overhead.
-    let gpu_batch_size = engine.lz77_batch_size(block_size);
-    let block_chunks: Vec<&[&[u8]]> = blocks.chunks(gpu_batch_size).collect();
-
-    let compressed_blocks: Vec<PzResult<Vec<u8>>> = std::thread::scope(|scope| {
-        let max_concurrent = num_threads.min(num_blocks);
-        let mut handles: Vec<(usize, std::thread::ScopedJoinHandle<PzResult<Vec<u8>>>)> =
-            Vec::with_capacity(max_concurrent);
-        let mut results: Vec<Option<PzResult<Vec<u8>>>> = (0..num_blocks).map(|_| None).collect();
-
-        let mut global_block_idx = 0usize;
-
-        for chunk in &block_chunks {
-            // GPU: batch LZ77 for this chunk
-            let match_vecs = match engine.find_matches_batched(chunk) {
-                Ok(v) => v,
-                Err(e) => {
-                    // Propagate error for all blocks in this chunk
-                    for local_i in 0..chunk.len() {
-                        let block_idx = global_block_idx + local_i;
-                        results[block_idx] = Some(Err(e.clone()));
-                    }
-                    global_block_idx += chunk.len();
-                    continue;
-                }
-            };
-
-            // CPU: entropy-encode each block (while GPU buffers are freed for next batch)
-            for (local_i, matches) in match_vecs.into_iter().enumerate() {
-                let block_idx = global_block_idx + local_i;
-
-                // Drain finished handles to maintain concurrency limit
-                while handles.len() >= max_concurrent {
-                    let (idx, handle) = handles.remove(0);
-                    results[idx] = Some(handle.join().unwrap_or(Err(PzError::InvalidInput)));
-                }
-
-                let block_input = blocks[block_idx];
-                handles.push((
-                    block_idx,
-                    scope.spawn(move || {
-                        entropy_encode_lz77_block(&matches, block_input.len(), pipeline, options)
-                    }),
-                ));
-            }
-
-            global_block_idx += chunk.len();
-        }
-
-        // Collect remaining handles
-        for (idx, handle) in handles {
-            results[idx] = Some(handle.join().unwrap_or(Err(PzError::InvalidInput)));
-        }
-
-        results.into_iter().map(|r| r.unwrap()).collect::<Vec<_>>()
-    });
-
-    assemble_multiblock_output(input, pipeline, block_size, &compressed_blocks)
-}
-
-/// Double-buffered streaming GPU compression for multi-block inputs.
-///
-/// Overlaps GPU LZ77 matching with CPU entropy encoding using a ring of
-/// pre-allocated GPU buffer slots. While the GPU processes block N+1,
-/// the CPU entropy-encodes block N's results. With triple buffering,
-/// upload/compute/download can all overlap on different slots.
-///
-/// # Threading model
-///
-/// - **GPU coordinator** (one thread): round-robins through buffer slots,
-///   submits work and reads back completed results.
-/// - **CPU workers** (N-1 threads): receive matches from channels, run
-///   demux + entropy encoding.
-/// - **Collector** (calling thread): gathers indexed results in order.
-#[cfg(feature = "webgpu")]
-fn compress_streaming_gpu(
-    input: &[u8],
-    pipeline: Pipeline,
-    options: &CompressOptions,
-    num_threads: usize,
-    engine: &crate::webgpu::WebGpuEngine,
-    mut ring: crate::webgpu::lz77::BufferRing<crate::webgpu::lz77::Lz77BufferSlot>,
-) -> PzResult<Vec<u8>> {
-    let block_size = options.block_size;
-    let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
-    let num_blocks = blocks.len();
-    let ring_depth = ring.depth();
-    let max_dispatch = engine.max_dispatch_input_size();
-
-    // Per-worker channels: GPU coordinator distributes work round-robin
-    let cpu_workers = (num_threads.saturating_sub(1)).max(1);
-
-    let compressed_blocks: Vec<PzResult<Vec<u8>>> = std::thread::scope(|scope| {
-        use std::sync::mpsc;
-
-        // Per-worker input channels: (block_index, matches, original_len)
-        let mut worker_txs: Vec<mpsc::SyncSender<(usize, Vec<crate::lz77::Match>, usize)>> =
-            Vec::with_capacity(cpu_workers);
-        // Single output channel from all workers: (block_index, result)
-        let (result_tx, result_rx) = mpsc::sync_channel::<(usize, PzResult<Vec<u8>>)>(num_blocks);
-
-        // Spawn CPU worker threads
-        for _ in 0..cpu_workers {
-            let (tx, rx) =
-                mpsc::sync_channel::<(usize, Vec<crate::lz77::Match>, usize)>(ring_depth);
-            worker_txs.push(tx);
-            let rtx = result_tx.clone();
-            scope.spawn(move || {
-                while let Ok((block_idx, matches, original_len)) = rx.recv() {
-                    let result =
-                        entropy_encode_lz77_block(&matches, original_len, pipeline, options);
-                    let _ = rtx.send((block_idx, result));
-                }
-            });
-        }
-        drop(result_tx); // Workers hold their own clones
-
-        // GPU coordinator thread — owns worker_txs so it can signal
-        // completion by dropping all senders when done.
-        //
-        // `slot_inflight` tracks which block index is in-flight on each slot.
-        // We borrow from `blocks` (which borrows `input`) to avoid copying.
-        scope.spawn(move || {
-            let worker_txs = worker_txs; // move into closure
-            let mut slot_inflight: Vec<Option<usize>> = vec![None; ring_depth];
-            let mut next_worker = 0usize;
-
-            for (block_idx, block) in blocks.iter().enumerate() {
-                let slot_idx = ring.acquire();
-
-                // If this slot has previous in-flight work, complete it first
-                if let Some(prev_idx) = slot_inflight[slot_idx].take() {
-                    engine.poll_wait();
-                    let prev_block = blocks[prev_idx];
-                    let result = engine.complete_lz77_from_slot(&ring.slots[slot_idx], prev_block);
-                    match result {
-                        Ok(matches) => {
-                            let _ = worker_txs[next_worker % cpu_workers].send((
-                                prev_idx,
-                                matches,
-                                prev_block.len(),
-                            ));
-                        }
-                        Err(e) => {
-                            eprintln!("[pz-gpu] streaming slot readback failed: {e}");
-                            // Fall back to CPU for this block
-                            let matches = crate::lz77::compress_lazy_to_matches(prev_block)
-                                .unwrap_or_default();
-                            let _ = worker_txs[next_worker % cpu_workers].send((
-                                prev_idx,
-                                matches,
-                                prev_block.len(),
-                            ));
-                        }
-                    }
-                    next_worker += 1;
-                }
-
-                // Submit new block to this slot (or CPU fallback for edge cases)
-                if block.is_empty()
-                    || block.len() < crate::webgpu::MIN_GPU_INPUT_SIZE
-                    || block.len() > max_dispatch
-                {
-                    // CPU fallback: compute matches on CPU, send directly
-                    let matches = crate::lz77::compress_lazy_to_matches(block).unwrap_or_default();
-                    let _ = worker_txs[next_worker % cpu_workers].send((
-                        block_idx,
-                        matches,
-                        block.len(),
-                    ));
-                    next_worker += 1;
-                } else if let Err(e) = engine.submit_lz77_to_slot(block, &ring.slots[slot_idx]) {
-                    eprintln!("[pz-gpu] streaming slot submission failed: {e}");
-                    let matches = crate::lz77::compress_lazy_to_matches(block).unwrap_or_default();
-                    let _ = worker_txs[next_worker % cpu_workers].send((
-                        block_idx,
-                        matches,
-                        block.len(),
-                    ));
-                    next_worker += 1;
-                } else {
-                    slot_inflight[slot_idx] = Some(block_idx);
-                }
-            }
-
-            // Drain remaining in-flight slots
-            for (slot_idx, inflight) in slot_inflight.iter_mut().enumerate() {
-                if let Some(prev_idx) = inflight.take() {
-                    engine.poll_wait();
-                    let prev_block = blocks[prev_idx];
-                    let result = engine.complete_lz77_from_slot(&ring.slots[slot_idx], prev_block);
-                    match result {
-                        Ok(matches) => {
-                            let _ = worker_txs[next_worker % cpu_workers].send((
-                                prev_idx,
-                                matches,
-                                prev_block.len(),
-                            ));
-                        }
-                        Err(e) => {
-                            eprintln!("[pz-gpu] streaming slot readback failed: {e}");
-                            let matches = crate::lz77::compress_lazy_to_matches(prev_block)
-                                .unwrap_or_default();
-                            let _ = worker_txs[next_worker % cpu_workers].send((
-                                prev_idx,
-                                matches,
-                                prev_block.len(),
-                            ));
-                        }
-                    }
-                    next_worker += 1;
-                }
-            }
-
-            // worker_txs dropped here → workers see channel closed → exit
-        });
-
-        // Collector: gather results indexed by block_index
-        let mut results: Vec<Option<PzResult<Vec<u8>>>> = (0..num_blocks).map(|_| None).collect();
-        for (idx, result) in result_rx {
-            results[idx] = Some(result);
-        }
-        results
-            .into_iter()
-            .map(|r| r.unwrap_or(Err(PzError::InvalidInput)))
-            .collect::<Vec<_>>()
-    });
-
-    // Build output
-    assemble_multiblock_output(input, pipeline, block_size, &compressed_blocks)
-}
-
-/// Helper to construct a StageBlock with standard defaults.
-/// Used in coordinator fallback paths to avoid repeating the boilerplate.
-#[cfg(feature = "webgpu")]
-fn make_stage_block(block_idx: usize, original_len: usize, data: Vec<u8>) -> StageBlock {
-    StageBlock {
-        block_index: block_idx,
-        original_len,
-        data,
-        streams: None,
-        metadata: StageMetadata::default(),
-    }
-}
-
-/// Ring-buffered heterogeneous compression for LzSeqR with GPU entropy dispatch.
-///
-/// Executes Stage0 (LzSeq match finding) on the CPU and dispatches entropy encoding
-/// to GPU for large blocks while smaller blocks run CPU entropy. Uses a ring of
-/// pre-allocated GPU buffer slots to overlap work: while GPU encodes block N,
-/// CPU finds matches for block N+1.
-///
-/// This function is the long-term heterogeneous scheduler path for LzSeqR pipelines
-/// when GPU is available. For now, it falls back to the unified scheduler (all CPU)
-/// since GPU entropy encoding is still being integrated in Phase 4+5.
-#[cfg(feature = "webgpu")]
-fn compress_parallel_heterogeneous_lzseq_rans(
-    input: &[u8],
-    pipeline: Pipeline,
-    options: &CompressOptions,
-    num_threads: usize,
+/// Shared by all GPU request types to avoid duplicating the stage-completion logic.
+#[allow(clippy::too_many_arguments)]
+fn complete_gpu_stage(
+    result: PzResult<StageBlock>,
+    stage_idx: usize,
+    block_idx: usize,
+    last_stage: usize,
     blocks: &[&[u8]],
-    engine: &crate::webgpu::WebGpuEngine,
-) -> PzResult<Vec<u8>> {
-    let num_blocks = blocks.len();
-    let block_size = options.block_size;
-
-    let mut resolved_options = options.clone();
-    if resolved_options.max_match_len.is_none() {
-        resolved_options.max_match_len = Some(super::resolve_max_match_len(pipeline, options));
-    }
-
-    // Entropy ring for GPU dispatch (ring depth is min of 4 or num_blocks to balance buffering)
-    let ring_depth = 4.min(num_blocks.max(1));
-    let entropy_ring = engine
-        .create_entropy_ring(1024 * 1024, ring_depth) // 1MB max per slot
-        .ok_or(PzError::InvalidInput)?;
-
-    // GPU device-lost flag: once set, all subsequent entropy encoding uses CPU fallback
-    let gpu_lost = std::sync::atomic::AtomicBool::new(false);
-
-    // Wrap ring in Mutex for thread-safe access
-    let entropy_ring = Mutex::new(entropy_ring);
-
-    let compressed_blocks: Vec<PzResult<Vec<u8>>> = std::thread::scope(|scope| {
-        use std::sync::mpsc;
-
-        // Channels for CPU entropy workers
-        let cpu_workers = (num_threads.saturating_sub(1)).max(1);
-        let mut worker_txs: Vec<mpsc::SyncSender<(usize, StageBlock)>> =
-            Vec::with_capacity(cpu_workers);
-        let (result_tx, result_rx) = mpsc::sync_channel::<(usize, PzResult<Vec<u8>>)>(num_blocks);
-
-        // Spawn CPU entropy worker threads
-        for _ in 0..cpu_workers {
-            let (tx, rx) = mpsc::sync_channel::<(usize, StageBlock)>(ring_depth);
-            worker_txs.push(tx);
-            let rtx = result_tx.clone();
-            let opts = resolved_options.clone();
-            scope.spawn(move || {
-                while let Ok((block_idx, stage0)) = rx.recv() {
-                    let result = run_compress_stage(pipeline, 1, stage0, &opts).map(|b| b.data);
-                    let _ = rtx.send((block_idx, result));
-                }
-            });
-        }
-        // Keep a clone of result_tx for the GPU coordinator to send already-encoded results
-        let coordinator_result_tx = result_tx.clone();
-        drop(result_tx);
-
-        // Stage0 prefetch worker: runs match finding (Stage0) for all blocks sequentially
-        let (stage0_tx, stage0_rx) =
-            mpsc::sync_channel::<(usize, PzResult<StageBlock>)>(ring_depth);
-        let opts = resolved_options.clone();
-        scope.spawn(move || {
-            for (block_idx, block) in blocks.iter().enumerate() {
-                let stage_block = StageBlock {
-                    block_index: block_idx,
-                    original_len: block.len(),
-                    data: block.to_vec(),
-                    streams: None,
-                    metadata: StageMetadata::default(),
-                };
-                let result = run_compress_stage(pipeline, 0, stage_block, &opts);
-                if stage0_tx.send((block_idx, result)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        // GPU coordinator thread: manages entropy ring slots and dispatches to GPU or CPU
-        let gpu_lost_ref = &gpu_lost;
-        let entropy_ring_ref = &entropy_ring;
-        scope.spawn(move || {
-            let coord_result_tx = coordinator_result_tx;
-            let mut slot_inflight: Vec<Option<usize>> = vec![None; ring_depth];
-            let mut stage0_cache: Vec<Option<StageBlock>> = vec![None; num_blocks];
-            let mut next_worker = 0usize;
-
-            for (block_idx, block) in blocks.iter().enumerate() {
-                // Get the Stage0 result from the prefetch worker
-                let (_, stage0_result) = match stage0_rx.recv() {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-
-                let stage0_block = match stage0_result {
-                    Ok(b) => b,
-                    Err(_e) => {
-                        let _ = worker_txs[next_worker % cpu_workers].send((
-                            block_idx,
-                            make_stage_block(block_idx, block.len(), block.to_vec()),
-                        ));
-                        next_worker += 1;
-                        continue;
-                    }
-                };
-
-                let slot_idx = entropy_ring_ref
-                    .lock()
-                    .expect("entropy ring lock poisoned")
-                    .acquire();
-
-                // Complete any in-flight entropy on this slot
-                if let Some(prev_idx) = slot_inflight[slot_idx].take() {
-                    engine.poll_wait();
-                    let ring_guard = entropy_ring_ref.lock().expect("entropy ring lock poisoned");
-                    let readback_result =
-                        engine.complete_entropy_from_slot(&ring_guard.slots[slot_idx]);
-                    drop(ring_guard);
-
-                    match readback_result {
-                        Ok(entropy_streams) => {
-                            // Successfully got entropy back from GPU
-                            if !entropy_streams.is_empty() {
-                                // Assemble entropy streams into final block
-                                // (in a full impl, would demux and assemble here)
-                                let mut result_data = Vec::new();
-                                for stream in entropy_streams {
-                                    result_data.extend_from_slice(&stream);
-                                }
-                                // GPU entropy is complete; send directly to result collector (bypassing CPU workers)
-                                let _ = coord_result_tx.send((prev_idx, Ok(result_data)));
-                            } else {
-                                // Fallback if entropy is empty
-                                if let Some(cached) = stage0_cache[prev_idx].take() {
-                                    let result =
-                                        run_compress_stage(pipeline, 1, cached, &resolved_options)
-                                            .map(|b| b.data);
-                                    let _ = coord_result_tx.send((prev_idx, result));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[pz-gpu] entropy slot readback failed (device lost?): {e}");
-                            gpu_lost_ref.store(true, std::sync::atomic::Ordering::Release);
-
-                            // Fallback: use cached stage0 for CPU entropy
-                            if let Some(cached) = stage0_cache[prev_idx].take() {
-                                let result =
-                                    run_compress_stage(pipeline, 1, cached, &resolved_options)
-                                        .map(|b| b.data);
-                                let _ = coord_result_tx.send((prev_idx, result));
-                            }
-                        }
-                    }
-                    next_worker += 1;
-                }
-
-                // Decide whether to use GPU or CPU for this block's entropy
-                let use_gpu = !gpu_lost_ref.load(std::sync::atomic::Ordering::Acquire)
-                    && should_route_block_to_gpu_entropy(block, &resolved_options);
-
-                if use_gpu {
-                    // Cache stage0 for potential fallback
-                    stage0_cache[block_idx] = Some(stage0_block.clone());
-
-                    // Extract LzSeq streams from stage0 output
-                    if let Some(ref streams) = stage0_block.streams {
-                        let ring_guard =
-                            entropy_ring_ref.lock().expect("entropy ring lock poisoned");
-                        let slot_ref = &ring_guard.slots[slot_idx];
-                        let submit_result = engine.submit_entropy_to_slot(streams, slot_ref);
-                        drop(ring_guard);
-                        match submit_result {
-                            Ok(()) => {
-                                slot_inflight[slot_idx] = Some(block_idx);
-                            }
-                            Err(e) => {
-                                eprintln!("[pz-gpu] entropy slot submit failed: {e}");
-                                // Fallback to CPU for this block
-                                let result = run_compress_stage(
-                                    pipeline,
-                                    1,
-                                    stage0_block,
-                                    &resolved_options,
-                                )
-                                .map(|b| b.data);
-                                let _ = worker_txs[next_worker % cpu_workers].send((
-                                    block_idx,
-                                    make_stage_block(
-                                        block_idx,
-                                        block.len(),
-                                        result.unwrap_or_default(),
-                                    ),
-                                ));
-                                next_worker += 1;
-                            }
-                        }
-                    } else {
-                        // No streams extracted; fallback to CPU
-                        let result =
-                            run_compress_stage(pipeline, 1, stage0_block, &resolved_options)
-                                .map(|b| b.data);
-                        let _ = worker_txs[next_worker % cpu_workers].send((
-                            block_idx,
-                            make_stage_block(block_idx, block.len(), result.unwrap_or_default()),
-                        ));
-                        next_worker += 1;
-                    }
-                } else {
-                    // Send directly to CPU workers
-                    let result =
-                        worker_txs[next_worker % cpu_workers].send((block_idx, stage0_block));
-                    if result.is_ok() {
-                        next_worker += 1;
-                    }
-                }
-            }
-
-            // Drain remaining in-flight slots
-            for (slot_idx, inflight) in slot_inflight.iter_mut().enumerate() {
-                if let Some(prev_idx) = inflight.take() {
-                    engine.poll_wait();
-                    let ring_guard = entropy_ring_ref.lock().expect("entropy ring lock poisoned");
-                    let readback_result =
-                        engine.complete_entropy_from_slot(&ring_guard.slots[slot_idx]);
-                    drop(ring_guard);
-
-                    match readback_result {
-                        Ok(entropy_streams) => {
-                            if !entropy_streams.is_empty() {
-                                let mut result_data = Vec::new();
-                                for stream in entropy_streams {
-                                    result_data.extend_from_slice(&stream);
-                                }
-                                // GPU entropy is complete; send directly to result collector
-                                let _ = coord_result_tx.send((prev_idx, Ok(result_data)));
-                            } else if let Some(cached) = stage0_cache[prev_idx].take() {
-                                let result =
-                                    run_compress_stage(pipeline, 1, cached, &resolved_options)
-                                        .map(|b| b.data);
-                                let _ = coord_result_tx.send((prev_idx, result));
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[pz-gpu] entropy slot drain readback failed (device lost?): {e}"
-                            );
-                            if let Some(cached) = stage0_cache[prev_idx].take() {
-                                let result =
-                                    run_compress_stage(pipeline, 1, cached, &resolved_options)
-                                        .map(|b| b.data);
-                                let _ = coord_result_tx.send((prev_idx, result));
-                            }
-                        }
-                    }
-                }
-            }
-
-            drop(worker_txs); // Signal to CPU workers that all blocks have been submitted
-        });
-
-        // Collector: gather results in order
-        let mut results: Vec<Option<PzResult<Vec<u8>>>> = (0..num_blocks).map(|_| None).collect();
-        for (block_idx, result) in result_rx {
-            if block_idx < num_blocks {
-                results[block_idx] = Some(result);
-            }
-        }
-
-        // Convert to Vec<PzResult<Vec<u8>>>
-        results
-            .into_iter()
-            .map(|r| r.unwrap_or(Err(PzError::InvalidInput)))
-            .collect()
-    });
-
-    assemble_multiblock_output(input, pipeline, block_size, &compressed_blocks)
-}
-
-/// Assemble the multi-block container from per-block compressed results.
-///
-/// Shared by all GPU paths (batched, streaming-webgpu)
-/// to avoid duplicating the header/table/data assembly logic.
-#[cfg(feature = "webgpu")]
-fn assemble_multiblock_output(
-    input: &[u8],
-    pipeline: Pipeline,
-    block_size: usize,
-    compressed_blocks: &[PzResult<Vec<u8>>],
-) -> PzResult<Vec<u8>> {
-    let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
-    let num_blocks = blocks.len();
-
-    let mut block_data_vec: Vec<&Vec<u8>> = Vec::with_capacity(num_blocks);
-    for result in compressed_blocks {
-        match result {
-            Ok(data) => block_data_vec.push(data),
-            Err(e) => return Err(e.clone()),
-        }
-    }
-
-    let orig_block_lens: Vec<usize> = blocks.iter().map(|b| b.len()).collect();
-    let block_slices: Vec<&[u8]> = block_data_vec.iter().map(|v| v.as_slice()).collect();
-    Ok(assemble_multiblock_container(
-        pipeline,
-        input.len(),
-        &orig_block_lens,
-        &block_slices,
-    ))
-}
-
-/// Demux LZ77 matches and apply the appropriate entropy encoder for the given pipeline.
-///
-/// For LZ77-based pipelines (Deflate, Lzr, Lzf): demux into 3 streams (offsets, lengths, literals).
-/// For LZSS-based pipelines (Lzfi, LzssR): convert matches to LZSS 4 streams (flags, literals,
-/// offsets, lengths).
-#[cfg(feature = "webgpu")]
-fn entropy_encode_lz77_block(
-    matches: &[crate::lz77::Match],
-    original_len: usize,
-    pipeline: Pipeline,
     options: &CompressOptions,
-) -> PzResult<Vec<u8>> {
-    use super::stages::{
-        stage_fse_encode, stage_fse_interleaved_encode, stage_huffman_encode,
-        stage_rans_encode_with_options,
-    };
-    use crate::lz77;
-
-    let uses_lzss = matches!(pipeline, Pipeline::Lzfi | Pipeline::LzssR);
-
-    if uses_lzss {
-        // Convert LZ77 matches to LZSS 4-stream format: [flags, literals, offsets, lengths]
-        // Each LZ77 match {offset, length, next} becomes:
-        //   - If length > 0 && offset > 0: a match token (flag=0) + a literal token (flag=1, byte=next)
-        //   - If length == 0: just a literal token (flag=1, byte=next)
-        let mut flags = Vec::new();
-        let mut literals = Vec::new();
-        let mut offsets = Vec::new();
-        let mut lengths = Vec::new();
-        let mut num_tokens: u32 = 0;
-        let mut flag_byte: u8 = 0;
-        let mut flag_bit = 0usize;
-
-        // Helper closure to push a literal token (flag=1)
-        let push_literal = |flag_byte: &mut u8,
-                            flag_bit: &mut usize,
-                            flags: &mut Vec<u8>,
-                            literals: &mut Vec<u8>,
-                            num_tokens: &mut u32,
-                            byte: u8| {
-            *flag_byte |= 1 << (7 - *flag_bit);
-            *flag_bit += 1;
-            if *flag_bit == 8 {
-                flags.push(*flag_byte);
-                *flag_byte = 0;
-                *flag_bit = 0;
+    intermediate_slots: &[Mutex<Option<StageBlock>>],
+    results: &[Mutex<Option<PzResult<Vec<u8>>>>],
+    queue: &Mutex<UnifiedQueueState>,
+    queue_cv: &Condvar,
+) {
+    match result {
+        Ok(sb) => {
+            if stage_idx == last_stage {
+                *results[block_idx].lock().expect("result slot poisoned") = Some(Ok(sb.data));
+            } else {
+                *intermediate_slots[block_idx]
+                    .lock()
+                    .expect("intermediate slot poisoned") = Some(sb);
+                let mut guard = queue.lock().expect("unified queue poisoned");
+                if !guard.failed {
+                    let next_stage = stage_idx + 1;
+                    let next_task = if next_stage == last_stage
+                        && should_route_block_to_gpu_entropy(blocks[block_idx], options)
+                    {
+                        UnifiedTask::StageGpu(next_stage, block_idx)
+                    } else {
+                        UnifiedTask::Stage(next_stage, block_idx)
+                    };
+                    guard.queue.push_back(next_task);
+                    guard.pending_tasks += 1;
+                    queue_cv.notify_one();
+                }
             }
-            literals.push(byte);
-            *num_tokens += 1;
-        };
-
-        // Helper closure to push a match token (flag=0)
-        let push_match = |flag_byte: &mut u8,
-                          flag_bit: &mut usize,
-                          flags: &mut Vec<u8>,
-                          offsets: &mut Vec<u8>,
-                          lengths_out: &mut Vec<u8>,
-                          num_tokens: &mut u32,
-                          offset: u16,
-                          length: u16| {
-            // flag=0, bit stays clear
-            *flag_bit += 1;
-            if *flag_bit == 8 {
-                flags.push(*flag_byte);
-                *flag_byte = 0;
-                *flag_bit = 0;
+        }
+        Err(e) => {
+            *results[block_idx].lock().expect("result slot poisoned") = Some(Err(e));
+            let mut guard = queue.lock().expect("unified queue poisoned");
+            if !guard.failed {
+                guard.failed = true;
+                let dropped = guard.queue.len();
+                guard.queue.clear();
+                guard.pending_tasks = guard.pending_tasks.saturating_sub(dropped);
             }
-            offsets.extend_from_slice(&offset.to_le_bytes());
-            lengths_out.extend_from_slice(&length.to_le_bytes());
-            *num_tokens += 1;
-        };
-
-        for m in matches {
-            if m.length > 0 && m.offset > 0 {
-                // Back-reference: emit LZSS match token + literal for `next`
-                push_match(
-                    &mut flag_byte,
-                    &mut flag_bit,
-                    &mut flags,
-                    &mut offsets,
-                    &mut lengths,
-                    &mut num_tokens,
-                    m.offset,
-                    m.length,
-                );
+            // Decrement and check for completion while we hold the lock
+            debug_assert!(guard.pending_tasks > 0);
+            guard.pending_tasks -= 1;
+            if guard.pending_tasks == 0 {
+                guard.closed = true;
             }
-            // Always emit the `next` byte as a literal
-            push_literal(
-                &mut flag_byte,
-                &mut flag_bit,
-                &mut flags,
-                &mut literals,
-                &mut num_tokens,
-                m.next,
-            );
+            queue_cv.notify_all();
+            return;
         }
+    }
 
-        // Flush partial flag byte
-        if flag_bit > 0 {
-            flags.push(flag_byte);
-        }
-
-        // pre_entropy_len: approximate the LZSS encoded blob size
-        let pre_entropy_len = 12 + flags.len() + offsets.len() + lengths.len() + literals.len();
-
-        let streams = vec![flags, literals, offsets, lengths];
-        let mut block = StageBlock {
-            block_index: 0,
-            original_len,
-            data: Vec::new(),
-            streams: Some(streams),
-            metadata: StageMetadata::default(),
-        };
-        block.metadata.pre_entropy_len = Some(pre_entropy_len);
-        block.metadata.demux_meta = num_tokens.to_le_bytes().to_vec();
-
-        let block = match pipeline {
-            Pipeline::Lzfi => stage_fse_interleaved_encode(block)?,
-            Pipeline::LzssR => stage_rans_encode_with_options(block, options)?,
-            _ => unreachable!(),
-        };
-        Ok(block.data)
-    } else {
-        // LZ77 3-stream format: [offsets, lengths, literals]
-        let match_size = lz77::Match::SERIALIZED_SIZE;
-        let num_matches = matches.len();
-        let lz_len = num_matches * match_size;
-
-        let mut offsets = Vec::with_capacity(num_matches * 2);
-        let mut lengths = Vec::with_capacity(num_matches * 2);
-        let mut literals = Vec::with_capacity(num_matches);
-
-        for m in matches {
-            let bytes = m.to_bytes();
-            offsets.push(bytes[0]);
-            offsets.push(bytes[1]);
-            lengths.push(bytes[2]);
-            lengths.push(bytes[3]);
-            literals.push(bytes[4]);
-        }
-
-        let streams = vec![offsets, lengths, literals];
-        let mut block = StageBlock {
-            block_index: 0,
-            original_len,
-            data: Vec::new(),
-            streams: Some(streams),
-            metadata: StageMetadata::default(),
-        };
-        block.metadata.pre_entropy_len = Some(lz_len);
-
-        let block = match pipeline {
-            Pipeline::Deflate => stage_huffman_encode(block)?,
-            Pipeline::Lzr => stage_rans_encode_with_options(block, options)?,
-            Pipeline::Lzf => stage_fse_encode(block)?,
-            _ => return Err(PzError::Unsupported),
-        };
-        Ok(block.data)
+    // Decrement pending_tasks and check for completion
+    let mut guard = queue.lock().expect("unified queue poisoned");
+    debug_assert!(guard.pending_tasks > 0);
+    guard.pending_tasks -= 1;
+    if guard.pending_tasks == 0 {
+        guard.closed = true;
+        queue_cv.notify_all();
     }
 }
 
@@ -1529,7 +1209,7 @@ mod tests {
     #[cfg(feature = "webgpu")]
     #[test]
     fn test_gpu_device_lost_fallback_continues() {
-        // Test that the heterogeneous path gracefully handles GPU errors.
+        // Test that the unified path gracefully handles GPU errors.
         // Since we can't easily inject real GPU failures, we test that the
         // fallback path (CPU entropy) is used when GPU submission fails.
         let input: Vec<u8> = (0..=255).cycle().take(1024 * 1024).collect();
@@ -1646,15 +1326,13 @@ mod tests {
         );
     }
 
-    // GPU-specific heterogeneous scheduler tests
-    // These tests verify compress_parallel_heterogeneous_lzseq_rans is actually invoked
-    // when GPU is available and stage1_backend is Auto or Gpu.
+    // GPU-specific unified scheduler tests
+    // These tests verify the unified scheduler dispatches GPU work correctly
+    // when GPU is available and backend settings allow it.
     #[test]
     #[cfg(feature = "webgpu")]
     fn test_heterogeneous_compress_with_gpu_entropy() {
-        // Test actual GPU heterogeneous compression when GPU is available.
-        // This verifies that compress_parallel_heterogeneous_lzseq_rans is invoked
-        // (not just CPU fallback).
+        // Test actual GPU unified compression when GPU is available.
         use crate::webgpu::WebGpuEngine;
 
         let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
@@ -1663,7 +1341,7 @@ mod tests {
         let engine = match WebGpuEngine::new() {
             Ok(e) => e,
             Err(_) => {
-                eprintln!("GPU device not available, skipping GPU heterogeneous test");
+                eprintln!("GPU device not available, skipping GPU test");
                 return;
             }
         };
@@ -1682,7 +1360,7 @@ mod tests {
         let decompressed = super::super::decompress(&compressed).unwrap();
         assert_eq!(
             decompressed, input,
-            "GPU heterogeneous path should decompress correctly"
+            "GPU unified path should decompress correctly"
         );
     }
 
@@ -1697,7 +1375,7 @@ mod tests {
         let engine = match WebGpuEngine::new() {
             Ok(e) => e,
             Err(_) => {
-                eprintln!("GPU device not available, skipping GPU heterogeneous test");
+                eprintln!("GPU device not available, skipping GPU test");
                 return;
             }
         };
@@ -1717,14 +1395,14 @@ mod tests {
         let decompressed = super::super::decompress(&compressed).unwrap();
         assert_eq!(
             decompressed, input,
-            "GPU forced heterogeneous path should decompress correctly"
+            "GPU forced unified path should decompress correctly"
         );
     }
 
     #[test]
     #[cfg(feature = "webgpu")]
     fn test_heterogeneous_mixed_block_sizes_with_gpu() {
-        // Verify heterogeneous path handles mixed block sizes correctly:
+        // Verify unified path handles mixed block sizes correctly:
         // some blocks trigger GPU (>= 256KB), some use CPU (< 256KB).
         use crate::webgpu::WebGpuEngine;
 
@@ -1743,7 +1421,7 @@ mod tests {
         let engine = match WebGpuEngine::new() {
             Ok(e) => e,
             Err(_) => {
-                eprintln!("GPU device not available, skipping GPU heterogeneous test");
+                eprintln!("GPU device not available, skipping GPU test");
                 return;
             }
         };
@@ -1763,7 +1441,99 @@ mod tests {
         let decompressed = super::super::decompress(&compressed).unwrap();
         assert_eq!(
             decompressed, input,
-            "Mixed GPU/CPU heterogeneous path should decompress correctly"
+            "Mixed GPU/CPU unified path should decompress correctly"
+        );
+    }
+
+    // GPU unified scheduler tests for LZ77-based pipelines (Deflate, Lzr, Lzf).
+    // These exercise the Stage 0 GPU routing and batch-collect path.
+
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn test_gpu_roundtrip_deflate() {
+        use crate::webgpu::WebGpuEngine;
+        let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let opts = CompressOptions {
+            backend: super::super::Backend::WebGpu,
+            threads: 2,
+            block_size: 256 * 1024,
+            webgpu_engine: Some(std::sync::Arc::new(engine)),
+            ..CompressOptions::default()
+        };
+        let compressed =
+            super::super::compress_with_options(&input, Pipeline::Deflate, &opts).unwrap();
+        let decompressed = super::super::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "GPU Deflate round-trip failed");
+    }
+
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn test_gpu_roundtrip_lzr() {
+        use crate::webgpu::WebGpuEngine;
+        let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let opts = CompressOptions {
+            backend: super::super::Backend::WebGpu,
+            threads: 2,
+            block_size: 256 * 1024,
+            webgpu_engine: Some(std::sync::Arc::new(engine)),
+            ..CompressOptions::default()
+        };
+        let compressed = super::super::compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
+        let decompressed = super::super::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "GPU Lzr round-trip failed");
+    }
+
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn test_gpu_roundtrip_lzf() {
+        use crate::webgpu::WebGpuEngine;
+        let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let opts = CompressOptions {
+            backend: super::super::Backend::WebGpu,
+            threads: 2,
+            block_size: 256 * 1024,
+            webgpu_engine: Some(std::sync::Arc::new(engine)),
+            ..CompressOptions::default()
+        };
+        let compressed = super::super::compress_with_options(&input, Pipeline::Lzf, &opts).unwrap();
+        let decompressed = super::super::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "GPU Lzf round-trip failed");
+    }
+
+    // Test that the channel-full fallback path produces correct results.
+    // Uses a single-capacity channel (ring_depth=1) with many blocks to force
+    // try_send failures, exercising the CPU fallback in the worker dispatch.
+    #[test]
+    fn test_channel_full_cpu_fallback() {
+        // Many small blocks with minimal threads — channel of depth 1 will overflow
+        let block_size = 64 * 1024; // 64KB blocks
+        let num_blocks = 16;
+        let input: Vec<u8> = (0..=255).cycle().take(block_size * num_blocks).collect();
+
+        let opts = CompressOptions {
+            block_size,
+            threads: 8, // many workers competing for channel
+            ..CompressOptions::default()
+        };
+
+        let compressed =
+            super::super::compress_with_options(&input, Pipeline::LzSeqR, &opts).unwrap();
+        let decompressed = super::super::decompress(&compressed).unwrap();
+        assert_eq!(
+            decompressed, input,
+            "channel-full fallback should produce correct results"
         );
     }
 }

@@ -519,14 +519,6 @@ impl WebGpuEngine {
         }
     }
 
-    /// Compute the batch size for LZ77 GPU dispatches, based on the cost model
-    /// and memory budget. Exposed for the pipelined batched path in `parallel.rs`.
-    pub(crate) fn lz77_batch_size(&self, block_size: usize) -> usize {
-        const GPU_MAX_BATCH: usize = 64;
-        let mem_limit = self.max_in_flight(&self.cost_lz77_lazy, block_size);
-        mem_limit.min(GPU_MAX_BATCH)
-    }
-
     /// Maximum input size (bytes) that fits in a single GPU dispatch.
     ///
     /// Bounded by both the 2D workgroup dispatch limit (`max^2 * workgroup_size`)

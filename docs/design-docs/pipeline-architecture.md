@@ -189,52 +189,35 @@ Synchronization: Join all threads before writing container
 
 **When used:** Default for >256KB inputs with multiple CPU cores
 
-### 2. GPU-Batched Compression
+### 2. Unified GPU Coordinator
 
-**File:** `src/pipeline/parallel.rs` - `compress_parallel_gpu_batched()`
+**File:** `src/pipeline/parallel.rs` - `compress_parallel_unified()`
 
-Multiple blocks submitted to GPU with ring-buffered streaming:
-
-```
-Input: 8 blocks (2MB batch)
-
-Loop:
-  Iteration 0:
-    GPU: LZ77 on block 0 (async, non-blocking)
-    CPU: write metadata for previous block (overlapped)
-    
-  Iteration 1:
-    GPU: LZ77 on block 1 (while block 0 still computing)
-    CPU: entropy code block 0, write output
-    
-  ... ring buffer enables pipelining ...
-```
-
-**Ring buffer:** 3 pre-allocated slots, managed via `Lz77BufferSlot`
-
-**Backpressure:** `poll_wait()` called when ring full to prevent GPU queue overflow
-
-**When used:** GPU available AND input ≥ 256KB AND not too many small blocks
-
-### 3. Pipeline-Parallel Compression
-
-**Status:** Documented but not heavily used
-
-**Idea:** Different stages on different GPU blocks
+A single GPU coordinator thread handles all GPU work. CPU workers send GPU requests via a bounded `SyncSender`; the coordinator batch-collects and dispatches:
 
 ```
-Block 0: GPU LZ77 → GPU Huffman (Stage A + Stage B)
-Block 1: GPU LZ77 → GPU Huffman (Stage A + Stage B)
+CPU workers: split input → enqueue StageGpu(0, block_idx)
+                          or FusedGpu(0, 1, block_idx)
 
-GPU timeline (idealized):
-  [Block 0 LZ77] [Block 0 Huff] [Block 1 LZ77] [Block 1 Huff] ...
-                                [Block 1 LZ77]
+GPU coordinator:
+  1. Block on rx.recv() for first request
+  2. Drain up to ring_depth more Stage0 requests via try_recv()
+  3. Batch Stage0 blocks → find_matches_batched() (ring-buffered overlap)
+  4. Demux results → push Stage(1, block_idx) to unified queue
+  5. Process StageN requests via run_compress_stage()
+  6. Process Fused requests: run stages start..=end sequentially on GPU
 ```
 
-**Challenges:**
-- Synchronization between dependent blocks
-- Memory allocation for intermediate results
-- Work balancing across stages
+**Task variants:** `UnifiedTask` enum routes work:
+- `Stage(stage_idx, block_idx)` — CPU worker picks up
+- `StageGpu(stage_idx, block_idx)` — GPU coordinator handles
+- `FusedGpu(start, end, block_idx)` — GPU runs multiple stages without queue round-trips
+
+**Deadlock prevention:** Workers use `try_send()` with CPU fallback when the bounded GPU channel is full
+
+**GPU-to-CPU fallback:** If GPU operations fail, blocks are re-enqueued as `Stage(0, block_idx)` for CPU retry
+
+**When used:** GPU available AND input ≥ 256KB
 
 ## Auto-Selection Strategy
 

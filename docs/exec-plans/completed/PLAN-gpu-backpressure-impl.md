@@ -1,5 +1,7 @@
 # Implementation Plan: GPU Kernel Cost Annotations and Runtime Scheduling
 
+> **Note (2026-03-01):** The functions referenced in this plan (`compress_parallel_gpu_batched`, `compress_streaming_gpu`) have been replaced by the unified scheduler (`compress_parallel_unified` in `src/pipeline/parallel.rs`, PR #101). GPU backpressure is now handled by the bounded `SyncSender` channel to the GPU coordinator thread.
+
 **Source plan:** `PLAN-gpu-backpressure.md` (was in exciting-cori worktree, now lost).
 
 **Goal:** Replace the hardcoded `MAX_GPU_BATCH_SIZE = 8` with a cost-model-driven scheduler that limits GPU in-flight work based on actual kernel memory requirements and device VRAM.

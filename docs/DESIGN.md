@@ -170,10 +170,7 @@ To understand how a pipeline works, trace a single block from `compress_block()`
 - Account for staging buffers and padding/alignment
 - Use `scripts/gpu-meminfo.sh` to analyze actual allocations
 
-**GPU batched vs pipeline-parallel paths:** Both in `pipeline/parallel.rs`:
-- `compress_parallel_gpu_batched` - Ring buffer batching for GPU
-- `compress_pipeline_parallel` - Pipeline-parallel execution
-They solve the same problem differently. Understand both before modifying either.
+**GPU scheduling:** All GPU work is routed through a single unified scheduler (`compress_parallel_unified` in `pipeline/parallel.rs`). A dedicated GPU coordinator thread batch-collects requests from CPU workers. The `UnifiedTask` enum has three variants: `Stage` (CPU), `StageGpu` (single GPU stage), and `FusedGpu` (multi-stage GPU execution). Workers use `try_send()` on a bounded channel with CPU fallback to avoid deadlock.
 
 ### Feature Flags and Build Configurations
 
