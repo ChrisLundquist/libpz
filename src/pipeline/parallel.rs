@@ -317,10 +317,25 @@ fn compress_parallel_unified(
                                     .expect("intermediate result missing");
                                 GpuRequest::StageN(s, b, stage_block)
                             };
-                            if tx.send(request).is_ok() {
-                                continue;
+                            match tx.try_send(request) {
+                                Ok(()) => continue,
+                                Err(
+                                    std::sync::mpsc::TrySendError::Full(req)
+                                    | std::sync::mpsc::TrySendError::Disconnected(req),
+                                ) => {
+                                    // Channel full or closed — fall through to CPU.
+                                    // Full: avoids deadlock where all workers block on
+                                    // send() and nobody processes CPU tasks the coordinator
+                                    // pushes back into the queue.
+                                    // Disconnected: GPU coordinator exited.
+                                    // Restore StageN's block to the intermediate slot
+                                    // so the CPU fallback path can .take() it.
+                                    if let GpuRequest::StageN(_, _, sb) = req {
+                                        *slots_ref[b].lock().expect("intermediate slot poisoned") =
+                                            Some(sb);
+                                    }
+                                }
                             }
-                            // Channel closed — GPU coordinator gone, fall through to CPU
                         }
                         // Fallback: execute on CPU
                         (s, b)
