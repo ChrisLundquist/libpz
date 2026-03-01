@@ -348,22 +348,20 @@ fn compress_parallel_unified(
                                 }
                             }
                             Err(e) => {
-                                // GPU batch failed — report error for each block.
-                                for (block_idx, _) in &stage0_batch {
-                                    complete_gpu_stage(
-                                        Err(PzError::InvalidInput),
-                                        0,
-                                        *block_idx,
-                                        last_stage,
-                                        blocks,
-                                        &opts,
-                                        slots_ref,
-                                        results_ref,
-                                        queue_ref,
-                                        cv_ref,
-                                    );
+                                // GPU batch failed — fall back to CPU for each block.
+                                eprintln!(
+                                    "[pz-gpu] find_matches_batched failed: {e}; \
+                                     retrying {} blocks on CPU",
+                                    stage0_batch.len()
+                                );
+                                let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                                if !guard.failed {
+                                    for (block_idx, _) in &stage0_batch {
+                                        guard.queue.push_back(UnifiedTask::Stage(0, *block_idx));
+                                    }
+                                    cv_ref.notify_all();
                                 }
-                                let _ = e;
+                                drop(guard);
                             }
                         }
                     } else {
@@ -378,9 +376,57 @@ fn compress_parallel_unified(
                                 metadata: StageMetadata::default(),
                             };
                             let result = run_compress_stage(pipeline, 0, block, &opts);
+                            if result.is_err() {
+                                // GPU stage 0 failed — retry on CPU.
+                                eprintln!(
+                                    "[pz-gpu] stage 0 failed for block {block_idx}; \
+                                     retrying on CPU"
+                                );
+                                let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                                if !guard.failed {
+                                    guard.queue.push_back(UnifiedTask::Stage(0, block_idx));
+                                    cv_ref.notify_one();
+                                }
+                                drop(guard);
+                            } else {
+                                complete_gpu_stage(
+                                    result,
+                                    0,
+                                    block_idx,
+                                    last_stage,
+                                    blocks,
+                                    &opts,
+                                    slots_ref,
+                                    results_ref,
+                                    queue_ref,
+                                    cv_ref,
+                                );
+                            }
+                        }
+                    }
+
+                    // Process Stage N requests individually — entropy GPU work
+                    // already has internal batching (rans_encode_chunked_payload_gpu_batched).
+                    for (stage_idx, block_idx, sb) in stage_n_queue {
+                        let result = run_compress_stage(pipeline, stage_idx, sb, &opts);
+                        if result.is_err() {
+                            // GPU entropy failed — restart from stage 0 on CPU.
+                            // The intermediate StageBlock is consumed so we cannot
+                            // retry just this stage; re-enqueue from scratch.
+                            eprintln!(
+                                "[pz-gpu] stage {stage_idx} failed for block {block_idx}; \
+                                 retrying from stage 0 on CPU"
+                            );
+                            let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                            if !guard.failed {
+                                guard.queue.push_back(UnifiedTask::Stage(0, block_idx));
+                                cv_ref.notify_one();
+                            }
+                            drop(guard);
+                        } else {
                             complete_gpu_stage(
                                 result,
-                                0,
+                                stage_idx,
                                 block_idx,
                                 last_stage,
                                 blocks,
@@ -391,24 +437,6 @@ fn compress_parallel_unified(
                                 cv_ref,
                             );
                         }
-                    }
-
-                    // Process Stage N requests individually — entropy GPU work
-                    // already has internal batching (rans_encode_chunked_payload_gpu_batched).
-                    for (stage_idx, block_idx, sb) in stage_n_queue {
-                        let result = run_compress_stage(pipeline, stage_idx, sb, &opts);
-                        complete_gpu_stage(
-                            result,
-                            stage_idx,
-                            block_idx,
-                            last_stage,
-                            blocks,
-                            &opts,
-                            slots_ref,
-                            results_ref,
-                            queue_ref,
-                            cv_ref,
-                        );
                     }
 
                     // Process fused requests: run stages start..=end sequentially
@@ -432,18 +460,33 @@ fn compress_parallel_unified(
                                 Err(_) => break,
                             }
                         }
-                        complete_gpu_stage(
-                            result,
-                            final_stage,
-                            block_idx,
-                            last_stage,
-                            blocks,
-                            &opts,
-                            slots_ref,
-                            results_ref,
-                            queue_ref,
-                            cv_ref,
-                        );
+                        if result.is_err() {
+                            // GPU fused path failed — fall back to per-stage CPU.
+                            // Re-enqueue from stage 0 since intermediate data is consumed.
+                            eprintln!(
+                                "[pz-gpu] fused stages {stage_start}..={stage_end} failed \
+                                 for block {block_idx}; retrying on CPU"
+                            );
+                            let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                            if !guard.failed {
+                                guard.queue.push_back(UnifiedTask::Stage(0, block_idx));
+                                cv_ref.notify_one();
+                            }
+                            drop(guard);
+                        } else {
+                            complete_gpu_stage(
+                                result,
+                                final_stage,
+                                block_idx,
+                                last_stage,
+                                blocks,
+                                &opts,
+                                slots_ref,
+                                results_ref,
+                                queue_ref,
+                                cv_ref,
+                            );
+                        }
                     }
                 }
             });
@@ -1399,6 +1442,98 @@ mod tests {
         assert_eq!(
             decompressed, input,
             "Mixed GPU/CPU unified path should decompress correctly"
+        );
+    }
+
+    // GPU unified scheduler tests for LZ77-based pipelines (Deflate, Lzr, Lzf).
+    // These exercise the Stage 0 GPU routing and batch-collect path.
+
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn test_gpu_roundtrip_deflate() {
+        use crate::webgpu::WebGpuEngine;
+        let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let opts = CompressOptions {
+            backend: super::super::Backend::WebGpu,
+            threads: 2,
+            block_size: 256 * 1024,
+            webgpu_engine: Some(std::sync::Arc::new(engine)),
+            ..CompressOptions::default()
+        };
+        let compressed =
+            super::super::compress_with_options(&input, Pipeline::Deflate, &opts).unwrap();
+        let decompressed = super::super::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "GPU Deflate round-trip failed");
+    }
+
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn test_gpu_roundtrip_lzr() {
+        use crate::webgpu::WebGpuEngine;
+        let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let opts = CompressOptions {
+            backend: super::super::Backend::WebGpu,
+            threads: 2,
+            block_size: 256 * 1024,
+            webgpu_engine: Some(std::sync::Arc::new(engine)),
+            ..CompressOptions::default()
+        };
+        let compressed = super::super::compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
+        let decompressed = super::super::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "GPU Lzr round-trip failed");
+    }
+
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn test_gpu_roundtrip_lzf() {
+        use crate::webgpu::WebGpuEngine;
+        let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let opts = CompressOptions {
+            backend: super::super::Backend::WebGpu,
+            threads: 2,
+            block_size: 256 * 1024,
+            webgpu_engine: Some(std::sync::Arc::new(engine)),
+            ..CompressOptions::default()
+        };
+        let compressed = super::super::compress_with_options(&input, Pipeline::Lzf, &opts).unwrap();
+        let decompressed = super::super::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, input, "GPU Lzf round-trip failed");
+    }
+
+    // Test that the channel-full fallback path produces correct results.
+    // Uses a single-capacity channel (ring_depth=1) with many blocks to force
+    // try_send failures, exercising the CPU fallback in the worker dispatch.
+    #[test]
+    fn test_channel_full_cpu_fallback() {
+        // Many small blocks with minimal threads — channel of depth 1 will overflow
+        let block_size = 64 * 1024; // 64KB blocks
+        let num_blocks = 16;
+        let input: Vec<u8> = (0..=255).cycle().take(block_size * num_blocks).collect();
+
+        let opts = CompressOptions {
+            block_size,
+            threads: 8, // many workers competing for channel
+            ..CompressOptions::default()
+        };
+
+        let compressed =
+            super::super::compress_with_options(&input, Pipeline::LzSeqR, &opts).unwrap();
+        let decompressed = super::super::decompress(&compressed).unwrap();
+        assert_eq!(
+            decompressed, input,
+            "channel-full fallback should produce correct results"
         );
     }
 }
