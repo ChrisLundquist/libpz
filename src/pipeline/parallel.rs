@@ -862,12 +862,14 @@ fn compress_parallel_unified(
                         .expect("intermediate result missing")
                 };
 
+                let mut next_task: Option<UnifiedTask> = None;
+                let mut stage_failed = false;
+                let mut mark_invalid_after_lock = false;
                 let t0 = Instant::now();
                 let result = run_compress_stage(pipeline, stage_idx, block, &opts);
                 if let Some(stats) = stats_ref.as_ref() {
                     stats.add_stage_compute(t0.elapsed());
                 }
-
                 match result {
                     Ok(stage_block) => {
                         if stage_idx == last_stage {
@@ -875,77 +877,82 @@ fn compress_parallel_unified(
                             *results_ref[block_idx].lock().expect("result slot poisoned") =
                                 Some(Ok(stage_block.data));
                         } else {
-                            // Intermediate stage: store block and enqueue next stage.
                             *slots_ref[block_idx]
                                 .lock()
                                 .expect("intermediate slot poisoned") = Some(stage_block);
-                            let lock_start = Instant::now();
-                            let mut guard = queue_ref.lock().expect("unified queue poisoned");
-                            if let Some(stats) = stats_ref.as_ref() {
-                                stats.add_queue_wait(lock_start.elapsed());
-                            }
-                            let admin_start = Instant::now();
-                            if !guard.failed {
-                                let next_stage = stage_idx + 1;
-                                let next_task = if next_stage == last_stage
+                            let next_stage = stage_idx + 1;
+                            next_task = Some(
+                                if next_stage == last_stage
                                     && should_route_block_to_gpu_entropy(blocks[block_idx], &opts)
                                 {
                                     UnifiedTask::StageGpu(next_stage, block_idx)
                                 } else {
                                     UnifiedTask::Stage(next_stage, block_idx)
-                                };
-                                guard.queue.push_back(next_task);
-                                guard.pending_tasks += 1;
-                                cv_ref.notify_one();
-                            } else {
-                                *results_ref[block_idx].lock().expect("result slot poisoned") =
-                                    Some(Err(PzError::InvalidInput));
-                            }
-                            if let Some(stats) = stats_ref.as_ref() {
-                                stats.add_queue_admin(admin_start.elapsed());
-                            }
+                                },
+                            );
                         }
                     }
                     Err(e) => {
                         *results_ref[block_idx].lock().expect("result slot poisoned") =
                             Some(Err(e));
-                        let lock_start = Instant::now();
-                        let mut guard = queue_ref.lock().expect("unified queue poisoned");
-                        if let Some(stats) = stats_ref.as_ref() {
-                            stats.add_queue_wait(lock_start.elapsed());
-                        }
-                        let admin_start = Instant::now();
-                        if !guard.failed {
-                            guard.failed = true;
-                            let dropped = guard.queue.len();
-                            guard.queue.clear();
-                            guard.pending_tasks = guard.pending_tasks.saturating_sub(dropped);
-                            cv_ref.notify_all();
-                        }
-                        if let Some(stats) = stats_ref.as_ref() {
-                            stats.add_queue_admin(admin_start.elapsed());
-                        }
+                        stage_failed = true;
                     }
                 }
 
+                // Single completion lock per task: either replace the current task
+                // with its next stage (pending unchanged) or retire it (pending--).
                 let lock_start = Instant::now();
                 let mut guard = queue_ref.lock().expect("unified queue poisoned");
                 if let Some(stats) = stats_ref.as_ref() {
                     stats.add_queue_wait(lock_start.elapsed());
                 }
                 let admin_start = Instant::now();
-                debug_assert!(guard.pending_tasks > 0);
-                guard.pending_tasks -= 1;
+                let mut should_return = false;
+
+                if stage_failed {
+                    if !guard.failed {
+                        guard.failed = true;
+                        let dropped = guard.queue.len();
+                        guard.queue.clear();
+                        guard.pending_tasks = guard.pending_tasks.saturating_sub(dropped);
+                        cv_ref.notify_all();
+                    }
+                    debug_assert!(guard.pending_tasks > 0);
+                    guard.pending_tasks -= 1;
+                } else if let Some(task) = next_task {
+                    if !guard.failed {
+                        // Current task transitions directly into next-stage task.
+                        // Keep pending count unchanged.
+                        guard.queue.push_back(task);
+                        cv_ref.notify_one();
+                    } else {
+                        // Scheduler already failed; retire this task.
+                        debug_assert!(guard.pending_tasks > 0);
+                        guard.pending_tasks -= 1;
+                        mark_invalid_after_lock = true;
+                    }
+                } else {
+                    // Final-stage success retires one pending task.
+                    debug_assert!(guard.pending_tasks > 0);
+                    guard.pending_tasks -= 1;
+                }
+
                 if guard.pending_tasks == 0 {
                     guard.closed = true;
                     cv_ref.notify_all();
-                    if let Some(stats) = stats_ref.as_ref() {
-                        stats.add_queue_admin(admin_start.elapsed());
-                    }
-                    return;
+                    should_return = true;
                 }
                 if let Some(stats) = stats_ref.as_ref() {
                     stats.add_queue_admin(admin_start.elapsed());
+                }
+                drop(guard);
+
+                if mark_invalid_after_lock {
+                    *results_ref[block_idx].lock().expect("result slot poisoned") =
+                        Some(Err(PzError::InvalidInput));
+                }
+                if should_return {
+                    return;
                 }
             });
         }
@@ -994,6 +1001,10 @@ fn complete_gpu_stage(
     queue_cv: &Condvar,
     stats: Option<&LocalSchedulerStats>,
 ) {
+    let mut next_task: Option<UnifiedTask> = None;
+    let mut stage_failed = false;
+    let mut mark_invalid_after_lock = false;
+
     match result {
         Ok(sb) => {
             if stage_idx == last_stage {
@@ -1002,73 +1013,69 @@ fn complete_gpu_stage(
                 *intermediate_slots[block_idx]
                     .lock()
                     .expect("intermediate slot poisoned") = Some(sb);
-                let lock_start = Instant::now();
-                let mut guard = queue.lock().expect("unified queue poisoned");
-                if let Some(stats) = stats {
-                    stats.add_queue_wait(lock_start.elapsed());
-                }
-                let admin_start = Instant::now();
-                if !guard.failed {
-                    let next_stage = stage_idx + 1;
-                    let next_task = if next_stage == last_stage
+                let next_stage = stage_idx + 1;
+                next_task = Some(
+                    if next_stage == last_stage
                         && should_route_block_to_gpu_entropy(blocks[block_idx], options)
                     {
                         UnifiedTask::StageGpu(next_stage, block_idx)
                     } else {
                         UnifiedTask::Stage(next_stage, block_idx)
-                    };
-                    guard.queue.push_back(next_task);
-                    guard.pending_tasks += 1;
-                    queue_cv.notify_one();
-                }
-                if let Some(stats) = stats {
-                    stats.add_queue_admin(admin_start.elapsed());
-                }
+                    },
+                );
             }
         }
         Err(e) => {
             *results[block_idx].lock().expect("result slot poisoned") = Some(Err(e));
-            let lock_start = Instant::now();
-            let mut guard = queue.lock().expect("unified queue poisoned");
-            if let Some(stats) = stats {
-                stats.add_queue_wait(lock_start.elapsed());
-            }
-            let admin_start = Instant::now();
-            if !guard.failed {
-                guard.failed = true;
-                let dropped = guard.queue.len();
-                guard.queue.clear();
-                guard.pending_tasks = guard.pending_tasks.saturating_sub(dropped);
-            }
-            // Decrement and check for completion while we hold the lock
-            debug_assert!(guard.pending_tasks > 0);
-            guard.pending_tasks -= 1;
-            if guard.pending_tasks == 0 {
-                guard.closed = true;
-            }
-            queue_cv.notify_all();
-            if let Some(stats) = stats {
-                stats.add_queue_admin(admin_start.elapsed());
-            }
-            return;
+            stage_failed = true;
         }
     }
 
-    // Decrement pending_tasks and check for completion
+    // Single completion lock per GPU-finished task.
     let lock_start = Instant::now();
     let mut guard = queue.lock().expect("unified queue poisoned");
     if let Some(stats) = stats {
         stats.add_queue_wait(lock_start.elapsed());
     }
     let admin_start = Instant::now();
-    debug_assert!(guard.pending_tasks > 0);
-    guard.pending_tasks -= 1;
+    if stage_failed {
+        if !guard.failed {
+            guard.failed = true;
+            let dropped = guard.queue.len();
+            guard.queue.clear();
+            guard.pending_tasks = guard.pending_tasks.saturating_sub(dropped);
+            queue_cv.notify_all();
+        }
+        debug_assert!(guard.pending_tasks > 0);
+        guard.pending_tasks -= 1;
+    } else if let Some(task) = next_task {
+        if !guard.failed {
+            // Current task transitions into next stage; pending is unchanged.
+            guard.queue.push_back(task);
+            queue_cv.notify_one();
+        } else {
+            // Scheduler already failed; retire this task.
+            debug_assert!(guard.pending_tasks > 0);
+            guard.pending_tasks -= 1;
+            mark_invalid_after_lock = true;
+        }
+    } else {
+        // Final-stage success retires one pending task.
+        debug_assert!(guard.pending_tasks > 0);
+        guard.pending_tasks -= 1;
+    }
     if guard.pending_tasks == 0 {
         guard.closed = true;
         queue_cv.notify_all();
     }
     if let Some(stats) = stats {
         stats.add_queue_admin(admin_start.elapsed());
+    }
+    drop(guard);
+
+    if mark_invalid_after_lock {
+        *results[block_idx].lock().expect("result slot poisoned") =
+            Some(Err(PzError::InvalidInput));
     }
 }
 
