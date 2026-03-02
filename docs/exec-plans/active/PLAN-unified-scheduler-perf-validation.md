@@ -72,6 +72,8 @@ If a target is missed, the commit may still land only with an explicit follow-up
 4. Phase 2 progress:
    1. Removed extra Stage0/Fused payload cloning across worker -> GPU coordinator handoff.
    2. `GpuRequest::Stage0`/`GpuRequest::Fused` now pass block indices and coordinator reads block slices directly.
+   3. Collapsed per-task completion bookkeeping from two queue locks to one in both CPU worker and GPU completion paths (pending replacement semantics preserved).
+   4. A/B (same-laptop, alternating order, 1MB, 20 iters, 3 repeats) vs `c502fb5` showed lower scheduler overhead on `deflate/lzr/lzf` with throughput deltas within gate tolerance in median; `lzseqr` overhead change was small (+0.0032 abs).
 
 ## Execution Phases
 
