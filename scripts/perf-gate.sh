@@ -17,6 +17,7 @@ PROFILE_BIN="$PROJECT_DIR/target/${CARGO_PROFILE}/examples/profile"
 SIZE=1048576
 ITERATIONS=20
 REPEATS=3
+THREADS=0
 PIPELINES_CSV="deflate,lzr,lzf,lzseqr"
 CPU_ONLY=false
 UPDATE_BASELINE=false
@@ -37,6 +38,7 @@ Options:
   --size N                    Input size in bytes (default: 1048576)
   --iterations N              profile-example loop iterations per run (default: 20)
   --repeats N                 repeated runs per case; must be odd (default: 3)
+  --threads N                 pass thread count to profile (0=auto, default: 0)
   --pipelines LIST            comma-separated pipelines (default: deflate,lzr,lzf,lzseqr)
   --cpu-only                  skip WebGPU matrix
   --cargo-profile NAME        cargo profile for example binary (default: profiling)
@@ -65,6 +67,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --repeats)
             REPEATS="$2"
+            shift 2
+            ;;
+        --threads)
+            THREADS="$2"
             shift 2
             ;;
         --pipelines)
@@ -120,6 +126,10 @@ if (( REPEATS % 2 == 0 )); then
     echo "ERROR: --repeats must be odd to compute an exact median" >&2
     exit 1
 fi
+if ! [[ "$THREADS" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: --threads must be a non-negative integer" >&2
+    exit 1
+fi
 
 mkdir -p "$(dirname "$OUTPUT")"
 mkdir -p "$(dirname "$BASELINE")"
@@ -149,7 +159,7 @@ HAS_WEBGPU=false
 if [[ "$CPU_ONLY" == false ]]; then
     probe_out="$(mktemp)"
     set +e
-    "$PROFILE_BIN" --pipeline lzf --size 262144 --iterations 1 --gpu --print-scheduler-stats >"$probe_out" 2>&1
+    "$PROFILE_BIN" --pipeline lzf --size 262144 --iterations 1 --threads "$THREADS" --gpu --print-scheduler-stats >"$probe_out" 2>&1
     probe_ec=$?
     set -e
     if (( probe_ec == 0 )); then
@@ -166,7 +176,7 @@ if [[ "$CPU_ONLY" == false ]]; then
     rm -f "$probe_out"
 fi
 
-printf "mode\tpipeline\tsize\titerations\trepeats\tmbps_median\tscheduler_overhead_pct_median\truns_median\ttotal_ns_median\ttracked_thread_time_ns_median\tstage_compute_ns_median\tqueue_wait_ns_median\tqueue_admin_ns_median\tgpu_handoff_ns_median\tgpu_try_send_full_count_median\tgpu_try_send_disconnected_count_median\n" >"$OUTPUT"
+printf "mode\tpipeline\tsize\titerations\trepeats\tmbps_median\tscheduler_overhead_pct_median\truns_median\ttotal_ns_median\ttracked_thread_time_ns_median\tstage_compute_ns_median\tqueue_wait_ns_median\tqueue_admin_ns_median\tgpu_handoff_ns_median\tgpu_try_send_full_count_median\tgpu_try_send_disconnected_count_median\tthreads\n" >"$OUTPUT"
 
 run_case() {
     local mode="$1"
@@ -187,17 +197,23 @@ run_case() {
     for ((i = 1; i <= REPEATS; i++)); do
         local out
         if [[ "$mode" == "webgpu" ]]; then
-            out="$("$PROFILE_BIN" --pipeline "$pipeline" --size "$SIZE" --iterations "$ITERATIONS" --gpu --print-scheduler-stats 2>&1)"
+            out="$("$PROFILE_BIN" --pipeline "$pipeline" --size "$SIZE" --iterations "$ITERATIONS" --threads "$THREADS" --gpu --print-scheduler-stats 2>&1)"
         else
-            out="$("$PROFILE_BIN" --pipeline "$pipeline" --size "$SIZE" --iterations "$ITERATIONS" --print-scheduler-stats 2>&1)"
+            out="$("$PROFILE_BIN" --pipeline "$pipeline" --size "$SIZE" --iterations "$ITERATIONS" --threads "$THREADS" --print-scheduler-stats 2>&1)"
         fi
 
+        local profile_line
+        profile_line="$(printf '%s\n' "$out" | grep '^PROFILE_STATS' | tail -n1)"
         local mbps
-        mbps="$(printf '%s\n' "$out" | sed -n 's/.* \([0-9][0-9.]*\) MB\/s.*/\1/p' | tail -n1)"
+        mbps="$(extract_stat "$profile_line" "mbps")"
         if [[ -z "$mbps" ]]; then
-            echo "ERROR: could not parse throughput for ${mode}/${pipeline}" >&2
-            printf '%s\n' "$out" >&2
-            exit 1
+            # Backward-compatible fallback for older profile binaries.
+            mbps="$(printf '%s\n' "$out" | sed -n 's/.* \([0-9][0-9.]*\) MB\/s.*/\1/p' | tail -n1)"
+            if [[ -z "$mbps" ]]; then
+                echo "ERROR: could not parse throughput for ${mode}/${pipeline}" >&2
+                printf '%s\n' "$out" >&2
+                exit 1
+            fi
         fi
 
         local stats_line
@@ -234,10 +250,10 @@ run_case() {
     full_m="$(median "${full_vals[@]}")"
     disc_m="$(median "${disc_vals[@]}")"
 
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$mode" "$pipeline" "$SIZE" "$ITERATIONS" "$REPEATS" \
         "$mbps_m" "$over_m" "$runs_m" "$total_m" "$tracked_m" "$stage_m" \
-        "$qwait_m" "$qadmin_m" "$handoff_m" "$full_m" "$disc_m" >>"$OUTPUT"
+        "$qwait_m" "$qadmin_m" "$handoff_m" "$full_m" "$disc_m" "$THREADS" >>"$OUTPUT"
 
     echo "case ${mode}/${pipeline}: median ${mbps_m} MB/s, overhead ${over_m}"
 }
