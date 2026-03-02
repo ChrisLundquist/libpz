@@ -136,6 +136,227 @@ GPU entropy would need a fundamentally different approach to be competitive:
 - **On-device chaining**: LZ77 → demux → entropy in a single command buffer submission would eliminate PCIe round-trips between stages. This requires the `lz77_demux.wgsl` kernel (not yet written).
 - **Alternative entropy coders**: Huffman is more parallelizable than rANS (no backward pass), but has worse compression ratio. The tradeoff may favor Huffman for GPU-heavy workloads.
 
+## Approaches to try: parallel GPU entropy
+
+The fundamental problem with GPU entropy is that rANS/Huffman are serial per-stream.
+Three known approaches exist for parallelizing entropy coding on GPU. None have been
+tried in libpz in their full form.
+
+### Approach 1: dietGPU-style warp-per-segment rANS
+
+**Source:** [dietGPU](https://github.com/facebookresearch/dietgpu) (Facebook Research)
+**Performance:** 250-410 GB/s on A100
+
+**How it works:**
+
+The input is split into independent 4KB segments at encode time. Each segment is
+rANS-encoded independently with its own final state. All segments share a single
+probability table. At decode time, each CUDA warp (32 threads) takes one segment
+and all 32 threads decode in lockstep, each maintaining its own rANS state.
+
+```
+Encode:
+  Input: [seg0: 4KB] [seg1: 4KB] [seg2: 4KB] ...
+  Each segment: independent rANS encode → compressed blob + final state
+
+Wire format (ANSCoalescedHeader):
+  [shared probability table]
+  [per-segment final states: one u32 per lane per segment]
+  [per-segment compressed word counts]
+  [compressed data: read backward]
+
+Decode:
+  One warp (32 threads) per segment
+  Each thread = one rANS lane, decodes its symbols round-robin
+  Threads coordinate compressed word reads via __ballot_sync() + __popc()
+  → 32 lanes × thousands of segments = massive parallelism
+```
+
+**Key differences from our chunked rANS:**
+- dietGPU: 32 lanes per segment, thousands of segments → millions of threads
+- libpz: 4 lanes per chunk, ~160 chunks → 640 threads
+- dietGPU: warp-level ballot/popc for coordinated reads (CUDA-specific)
+- libpz: WebGPU has no warp-level primitives (subgroup ops are limited)
+
+**What we'd need to try:**
+1. Increase lanes from 4 to 16 or 32 (our wg64 entry point exists)
+2. Decrease chunk size from 256 bytes to match dietGPU's effective per-lane chunk
+3. Accumulate segments across multiple streams and blocks into one mega-dispatch
+4. WebGPU subgroup operations (`subgroupBallot`, `subgroupAdd`) as ballot/popc
+   substitute — available in WebGPU but not universally supported
+
+**Risk:** WebGPU's subgroup support is spotty. Without warp-level coordination,
+threads can't efficiently share compressed word reads. May need to fall back to
+workgroup shared memory, adding latency.
+
+### Approach 2: Huffman sync-point decode
+
+**Source:** nvCOMP, GDeflate
+**Reference:** `docs/exec-plans/active/TODO-huffman-sync-decode.md`
+
+**How it works:**
+
+During Huffman encode, periodically record `(bit_offset, symbol_index)` checkpoints
+every N symbols (N=1024). During decode, each GPU thread independently decodes one
+segment between checkpoints using a LUT (2^L entries for max code length L).
+
+```
+Encode:
+  Normal Huffman encode, but every 1024 symbols:
+    record SyncPoint { bit_offset: u32, symbol_index: u32 }
+
+Wire format:
+  [Huffman tree header]
+  [num_sync_points: u16]
+  [sync_points: (bit_offset, symbol_index) × N]
+  [bitstream]
+
+Decode:
+  One thread per segment (between adjacent sync points)
+  Each thread: read L bits → LUT lookup → (symbol, code_length) → advance
+  Segments are fully independent once sync points are known
+```
+
+**Advantage over rANS:** Huffman decode is forward-only (no backward pass) and
+uses simple table lookup — no multiply/divide. The sync points add ~8 bytes per
+1024 symbols (~0.8% overhead) but enable embarrassingly parallel decode.
+
+**What we'd need to try:**
+1. Modify `src/huffman.rs` encode to emit sync points (the GPU encode path
+   already computes per-symbol bit offsets via prefix sum — sync points are
+   just a sample of those offsets)
+2. Write `kernels/huffman_decode.wgsl` — one thread per segment, LUT decode
+3. Wire through `WebGpuEngine::huffman_decode_gpu()`
+4. Measure: does parallel decode + sync point overhead beat CPU?
+
+**Risk:** Lower compression ratio than rANS. But if decode throughput is 10x
+higher, the ratio tradeoff may be worthwhile for GPU-heavy workloads. This is
+the approach GDeflate uses in production.
+
+### Approach 3: Recoil-style arbitrary-position rANS decode
+
+**Source:** [Recoil (ICPP 2023)](https://arxiv.org/abs/2306.12141)
+
+**How it works:**
+
+Unlike dietGPU (which requires independent segments at encode time), Recoil
+encodes as a single contiguous rANS stream. At encode time, it records the
+intermediate rANS state at periodic positions. At decode time, any thread can
+start decoding from any recorded position because the state is known.
+
+```
+Encode:
+  Normal rANS encode (one contiguous stream)
+  Every K symbols: store intermediate state in metadata
+  States have a smaller upper bound after renormalization → compact storage
+
+Wire format:
+  [probability table]
+  [num_checkpoints: u16]
+  [checkpoints: (state: u32, symbol_index: u32, word_offset: u32) × N]
+  [compressed stream]
+
+Decode:
+  Split stream heuristically to balance workload
+  Each thread starts from a checkpoint with known state
+  Decode forward until the next checkpoint's symbol_index
+```
+
+**Advantage:** No per-segment encode overhead. The stream is encoded as one
+unit (best compression ratio). Parallelism is decided at decode time based
+on available decoder resources ("decoder-adaptive scalability").
+
+**What we'd need to try:**
+1. Modify rANS encode to record intermediate states every K symbols
+2. Store checkpoint metadata in wire format (compact — states have bounded
+   range after renormalization)
+3. Write decode kernel that starts from arbitrary checkpoints
+4. Measure: does checkpoint overhead eat the ratio savings vs dietGPU segments?
+
+**Risk:** More complex implementation. The checkpoint metadata format needs
+careful design. The paper claims "reducing unnecessary data transfer by
+adaptively scaling parallelism overhead to match decoder capability" but
+the practical gain over dietGPU's simpler approach is unclear for our
+input sizes.
+
+### Comparison of approaches
+
+| Approach | Encode change | Ratio impact | Parallelism | WebGPU feasible? |
+|----------|--------------|-------------|-------------|-----------------|
+| dietGPU segments | Split into 4KB independent segments | Small (shared table) | Very high | Maybe (needs subgroup ops) |
+| Huffman sync points | Add checkpoints every 1024 symbols | ~0.8% overhead | High | Yes (no warp primitives needed) |
+| Recoil checkpoints | Store intermediate rANS states | Minimal | High | Yes |
+
+**Recommendation:** Try Huffman sync-point decode first (Approach 2). It has
+the simplest implementation, doesn't require subgroup operations, and a
+detailed implementation plan already exists (`TODO-huffman-sync-decode.md`).
+If Huffman ratio is unacceptable, try Recoil checkpoints (Approach 3) which
+preserves rANS ratio. dietGPU segments (Approach 1) are the proven approach
+but may not be feasible without CUDA warp primitives.
+
+### Approach 4: Reduce per-stream framing overhead
+
+**Source:** Internal analysis (2026-03-01)
+
+Orthogonal to the parallel entropy approaches above. Currently each rANS stream
+carries a 512-byte frequency table (256 × u16). For narrow-alphabet streams
+like `offset_codes` (~20 symbols) and `length_codes` (~15 symbols), most
+entries are zero.
+
+**Sparse frequency tables:** Store only nonzero entries:
+```
+Dense:  [freq: 256 × u16 LE]                    = 512 bytes always
+Sparse: [n: u8] [symbols: n × u8] [freqs: n × u16 LE] = 3n + 1 bytes
+```
+
+For `offset_codes` with 20 symbols: 61 bytes instead of 512. Saves ~450
+bytes per stream, ~1.3-1.6 KB per block across all streams.
+
+**Impact:** Closes ~9% of the gzip gap on the Canterbury corpus (~83 KB
+total savings on 13.9 MB). Small but free — the GPU kernels read pre-built
+table buffers and never parse the wire format, so zero WGSL changes needed.
+
+Touch points: `serialize_freq_table()` and `deserialize_freq_table()` in
+`src/rans.rs`, plus callers in `src/webgpu/rans.rs`. The `HEADER_SIZE`
+constant becomes variable.
+
+### Approach 5: Improve match encoding efficiency
+
+**Source:** Internal analysis (2026-03-01)
+
+The largest ratio gap vs gzip comes from per-match encoding cost, not
+entropy coding throughput. Structural encoding improvements for LzSeq:
+
+**5a. Zstd-style sequences (eliminate flags stream)**
+
+Replace per-token flags with sequences: `(literal_run_length, offset, length)`.
+Kills the flags stream entirely. Reduces from 6 streams to 4-5. The literal
+run length also acts as implicit context.
+
+**5b. Entropy-code the extra bits**
+
+`offset_extra` and `length_extra` bypass entropy coding (raw packed bits).
+If extra bit values are skewed (small values more common), rANS could
+save 5-15%. Tradeoff: needs additional frequency tables per stream.
+
+**5c. Larger repeat offset cache**
+
+LzSeq tracks 3 recent offsets (matching zstd). Expanding to 4-8 could
+capture more repeats on structured data. Each additional repeat offset
+saves all extra bits for that match (0 extra bits vs 8-16 for a far match).
+
+**5d. Combined literal/length alphabet**
+
+Deflate puts literals (0-255) and length codes (257-285) into one
+286-symbol Huffman tree. Common literals get short codes. LzSeq keeps
+them separate — they can't share probability mass. A combined alphabet
+could save bits but would change the stream structure.
+
+**Impact:** These are format-level changes. 5a (zstd sequences) has the
+highest ceiling — it's the structural difference between how zstd and
+LzSeq encode. 5c (repeat offsets) is the simplest to implement. The
+format is not yet released, so all changes are free.
+
 ## Key files
 
 | File | Purpose |
