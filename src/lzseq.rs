@@ -292,12 +292,14 @@ fn check_repeat_match(input: &[u8], pos: usize, offset: u32, max_match: usize) -
         return 0;
     }
     let max_len = (input.len() - pos).min(max_match);
-    let src = pos - offset as usize;
-    let mut len = 0;
-    while len < max_len && input[src + len] == input[pos + len] {
-        len += 1;
+    let mut src_idx = pos - offset as usize;
+    let mut dst_idx = pos;
+    let end = pos + max_len;
+    while dst_idx < end && input[src_idx] == input[dst_idx] {
+        src_idx += 1;
+        dst_idx += 1;
     }
-    len as u16
+    (dst_idx - pos) as u16
 }
 
 // ---------------------------------------------------------------------------
@@ -546,15 +548,32 @@ fn select_best_match(
     repeats: &RepeatOffsets,
     max_match_len: usize,
 ) -> (u32, u16, bool) {
-    // Find the best repeat-offset match
-    let mut best_rep_offset = 0u32;
-    let mut best_rep_len = 0u16;
-    for &rep_offset in &repeats.recent {
-        let rep_len = check_repeat_match(input, pos, rep_offset, max_match_len);
-        if rep_len > best_rep_len {
-            best_rep_len = rep_len;
-            best_rep_offset = rep_offset;
-        }
+    // Find the best repeat-offset match. Deduplicate comparisons when the
+    // repeat set contains identical offsets (common in early stream positions).
+    let [rep0, rep1, rep2] = repeats.recent;
+    let len0 = check_repeat_match(input, pos, rep0, max_match_len);
+    let len1 = if rep1 == rep0 {
+        len0
+    } else {
+        check_repeat_match(input, pos, rep1, max_match_len)
+    };
+    let len2 = if rep2 == rep0 {
+        len0
+    } else if rep2 == rep1 {
+        len1
+    } else {
+        check_repeat_match(input, pos, rep2, max_match_len)
+    };
+
+    let mut best_rep_offset = rep0;
+    let mut best_rep_len = len0;
+    if len1 > best_rep_len {
+        best_rep_len = len1;
+        best_rep_offset = rep1;
+    }
+    if len2 > best_rep_len {
+        best_rep_len = len2;
+        best_rep_offset = rep2;
     }
 
     // Decide: hash-chain vs repeat

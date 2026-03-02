@@ -173,27 +173,19 @@ pub(crate) fn spread_symbols(norm: &NormalizedFreqs) -> Vec<u8> {
 
     let mut table = vec![255u8; table_size];
 
-    // Generate the full permutation sequence first. Since gcd(step, table_size)=1,
-    // the sequence pos, pos+step, pos+2*step, ... (mod table_size) visits every
-    // position exactly once before repeating.
-    let mut positions = Vec::with_capacity(table_size);
+    // Assign symbols directly while walking the permutation cycle. This keeps
+    // the classic spread pattern but avoids the intermediate positions buffer.
     let mut pos = 0usize;
-    for _ in 0..table_size {
-        positions.push(pos);
-        pos = (pos + step) & mask;
-    }
-
-    // Assign symbols to positions: symbol 0 gets the first freq[0] positions,
-    // symbol 1 gets the next freq[1] positions, etc.
-    let mut idx = 0;
+    let mut written = 0usize;
     for (symbol, &freq) in norm.freq.iter().enumerate() {
         for _ in 0..freq {
-            table[positions[idx]] = symbol as u8;
-            idx += 1;
+            table[pos] = symbol as u8;
+            pos = (pos + step) & mask;
+            written += 1;
         }
     }
 
-    debug_assert_eq!(idx, table_size);
+    debug_assert_eq!(written, table_size);
     table
 }
 
@@ -328,13 +320,9 @@ fn build_encode_tables(
             let mut lookup = vec![EncodeMapping::default(); table_size];
             for m in sym_mappings {
                 let range_start = m.base as usize;
-                let range_end = range_start + (1usize << m.bits);
-                for entry in lookup
-                    .iter_mut()
-                    .take(range_end.min(table_size))
-                    .skip(range_start)
-                {
-                    *entry = *m;
+                let range_end = range_start.saturating_add(1usize << m.bits).min(table_size);
+                if range_start < range_end {
+                    lookup[range_start..range_end].fill(*m);
                 }
             }
             SymbolEncodeTable { lookup }
@@ -544,22 +532,23 @@ fn fse_encode_internal(input: &[u8], table: &FseTable) -> (Vec<u8>, u16, u32) {
     // the final state becomes the decoder's initial state.
     let mut state: usize = 0;
 
-    // Pre-allocate and index directly: chunks[j] holds the bit-chunk for
-    // input[j]. The backward pass fills from the end, so after the loop
-    // chunks[0..n] is already in forward order — no reverse needed.
-    let mut chunks: Vec<(u32, u32)> = vec![(0, 0); input.len()]; // (value, nb_bits)
+    // Store bit values and bit counts in separate arrays to reduce memory
+    // bandwidth during the write pass.
+    let mut bit_values = vec![0u32; input.len()];
+    let mut bit_counts = vec![0u8; input.len()];
 
     for (j, &byte) in input.iter().enumerate().rev() {
         let s = byte as usize;
         let mapping = table.encode_tables[s].find(state);
         let value = state as u32 - mapping.base as u32;
-        chunks[j] = (value, mapping.bits as u32);
+        bit_values[j] = value;
+        bit_counts[j] = mapping.bits;
         state = mapping.compressed_state as usize;
     }
 
     let mut writer = BitWriter::new();
-    for &(value, nb_bits) in &chunks {
-        writer.write_bits(value, nb_bits);
+    for (&value, &nb_bits) in bit_values.iter().zip(bit_counts.iter()) {
+        writer.write_bits(value, nb_bits as u32);
     }
 
     let (bitstream, total_bits) = writer.finish();
