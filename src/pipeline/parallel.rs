@@ -780,262 +780,319 @@ fn compress_parallel_unified(
             #[cfg(feature = "webgpu")]
             let gpu_tx_clone = gpu_tx.clone();
 
-            scope.spawn(move || loop {
-                let task = {
-                    let lock_start = Instant::now();
-                    let mut guard = queue_ref.lock().expect("unified queue poisoned");
-                    if let Some(stats) = stats_ref.as_ref() {
-                        stats.add_queue_wait(lock_start.elapsed());
-                    }
-                    loop {
-                        let admin_start = Instant::now();
-                        if let Some(task) = guard.queue.pop_front() {
+            scope.spawn(move || {
+                // Local continuation state for this worker.
+                // When set, process the next stage directly instead of
+                // round-tripping through the shared queue.
+                let mut local_task: Option<(usize, usize, Option<StageBlock>)> = None;
+
+                loop {
+                    let (stage_idx, block_idx, inline_block) = if let Some(task) = local_task.take()
+                    {
+                        task
+                    } else {
+                        let task = {
+                            let lock_start = Instant::now();
+                            let mut guard = queue_ref.lock().expect("unified queue poisoned");
                             if let Some(stats) = stats_ref.as_ref() {
-                                stats.add_queue_admin(admin_start.elapsed());
+                                stats.add_queue_wait(lock_start.elapsed());
                             }
-                            break task;
-                        }
-                        if let Some(stats) = stats_ref.as_ref() {
-                            stats.add_queue_admin(admin_start.elapsed());
-                        }
-                        if guard.closed || (guard.failed && guard.queue.is_empty()) {
-                            return;
-                        }
-                        let wait_start = Instant::now();
-                        guard = cv_ref.wait(guard).expect("unified queue wait poisoned");
-                        if let Some(stats) = stats_ref.as_ref() {
-                            stats.add_queue_wait(wait_start.elapsed());
-                        }
-                    }
-                };
+                            loop {
+                                let admin_start = Instant::now();
+                                if let Some(task) = guard.queue.pop_front() {
+                                    if let Some(stats) = stats_ref.as_ref() {
+                                        stats.add_queue_admin(admin_start.elapsed());
+                                    }
+                                    break task;
+                                }
+                                if let Some(stats) = stats_ref.as_ref() {
+                                    stats.add_queue_admin(admin_start.elapsed());
+                                }
+                                if guard.closed || (guard.failed && guard.queue.is_empty()) {
+                                    return;
+                                }
+                                let wait_start = Instant::now();
+                                guard = cv_ref.wait(guard).expect("unified queue wait poisoned");
+                                if let Some(stats) = stats_ref.as_ref() {
+                                    stats.add_queue_wait(wait_start.elapsed());
+                                }
+                            }
+                        };
 
-                let (stage_idx, block_idx) = match task {
-                    UnifiedTask::Stage(s, b) => (s, b),
-                    UnifiedTask::FusedGpu(start, end, b) => {
-                        // Route to GPU coordinator for fused multi-stage execution
-                        #[cfg(feature = "webgpu")]
-                        if let Some(ref tx) = gpu_tx_clone {
-                            let handoff_start = Instant::now();
-                            let request = GpuRequest::Fused(start, end, b);
-                            match tx.try_send(request) {
-                                Ok(()) => {
-                                    if let Some(stats) = stats_ref.as_ref() {
-                                        stats.add_gpu_handoff(handoff_start.elapsed());
+                        match task {
+                            UnifiedTask::Stage(s, b) => (s, b, None),
+                            UnifiedTask::FusedGpu(start, end, b) => {
+                                // Route to GPU coordinator for fused multi-stage execution.
+                                #[cfg(feature = "webgpu")]
+                                if let Some(ref tx) = gpu_tx_clone {
+                                    let handoff_start = Instant::now();
+                                    let request = GpuRequest::Fused(start, end, b);
+                                    match tx.try_send(request) {
+                                        Ok(()) => {
+                                            if let Some(stats) = stats_ref.as_ref() {
+                                                stats.add_gpu_handoff(handoff_start.elapsed());
+                                            }
+                                            if let Some(score) = gpu_pressure_ref.as_ref() {
+                                                pressure_dec(score);
+                                            }
+                                            continue;
+                                        }
+                                        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                            if let Some(stats) = stats_ref.as_ref() {
+                                                stats.add_gpu_handoff(handoff_start.elapsed());
+                                                stats.inc_gpu_try_send_full();
+                                            }
+                                            if let Some(score) = gpu_pressure_ref.as_ref() {
+                                                pressure_inc(score, 2);
+                                            }
+                                            // Channel full — fall through to CPU stage start.
+                                        }
+                                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                            if let Some(stats) = stats_ref.as_ref() {
+                                                stats.add_gpu_handoff(handoff_start.elapsed());
+                                                stats.inc_gpu_try_send_disconnected();
+                                            }
+                                            if let Some(score) = gpu_pressure_ref.as_ref() {
+                                                pressure_inc(score, 1);
+                                            }
+                                            // Channel closed — fall through to CPU stage start.
+                                        }
                                     }
-                                    if let Some(score) = gpu_pressure_ref.as_ref() {
-                                        pressure_dec(score);
-                                    }
-                                    continue;
                                 }
-                                Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                                    if let Some(stats) = stats_ref.as_ref() {
-                                        stats.add_gpu_handoff(handoff_start.elapsed());
-                                        stats.inc_gpu_try_send_full();
+                                (start, b, None)
+                            }
+                            UnifiedTask::StageGpu(s, b) => {
+                                #[cfg(feature = "webgpu")]
+                                {
+                                    // Route to GPU coordinator — send and continue to next task.
+                                    if let Some(ref tx) = gpu_tx_clone {
+                                        let request = if s == 0 {
+                                            GpuRequest::Stage0(b)
+                                        } else {
+                                            let stage_block = slots_ref[b]
+                                                .lock()
+                                                .expect("intermediate slot poisoned")
+                                                .take()
+                                                .expect("intermediate result missing");
+                                            GpuRequest::StageN(s, b, stage_block)
+                                        };
+                                        let handoff_start = Instant::now();
+                                        let inline_stage_block = match tx.try_send(request) {
+                                            Ok(()) => {
+                                                if let Some(stats) = stats_ref.as_ref() {
+                                                    stats.add_gpu_handoff(handoff_start.elapsed());
+                                                }
+                                                if let Some(score) = gpu_pressure_ref.as_ref() {
+                                                    pressure_dec(score);
+                                                }
+                                                continue;
+                                            }
+                                            Err(std::sync::mpsc::TrySendError::Full(req)) => {
+                                                if let Some(stats) = stats_ref.as_ref() {
+                                                    stats.add_gpu_handoff(handoff_start.elapsed());
+                                                    stats.inc_gpu_try_send_full();
+                                                }
+                                                if let Some(score) = gpu_pressure_ref.as_ref() {
+                                                    pressure_inc(score, 2);
+                                                }
+                                                match req {
+                                                    // Keep StageN payload local for CPU fallback
+                                                    // to avoid slot round-trips under pressure.
+                                                    GpuRequest::StageN(_, _, sb) => Some(sb),
+                                                    _ => None,
+                                                }
+                                            }
+                                            Err(std::sync::mpsc::TrySendError::Disconnected(
+                                                req,
+                                            )) => {
+                                                if let Some(stats) = stats_ref.as_ref() {
+                                                    stats.add_gpu_handoff(handoff_start.elapsed());
+                                                    stats.inc_gpu_try_send_disconnected();
+                                                }
+                                                if let Some(score) = gpu_pressure_ref.as_ref() {
+                                                    pressure_inc(score, 1);
+                                                }
+                                                match req {
+                                                    GpuRequest::StageN(_, _, sb) => Some(sb),
+                                                    _ => None,
+                                                }
+                                            }
+                                        };
+                                        if let Some(sb) = inline_stage_block {
+                                            (s, b, Some(sb))
+                                        } else {
+                                            (s, b, None)
+                                        }
+                                    } else {
+                                        (s, b, None)
                                     }
-                                    if let Some(score) = gpu_pressure_ref.as_ref() {
-                                        pressure_inc(score, 2);
-                                    }
-                                    // Channel full or closed — fall through to CPU stage 0
                                 }
-                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                                    if let Some(stats) = stats_ref.as_ref() {
-                                        stats.add_gpu_handoff(handoff_start.elapsed());
-                                        stats.inc_gpu_try_send_disconnected();
-                                    }
-                                    if let Some(score) = gpu_pressure_ref.as_ref() {
-                                        pressure_inc(score, 1);
-                                    }
-                                    // Channel closed — fall through to CPU stage 0
+                                #[cfg(not(feature = "webgpu"))]
+                                {
+                                    (s, b, None)
                                 }
                             }
                         }
-                        // Fallback: execute first stage on CPU
-                        (start, b)
+                    };
+
+                    // Build or retrieve the StageBlock for this stage.
+                    let block = if let Some(sb) = inline_block {
+                        sb
+                    } else if stage_idx == 0 {
+                        StageBlock {
+                            block_index: block_idx,
+                            original_len: blocks[block_idx].len(),
+                            data: blocks[block_idx].to_vec(),
+                            streams: None,
+                            metadata: StageMetadata::default(),
+                        }
+                    } else {
+                        slots_ref[block_idx]
+                            .lock()
+                            .expect("intermediate slot poisoned")
+                            .take()
+                            .expect("intermediate result missing")
+                    };
+
+                    let mut stage_failed = false;
+                    let mut mark_invalid_after_lock = false;
+                    let t0 = Instant::now();
+                    let result = run_compress_stage(pipeline, stage_idx, block, &opts);
+                    if let Some(stats) = stats_ref.as_ref() {
+                        stats.add_stage_compute(t0.elapsed());
                     }
-                    UnifiedTask::StageGpu(s, b) => {
-                        // Route to GPU coordinator — send and continue to next task
-                        #[cfg(feature = "webgpu")]
-                        if let Some(ref tx) = gpu_tx_clone {
-                            let request = if s == 0 {
-                                GpuRequest::Stage0(b)
+
+                    match result {
+                        Ok(stage_block) => {
+                            if stage_idx == last_stage {
+                                // Final stage: store compressed bytes and retire this block.
+                                *results_ref[block_idx].lock().expect("result slot poisoned") =
+                                    Some(Ok(stage_block.data));
                             } else {
-                                let stage_block = slots_ref[b]
-                                    .lock()
-                                    .expect("intermediate slot poisoned")
-                                    .take()
-                                    .expect("intermediate result missing");
-                                GpuRequest::StageN(s, b, stage_block)
-                            };
-                            let handoff_start = Instant::now();
-                            match tx.try_send(request) {
-                                Ok(()) => {
-                                    if let Some(stats) = stats_ref.as_ref() {
-                                        stats.add_gpu_handoff(handoff_start.elapsed());
-                                    }
-                                    if let Some(score) = gpu_pressure_ref.as_ref() {
-                                        pressure_dec(score);
-                                    }
-                                    continue;
-                                }
-                                Err(std::sync::mpsc::TrySendError::Full(req)) => {
-                                    if let Some(stats) = stats_ref.as_ref() {
-                                        stats.add_gpu_handoff(handoff_start.elapsed());
-                                        stats.inc_gpu_try_send_full();
-                                    }
-                                    if let Some(score) = gpu_pressure_ref.as_ref() {
-                                        pressure_inc(score, 2);
-                                    }
-                                    // Channel full or closed — fall through to CPU.
-                                    // Full: avoids deadlock where all workers block on
-                                    // send() and nobody processes CPU tasks the coordinator
-                                    // pushes back into the queue.
-                                    // Restore StageN's block to the intermediate slot
-                                    // so the CPU fallback path can .take() it.
-                                    if let GpuRequest::StageN(_, _, sb) = req {
-                                        *slots_ref[b].lock().expect("intermediate slot poisoned") =
-                                            Some(sb);
-                                    }
-                                }
-                                Err(std::sync::mpsc::TrySendError::Disconnected(req)) => {
-                                    if let Some(stats) = stats_ref.as_ref() {
-                                        stats.add_gpu_handoff(handoff_start.elapsed());
-                                        stats.inc_gpu_try_send_disconnected();
-                                    }
-                                    if let Some(score) = gpu_pressure_ref.as_ref() {
-                                        pressure_inc(score, 1);
-                                    }
-                                    // Disconnected: GPU coordinator exited.
-                                    // Restore StageN's block to the intermediate slot
-                                    // so the CPU fallback path can .take() it.
-                                    if let GpuRequest::StageN(_, _, sb) = req {
-                                        *slots_ref[b].lock().expect("intermediate slot poisoned") =
-                                            Some(sb);
-                                    }
-                                }
-                            }
-                        }
-                        // Fallback: execute on CPU
-                        (s, b)
-                    }
-                };
-
-                // Build or retrieve the StageBlock for this stage.
-                let block = if stage_idx == 0 {
-                    StageBlock {
-                        block_index: block_idx,
-                        original_len: blocks[block_idx].len(),
-                        data: blocks[block_idx].to_vec(),
-                        streams: None,
-                        metadata: StageMetadata::default(),
-                    }
-                } else {
-                    slots_ref[block_idx]
-                        .lock()
-                        .expect("intermediate slot poisoned")
-                        .take()
-                        .expect("intermediate result missing")
-                };
-
-                let mut next_task: Option<UnifiedTask> = None;
-                let mut stage_failed = false;
-                let mut mark_invalid_after_lock = false;
-                let t0 = Instant::now();
-                let result = run_compress_stage(pipeline, stage_idx, block, &opts);
-                if let Some(stats) = stats_ref.as_ref() {
-                    stats.add_stage_compute(t0.elapsed());
-                }
-                match result {
-                    Ok(stage_block) => {
-                        if stage_idx == last_stage {
-                            // Final stage: store the compressed data.
-                            *results_ref[block_idx].lock().expect("result slot poisoned") =
-                                Some(Ok(stage_block.data));
-                        } else {
-                            *slots_ref[block_idx]
-                                .lock()
-                                .expect("intermediate slot poisoned") = Some(stage_block);
-                            let next_stage = stage_idx + 1;
-                            let backpressure_score = gpu_pressure_ref
-                                .as_ref()
-                                .map_or(0usize, |s| s.load(Ordering::Relaxed));
-                            next_task = Some(
-                                if next_stage == last_stage
+                                let next_stage = stage_idx + 1;
+                                let backpressure_score = gpu_pressure_ref
+                                    .as_ref()
+                                    .map_or(0usize, |s| s.load(Ordering::Relaxed));
+                                let route_next_to_gpu = next_stage == last_stage
                                     && should_route_block_to_gpu_entropy_with_backpressure(
                                         blocks[block_idx].len(),
                                         opts.stage1_backend,
                                         opts.webgpu_engine.is_some(),
                                         backpressure_score,
                                         gpu_pressure_limit,
-                                    )
-                                {
-                                    UnifiedTask::StageGpu(next_stage, block_idx)
-                                } else {
-                                    UnifiedTask::Stage(next_stage, block_idx)
-                                },
-                            );
+                                    );
+
+                                if route_next_to_gpu {
+                                    // Directly hand off StageN to GPU coordinator from this
+                                    // worker, avoiding queue and slot round-trips.
+                                    #[cfg(feature = "webgpu")]
+                                    if let Some(ref tx) = gpu_tx_clone {
+                                        let handoff_start = Instant::now();
+                                        let request =
+                                            GpuRequest::StageN(next_stage, block_idx, stage_block);
+                                        match tx.try_send(request) {
+                                            Ok(()) => {
+                                                if let Some(stats) = stats_ref.as_ref() {
+                                                    stats.add_gpu_handoff(handoff_start.elapsed());
+                                                }
+                                                if let Some(score) = gpu_pressure_ref.as_ref() {
+                                                    pressure_dec(score);
+                                                }
+                                                continue;
+                                            }
+                                            Err(std::sync::mpsc::TrySendError::Full(req)) => {
+                                                if let Some(stats) = stats_ref.as_ref() {
+                                                    stats.add_gpu_handoff(handoff_start.elapsed());
+                                                    stats.inc_gpu_try_send_full();
+                                                }
+                                                if let Some(score) = gpu_pressure_ref.as_ref() {
+                                                    pressure_inc(score, 2);
+                                                }
+                                                if let GpuRequest::StageN(_, _, sb) = req {
+                                                    local_task =
+                                                        Some((next_stage, block_idx, Some(sb)));
+                                                    continue;
+                                                }
+                                                unreachable!("StageN request expected");
+                                            }
+                                            Err(std::sync::mpsc::TrySendError::Disconnected(
+                                                req,
+                                            )) => {
+                                                if let Some(stats) = stats_ref.as_ref() {
+                                                    stats.add_gpu_handoff(handoff_start.elapsed());
+                                                    stats.inc_gpu_try_send_disconnected();
+                                                }
+                                                if let Some(score) = gpu_pressure_ref.as_ref() {
+                                                    pressure_inc(score, 1);
+                                                }
+                                                if let GpuRequest::StageN(_, _, sb) = req {
+                                                    local_task =
+                                                        Some((next_stage, block_idx, Some(sb)));
+                                                    continue;
+                                                }
+                                                unreachable!("StageN request expected");
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // CPU continuation: keep processing the same block locally.
+                                local_task = Some((next_stage, block_idx, Some(stage_block)));
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            *results_ref[block_idx].lock().expect("result slot poisoned") =
+                                Some(Err(e));
+                            stage_failed = true;
                         }
                     }
-                    Err(e) => {
-                        *results_ref[block_idx].lock().expect("result slot poisoned") =
-                            Some(Err(e));
-                        stage_failed = true;
-                    }
-                }
 
-                // Single completion lock per task: either replace the current task
-                // with its next stage (pending unchanged) or retire it (pending--).
-                let lock_start = Instant::now();
-                let mut guard = queue_ref.lock().expect("unified queue poisoned");
-                if let Some(stats) = stats_ref.as_ref() {
-                    stats.add_queue_wait(lock_start.elapsed());
-                }
-                let admin_start = Instant::now();
-                let mut should_return = false;
-
-                if stage_failed {
-                    if !guard.failed {
-                        guard.failed = true;
-                        let dropped = guard.queue.len();
-                        guard.queue.clear();
-                        guard.pending_tasks = guard.pending_tasks.saturating_sub(dropped);
-                        cv_ref.notify_all();
+                    // Single completion lock when a block retires (final success/error).
+                    let lock_start = Instant::now();
+                    let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                    if let Some(stats) = stats_ref.as_ref() {
+                        stats.add_queue_wait(lock_start.elapsed());
                     }
-                    debug_assert!(guard.pending_tasks > 0);
-                    guard.pending_tasks -= 1;
-                } else if let Some(task) = next_task {
-                    if !guard.failed {
-                        // Current task transitions directly into next-stage task.
-                        // Keep pending count unchanged.
-                        guard.queue.push_back(task);
-                        cv_ref.notify_one();
-                    } else {
-                        // Scheduler already failed; retire this task.
+                    let admin_start = Instant::now();
+                    let mut should_return = false;
+
+                    if stage_failed {
+                        if !guard.failed {
+                            guard.failed = true;
+                            let dropped = guard.queue.len();
+                            guard.queue.clear();
+                            guard.pending_tasks = guard.pending_tasks.saturating_sub(dropped);
+                            cv_ref.notify_all();
+                        }
                         debug_assert!(guard.pending_tasks > 0);
                         guard.pending_tasks -= 1;
-                        mark_invalid_after_lock = true;
+                    } else {
+                        if guard.failed {
+                            mark_invalid_after_lock = true;
+                        }
+                        // Final-stage success retires one pending task.
+                        debug_assert!(guard.pending_tasks > 0);
+                        guard.pending_tasks -= 1;
                     }
-                } else {
-                    // Final-stage success retires one pending task.
-                    debug_assert!(guard.pending_tasks > 0);
-                    guard.pending_tasks -= 1;
-                }
 
-                if guard.pending_tasks == 0 {
-                    guard.closed = true;
-                    cv_ref.notify_all();
-                    should_return = true;
-                }
-                if let Some(stats) = stats_ref.as_ref() {
-                    stats.add_queue_admin(admin_start.elapsed());
-                }
-                drop(guard);
+                    if guard.pending_tasks == 0 {
+                        guard.closed = true;
+                        cv_ref.notify_all();
+                        should_return = true;
+                    }
+                    if let Some(stats) = stats_ref.as_ref() {
+                        stats.add_queue_admin(admin_start.elapsed());
+                    }
+                    drop(guard);
 
-                if mark_invalid_after_lock {
-                    *results_ref[block_idx].lock().expect("result slot poisoned") =
-                        Some(Err(PzError::InvalidInput));
-                }
-                if should_return {
-                    return;
+                    if mark_invalid_after_lock {
+                        *results_ref[block_idx].lock().expect("result slot poisoned") =
+                            Some(Err(PzError::InvalidInput));
+                    }
+                    if should_return {
+                        return;
+                    }
                 }
             });
         }
