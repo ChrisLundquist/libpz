@@ -1,6 +1,6 @@
 # Active Execution Plans
 
-**Last Updated:** 2026-02-22
+**Last Updated:** 2026-03-02
 
 ## Active Plans
 
@@ -15,6 +15,9 @@
 
 ### [PLAN-unified-scheduler-north-star.md](PLAN-unified-scheduler-north-star.md)
 **Status:** In Progress (prototype merged; GPU Phases 1–5 pending P0-A perf gate) | **Priority:** P1
+
+### [PLAN-unified-scheduler-perf-validation.md](PLAN-unified-scheduler-perf-validation.md)
+**Status:** In Progress (Phases 0-1 landed; local baseline captured; Phase 2 optimization started) | **Priority:** P0
 
 ### [agent-harness-implementation.md](agent-harness-implementation.md)
 **Status:** In Progress (Phase 1 complete 2026-02-14, Phases 2–8 deferred) | **Priority:** P1

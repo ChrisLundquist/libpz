@@ -10,7 +10,11 @@
 
 use crate::{PzError, PzResult};
 use std::collections::VecDeque;
-use std::sync::{Condvar, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Condvar, Mutex, OnceLock,
+};
+use std::time::{Duration, Instant};
 
 use super::stages::{run_compress_stage, StageBlock, StageMetadata};
 use super::{write_header, CompressOptions, DecompressOptions, Pipeline, BLOCK_HEADER_SIZE};
@@ -83,6 +87,165 @@ struct UnifiedQueueState {
     pending_tasks: usize,
     closed: bool,
     failed: bool,
+}
+
+/// Aggregated timing/counter telemetry for the unified scheduler.
+///
+/// Collection is disabled by default and can be enabled via
+/// [`set_unified_scheduler_stats_enabled()`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnifiedSchedulerStats {
+    pub runs: u64,
+    pub total_ns: u64,
+    pub stage_compute_ns: u64,
+    pub queue_wait_ns: u64,
+    pub queue_admin_ns: u64,
+    pub gpu_handoff_ns: u64,
+    pub gpu_try_send_full_count: u64,
+    pub gpu_try_send_disconnected_count: u64,
+}
+
+impl UnifiedSchedulerStats {
+    /// Sum of tracked scheduler thread-time across workers/coordinator.
+    pub fn scheduler_overhead_ns(&self) -> u64 {
+        self.queue_wait_ns
+            .saturating_add(self.queue_admin_ns)
+            .saturating_add(self.gpu_handoff_ns)
+    }
+
+    /// Sum of tracked thread-time for scheduler + stage execution.
+    pub fn tracked_thread_time_ns(&self) -> u64 {
+        self.stage_compute_ns
+            .saturating_add(self.scheduler_overhead_ns())
+    }
+
+    /// Fraction of tracked thread-time spent in scheduler overhead (0.0..=1.0).
+    pub fn scheduler_overhead_pct(&self) -> f64 {
+        let denom = self.tracked_thread_time_ns();
+        if denom == 0 {
+            0.0
+        } else {
+            self.scheduler_overhead_ns() as f64 / denom as f64
+        }
+    }
+}
+
+#[derive(Default)]
+struct LocalSchedulerStats {
+    stage_compute_ns: AtomicU64,
+    queue_wait_ns: AtomicU64,
+    queue_admin_ns: AtomicU64,
+    gpu_handoff_ns: AtomicU64,
+    gpu_try_send_full_count: AtomicU64,
+    gpu_try_send_disconnected_count: AtomicU64,
+}
+
+impl LocalSchedulerStats {
+    fn add_stage_compute(&self, d: Duration) {
+        self.stage_compute_ns
+            .fetch_add(duration_to_ns(d), Ordering::Relaxed);
+    }
+
+    fn add_queue_wait(&self, d: Duration) {
+        self.queue_wait_ns
+            .fetch_add(duration_to_ns(d), Ordering::Relaxed);
+    }
+
+    fn add_queue_admin(&self, d: Duration) {
+        self.queue_admin_ns
+            .fetch_add(duration_to_ns(d), Ordering::Relaxed);
+    }
+
+    fn add_gpu_handoff(&self, d: Duration) {
+        self.gpu_handoff_ns
+            .fetch_add(duration_to_ns(d), Ordering::Relaxed);
+    }
+
+    fn inc_gpu_try_send_full(&self) {
+        self.gpu_try_send_full_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_gpu_try_send_disconnected(&self) {
+        self.gpu_try_send_disconnected_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn duration_to_ns(d: Duration) -> u64 {
+    d.as_nanos().min(u64::MAX as u128) as u64
+}
+
+static UNIFIED_SCHEDULER_STATS_ENABLED: AtomicBool = AtomicBool::new(false);
+static UNIFIED_SCHEDULER_STATS: OnceLock<Mutex<UnifiedSchedulerStats>> = OnceLock::new();
+
+struct SchedulerRunRecorder {
+    start: Instant,
+    local: Option<Arc<LocalSchedulerStats>>,
+}
+
+impl SchedulerRunRecorder {
+    fn new(local: Option<Arc<LocalSchedulerStats>>) -> Self {
+        Self {
+            start: Instant::now(),
+            local,
+        }
+    }
+}
+
+impl Drop for SchedulerRunRecorder {
+    fn drop(&mut self) {
+        let Some(local) = self.local.as_ref() else {
+            return;
+        };
+        let mut guard = UNIFIED_SCHEDULER_STATS
+            .get_or_init(|| Mutex::new(UnifiedSchedulerStats::default()))
+            .lock()
+            .expect("unified scheduler stats lock poisoned");
+        guard.runs = guard.runs.saturating_add(1);
+        guard.total_ns = guard
+            .total_ns
+            .saturating_add(duration_to_ns(self.start.elapsed()));
+        guard.stage_compute_ns = guard
+            .stage_compute_ns
+            .saturating_add(local.stage_compute_ns.load(Ordering::Relaxed));
+        guard.queue_wait_ns = guard
+            .queue_wait_ns
+            .saturating_add(local.queue_wait_ns.load(Ordering::Relaxed));
+        guard.queue_admin_ns = guard
+            .queue_admin_ns
+            .saturating_add(local.queue_admin_ns.load(Ordering::Relaxed));
+        guard.gpu_handoff_ns = guard
+            .gpu_handoff_ns
+            .saturating_add(local.gpu_handoff_ns.load(Ordering::Relaxed));
+        guard.gpu_try_send_full_count = guard
+            .gpu_try_send_full_count
+            .saturating_add(local.gpu_try_send_full_count.load(Ordering::Relaxed));
+        guard.gpu_try_send_disconnected_count =
+            guard.gpu_try_send_disconnected_count.saturating_add(
+                local
+                    .gpu_try_send_disconnected_count
+                    .load(Ordering::Relaxed),
+            );
+    }
+}
+
+pub(crate) fn set_unified_scheduler_stats_enabled(enabled: bool) {
+    UNIFIED_SCHEDULER_STATS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub(crate) fn reset_unified_scheduler_stats() {
+    let mut guard = UNIFIED_SCHEDULER_STATS
+        .get_or_init(|| Mutex::new(UnifiedSchedulerStats::default()))
+        .lock()
+        .expect("unified scheduler stats lock poisoned");
+    *guard = UnifiedSchedulerStats::default();
+}
+
+pub(crate) fn unified_scheduler_stats() -> UnifiedSchedulerStats {
+    *UNIFIED_SCHEDULER_STATS
+        .get_or_init(|| Mutex::new(UnifiedSchedulerStats::default()))
+        .lock()
+        .expect("unified scheduler stats lock poisoned")
 }
 
 /// Determine whether to route a block to GPU entropy encoding.
@@ -177,14 +340,14 @@ fn gpu_fused_span(pipeline: Pipeline) -> Option<(usize, usize)> {
 #[cfg(feature = "webgpu")]
 enum GpuRequest {
     /// Stage 0: LZ77/LzSeq match-finding on GPU.
-    /// (block_idx, input_data)
-    Stage0(usize, Vec<u8>),
+    /// (block_idx)
+    Stage0(usize),
     /// Stage 1+: entropy encoding on GPU.
     /// (stage_idx, block_idx, stage_block)
     StageN(usize, usize, StageBlock),
     /// Fused: run stages start..=end on GPU without queue round-trips.
-    /// (stage_start, stage_end, block_idx, input_data)
-    Fused(usize, usize, usize, Vec<u8>),
+    /// (stage_start, stage_end, block_idx)
+    Fused(usize, usize, usize),
 }
 
 fn compress_parallel_unified(
@@ -198,6 +361,12 @@ fn compress_parallel_unified(
     let num_stages = unified_stage_count(pipeline);
     let last_stage = num_stages - 1;
     let worker_count = num_threads.min(num_blocks).max(1);
+    let stats_local = if UNIFIED_SCHEDULER_STATS_ENABLED.load(Ordering::Relaxed) {
+        Some(Arc::new(LocalSchedulerStats::default()))
+    } else {
+        None
+    };
+    let _stats_run = SchedulerRunRecorder::new(stats_local.clone());
 
     let mut resolved_options = options.clone();
     if resolved_options.max_match_len.is_none() {
@@ -280,6 +449,7 @@ fn compress_parallel_unified(
             let slots_ref = &intermediate_slots;
             let results_ref = &results;
             let opts = resolved_options.clone();
+            let stats_ref = stats_local.clone();
 
             scope.spawn(move || {
                 let engine = opts.webgpu_engine.as_ref().unwrap();
@@ -288,25 +458,23 @@ fn compress_parallel_unified(
 
                 while let Ok(first) = rx.recv() {
                     // Batch-collect: drain additional pending requests.
-                    let mut stage0_batch: Vec<(usize, Vec<u8>)> = Vec::new();
+                    let mut stage0_batch: Vec<usize> = Vec::new();
                     let mut stage_n_queue: Vec<(usize, usize, StageBlock)> = Vec::new();
-                    let mut fused_queue: Vec<(usize, usize, usize, Vec<u8>)> = Vec::new();
+                    let mut fused_queue: Vec<(usize, usize, usize)> = Vec::new();
 
                     // Classify the first request.
                     match first {
-                        GpuRequest::Stage0(b, data) => stage0_batch.push((b, data)),
+                        GpuRequest::Stage0(b) => stage0_batch.push(b),
                         GpuRequest::StageN(s, b, sb) => stage_n_queue.push((s, b, sb)),
-                        GpuRequest::Fused(s, e, b, data) => fused_queue.push((s, e, b, data)),
+                        GpuRequest::Fused(s, e, b) => fused_queue.push((s, e, b)),
                     }
 
                     // Non-blocking drain of additional requests.
                     while let Ok(req) = rx.try_recv() {
                         match req {
-                            GpuRequest::Stage0(b, data) => stage0_batch.push((b, data)),
+                            GpuRequest::Stage0(b) => stage0_batch.push(b),
                             GpuRequest::StageN(s, b, sb) => stage_n_queue.push((s, b, sb)),
-                            GpuRequest::Fused(s, e, b, data) => {
-                                fused_queue.push((s, e, b, data));
-                            }
+                            GpuRequest::Fused(s, e, b) => fused_queue.push((s, e, b)),
                         }
                     }
 
@@ -314,17 +482,21 @@ fn compress_parallel_unified(
                     // pipelines to get ring-buffered GPU overlap.
                     if !stage0_batch.is_empty() && uses_lz77_demux {
                         let batch_blocks: Vec<&[u8]> =
-                            stage0_batch.iter().map(|(_, d)| d.as_slice()).collect();
+                            stage0_batch.iter().map(|&b| blocks[b]).collect();
+                        let t0 = Instant::now();
                         let batch_results = engine.find_matches_batched(&batch_blocks);
+                        if let Some(stats) = stats_ref.as_ref() {
+                            stats.add_stage_compute(t0.elapsed());
+                        }
                         match batch_results {
                             Ok(all_matches) => {
-                                for (matches, &(block_idx, ref data)) in
-                                    all_matches.into_iter().zip(&stage0_batch)
+                                for (matches, block_idx) in
+                                    all_matches.into_iter().zip(stage0_batch.iter().copied())
                                 {
                                     let demux = super::demux::demux_lz77_matches(matches);
                                     let sb = StageBlock {
                                         block_index: block_idx,
-                                        original_len: data.len(),
+                                        original_len: blocks[block_idx].len(),
                                         data: Vec::new(),
                                         streams: Some(demux.streams),
                                         metadata: StageMetadata {
@@ -344,6 +516,7 @@ fn compress_parallel_unified(
                                         results_ref,
                                         queue_ref,
                                         cv_ref,
+                                        stats_ref.as_deref(),
                                     );
                                 }
                             }
@@ -354,12 +527,20 @@ fn compress_parallel_unified(
                                      retrying {} blocks on CPU",
                                     stage0_batch.len()
                                 );
+                                let lock_start = Instant::now();
                                 let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                                if let Some(stats) = stats_ref.as_ref() {
+                                    stats.add_queue_wait(lock_start.elapsed());
+                                }
+                                let admin_start = Instant::now();
                                 if !guard.failed {
-                                    for (block_idx, _) in &stage0_batch {
+                                    for block_idx in &stage0_batch {
                                         guard.queue.push_back(UnifiedTask::Stage(0, *block_idx));
                                     }
                                     cv_ref.notify_all();
+                                }
+                                if let Some(stats) = stats_ref.as_ref() {
+                                    stats.add_queue_admin(admin_start.elapsed());
                                 }
                                 drop(guard);
                             }
@@ -367,25 +548,37 @@ fn compress_parallel_unified(
                     } else {
                         // Non-LZ77 pipelines (LzSeq, LZSS): dispatch individually
                         // through run_compress_stage which calls lzseq_encode_gpu etc.
-                        for (block_idx, data) in stage0_batch {
+                        for block_idx in stage0_batch {
                             let block = StageBlock {
                                 block_index: block_idx,
-                                original_len: data.len(),
-                                data,
+                                original_len: blocks[block_idx].len(),
+                                data: blocks[block_idx].to_vec(),
                                 streams: None,
                                 metadata: StageMetadata::default(),
                             };
+                            let t0 = Instant::now();
                             let result = run_compress_stage(pipeline, 0, block, &opts);
+                            if let Some(stats) = stats_ref.as_ref() {
+                                stats.add_stage_compute(t0.elapsed());
+                            }
                             if result.is_err() {
                                 // GPU stage 0 failed — retry on CPU.
                                 eprintln!(
                                     "[pz-gpu] stage 0 failed for block {block_idx}; \
                                      retrying on CPU"
                                 );
+                                let lock_start = Instant::now();
                                 let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                                if let Some(stats) = stats_ref.as_ref() {
+                                    stats.add_queue_wait(lock_start.elapsed());
+                                }
+                                let admin_start = Instant::now();
                                 if !guard.failed {
                                     guard.queue.push_back(UnifiedTask::Stage(0, block_idx));
                                     cv_ref.notify_one();
+                                }
+                                if let Some(stats) = stats_ref.as_ref() {
+                                    stats.add_queue_admin(admin_start.elapsed());
                                 }
                                 drop(guard);
                             } else {
@@ -400,6 +593,7 @@ fn compress_parallel_unified(
                                     results_ref,
                                     queue_ref,
                                     cv_ref,
+                                    stats_ref.as_deref(),
                                 );
                             }
                         }
@@ -408,7 +602,11 @@ fn compress_parallel_unified(
                     // Process Stage N requests individually — entropy GPU work
                     // already has internal batching (rans_encode_chunked_payload_gpu_batched).
                     for (stage_idx, block_idx, sb) in stage_n_queue {
+                        let t0 = Instant::now();
                         let result = run_compress_stage(pipeline, stage_idx, sb, &opts);
+                        if let Some(stats) = stats_ref.as_ref() {
+                            stats.add_stage_compute(t0.elapsed());
+                        }
                         if result.is_err() {
                             // GPU entropy failed — restart from stage 0 on CPU.
                             // The intermediate StageBlock is consumed so we cannot
@@ -417,10 +615,18 @@ fn compress_parallel_unified(
                                 "[pz-gpu] stage {stage_idx} failed for block {block_idx}; \
                                  retrying from stage 0 on CPU"
                             );
+                            let lock_start = Instant::now();
                             let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                            if let Some(stats) = stats_ref.as_ref() {
+                                stats.add_queue_wait(lock_start.elapsed());
+                            }
+                            let admin_start = Instant::now();
                             if !guard.failed {
                                 guard.queue.push_back(UnifiedTask::Stage(0, block_idx));
                                 cv_ref.notify_one();
+                            }
+                            if let Some(stats) = stats_ref.as_ref() {
+                                stats.add_queue_admin(admin_start.elapsed());
                             }
                             drop(guard);
                         } else {
@@ -435,17 +641,18 @@ fn compress_parallel_unified(
                                 results_ref,
                                 queue_ref,
                                 cv_ref,
+                                stats_ref.as_deref(),
                             );
                         }
                     }
 
                     // Process fused requests: run stages start..=end sequentially
                     // on GPU without intermediate queue round-trips.
-                    for (stage_start, stage_end, block_idx, data) in fused_queue {
+                    for (stage_start, stage_end, block_idx) in fused_queue {
                         let block = StageBlock {
                             block_index: block_idx,
-                            original_len: data.len(),
-                            data,
+                            original_len: blocks[block_idx].len(),
+                            data: blocks[block_idx].to_vec(),
                             streams: None,
                             metadata: StageMetadata::default(),
                         };
@@ -454,7 +661,11 @@ fn compress_parallel_unified(
                         for stage in stage_start..=stage_end {
                             match result {
                                 Ok(sb) => {
+                                    let t0 = Instant::now();
                                     result = run_compress_stage(pipeline, stage, sb, &opts);
+                                    if let Some(stats) = stats_ref.as_ref() {
+                                        stats.add_stage_compute(t0.elapsed());
+                                    }
                                     final_stage = stage;
                                 }
                                 Err(_) => break,
@@ -467,10 +678,18 @@ fn compress_parallel_unified(
                                 "[pz-gpu] fused stages {stage_start}..={stage_end} failed \
                                  for block {block_idx}; retrying on CPU"
                             );
+                            let lock_start = Instant::now();
                             let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                            if let Some(stats) = stats_ref.as_ref() {
+                                stats.add_queue_wait(lock_start.elapsed());
+                            }
+                            let admin_start = Instant::now();
                             if !guard.failed {
                                 guard.queue.push_back(UnifiedTask::Stage(0, block_idx));
                                 cv_ref.notify_one();
+                            }
+                            if let Some(stats) = stats_ref.as_ref() {
+                                stats.add_queue_admin(admin_start.elapsed());
                             }
                             drop(guard);
                         } else {
@@ -485,6 +704,7 @@ fn compress_parallel_unified(
                                 results_ref,
                                 queue_ref,
                                 cv_ref,
+                                stats_ref.as_deref(),
                             );
                         }
                     }
@@ -500,20 +720,36 @@ fn compress_parallel_unified(
             let slots_ref = &intermediate_slots;
             let results_ref = &results;
             let opts = resolved_options.clone();
+            let stats_ref = stats_local.clone();
             #[cfg(feature = "webgpu")]
             let gpu_tx_clone = gpu_tx.clone();
 
             scope.spawn(move || loop {
                 let task = {
+                    let lock_start = Instant::now();
                     let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                    if let Some(stats) = stats_ref.as_ref() {
+                        stats.add_queue_wait(lock_start.elapsed());
+                    }
                     loop {
+                        let admin_start = Instant::now();
                         if let Some(task) = guard.queue.pop_front() {
+                            if let Some(stats) = stats_ref.as_ref() {
+                                stats.add_queue_admin(admin_start.elapsed());
+                            }
                             break task;
+                        }
+                        if let Some(stats) = stats_ref.as_ref() {
+                            stats.add_queue_admin(admin_start.elapsed());
                         }
                         if guard.closed || (guard.failed && guard.queue.is_empty()) {
                             return;
                         }
+                        let wait_start = Instant::now();
                         guard = cv_ref.wait(guard).expect("unified queue wait poisoned");
+                        if let Some(stats) = stats_ref.as_ref() {
+                            stats.add_queue_wait(wait_start.elapsed());
+                        }
                     }
                 };
 
@@ -523,14 +759,28 @@ fn compress_parallel_unified(
                         // Route to GPU coordinator for fused multi-stage execution
                         #[cfg(feature = "webgpu")]
                         if let Some(ref tx) = gpu_tx_clone {
-                            let request = GpuRequest::Fused(start, end, b, blocks[b].to_vec());
+                            let handoff_start = Instant::now();
+                            let request = GpuRequest::Fused(start, end, b);
                             match tx.try_send(request) {
-                                Ok(()) => continue,
-                                Err(
-                                    std::sync::mpsc::TrySendError::Full(_)
-                                    | std::sync::mpsc::TrySendError::Disconnected(_),
-                                ) => {
+                                Ok(()) => {
+                                    if let Some(stats) = stats_ref.as_ref() {
+                                        stats.add_gpu_handoff(handoff_start.elapsed());
+                                    }
+                                    continue;
+                                }
+                                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                    if let Some(stats) = stats_ref.as_ref() {
+                                        stats.add_gpu_handoff(handoff_start.elapsed());
+                                        stats.inc_gpu_try_send_full();
+                                    }
                                     // Channel full or closed — fall through to CPU stage 0
+                                }
+                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                    if let Some(stats) = stats_ref.as_ref() {
+                                        stats.add_gpu_handoff(handoff_start.elapsed());
+                                        stats.inc_gpu_try_send_disconnected();
+                                    }
+                                    // Channel closed — fall through to CPU stage 0
                                 }
                             }
                         }
@@ -542,7 +792,7 @@ fn compress_parallel_unified(
                         #[cfg(feature = "webgpu")]
                         if let Some(ref tx) = gpu_tx_clone {
                             let request = if s == 0 {
-                                GpuRequest::Stage0(b, blocks[b].to_vec())
+                                GpuRequest::Stage0(b)
                             } else {
                                 let stage_block = slots_ref[b]
                                     .lock()
@@ -551,16 +801,35 @@ fn compress_parallel_unified(
                                     .expect("intermediate result missing");
                                 GpuRequest::StageN(s, b, stage_block)
                             };
+                            let handoff_start = Instant::now();
                             match tx.try_send(request) {
-                                Ok(()) => continue,
-                                Err(
-                                    std::sync::mpsc::TrySendError::Full(req)
-                                    | std::sync::mpsc::TrySendError::Disconnected(req),
-                                ) => {
+                                Ok(()) => {
+                                    if let Some(stats) = stats_ref.as_ref() {
+                                        stats.add_gpu_handoff(handoff_start.elapsed());
+                                    }
+                                    continue;
+                                }
+                                Err(std::sync::mpsc::TrySendError::Full(req)) => {
+                                    if let Some(stats) = stats_ref.as_ref() {
+                                        stats.add_gpu_handoff(handoff_start.elapsed());
+                                        stats.inc_gpu_try_send_full();
+                                    }
                                     // Channel full or closed — fall through to CPU.
                                     // Full: avoids deadlock where all workers block on
                                     // send() and nobody processes CPU tasks the coordinator
                                     // pushes back into the queue.
+                                    // Restore StageN's block to the intermediate slot
+                                    // so the CPU fallback path can .take() it.
+                                    if let GpuRequest::StageN(_, _, sb) = req {
+                                        *slots_ref[b].lock().expect("intermediate slot poisoned") =
+                                            Some(sb);
+                                    }
+                                }
+                                Err(std::sync::mpsc::TrySendError::Disconnected(req)) => {
+                                    if let Some(stats) = stats_ref.as_ref() {
+                                        stats.add_gpu_handoff(handoff_start.elapsed());
+                                        stats.inc_gpu_try_send_disconnected();
+                                    }
                                     // Disconnected: GPU coordinator exited.
                                     // Restore StageN's block to the intermediate slot
                                     // so the CPU fallback path can .take() it.
@@ -593,7 +862,11 @@ fn compress_parallel_unified(
                         .expect("intermediate result missing")
                 };
 
+                let t0 = Instant::now();
                 let result = run_compress_stage(pipeline, stage_idx, block, &opts);
+                if let Some(stats) = stats_ref.as_ref() {
+                    stats.add_stage_compute(t0.elapsed());
+                }
 
                 match result {
                     Ok(stage_block) => {
@@ -606,7 +879,12 @@ fn compress_parallel_unified(
                             *slots_ref[block_idx]
                                 .lock()
                                 .expect("intermediate slot poisoned") = Some(stage_block);
+                            let lock_start = Instant::now();
                             let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                            if let Some(stats) = stats_ref.as_ref() {
+                                stats.add_queue_wait(lock_start.elapsed());
+                            }
+                            let admin_start = Instant::now();
                             if !guard.failed {
                                 let next_stage = stage_idx + 1;
                                 let next_task = if next_stage == last_stage
@@ -623,12 +901,20 @@ fn compress_parallel_unified(
                                 *results_ref[block_idx].lock().expect("result slot poisoned") =
                                     Some(Err(PzError::InvalidInput));
                             }
+                            if let Some(stats) = stats_ref.as_ref() {
+                                stats.add_queue_admin(admin_start.elapsed());
+                            }
                         }
                     }
                     Err(e) => {
                         *results_ref[block_idx].lock().expect("result slot poisoned") =
                             Some(Err(e));
+                        let lock_start = Instant::now();
                         let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                        if let Some(stats) = stats_ref.as_ref() {
+                            stats.add_queue_wait(lock_start.elapsed());
+                        }
+                        let admin_start = Instant::now();
                         if !guard.failed {
                             guard.failed = true;
                             let dropped = guard.queue.len();
@@ -636,16 +922,30 @@ fn compress_parallel_unified(
                             guard.pending_tasks = guard.pending_tasks.saturating_sub(dropped);
                             cv_ref.notify_all();
                         }
+                        if let Some(stats) = stats_ref.as_ref() {
+                            stats.add_queue_admin(admin_start.elapsed());
+                        }
                     }
                 }
 
+                let lock_start = Instant::now();
                 let mut guard = queue_ref.lock().expect("unified queue poisoned");
+                if let Some(stats) = stats_ref.as_ref() {
+                    stats.add_queue_wait(lock_start.elapsed());
+                }
+                let admin_start = Instant::now();
                 debug_assert!(guard.pending_tasks > 0);
                 guard.pending_tasks -= 1;
                 if guard.pending_tasks == 0 {
                     guard.closed = true;
                     cv_ref.notify_all();
+                    if let Some(stats) = stats_ref.as_ref() {
+                        stats.add_queue_admin(admin_start.elapsed());
+                    }
                     return;
+                }
+                if let Some(stats) = stats_ref.as_ref() {
+                    stats.add_queue_admin(admin_start.elapsed());
                 }
             });
         }
@@ -692,6 +992,7 @@ fn complete_gpu_stage(
     results: &[Mutex<Option<PzResult<Vec<u8>>>>],
     queue: &Mutex<UnifiedQueueState>,
     queue_cv: &Condvar,
+    stats: Option<&LocalSchedulerStats>,
 ) {
     match result {
         Ok(sb) => {
@@ -701,7 +1002,12 @@ fn complete_gpu_stage(
                 *intermediate_slots[block_idx]
                     .lock()
                     .expect("intermediate slot poisoned") = Some(sb);
+                let lock_start = Instant::now();
                 let mut guard = queue.lock().expect("unified queue poisoned");
+                if let Some(stats) = stats {
+                    stats.add_queue_wait(lock_start.elapsed());
+                }
+                let admin_start = Instant::now();
                 if !guard.failed {
                     let next_stage = stage_idx + 1;
                     let next_task = if next_stage == last_stage
@@ -715,11 +1021,19 @@ fn complete_gpu_stage(
                     guard.pending_tasks += 1;
                     queue_cv.notify_one();
                 }
+                if let Some(stats) = stats {
+                    stats.add_queue_admin(admin_start.elapsed());
+                }
             }
         }
         Err(e) => {
             *results[block_idx].lock().expect("result slot poisoned") = Some(Err(e));
+            let lock_start = Instant::now();
             let mut guard = queue.lock().expect("unified queue poisoned");
+            if let Some(stats) = stats {
+                stats.add_queue_wait(lock_start.elapsed());
+            }
+            let admin_start = Instant::now();
             if !guard.failed {
                 guard.failed = true;
                 let dropped = guard.queue.len();
@@ -733,17 +1047,28 @@ fn complete_gpu_stage(
                 guard.closed = true;
             }
             queue_cv.notify_all();
+            if let Some(stats) = stats {
+                stats.add_queue_admin(admin_start.elapsed());
+            }
             return;
         }
     }
 
     // Decrement pending_tasks and check for completion
+    let lock_start = Instant::now();
     let mut guard = queue.lock().expect("unified queue poisoned");
+    if let Some(stats) = stats {
+        stats.add_queue_wait(lock_start.elapsed());
+    }
+    let admin_start = Instant::now();
     debug_assert!(guard.pending_tasks > 0);
     guard.pending_tasks -= 1;
     if guard.pending_tasks == 0 {
         guard.closed = true;
         queue_cv.notify_all();
+    }
+    if let Some(stats) = stats {
+        stats.add_queue_admin(admin_start.elapsed());
     }
 }
 
@@ -1510,6 +1835,49 @@ mod tests {
         let compressed = super::super::compress_with_options(&input, Pipeline::Lzf, &opts).unwrap();
         let decompressed = super::super::decompress(&compressed).unwrap();
         assert_eq!(decompressed, input, "GPU Lzf round-trip failed");
+    }
+
+    #[test]
+    #[cfg(feature = "webgpu")]
+    fn test_lzr_backend_assignments_are_interchangeable() {
+        use crate::pipeline::{Backend, BackendAssignment};
+        use crate::webgpu::WebGpuEngine;
+
+        let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
+        let engine = match WebGpuEngine::new() {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(_) => return,
+        };
+
+        let cases = [
+            ("cpu/cpu", BackendAssignment::Cpu, BackendAssignment::Cpu),
+            ("gpu/cpu", BackendAssignment::Gpu, BackendAssignment::Cpu),
+            ("cpu/gpu", BackendAssignment::Cpu, BackendAssignment::Gpu),
+            (
+                "auto/auto",
+                BackendAssignment::Auto,
+                BackendAssignment::Auto,
+            ),
+        ];
+
+        for (label, stage0_backend, stage1_backend) in cases {
+            let opts = CompressOptions {
+                backend: Backend::WebGpu,
+                threads: 2,
+                block_size: 256 * 1024,
+                stage0_backend,
+                stage1_backend,
+                webgpu_engine: Some(engine.clone()),
+                ..CompressOptions::default()
+            };
+            let compressed =
+                super::super::compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
+            let decompressed = super::super::decompress(&compressed).unwrap();
+            assert_eq!(
+                decompressed, input,
+                "Lzr round-trip failed for interchangeable backends: {label}"
+            );
+        }
     }
 
     // Test that the channel-full fallback path produces correct results.
