@@ -78,6 +78,10 @@ If a target is missed, the commit may still land only with an explicit follow-up
    1. Increased GPU request channel depth from fixed `4` to adaptive `min(num_blocks, 2*worker_count)` clamped to `1..16` to reduce transient `try_send(Full)` fallback pressure.
    2. Reordered GPU coordinator servicing to process StageN and fused requests before Stage0 batches for better downstream fairness.
    3. Validation: `cargo test pipeline::parallel::tests` and targeted WebGPU-feature interchangeability tests pass.
+6. Phase 4 progress:
+   1. Added backpressure-aware Auto stage1 entropy routing heuristic using GPU channel pressure score (`try_send` success/full/disconnected feedback).
+   2. Explicit backend assignments remain strict: `Gpu` is never demoted by pressure and `Cpu` is never promoted.
+   3. Added deterministic unit tests for Auto pressure behavior and explicit-backend invariants.
 
 ## Execution Phases
 

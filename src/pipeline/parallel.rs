@@ -11,7 +11,7 @@
 use crate::{PzError, PzResult};
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Condvar, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant};
@@ -248,29 +248,49 @@ pub(crate) fn unified_scheduler_stats() -> UnifiedSchedulerStats {
         .expect("unified scheduler stats lock poisoned")
 }
 
-/// Determine whether to route a block to GPU entropy encoding.
-///
-/// Checks the backend assignment setting and block size to decide if GPU entropy
-/// should be used. Returns false when no GPU is available or when CPU is explicitly
-/// assigned or when the block is too small.
-fn should_route_block_to_gpu_entropy(block: &[u8], options: &CompressOptions) -> bool {
+fn should_route_block_to_gpu_entropy_with_backpressure(
+    block_len: usize,
+    stage1_backend: super::BackendAssignment,
+    has_gpu_entropy: bool,
+    auto_backpressure_score: usize,
+    auto_backpressure_limit: usize,
+) -> bool {
     #[cfg(feature = "webgpu")]
     {
         use super::{BackendAssignment, GPU_ENTROPY_THRESHOLD};
-        match options.stage1_backend {
-            BackendAssignment::Gpu => options.webgpu_engine.is_some(),
+        match stage1_backend {
+            BackendAssignment::Gpu => has_gpu_entropy,
             BackendAssignment::Cpu => false,
             BackendAssignment::Auto => {
-                options.webgpu_engine.is_some() && block.len() >= GPU_ENTROPY_THRESHOLD
+                has_gpu_entropy
+                    && block_len >= GPU_ENTROPY_THRESHOLD
+                    && auto_backpressure_score < auto_backpressure_limit
             }
         }
     }
     #[cfg(not(feature = "webgpu"))]
     {
-        let _ = block;
-        let _ = options;
+        let _ = block_len;
+        let _ = stage1_backend;
+        let _ = has_gpu_entropy;
+        let _ = auto_backpressure_score;
+        let _ = auto_backpressure_limit;
         false
     }
+}
+
+#[cfg(feature = "webgpu")]
+#[inline]
+fn pressure_inc(score: &AtomicUsize, delta: usize) {
+    score.fetch_add(delta, Ordering::Relaxed);
+}
+
+#[cfg(feature = "webgpu")]
+#[inline]
+fn pressure_dec(score: &AtomicUsize) {
+    let _ = score.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(1))
+    });
 }
 
 /// Determine whether to route a block's Stage 0 (LZ77/LzSeq match-finding) to GPU.
@@ -386,6 +406,18 @@ fn compress_parallel_unified(
         matches!(options.backend, super::Backend::WebGpu) && options.webgpu_engine.is_some();
     #[cfg(not(feature = "webgpu"))]
     let has_gpu = false;
+    #[cfg(feature = "webgpu")]
+    let gpu_auto_backpressure = if has_gpu {
+        Some(Arc::new(AtomicUsize::new(0)))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "webgpu"))]
+    let gpu_auto_backpressure: Option<Arc<AtomicUsize>> = None;
+    #[cfg(feature = "webgpu")]
+    let gpu_auto_backpressure_limit = worker_count.saturating_mul(2).max(4);
+    #[cfg(not(feature = "webgpu"))]
+    let gpu_auto_backpressure_limit = 0usize;
 
     // Determine if this pipeline can fuse all GPU stages.
     #[cfg(feature = "webgpu")]
@@ -405,7 +437,13 @@ fn compress_parallel_unified(
                 // If the pipeline supports fusion and entropy also qualifies for GPU,
                 // fuse all stages into a single GPU coordinator dispatch.
                 if let Some((start, end)) = fused_span {
-                    if should_route_block_to_gpu_entropy(blocks[i], &resolved_options) {
+                    if should_route_block_to_gpu_entropy_with_backpressure(
+                        blocks[i].len(),
+                        resolved_options.stage1_backend,
+                        resolved_options.webgpu_engine.is_some(),
+                        0,
+                        gpu_auto_backpressure_limit,
+                    ) {
                         return UnifiedTask::FusedGpu(start, end, i);
                     }
                 }
@@ -455,6 +493,8 @@ fn compress_parallel_unified(
             let results_ref = &results;
             let opts = resolved_options.clone();
             let stats_ref = stats_local.clone();
+            let gpu_pressure_ref = gpu_auto_backpressure.clone();
+            let gpu_pressure_limit = gpu_auto_backpressure_limit;
 
             scope.spawn(move || {
                 let engine = opts.webgpu_engine.as_ref().unwrap();
@@ -527,6 +567,8 @@ fn compress_parallel_unified(
                                 queue_ref,
                                 cv_ref,
                                 stats_ref.as_deref(),
+                                gpu_pressure_ref.as_deref(),
+                                gpu_pressure_limit,
                             );
                         }
                     }
@@ -590,6 +632,8 @@ fn compress_parallel_unified(
                                 queue_ref,
                                 cv_ref,
                                 stats_ref.as_deref(),
+                                gpu_pressure_ref.as_deref(),
+                                gpu_pressure_limit,
                             );
                         }
                     }
@@ -633,6 +677,8 @@ fn compress_parallel_unified(
                                         queue_ref,
                                         cv_ref,
                                         stats_ref.as_deref(),
+                                        gpu_pressure_ref.as_deref(),
+                                        gpu_pressure_limit,
                                     );
                                 }
                             }
@@ -710,6 +756,8 @@ fn compress_parallel_unified(
                                     queue_ref,
                                     cv_ref,
                                     stats_ref.as_deref(),
+                                    gpu_pressure_ref.as_deref(),
+                                    gpu_pressure_limit,
                                 );
                             }
                         }
@@ -727,6 +775,8 @@ fn compress_parallel_unified(
             let results_ref = &results;
             let opts = resolved_options.clone();
             let stats_ref = stats_local.clone();
+            let gpu_pressure_ref = gpu_auto_backpressure.clone();
+            let gpu_pressure_limit = gpu_auto_backpressure_limit;
             #[cfg(feature = "webgpu")]
             let gpu_tx_clone = gpu_tx.clone();
 
@@ -772,6 +822,9 @@ fn compress_parallel_unified(
                                     if let Some(stats) = stats_ref.as_ref() {
                                         stats.add_gpu_handoff(handoff_start.elapsed());
                                     }
+                                    if let Some(score) = gpu_pressure_ref.as_ref() {
+                                        pressure_dec(score);
+                                    }
                                     continue;
                                 }
                                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
@@ -779,12 +832,18 @@ fn compress_parallel_unified(
                                         stats.add_gpu_handoff(handoff_start.elapsed());
                                         stats.inc_gpu_try_send_full();
                                     }
+                                    if let Some(score) = gpu_pressure_ref.as_ref() {
+                                        pressure_inc(score, 2);
+                                    }
                                     // Channel full or closed — fall through to CPU stage 0
                                 }
                                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                                     if let Some(stats) = stats_ref.as_ref() {
                                         stats.add_gpu_handoff(handoff_start.elapsed());
                                         stats.inc_gpu_try_send_disconnected();
+                                    }
+                                    if let Some(score) = gpu_pressure_ref.as_ref() {
+                                        pressure_inc(score, 1);
                                     }
                                     // Channel closed — fall through to CPU stage 0
                                 }
@@ -813,12 +872,18 @@ fn compress_parallel_unified(
                                     if let Some(stats) = stats_ref.as_ref() {
                                         stats.add_gpu_handoff(handoff_start.elapsed());
                                     }
+                                    if let Some(score) = gpu_pressure_ref.as_ref() {
+                                        pressure_dec(score);
+                                    }
                                     continue;
                                 }
                                 Err(std::sync::mpsc::TrySendError::Full(req)) => {
                                     if let Some(stats) = stats_ref.as_ref() {
                                         stats.add_gpu_handoff(handoff_start.elapsed());
                                         stats.inc_gpu_try_send_full();
+                                    }
+                                    if let Some(score) = gpu_pressure_ref.as_ref() {
+                                        pressure_inc(score, 2);
                                     }
                                     // Channel full or closed — fall through to CPU.
                                     // Full: avoids deadlock where all workers block on
@@ -835,6 +900,9 @@ fn compress_parallel_unified(
                                     if let Some(stats) = stats_ref.as_ref() {
                                         stats.add_gpu_handoff(handoff_start.elapsed());
                                         stats.inc_gpu_try_send_disconnected();
+                                    }
+                                    if let Some(score) = gpu_pressure_ref.as_ref() {
+                                        pressure_inc(score, 1);
                                     }
                                     // Disconnected: GPU coordinator exited.
                                     // Restore StageN's block to the intermediate slot
@@ -887,9 +955,18 @@ fn compress_parallel_unified(
                                 .lock()
                                 .expect("intermediate slot poisoned") = Some(stage_block);
                             let next_stage = stage_idx + 1;
+                            let backpressure_score = gpu_pressure_ref
+                                .as_ref()
+                                .map_or(0usize, |s| s.load(Ordering::Relaxed));
                             next_task = Some(
                                 if next_stage == last_stage
-                                    && should_route_block_to_gpu_entropy(blocks[block_idx], &opts)
+                                    && should_route_block_to_gpu_entropy_with_backpressure(
+                                        blocks[block_idx].len(),
+                                        opts.stage1_backend,
+                                        opts.webgpu_engine.is_some(),
+                                        backpressure_score,
+                                        gpu_pressure_limit,
+                                    )
                                 {
                                     UnifiedTask::StageGpu(next_stage, block_idx)
                                 } else {
@@ -1006,6 +1083,8 @@ fn complete_gpu_stage(
     queue: &Mutex<UnifiedQueueState>,
     queue_cv: &Condvar,
     stats: Option<&LocalSchedulerStats>,
+    gpu_pressure: Option<&AtomicUsize>,
+    gpu_pressure_limit: usize,
 ) {
     let mut next_task: Option<UnifiedTask> = None;
     let mut stage_failed = false;
@@ -1020,9 +1099,16 @@ fn complete_gpu_stage(
                     .lock()
                     .expect("intermediate slot poisoned") = Some(sb);
                 let next_stage = stage_idx + 1;
+                let backpressure_score = gpu_pressure.map_or(0usize, |s| s.load(Ordering::Relaxed));
                 next_task = Some(
                     if next_stage == last_stage
-                        && should_route_block_to_gpu_entropy(blocks[block_idx], options)
+                        && should_route_block_to_gpu_entropy_with_backpressure(
+                            blocks[block_idx].len(),
+                            options.stage1_backend,
+                            options.webgpu_engine.is_some(),
+                            backpressure_score,
+                            gpu_pressure_limit,
+                        )
                     {
                         UnifiedTask::StageGpu(next_stage, block_idx)
                     } else {
@@ -1238,6 +1324,68 @@ mod tests {
             .expect("compression failed");
         let decompressed = super::super::decompress(&compressed).expect("decompression failed");
         assert_eq!(decompressed, input, "round-trip should match");
+    }
+
+    #[cfg(feature = "webgpu")]
+    #[test]
+    fn test_stage1_auto_backpressure_biases_to_cpu() {
+        use super::super::BackendAssignment;
+        use super::super::GPU_ENTROPY_THRESHOLD;
+
+        let block_len = GPU_ENTROPY_THRESHOLD * 2;
+        let limit = 8usize;
+
+        assert!(
+            should_route_block_to_gpu_entropy_with_backpressure(
+                block_len,
+                BackendAssignment::Auto,
+                true,
+                0,
+                limit,
+            ),
+            "auto should route to GPU when pressure is low"
+        );
+        assert!(
+            !should_route_block_to_gpu_entropy_with_backpressure(
+                block_len,
+                BackendAssignment::Auto,
+                true,
+                limit,
+                limit,
+            ),
+            "auto should bias to CPU when pressure reaches limit"
+        );
+    }
+
+    #[cfg(feature = "webgpu")]
+    #[test]
+    fn test_stage1_backpressure_does_not_override_explicit_backend() {
+        use super::super::BackendAssignment;
+        use super::super::GPU_ENTROPY_THRESHOLD;
+
+        let block_len = GPU_ENTROPY_THRESHOLD * 2;
+        let high_pressure = 1_000usize;
+
+        assert!(
+            should_route_block_to_gpu_entropy_with_backpressure(
+                block_len,
+                BackendAssignment::Gpu,
+                true,
+                high_pressure,
+                1,
+            ),
+            "explicit GPU assignment should remain GPU regardless of pressure"
+        );
+        assert!(
+            !should_route_block_to_gpu_entropy_with_backpressure(
+                block_len,
+                BackendAssignment::Cpu,
+                true,
+                0,
+                1,
+            ),
+            "explicit CPU assignment should remain CPU regardless of pressure"
+        );
     }
 
     // --- Task 3 tests: Round-trip correctness and threshold boundary ---
