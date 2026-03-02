@@ -27,6 +27,7 @@ fn usage() {
     eprintln!("  --stage S       Profile a single stage instead of full pipeline:");
     eprintln!("                    lz77, huffman, bwt, mtf, rle, fse, rans");
     eprintln!("  --decompress    Profile decompression instead of compression");
+    eprintln!("  --gpu           Use WebGPU backend for full-pipeline profiling");
     eprintln!("  --iterations N  Number of iterations (default: 200)");
     eprintln!("  --size N        Input data size in bytes (default: 262144)");
     eprintln!(
@@ -51,7 +52,7 @@ fn usage() {
     eprintln!(
         "  --rans-independent-block-bytes N  Split input into independent blocks for nvCOMP-style stage profiling (default: disabled)"
     );
-    eprintln!("  --unified-scheduler           Enable prototype mixed-task scheduler");
+    eprintln!("  --print-scheduler-stats       Print unified scheduler telemetry after run");
     eprintln!("  --help          Show this help");
 }
 
@@ -465,6 +466,7 @@ fn main() {
     let mut pipeline_name = "lzf".to_string();
     let mut stage: Option<String> = None;
     let mut decompress = false;
+    let mut use_gpu = false;
     let mut iterations = 200usize;
     let mut size = 262_144usize;
     let mut rans_interleaved = false;
@@ -475,6 +477,7 @@ fn main() {
     let mut rans_chunk_bytes = DEFAULT_RANS_CHUNK_BYTES;
     let mut rans_gpu_batch = DEFAULT_RANS_GPU_BATCH;
     let mut rans_independent_block_bytes = 0usize;
+    let mut print_scheduler_stats = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -488,6 +491,7 @@ fn main() {
                 stage = Some(args[i].clone());
             }
             "--decompress" | "-d" => decompress = true,
+            "--gpu" => use_gpu = true,
             "--iterations" | "-n" => {
                 i += 1;
                 iterations = args[i].parse().expect("invalid iterations");
@@ -533,6 +537,9 @@ fn main() {
                     .parse()
                     .expect("invalid --rans-independent-block-bytes");
             }
+            "--print-scheduler-stats" => {
+                print_scheduler_stats = true;
+            }
             "--help" | "-h" => {
                 usage();
                 return;
@@ -557,7 +564,17 @@ fn main() {
         independent_block_bytes: rans_independent_block_bytes,
     };
 
+    pipeline::set_unified_scheduler_stats_enabled(print_scheduler_stats);
+    if print_scheduler_stats {
+        pipeline::reset_unified_scheduler_stats();
+    }
+
     if let Some(ref stage_name) = stage {
+        if use_gpu {
+            eprintln!(
+                "note: --gpu applies to full-pipeline mode; stage mode uses stage-specific paths"
+            );
+        }
         profile_stage(&data, stage_name, decompress, iterations, rans_profile_opts);
     } else {
         let pipe = match pipeline_name.as_str() {
@@ -577,14 +594,53 @@ fn main() {
         };
 
         // Warm up once
-        let opts = CompressOptions {
+        let mut opts = CompressOptions {
             rans_interleaved,
             rans_interleaved_min_bytes,
             rans_interleaved_states,
             ..CompressOptions::default()
         };
+        #[cfg(feature = "webgpu")]
+        if use_gpu {
+            let engine = match pz::webgpu::WebGpuEngine::new() {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("webgpu requested but unavailable: {e}");
+                    std::process::exit(2);
+                }
+            };
+            eprintln!("using webgpu device: {}", engine.device_name());
+            opts.backend = pz::pipeline::Backend::WebGpu;
+            opts.webgpu_engine = Some(std::sync::Arc::new(engine));
+        }
+        #[cfg(not(feature = "webgpu"))]
+        if use_gpu {
+            eprintln!("webgpu requested but this binary was built without `webgpu` feature");
+            std::process::exit(2);
+        }
         let _ = pipeline::compress_with_options(&data, pipe, &opts).unwrap();
+        if print_scheduler_stats {
+            pipeline::reset_unified_scheduler_stats();
+        }
 
         profile_pipeline(&data, pipe, decompress, iterations, &opts);
+    }
+
+    if print_scheduler_stats {
+        let stats = pipeline::unified_scheduler_stats();
+        println!(
+            "SCHEDULER_STATS\truns={}\ttotal_ns={}\ttracked_thread_time_ns={}\tstage_compute_ns={}\tqueue_wait_ns={}\tqueue_admin_ns={}\tgpu_handoff_ns={}\tgpu_try_send_full_count={}\tgpu_try_send_disconnected_count={}\tscheduler_overhead_ns={}\tscheduler_overhead_pct={:.6}",
+            stats.runs,
+            stats.total_ns,
+            stats.tracked_thread_time_ns(),
+            stats.stage_compute_ns,
+            stats.queue_wait_ns,
+            stats.queue_admin_ns,
+            stats.gpu_handoff_ns,
+            stats.gpu_try_send_full_count,
+            stats.gpu_try_send_disconnected_count,
+            stats.scheduler_overhead_ns(),
+            stats.scheduler_overhead_pct()
+        );
     }
 }

@@ -39,6 +39,7 @@ use crate::lz77;
 use crate::{PzError, PzResult};
 
 pub(crate) use blocks::{compress_block, decompress_block};
+pub use parallel::UnifiedSchedulerStats;
 use parallel::{compress_parallel, decompress_parallel};
 
 /// Compute backend selection for pipeline stages.
@@ -314,6 +315,23 @@ impl TryFrom<u8> for Pipeline {
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/// Enable or disable unified scheduler telemetry collection.
+///
+/// Disabled by default to avoid profiling overhead in normal runs.
+pub fn set_unified_scheduler_stats_enabled(enabled: bool) {
+    parallel::set_unified_scheduler_stats_enabled(enabled);
+}
+
+/// Reset all aggregated unified scheduler telemetry counters/timers.
+pub fn reset_unified_scheduler_stats() {
+    parallel::reset_unified_scheduler_stats();
+}
+
+/// Snapshot the current aggregated unified scheduler telemetry.
+pub fn unified_scheduler_stats() -> UnifiedSchedulerStats {
+    parallel::unified_scheduler_stats()
+}
 
 /// Compress data using the specified pipeline (CPU backend).
 ///
