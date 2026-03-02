@@ -9,7 +9,7 @@
 ///   samply record ./target/profiling/examples/profile --stage lz77
 ///   samply record ./target/profiling/examples/profile --stage fse --size 1048576
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pz::pipeline::{self, CompressOptions, Pipeline};
 
@@ -28,6 +28,7 @@ fn usage() {
     eprintln!("                    lz77, huffman, bwt, mtf, rle, fse, rans");
     eprintln!("  --decompress    Profile decompression instead of compression");
     eprintln!("  --gpu           Use WebGPU backend for full-pipeline profiling");
+    eprintln!("  --threads N     Threads for pipeline mode (0=auto, default: 0)");
     eprintln!("  --iterations N  Number of iterations (default: 200)");
     eprintln!("  --size N        Input data size in bytes (default: 262144)");
     eprintln!(
@@ -54,6 +55,14 @@ fn usage() {
     );
     eprintln!("  --print-scheduler-stats       Print unified scheduler telemetry after run");
     eprintln!("  --help          Show this help");
+}
+
+fn print_profile_stats(mbps: f64, elapsed: Duration) {
+    eprintln!(
+        "PROFILE_STATS\tmbps={:.6}\telapsed_ns={}",
+        mbps,
+        elapsed.as_nanos()
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -122,12 +131,15 @@ fn profile_pipeline(
         );
         let start = Instant::now();
         for _ in 0..iterations {
-            let _ = std::hint::black_box(pipeline::decompress(&compressed).unwrap());
+            let _ = std::hint::black_box(
+                pipeline::decompress_with_threads(&compressed, opts.threads).unwrap(),
+            );
         }
         let elapsed = start.elapsed();
         let mbps =
             (data.len() as f64 * iterations as f64) / elapsed.as_secs_f64() / (1024.0 * 1024.0);
         eprintln!("done: {:.1}s, {:.1} MB/s", elapsed.as_secs_f64(), mbps);
+        print_profile_stats(mbps, elapsed);
     } else {
         eprintln!(
             "profiling {:?} compress: {} bytes, {} iterations",
@@ -144,6 +156,7 @@ fn profile_pipeline(
         let mbps =
             (data.len() as f64 * iterations as f64) / elapsed.as_secs_f64() / (1024.0 * 1024.0);
         eprintln!("done: {:.1}s, {:.1} MB/s", elapsed.as_secs_f64(), mbps);
+        print_profile_stats(mbps, elapsed);
     }
 }
 
@@ -305,6 +318,7 @@ fn profile_stage(
     let elapsed = start.elapsed();
     let mbps = (data.len() as f64 * iterations as f64) / elapsed.as_secs_f64() / (1024.0 * 1024.0);
     eprintln!("done: {:.1}s, {:.1} MB/s", elapsed.as_secs_f64(), mbps);
+    print_profile_stats(mbps, elapsed);
 }
 
 #[cfg(feature = "webgpu")]
@@ -467,6 +481,7 @@ fn main() {
     let mut stage: Option<String> = None;
     let mut decompress = false;
     let mut use_gpu = false;
+    let mut threads = 0usize;
     let mut iterations = 200usize;
     let mut size = 262_144usize;
     let mut rans_interleaved = false;
@@ -492,6 +507,10 @@ fn main() {
             }
             "--decompress" | "-d" => decompress = true,
             "--gpu" => use_gpu = true,
+            "--threads" | "-t" => {
+                i += 1;
+                threads = args[i].parse().expect("invalid threads");
+            }
             "--iterations" | "-n" => {
                 i += 1;
                 iterations = args[i].parse().expect("invalid iterations");
@@ -575,6 +594,9 @@ fn main() {
                 "note: --gpu applies to full-pipeline mode; stage mode uses stage-specific paths"
             );
         }
+        if threads != 0 {
+            eprintln!("note: --threads applies to full-pipeline mode; stage mode ignores it");
+        }
         profile_stage(&data, stage_name, decompress, iterations, rans_profile_opts);
     } else {
         let pipe = match pipeline_name.as_str() {
@@ -595,6 +617,7 @@ fn main() {
 
         // Warm up once
         let mut opts = CompressOptions {
+            threads,
             rans_interleaved,
             rans_interleaved_min_bytes,
             rans_interleaved_states,

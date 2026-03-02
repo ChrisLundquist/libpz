@@ -360,7 +360,8 @@ fn gpu_fused_span(pipeline: Pipeline) -> Option<(usize, usize)> {
 #[cfg(feature = "webgpu")]
 enum GpuRequest {
     /// Stage 0: LZ77/LzSeq match-finding on GPU.
-    /// (block_idx)
+    /// Carries only `block_idx`: the coordinator reads immutable input slices
+    /// directly from the parent-scoped `blocks` array to avoid payload copies.
     Stage0(usize),
     /// Stage 1+: entropy encoding on GPU.
     /// (stage_idx, block_idx, stage_block)
@@ -368,6 +369,58 @@ enum GpuRequest {
     /// Fused: run stages start..=end on GPU without queue round-trips.
     /// (stage_start, stage_end, block_idx)
     Fused(usize, usize, usize),
+}
+
+/// Apply unified queue completion semantics for one finished task.
+///
+/// Returns `(mark_invalid_after_lock, should_return_worker)`.
+fn complete_task_lifecycle(
+    guard: &mut UnifiedQueueState,
+    queue_cv: &Condvar,
+    next_task: Option<UnifiedTask>,
+    stage_failed: bool,
+    mark_invalid_on_failed_final: bool,
+) -> (bool, bool) {
+    let mut mark_invalid_after_lock = false;
+    let mut should_return = false;
+
+    if stage_failed {
+        if !guard.failed {
+            guard.failed = true;
+            let dropped = guard.queue.len();
+            guard.queue.clear();
+            guard.pending_tasks = guard.pending_tasks.saturating_sub(dropped);
+            queue_cv.notify_all();
+        }
+        debug_assert!(guard.pending_tasks > 0);
+        guard.pending_tasks -= 1;
+    } else if let Some(task) = next_task {
+        if !guard.failed {
+            // Current task transitions into next stage; pending is unchanged.
+            guard.queue.push_back(task);
+            queue_cv.notify_one();
+        } else {
+            // Scheduler already failed; retire this task.
+            debug_assert!(guard.pending_tasks > 0);
+            guard.pending_tasks -= 1;
+            mark_invalid_after_lock = true;
+        }
+    } else {
+        if mark_invalid_on_failed_final && guard.failed {
+            mark_invalid_after_lock = true;
+        }
+        // Final-stage success retires one pending task.
+        debug_assert!(guard.pending_tasks > 0);
+        guard.pending_tasks -= 1;
+    }
+
+    if guard.pending_tasks == 0 {
+        guard.closed = true;
+        queue_cv.notify_all();
+        should_return = true;
+    }
+
+    (mark_invalid_after_lock, should_return)
 }
 
 fn compress_parallel_unified(
@@ -955,7 +1008,6 @@ fn compress_parallel_unified(
                     };
 
                     let mut stage_failed = false;
-                    let mut mark_invalid_after_lock = false;
                     let t0 = Instant::now();
                     let result = run_compress_stage(pipeline, stage_idx, block, &opts);
                     if let Some(stats) = stats_ref.as_ref() {
@@ -1055,32 +1107,8 @@ fn compress_parallel_unified(
                         stats.add_queue_wait(lock_start.elapsed());
                     }
                     let admin_start = Instant::now();
-                    let mut should_return = false;
-
-                    if stage_failed {
-                        if !guard.failed {
-                            guard.failed = true;
-                            let dropped = guard.queue.len();
-                            guard.queue.clear();
-                            guard.pending_tasks = guard.pending_tasks.saturating_sub(dropped);
-                            cv_ref.notify_all();
-                        }
-                        debug_assert!(guard.pending_tasks > 0);
-                        guard.pending_tasks -= 1;
-                    } else {
-                        if guard.failed {
-                            mark_invalid_after_lock = true;
-                        }
-                        // Final-stage success retires one pending task.
-                        debug_assert!(guard.pending_tasks > 0);
-                        guard.pending_tasks -= 1;
-                    }
-
-                    if guard.pending_tasks == 0 {
-                        guard.closed = true;
-                        cv_ref.notify_all();
-                        should_return = true;
-                    }
+                    let (mark_invalid_after_lock, should_return) =
+                        complete_task_lifecycle(&mut guard, cv_ref, None, stage_failed, true);
                     if let Some(stats) = stats_ref.as_ref() {
                         stats.add_queue_admin(admin_start.elapsed());
                     }
@@ -1145,7 +1173,6 @@ fn complete_gpu_stage(
 ) {
     let mut next_task: Option<UnifiedTask> = None;
     let mut stage_failed = false;
-    let mut mark_invalid_after_lock = false;
 
     match result {
         Ok(sb) => {
@@ -1187,36 +1214,8 @@ fn complete_gpu_stage(
         stats.add_queue_wait(lock_start.elapsed());
     }
     let admin_start = Instant::now();
-    if stage_failed {
-        if !guard.failed {
-            guard.failed = true;
-            let dropped = guard.queue.len();
-            guard.queue.clear();
-            guard.pending_tasks = guard.pending_tasks.saturating_sub(dropped);
-            queue_cv.notify_all();
-        }
-        debug_assert!(guard.pending_tasks > 0);
-        guard.pending_tasks -= 1;
-    } else if let Some(task) = next_task {
-        if !guard.failed {
-            // Current task transitions into next stage; pending is unchanged.
-            guard.queue.push_back(task);
-            queue_cv.notify_one();
-        } else {
-            // Scheduler already failed; retire this task.
-            debug_assert!(guard.pending_tasks > 0);
-            guard.pending_tasks -= 1;
-            mark_invalid_after_lock = true;
-        }
-    } else {
-        // Final-stage success retires one pending task.
-        debug_assert!(guard.pending_tasks > 0);
-        guard.pending_tasks -= 1;
-    }
-    if guard.pending_tasks == 0 {
-        guard.closed = true;
-        queue_cv.notify_all();
-    }
+    let (mark_invalid_after_lock, _) =
+        complete_task_lifecycle(&mut guard, queue_cv, next_task, stage_failed, false);
     if let Some(stats) = stats {
         stats.add_queue_admin(admin_start.elapsed());
     }
