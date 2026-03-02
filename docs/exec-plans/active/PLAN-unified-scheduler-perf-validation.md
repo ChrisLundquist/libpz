@@ -74,6 +74,10 @@ If a target is missed, the commit may still land only with an explicit follow-up
    2. `GpuRequest::Stage0`/`GpuRequest::Fused` now pass block indices and coordinator reads block slices directly.
    3. Collapsed per-task completion bookkeeping from two queue locks to one in both CPU worker and GPU completion paths (pending replacement semantics preserved).
    4. A/B (same-laptop, alternating order, 1MB, 20 iters, 3 repeats) vs `c502fb5` showed lower scheduler overhead on `deflate/lzr/lzf` with throughput deltas within gate tolerance in median; `lzseqr` overhead change was small (+0.0032 abs).
+5. Phase 3 progress:
+   1. Increased GPU request channel depth from fixed `4` to adaptive `min(num_blocks, 2*worker_count)` clamped to `1..16` to reduce transient `try_send(Full)` fallback pressure.
+   2. Reordered GPU coordinator servicing to process StageN and fused requests before Stage0 batches for better downstream fairness.
+   3. Validation: `cargo test pipeline::parallel::tests` and targeted WebGPU-feature interchangeability tests pass.
 
 ## Execution Phases
 
