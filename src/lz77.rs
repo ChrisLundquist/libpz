@@ -358,8 +358,12 @@ impl HashChainFinder {
         let mut best_probe_byte: u8 = 0;
         let min_pos = pos.saturating_sub(max_lookback);
         let mut chain_count = 0;
-        let pos_suffix = &input[pos..];
         let cmp_limit = remaining.min(self.max_match_len);
+        let input_ptr = input.as_ptr();
+        // SAFETY: `pos < input.len()` whenever `remaining > 0`.
+        let pos_ptr = unsafe { input_ptr.add(pos) };
+        let prev = &self.prev;
+        let window_mask = self.window_mask;
 
         while chain_pos >= min_pos && chain_pos < pos && chain_count < self.max_chain {
             // If a candidate differs at the current best-length probe point,
@@ -367,8 +371,10 @@ impl HashChainFinder {
             if best_length >= MIN_MATCH as u32 {
                 let probe = best_length as usize;
                 debug_assert!(probe < remaining);
-                if input[chain_pos + probe] != best_probe_byte {
-                    let prev_pos = self.prev[chain_pos & self.window_mask] as usize;
+                // SAFETY: chain_pos < pos and probe < remaining guarantees in-bounds.
+                let candidate_probe = unsafe { *input_ptr.add(chain_pos + probe) };
+                if candidate_probe != best_probe_byte {
+                    let prev_pos = prev[chain_pos & window_mask] as usize;
                     if prev_pos >= chain_pos || prev_pos < min_pos {
                         break;
                     }
@@ -384,10 +390,10 @@ impl HashChainFinder {
             // efficient encoding of repeated-byte runs (e.g., offset=1, length=999
             // for 1000 identical bytes). The decompressor's byte-by-byte copy loop
             // already handles the overlap correctly.
-            let match_len =
+            let match_len = unsafe {
                 self.dispatcher
-                    .compare_bytes(&input[chain_pos..], pos_suffix, cmp_limit)
-                    as u32;
+                    .compare_bytes_ptr(input_ptr.add(chain_pos), pos_ptr, cmp_limit)
+            } as u32;
 
             if match_len > best_length && match_len >= MIN_MATCH as u32 {
                 best_length = match_len;
@@ -395,11 +401,12 @@ impl HashChainFinder {
                 if best_length as usize >= cmp_limit {
                     break;
                 }
-                best_probe_byte = input[pos + best_length as usize];
+                // SAFETY: best_length < cmp_limit <= remaining, so pos + best_length is valid.
+                best_probe_byte = unsafe { *input_ptr.add(pos + best_length as usize) };
             }
 
             // Follow chain
-            let prev_pos = self.prev[chain_pos & self.window_mask] as usize;
+            let prev_pos = prev[chain_pos & window_mask] as usize;
             if prev_pos >= chain_pos || prev_pos < min_pos {
                 break;
             }
@@ -497,6 +504,10 @@ impl HashChainFinder {
         let mut chain_pos = self.head[h] as usize;
         let min_pos = pos.saturating_sub(self.max_window);
         let mut chain_count = 0;
+        let cmp_limit = remaining.min(self.max_match_len);
+        let input_ptr = input.as_ptr();
+        // SAFETY: `pos < input.len()` whenever `remaining > 0`.
+        let pos_ptr = unsafe { input_ptr.add(pos) };
 
         // For each distinct length, keep the match with the smallest offset.
         // Use a simple vec of (length, offset) pairs; K is small.
@@ -504,11 +515,10 @@ impl HashChainFinder {
 
         while chain_pos >= min_pos && chain_pos < pos && chain_count < self.max_chain {
             // Allow overlapping matches (length > offset) for run compression.
-            let match_len = self.dispatcher.compare_bytes(
-                &input[chain_pos..],
-                &input[pos..],
-                self.max_match_len,
-            ) as u32;
+            let match_len = unsafe {
+                self.dispatcher
+                    .compare_bytes_ptr(input_ptr.add(chain_pos), pos_ptr, cmp_limit)
+            } as u32;
 
             if match_len >= MIN_MATCH as u32 {
                 let offset = (pos - chain_pos) as u16;
