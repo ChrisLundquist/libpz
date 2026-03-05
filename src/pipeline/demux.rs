@@ -62,6 +62,10 @@ pub(crate) fn demuxer_for_pipeline(pipeline: super::Pipeline) -> Option<LzDemuxe
         super::Pipeline::LzSeqR | super::Pipeline::LzSeqH => Some(LzDemuxer::LzSeq),
         super::Pipeline::Bw | super::Pipeline::Bbw => None,
         super::Pipeline::Csbwt | super::Pipeline::SortLz => None,
+        super::Pipeline::Bitplane
+        | super::Pipeline::Fwst
+        | super::Pipeline::Parlz
+        | super::Pipeline::Repair => None,
     }
 }
 
