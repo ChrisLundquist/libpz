@@ -123,7 +123,6 @@ Requires Phase 2 demux kernel. Would eliminate host-device copies between LZ77 a
 
 - **PLAN-p0a-gpu-rans-vertical-slice.md**: Full execution history of GPU rANS kernel development with benchmarks.
 - **gpu-strategy.md**: High-level GPU compression strategy document.
-- **PLAN-interleaved-rans.md** Phase A (PR #91): provides the CPU interleaved rANS implementation and wire format that GPU kernels must match bit-for-bit.
 - **PLAN-competitive-roadmap.md** Phase 4 (nvCOMP-style batch track): this roadmap is the enabling work for that throughput target.
 
 ## Recommended Next Actions
