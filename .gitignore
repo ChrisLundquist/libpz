@@ -4,6 +4,18 @@
 # Extracted test samples (from tar.gz archives)
 samples/cantrbry/
 samples/large/
+# Canterbury corpus files extracted directly into samples/
+samples/alice29.txt
+samples/asyoulik.txt
+samples/cp.html
+samples/fields.c
+samples/grammar.lsp
+samples/kennedy.xls
+samples/lcet10.txt
+samples/plrabn12.txt
+samples/ptt5
+samples/sum
+samples/xargs.1
 
 # Editor
 *.swp
