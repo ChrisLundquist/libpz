@@ -36,12 +36,16 @@ use std::sync::OnceLock;
 
 use wgpu::util::DeviceExt;
 
+mod bitplane;
 mod bwt;
 mod fse;
+mod fwst;
 mod huffman;
 pub(crate) mod lz77;
 pub(crate) mod lzseq;
+mod parlz;
 pub(crate) mod rans;
+mod repair;
 
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -85,6 +89,16 @@ const RANS_ENCODE_KERNEL_SOURCE: &str = include_str!("../../kernels/rans_encode.
 
 /// Embedded WGSL kernel source: GPU LzSeq demux (match buffer → 6 streams).
 const LZSEQ_DEMUX_KERNEL_SOURCE: &str = include_str!("../../kernels/lzseq_demux.wgsl");
+
+/// Embedded WGSL kernel source: GPU bit-plane transpose (Experiment D).
+const BITPLANE_TRANSPOSE_KERNEL_SOURCE: &str =
+    include_str!("../../kernels/bitplane_transpose.wgsl");
+
+/// Embedded WGSL kernel source: GPU parlz conflict resolution (Experiment E).
+const PARLZ_RESOLVE_KERNEL_SOURCE: &str = include_str!("../../kernels/parlz_resolve.wgsl");
+
+/// Embedded WGSL kernel source: GPU Re-Pair operations (Experiment C).
+const REPAIR_OPS_KERNEL_SOURCE: &str = include_str!("../../kernels/repair_ops.wgsl");
 
 /// Number of candidates per position in the top-K kernel (must match K in lz77_topk.wgsl).
 const TOPK_K: usize = 4;
@@ -270,6 +284,27 @@ struct LzSeqPipelines {
     demux: wgpu::ComputePipeline,
 }
 
+/// Bitplane transpose pipeline (Experiment D).
+struct BitplanePipelines {
+    transpose: wgpu::ComputePipeline,
+}
+
+/// Parlz conflict resolution pipelines (Experiment E).
+struct ParlzPipelines {
+    init_coverage: wgpu::ComputePipeline,
+    prefix_max_local: wgpu::ComputePipeline,
+    prefix_max_propagate: wgpu::ComputePipeline,
+    classify: wgpu::ComputePipeline,
+}
+
+/// Repair grammar compression pipelines (Experiment C).
+#[allow(dead_code)] // replace used when GPU compaction is wired up
+struct RepairPipelines {
+    histogram: wgpu::ComputePipeline,
+    argmax: wgpu::ComputePipeline,
+    replace: wgpu::ComputePipeline,
+}
+
 /// WebGPU compute engine.
 ///
 /// Manages the wgpu device, queue, and lazily-compiled compute pipelines.
@@ -294,6 +329,9 @@ pub struct WebGpuEngine {
     rans_decode: OnceLock<RansDecodePipelines>,
     rans_encode: OnceLock<RansEncodePipelines>,
     lzseq_demux: OnceLock<LzSeqPipelines>,
+    bitplane: OnceLock<BitplanePipelines>,
+    parlz: OnceLock<ParlzPipelines>,
+    repair: OnceLock<RepairPipelines>,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum compute workgroup size.
@@ -449,6 +487,9 @@ impl WebGpuEngine {
             rans_decode: OnceLock::new(),
             rans_encode: OnceLock::new(),
             lzseq_demux: OnceLock::new(),
+            bitplane: OnceLock::new(),
+            parlz: OnceLock::new(),
+            repair: OnceLock::new(),
             device_name,
             max_work_group_size,
             max_workgroups_per_dim,
@@ -1339,6 +1380,100 @@ impl WebGpuEngine {
                 group
             })
             .demux
+    }
+
+    // --- Experiment D: Bitplane transpose ---
+
+    fn pipeline_bitplane_transpose(&self) -> &wgpu::ComputePipeline {
+        &self
+            .bitplane
+            .get_or_init(|| {
+                let t0 = std::time::Instant::now();
+                let group = BitplanePipelines {
+                    transpose: self.make_pipeline(
+                        "bitplane_transpose",
+                        BITPLANE_TRANSPOSE_KERNEL_SOURCE,
+                        "bitplane_transpose",
+                    ),
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile bitplane_transpose.wgsl: {ms:.3} ms");
+                }
+                group
+            })
+            .transpose
+    }
+
+    // --- Experiment E: Parlz conflict resolution ---
+
+    fn parlz_pipelines(&self) -> &ParlzPipelines {
+        self.parlz.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("parlz_resolve"),
+                    source: wgpu::ShaderSource::Wgsl(PARLZ_RESOLVE_KERNEL_SOURCE.into()),
+                });
+            let make = |label, entry| {
+                self.device
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some(label),
+                        layout: None,
+                        module: &module,
+                        entry_point: Some(entry),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    })
+            };
+            let group = ParlzPipelines {
+                init_coverage: make("parlz_init_coverage", "init_coverage"),
+                prefix_max_local: make("parlz_prefix_max_local", "prefix_max_local"),
+                prefix_max_propagate: make("parlz_prefix_max_propagate", "prefix_max_propagate"),
+                classify: make("parlz_classify", "classify"),
+            };
+            if self.profiling {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[pz-gpu] compile parlz_resolve.wgsl: {ms:.3} ms");
+            }
+            group
+        })
+    }
+
+    // --- Experiment C: Repair grammar compression ---
+
+    fn repair_pipelines(&self) -> &RepairPipelines {
+        self.repair.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("repair_ops"),
+                    source: wgpu::ShaderSource::Wgsl(REPAIR_OPS_KERNEL_SOURCE.into()),
+                });
+            let make = |label, entry| {
+                self.device
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some(label),
+                        layout: None,
+                        module: &module,
+                        entry_point: Some(entry),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    })
+            };
+            let group = RepairPipelines {
+                histogram: make("repair_histogram", "repair_histogram"),
+                argmax: make("repair_argmax", "repair_argmax"),
+                replace: make("repair_replace", "repair_replace"),
+            };
+            if self.profiling {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[pz-gpu] compile repair_ops.wgsl: {ms:.3} ms");
+            }
+            group
+        })
     }
 }
 

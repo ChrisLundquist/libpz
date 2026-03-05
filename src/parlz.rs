@@ -43,7 +43,7 @@ enum LzToken {
 ///
 /// Returns a vector where `matches[i]` is `Some((offset, length))` if a match
 /// was found at position i, or `None` otherwise.
-fn find_all_matches(input: &[u8]) -> Vec<Option<(u16, u16)>> {
+pub(crate) fn find_all_matches(input: &[u8]) -> Vec<Option<(u16, u16)>> {
     let n = input.len();
     let mut best: Vec<Option<(u16, u16)>> = vec![None; n];
 
@@ -112,7 +112,7 @@ fn find_all_matches(input: &[u8]) -> Vec<Option<(u16, u16)>> {
 /// After prefix-max scan, position p is covered (suppressed) if `coverage[p-1] > p`.
 ///
 /// Returns classification: true = match start, false = literal or covered.
-fn parallel_resolve(matches: &[Option<(u16, u16)>]) -> Vec<bool> {
+pub(crate) fn parallel_resolve(matches: &[Option<(u16, u16)>]) -> Vec<bool> {
     let n = matches.len();
     let mut is_match_start = vec![false; n];
 
@@ -346,6 +346,16 @@ fn read_fse_stream(payload: &[u8], pos: &mut usize, expected_len: usize) -> PzRe
     let data = fse::decode(&payload[*pos..*pos + fse_len], expected_len)?;
     *pos += fse_len;
     Ok(data)
+}
+
+/// Parallel parse + encode in one step (avoids exposing LzToken).
+pub(crate) fn parallel_parse_and_encode(
+    input: &[u8],
+    matches: &[Option<(u16, u16)>],
+    is_match_start: &[bool],
+) -> Vec<u8> {
+    let tokens = parallel_parse(input, matches, is_match_start);
+    encode_tokens(&tokens)
 }
 
 /// Diagnostic: compute ratio gap between parallel and greedy parsing.

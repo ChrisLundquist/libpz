@@ -250,6 +250,36 @@ pub fn decompress(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     Ok(output)
 }
 
+/// Encode Re-Pair output from symbol array and rules.
+/// Used by both CPU and GPU paths.
+pub(crate) fn encode_repair_output(symbols: &[u32], rules: &[(u32, u32, u32)]) -> Vec<u8> {
+    // Serialize symbols as varint bytes.
+    let mut final_bytes = Vec::new();
+    for &sym in symbols {
+        if sym < 255 {
+            final_bytes.push(sym as u8);
+        } else {
+            final_bytes.push(0xFF);
+            let idx = (sym.wrapping_sub(255)) as u16;
+            final_bytes.extend_from_slice(&idx.to_le_bytes());
+        }
+    }
+
+    let fse_data = fse::encode(&final_bytes);
+
+    let mut output = Vec::new();
+    output.extend_from_slice(&(rules.len() as u32).to_le_bytes());
+    for &(_, left, right) in rules {
+        output.extend_from_slice(&left.to_le_bytes());
+        output.extend_from_slice(&right.to_le_bytes());
+    }
+    output.extend_from_slice(&(final_bytes.len() as u32).to_le_bytes());
+    output.extend_from_slice(&(fse_data.len() as u32).to_le_bytes());
+    output.extend_from_slice(&fse_data);
+
+    output
+}
+
 /// Diagnostic: return per-round statistics.
 ///
 /// Returns a vector of `(round, frequency, symbols_remaining, dictionary_size)`.

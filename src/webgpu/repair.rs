@@ -1,0 +1,231 @@
+//! GPU Re-Pair grammar compression for Experiment C.
+//!
+//! Tests the viability of iterative GPU kernel dispatch.
+//! Each round dispatches 3 kernels: histogram, argmax, replace.
+//! The key measurement is dispatch_overhead / compute_time ratio.
+
+use super::*;
+
+impl WebGpuEngine {
+    /// GPU-accelerated Re-Pair compression.
+    ///
+    /// Runs the iterative grammar compression loop on the GPU:
+    /// while any bigram frequency > threshold:
+    ///   1. GPU histogram: count all bigram frequencies
+    ///   2. GPU argmax: find most frequent bigram
+    ///   3. GPU replace: replace all occurrences with new symbol
+    ///
+    /// Returns compressed data in the same wire format as the CPU implementation.
+    pub fn repair_compress(&self, input: &[u8]) -> PzResult<Vec<u8>> {
+        let n = input.len();
+        if n == 0 {
+            return Err(PzError::InvalidInput);
+        }
+
+        let pipelines = self.repair_pipelines();
+
+        // Convert input to u32 symbol array.
+        let mut symbols: Vec<u32> = input.iter().map(|&b| b as u32).collect();
+        let mut next_symbol: u32 = 256;
+        let mut rules: Vec<(u32, u32, u32)> = Vec::new(); // (new_sym, left, right)
+        let max_rounds = 1000;
+        let min_freq = 2u32;
+
+        for _round in 0..max_rounds {
+            let current_n = symbols.len();
+            if current_n < 2 {
+                break;
+            }
+
+            // Current alphabet size (for histogram sizing).
+            let max_alphabet = next_symbol.max(256) as usize;
+
+            // For large alphabets, histogram becomes too large for shared memory.
+            // Fall back to CPU for alphabets > 512.
+            if max_alphabet > 512 {
+                // CPU fallback for large alphabets.
+                let (best_a, best_b, best_freq) = cpu_find_best_bigram(&symbols);
+                if best_freq < min_freq {
+                    break;
+                }
+                cpu_replace_bigram(&mut symbols, best_a, best_b, next_symbol);
+                rules.push((next_symbol, best_a, best_b));
+                next_symbol += 1;
+                continue;
+            }
+
+            let hist_size = max_alphabet * max_alphabet;
+
+            // Upload current symbol array.
+            let symbols_buf = self.create_buffer_init(
+                "repair_symbols",
+                bytemuck::cast_slice(&symbols),
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            );
+
+            // Histogram buffer (zero-initialized).
+            let histogram_buf = self.create_buffer_init(
+                "repair_histogram",
+                &vec![0u8; hist_size * 4],
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            );
+
+            // Scratch buffer for argmax results and compaction.
+            let scratch_size = current_n.max(hist_size / 256 * 2 + 2);
+            let scratch_buf = self.create_buffer_init(
+                "repair_scratch",
+                &vec![0u8; scratch_size * 4],
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            );
+
+            // --- Kernel 1: Histogram ---
+            let hist_params = [current_n as u32, max_alphabet as u32, 0u32, 0u32];
+            let hist_params_buf = self.create_buffer_init(
+                "repair_hist_params",
+                bytemuck::cast_slice(&hist_params),
+                wgpu::BufferUsages::UNIFORM,
+            );
+
+            let hist_bg_layout = pipelines.histogram.get_bind_group_layout(0);
+            let hist_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("repair_histogram_bg"),
+                layout: &hist_bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: symbols_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: histogram_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: scratch_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: hist_params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let workgroups = (current_n as u32).div_ceil(256);
+            self.dispatch(
+                &pipelines.histogram,
+                &hist_bg,
+                workgroups,
+                "repair_histogram",
+            )?;
+
+            // --- Kernel 2: Argmax ---
+            let argmax_params = [hist_size as u32, max_alphabet as u32, 0u32, 0u32];
+            let argmax_params_buf = self.create_buffer_init(
+                "repair_argmax_params",
+                bytemuck::cast_slice(&argmax_params),
+                wgpu::BufferUsages::UNIFORM,
+            );
+
+            let argmax_bg_layout = pipelines.argmax.get_bind_group_layout(0);
+            let argmax_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("repair_argmax_bg"),
+                layout: &argmax_bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: symbols_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: histogram_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: scratch_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: argmax_params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let argmax_workgroups = (hist_size as u32).div_ceil(256);
+            self.dispatch(
+                &pipelines.argmax,
+                &argmax_bg,
+                argmax_workgroups,
+                "repair_argmax",
+            )?;
+
+            // Read back the argmax result.
+            // For single-level reduction, block 0's result is the global max.
+            // scratch[0] = max_freq, scratch[1] = max_idx (flat index into histogram).
+            let num_argmax_blocks = (hist_size as u32).div_ceil(256) as usize;
+
+            // If multiple blocks, do a CPU-side final reduction over block results.
+            let argmax_data = self.read_buffer(&scratch_buf, (num_argmax_blocks * 2 * 4) as u64);
+            let argmax_u32s: &[u32] = bytemuck::cast_slice(&argmax_data);
+
+            let mut best_freq = 0u32;
+            let mut best_idx = 0u32;
+            for block in 0..num_argmax_blocks {
+                let freq = argmax_u32s[block * 2];
+                let idx = argmax_u32s[block * 2 + 1];
+                if freq > best_freq {
+                    best_freq = freq;
+                    best_idx = idx;
+                }
+            }
+
+            if best_freq < min_freq {
+                break;
+            }
+
+            let best_a = best_idx / max_alphabet as u32;
+            let best_b = best_idx % max_alphabet as u32;
+
+            // --- Kernel 3: Replace ---
+            // For now, do replacement on CPU since compaction requires prefix-sum
+            // infrastructure that's complex to wire up for the first pass.
+            cpu_replace_bigram(&mut symbols, best_a, best_b, next_symbol);
+            rules.push((next_symbol, best_a, best_b));
+            next_symbol += 1;
+        }
+
+        // Encode output (same format as CPU repair).
+        Ok(crate::repair::encode_repair_output(&symbols, &rules))
+    }
+}
+
+/// CPU fallback: find the most frequent bigram.
+fn cpu_find_best_bigram(symbols: &[u32]) -> (u32, u32, u32) {
+    use std::collections::HashMap;
+    let mut counts: HashMap<(u32, u32), u32> = HashMap::new();
+    for i in 0..symbols.len().saturating_sub(1) {
+        *counts.entry((symbols[i], symbols[i + 1])).or_default() += 1;
+    }
+    let mut best = (0u32, 0u32, 0u32);
+    for (&(a, b), &freq) in &counts {
+        if freq > best.2 {
+            best = (a, b, freq);
+        }
+    }
+    best
+}
+
+/// CPU fallback: replace all non-overlapping occurrences of bigram.
+fn cpu_replace_bigram(symbols: &mut Vec<u32>, target_a: u32, target_b: u32, new_symbol: u32) {
+    let mut i = 0;
+    let mut new_symbols = Vec::with_capacity(symbols.len());
+    while i < symbols.len() {
+        if i + 1 < symbols.len() && symbols[i] == target_a && symbols[i + 1] == target_b {
+            new_symbols.push(new_symbol);
+            i += 2;
+        } else {
+            new_symbols.push(symbols[i]);
+            i += 1;
+        }
+    }
+    *symbols = new_symbols;
+}
