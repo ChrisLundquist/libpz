@@ -17,20 +17,11 @@
 /// Output
 /// ```
 use crate::fse;
+use crate::lz77;
 use crate::{PzError, PzResult};
 
-/// Minimum match length.
-const MIN_MATCH: usize = 3;
-
-/// Maximum back-reference window.
-const MAX_WINDOW: usize = 32768;
-
-/// Hash table size (must be power of 2).
-const HASH_SIZE: usize = 1 << 15;
-const HASH_MASK: usize = HASH_SIZE - 1;
-
-/// Maximum hash chain depth.
-const MAX_CHAIN: usize = 64;
+/// Minimum match length (must match lz77::MIN_MATCH).
+const MIN_MATCH: usize = lz77::MIN_MATCH as usize;
 
 /// A parsed LZ token.
 #[derive(Debug, Clone, Copy)]
@@ -41,68 +32,19 @@ enum LzToken {
 
 /// Find best match at every position using hash chains.
 ///
+/// Delegates to `lz77::HashChainFinder::find_all()` to avoid duplicating
+/// the hash-chain match finder logic.
+///
 /// Returns a vector where `matches[i]` is `Some((offset, length))` if a match
 /// was found at position i, or `None` otherwise.
 pub(crate) fn find_all_matches(input: &[u8]) -> Vec<Option<(u16, u16)>> {
     let n = input.len();
-    let mut best: Vec<Option<(u16, u16)>> = vec![None; n];
-
     if n < MIN_MATCH {
-        return best;
+        return vec![None; n];
     }
 
-    // Hash chain match finder.
-    let mut head = vec![0u32; HASH_SIZE];
-    let mut prev = vec![0u32; n];
-
-    let hash3 = |pos: usize| -> usize {
-        let b0 = input[pos] as usize;
-        let b1 = input[pos + 1] as usize;
-        let b2 = input[pos + 2] as usize;
-        (b0 ^ (b1 << 5) ^ (b2 << 10)) & HASH_MASK
-    };
-
-    // Build hash chains and find matches simultaneously.
-    for i in 0..n.saturating_sub(MIN_MATCH - 1) {
-        let h = hash3(i);
-        prev[i] = head[h];
-        head[h] = (i + 1) as u32; // +1 so 0 means "empty"
-
-        // Search chain for best match at position i.
-        let mut chain_pos = prev[i];
-        let mut chain_depth = 0;
-        let mut best_len = 0u16;
-        let mut best_off = 0u16;
-
-        while chain_pos > 0 && chain_depth < MAX_CHAIN {
-            let candidate = (chain_pos - 1) as usize;
-            let distance = i - candidate;
-            if distance > MAX_WINDOW {
-                break;
-            }
-
-            // Extend match.
-            let max_len = (n - i).min(u16::MAX as usize);
-            let mut len = 0;
-            while len < max_len && input[candidate + len] == input[i + len] {
-                len += 1;
-            }
-
-            if len >= MIN_MATCH && len as u16 > best_len {
-                best_len = len as u16;
-                best_off = distance as u16;
-            }
-
-            chain_pos = prev[candidate];
-            chain_depth += 1;
-        }
-
-        if best_len >= MIN_MATCH as u16 {
-            best[i] = Some((best_off, best_len));
-        }
-    }
-
-    best
+    let mut finder = lz77::HashChainFinder::with_max_match_len(lz77::DEFAULT_MAX_MATCH);
+    finder.find_all(input)
 }
 
 /// Parallel conflict resolution via forward max-propagation scan.
