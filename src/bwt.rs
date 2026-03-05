@@ -210,6 +210,14 @@ fn build_suffix_array(input: &[u8]) -> Vec<usize> {
     result
 }
 
+/// Public wrapper for suffix array construction.
+///
+/// Returns the rotation suffix array of the input, used by the CSBWT pipeline
+/// for context boundary detection.
+pub fn build_suffix_array_public(input: &[u8]) -> Vec<usize> {
+    build_suffix_array(input)
+}
+
 /// SA-IS core: build suffix array of integer array `text` with alphabet [0, alpha_size).
 ///
 /// text must end with a unique sentinel (value 0) that is the smallest character.

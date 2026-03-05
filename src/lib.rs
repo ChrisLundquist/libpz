@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod bwt;
 pub mod crc32;
+pub mod csbwt;
 pub mod deflate;
 pub mod frequency;
 pub mod fse;
@@ -18,6 +19,7 @@ pub mod rans;
 pub mod recoil;
 pub mod rle;
 pub mod simd;
+pub mod sortlz;
 pub mod streaming;
 
 #[allow(dead_code)]
