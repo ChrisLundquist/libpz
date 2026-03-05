@@ -141,12 +141,23 @@ impl WebGpuEngine {
             return Err(PzError::InvalidInput);
         }
 
-        // For the initial implementation, use CPU match finding + CPU conflict resolution.
-        // GPU match finding (coop kernel) produces matches indexed differently than
-        // the per-position format expected by parlz_resolve. Once the format mapping
-        // is verified, we can wire GPU match finding + GPU resolve together.
-        let matches = crate::parlz::find_all_matches(input);
-        let is_match_start = crate::parlz::parallel_resolve(&matches);
+        // Step 1: GPU cooperative match finding (raw per-position matches).
+        let matches = self.find_raw_matches_coop(input)?;
+
+        // Step 2: Convert to packed u32 format for GPU conflict resolution.
+        // Packed format: high 16 bits = offset, low 16 bits = length.
+        let match_data: Vec<u32> = matches
+            .iter()
+            .map(|m| match m {
+                Some((offset, length)) => ((*offset as u32) << 16) | (*length as u32),
+                None => 0u32,
+            })
+            .collect();
+
+        // Step 3: GPU conflict resolution (prefix-max scan).
+        let is_match_start = self.parlz_resolve(&match_data)?;
+
+        // Step 4: CPU encoding (token stream → wire format).
         Ok(crate::parlz::parallel_parse_and_encode(
             input,
             &matches,

@@ -185,10 +185,64 @@ impl WebGpuEngine {
             let best_a = best_idx / max_alphabet as u32;
             let best_b = best_idx % max_alphabet as u32;
 
-            // --- Kernel 3: Replace ---
-            // For now, do replacement on CPU since compaction requires prefix-sum
-            // infrastructure that's complex to wire up for the first pass.
-            cpu_replace_bigram(&mut symbols, best_a, best_b, next_symbol);
+            // --- Kernel 3: GPU Replace + CPU Compaction ---
+            let target_packed = best_a | (best_b << 16);
+            let replace_params = [
+                current_n as u32,
+                max_alphabet as u32,
+                next_symbol,
+                target_packed,
+            ];
+            let replace_params_buf = self.create_buffer_init(
+                "repair_replace_params",
+                bytemuck::cast_slice(&replace_params),
+                wgpu::BufferUsages::UNIFORM,
+            );
+
+            let replace_bg_layout = pipelines.replace.get_bind_group_layout(0);
+            let replace_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("repair_replace_bg"),
+                layout: &replace_bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: symbols_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: histogram_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: scratch_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: replace_params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            self.dispatch(
+                &pipelines.replace,
+                &replace_bg,
+                workgroups,
+                "repair_replace",
+            )?;
+
+            // Read back symbols and keep-flags, then compact on CPU.
+            let sym_data = self.read_buffer(&symbols_buf, (current_n * 4) as u64);
+            let sym_u32: &[u32] = bytemuck::cast_slice(&sym_data);
+            let flag_data = self.read_buffer(&scratch_buf, (current_n * 4) as u64);
+            let flags: &[u32] = bytemuck::cast_slice(&flag_data);
+
+            symbols = sym_u32
+                .iter()
+                .zip(flags.iter())
+                .filter(|(_, &keep)| keep != 0)
+                .map(|(&sym, _)| sym)
+                .collect();
+
             rules.push((next_symbol, best_a, best_b));
             next_symbol += 1;
         }
