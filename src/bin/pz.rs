@@ -85,6 +85,26 @@ fn list_pipelines() {
             "Context-Segmented BWT + per-segment FSE (GPU experiment)",
         ),
         ("sortlz", "11", "Sort-based LZ77 + FSE (GPU experiment)"),
+        (
+            "bitplane",
+            "12",
+            "Bit-plane decomposition + RLE + FSE (throughput ceiling)",
+        ),
+        (
+            "fwst",
+            "13",
+            "Fixed-window sort + MTF + RLE + FSE (context depth)",
+        ),
+        (
+            "parlz",
+            "14",
+            "Parallel-parse LZ + FSE (serial parsing cost)",
+        ),
+        (
+            "repair",
+            "15",
+            "Re-Pair grammar compression + FSE (iterative dispatch)",
+        ),
     ];
     for (name, id, desc) in pipelines {
         println!("  {name:10} {id:>2}  {desc}");
@@ -224,6 +244,10 @@ fn parse_args() -> Opts {
                     "lzseqh" | "9" => Pipeline::LzSeqH,
                     "csbwt" | "10" => Pipeline::Csbwt,
                     "sortlz" | "11" => Pipeline::SortLz,
+                    "bitplane" | "12" => Pipeline::Bitplane,
+                    "fwst" | "13" => Pipeline::Fwst,
+                    "parlz" | "14" => Pipeline::Parlz,
+                    "repair" | "15" => Pipeline::Repair,
                     other => {
                         eprintln!("pz: unknown pipeline '{other}'");
                         eprintln!("pz: run 'pz --list-pipelines' to see available pipelines");

@@ -951,6 +951,10 @@ pub(crate) fn run_compress_stage(
         (Pipeline::LzSeqH, 1) => stage_huffman_encode(block),
         (Pipeline::Csbwt, 0) => stage_csbwt_compress(block),
         (Pipeline::SortLz, 0) => stage_sortlz_compress(block),
+        (Pipeline::Bitplane, 0) => stage_bitplane_compress(block),
+        (Pipeline::Fwst, 0) => stage_fwst_compress(block),
+        (Pipeline::Parlz, 0) => stage_parlz_compress(block),
+        (Pipeline::Repair, 0) => stage_repair_compress(block),
         _ => Err(PzError::Unsupported),
     }
 }
@@ -972,6 +976,46 @@ pub(crate) fn stage_csbwt_compress(mut block: StageBlock) -> PzResult<StageBlock
 /// SortLZ single-stage compression: sort-based LZ77 + FSE.
 pub(crate) fn stage_sortlz_compress(mut block: StageBlock) -> PzResult<StageBlock> {
     block.data = crate::sortlz::compress(&block.data, &crate::sortlz::SortLzConfig::default())?;
+    Ok(block)
+}
+
+// ---------------------------------------------------------------------------
+// Bitplane pipeline stage (single-stage: does everything)
+// ---------------------------------------------------------------------------
+
+/// Bitplane single-stage compression: bit-plane decomposition + RLE + FSE.
+pub(crate) fn stage_bitplane_compress(mut block: StageBlock) -> PzResult<StageBlock> {
+    block.data = crate::bitplane::compress(&block.data)?;
+    Ok(block)
+}
+
+// ---------------------------------------------------------------------------
+// FWST pipeline stage (single-stage: does everything)
+// ---------------------------------------------------------------------------
+
+/// FWST single-stage compression: fixed-window sort transform + MTF + RLE + FSE.
+pub(crate) fn stage_fwst_compress(mut block: StageBlock) -> PzResult<StageBlock> {
+    block.data = crate::fwst::compress(&block.data, &crate::fwst::FwstConfig::default())?;
+    Ok(block)
+}
+
+// ---------------------------------------------------------------------------
+// ParlZ pipeline stage (single-stage: does everything)
+// ---------------------------------------------------------------------------
+
+/// ParlZ single-stage compression: parallel-parse LZ + FSE.
+pub(crate) fn stage_parlz_compress(mut block: StageBlock) -> PzResult<StageBlock> {
+    block.data = crate::parlz::compress(&block.data)?;
+    Ok(block)
+}
+
+// ---------------------------------------------------------------------------
+// Repair pipeline stage (single-stage: does everything)
+// ---------------------------------------------------------------------------
+
+/// Repair single-stage compression: Re-Pair grammar compression + FSE.
+pub(crate) fn stage_repair_compress(mut block: StageBlock) -> PzResult<StageBlock> {
+    block.data = crate::repair::compress(&block.data)?;
     Ok(block)
 }
 

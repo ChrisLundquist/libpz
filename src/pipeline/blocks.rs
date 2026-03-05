@@ -48,6 +48,10 @@ pub(crate) fn compress_block(
             Pipeline::Bbw => compress_block_bbw(input, opts),
             Pipeline::Csbwt => compress_block_csbwt(input),
             Pipeline::SortLz => compress_block_sortlz(input),
+            Pipeline::Bitplane => compress_block_bitplane(input),
+            Pipeline::Fwst => compress_block_fwst(input),
+            Pipeline::Parlz => compress_block_parlz(input),
+            Pipeline::Repair => compress_block_repair(input),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -67,6 +71,10 @@ pub(crate) fn decompress_block(
             Pipeline::Bbw => decompress_block_bbw(payload, orig_len),
             Pipeline::Csbwt => decompress_block_csbwt(payload, orig_len),
             Pipeline::SortLz => decompress_block_sortlz(payload, orig_len),
+            Pipeline::Bitplane => decompress_block_bitplane(payload, orig_len),
+            Pipeline::Fwst => decompress_block_fwst(payload, orig_len),
+            Pipeline::Parlz => decompress_block_parlz(payload, orig_len),
+            Pipeline::Repair => decompress_block_repair(payload, orig_len),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -362,4 +370,60 @@ fn compress_block_sortlz(input: &[u8]) -> PzResult<Vec<u8>> {
 /// Decompress a single SortLZ block (no container header).
 fn decompress_block_sortlz(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     crate::sortlz::decompress(payload, orig_len)
+}
+
+// ---------------------------------------------------------------------------
+// Bitplane pipeline: bit-plane decomposition + RLE + FSE
+// ---------------------------------------------------------------------------
+
+/// Compress a single block using the Bitplane pipeline (no container header).
+fn compress_block_bitplane(input: &[u8]) -> PzResult<Vec<u8>> {
+    crate::bitplane::compress(input)
+}
+
+/// Decompress a single Bitplane block (no container header).
+fn decompress_block_bitplane(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    crate::bitplane::decompress(payload, orig_len)
+}
+
+// ---------------------------------------------------------------------------
+// FWST pipeline: fixed-window sort transform + MTF + RLE + FSE
+// ---------------------------------------------------------------------------
+
+/// Compress a single block using the FWST pipeline (no container header).
+fn compress_block_fwst(input: &[u8]) -> PzResult<Vec<u8>> {
+    crate::fwst::compress(input, &crate::fwst::FwstConfig::default())
+}
+
+/// Decompress a single FWST block (no container header).
+fn decompress_block_fwst(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    crate::fwst::decompress(payload, orig_len)
+}
+
+// ---------------------------------------------------------------------------
+// ParlZ pipeline: parallel-parse LZ + FSE
+// ---------------------------------------------------------------------------
+
+/// Compress a single block using the ParlZ pipeline (no container header).
+fn compress_block_parlz(input: &[u8]) -> PzResult<Vec<u8>> {
+    crate::parlz::compress(input)
+}
+
+/// Decompress a single ParlZ block (no container header).
+fn decompress_block_parlz(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    crate::parlz::decompress(payload, orig_len)
+}
+
+// ---------------------------------------------------------------------------
+// Repair pipeline: Re-Pair grammar compression + FSE
+// ---------------------------------------------------------------------------
+
+/// Compress a single block using the Repair pipeline (no container header).
+fn compress_block_repair(input: &[u8]) -> PzResult<Vec<u8>> {
+    crate::repair::compress(input)
+}
+
+/// Decompress a single Repair block (no container header).
+fn decompress_block_repair(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    crate::repair::decompress(payload, orig_len)
 }
