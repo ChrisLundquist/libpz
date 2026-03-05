@@ -1,9 +1,9 @@
 /// Recoil: parallel rANS decoding with decoder-adaptive scalability.
 ///
-/// Implements the Recoil algorithm (Lin et al., ICPP 2023) which enables
-/// parallel decoding of a *single* interleaved rANS bitstream by recording
-/// split-point metadata during a post-encode pass. The decoder uses this
-/// metadata to start decoding from any split point in parallel.
+/// Implements a variant of the Recoil algorithm (Lin et al., ICPP 2023) which
+/// enables parallel decoding of a *single* interleaved rANS bitstream by
+/// recording split-point metadata during a post-encode pass. The decoder uses
+/// this metadata to start decoding from any split point in parallel.
 ///
 /// Unlike the conventional chunked approach ([`crate::rans::encode_chunked`]),
 /// Recoil does **not** modify the rANS bitstream. The encoder produces one
@@ -11,31 +11,23 @@
 /// decoder can resume decoding. Metadata entries can be dropped to reduce
 /// parallelism — no re-encoding needed.
 ///
-/// # Three-Phase Decode
+/// # Exact-state splits (no catchup needed)
 ///
-/// Each split is decoded in three phases:
+/// The original Recoil paper uses approximate split points that require a
+/// "catchup" phase where the decoder discards symbols until it resynchronizes
+/// with the bitstream. Our implementation avoids this: the splitting pass
+/// performs a full forward decode simulation and records **exact** decoder
+/// state (rANS states + per-lane word positions) at each split boundary.
+/// This means each split can begin decoding immediately — no catchup, no
+/// overlap, no discarded symbols.
 ///
-/// 1. **Catchup**: Start from the split's saved states/positions. Decode
-///    forward until every lane has renormalized at least once (synchronizing
-///    the decoder with the bitstream). Symbols before the split's
-///    `symbol_index` are discarded (they overlap with the previous split).
-///
-/// 2. **Steady-state**: Normal interleaved rANS decode, writing symbols to
-///    the output buffer starting at the split's `symbol_index`.
-///
-/// 3. **Wind-down**: Stop when reaching the next split's `symbol_index`
-///    (or end-of-stream for the last split).
+/// Each split decodes its range `[symbol_index, next_split.symbol_index)`
+/// directly into the output buffer.
 use crate::rans::{
-    self, build_symbol_lookup, bytes_as_u16_le, deserialize_freq_table, NormalizedFreqs,
-    WordSlice, MAX_SCALE_BITS, MIN_SCALE_BITS, NUM_SYMBOLS,
+    self, build_symbol_lookup, bytes_as_u16_le, deserialize_freq_table, NormalizedFreqs, WordSlice,
+    IO_BITS, MAX_SCALE_BITS, MIN_SCALE_BITS, NUM_SYMBOLS, RANS_L,
 };
 use crate::{PzError, PzResult};
-
-/// Lower bound of the normalized rANS state (must match `rans.rs`).
-const RANS_L: u32 = 1 << 16;
-
-/// I/O granularity in bits (must match `rans.rs`).
-const IO_BITS: u32 = 16;
 
 /// Magic byte identifying serialized Recoil metadata.
 const RECOIL_MAGIC: u8 = 0xEC;
@@ -73,6 +65,9 @@ pub(crate) struct RecoilMetadata {
     /// Frequency precision bits. Matches the encode's scale_bits.
     pub scale_bits: u8,
     /// Total number of symbols in the original input.
+    ///
+    /// Stored as `u32`, limiting Recoil metadata to inputs < 4 GiB.
+    /// The wire format (`symbol_index: u32`) shares this constraint.
     pub total_symbols: u32,
     /// Split points, sorted by symbol_index. The first split always has
     /// symbol_index = 0.
@@ -195,6 +190,11 @@ pub(crate) fn recoil_generate_splits(
             total_symbols: 0,
             splits: vec![],
         });
+    }
+
+    // Split metadata stores symbol indices as u32; reject inputs that overflow.
+    if original_len > u32::MAX as usize {
+        return Err(PzError::InvalidInput);
     }
 
     let num_splits = num_splits.max(1);
@@ -515,7 +515,7 @@ struct DecodeContext<'a> {
 /// and are already synchronized (they were recorded mid-decode), so
 /// **no catchup phase is needed** — the states and word positions precisely
 /// capture the decoder state at that symbol boundary.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_range_loop)] // `i` drives both lane assignment and output indexing
 fn decode_split_range(
     ctx: &DecodeContext<'_>,
     initial_states: &[u32],
@@ -529,13 +529,16 @@ fn decode_split_range(
     let scale_mask = (1u32 << scale_bits) - 1;
 
     let mut states: Vec<u32> = initial_states.to_vec();
-    let mut word_positions: Vec<usize> = initial_word_positions
-        .iter()
-        .map(|&p| p as usize)
-        .collect();
+    let mut word_positions: Vec<usize> =
+        initial_word_positions.iter().map(|&p| p as usize).collect();
 
-    for i in sym_start..sym_end {
-        let lane = i % num_states;
+    for (idx, output_ref) in output
+        .iter_mut()
+        .enumerate()
+        .skip(sym_start)
+        .take(sym_end - sym_start)
+    {
+        let lane = idx % num_states;
 
         let slot = states[lane] & scale_mask;
         if slot as usize >= ctx.lookup.len() {
@@ -547,15 +550,13 @@ fn decode_split_range(
 
         states[lane] = freq * (states[lane] >> scale_bits) + slot - cum;
 
-        if states[lane] < RANS_L
-            && word_positions[lane] < ctx.word_streams[lane].len()
-        {
-            states[lane] = (states[lane] << IO_BITS)
-                | ctx.word_streams[lane][word_positions[lane]] as u32;
+        if states[lane] < RANS_L && word_positions[lane] < ctx.word_streams[lane].len() {
+            states[lane] =
+                (states[lane] << IO_BITS) | ctx.word_streams[lane][word_positions[lane]] as u32;
             word_positions[lane] += 1;
         }
 
-        output[i] = s;
+        *output_ref = s;
     }
 
     Ok(())
@@ -680,10 +681,8 @@ fn decode_split_range_local(
     let scale_mask = (1u32 << scale_bits) - 1;
 
     let mut states: Vec<u32> = initial_states.to_vec();
-    let mut word_positions: Vec<usize> = initial_word_positions
-        .iter()
-        .map(|&p| p as usize)
-        .collect();
+    let mut word_positions: Vec<usize> =
+        initial_word_positions.iter().map(|&p| p as usize).collect();
 
     for i in sym_start..sym_end {
         let lane = i % num_states;
@@ -699,11 +698,9 @@ fn decode_split_range_local(
 
         states[lane] = freq * (states[lane] >> scale_bits) + slot - cum;
 
-        if states[lane] < RANS_L
-            && word_positions[lane] < ctx.word_streams[lane].len()
-        {
-            states[lane] = (states[lane] << IO_BITS)
-                | ctx.word_streams[lane][word_positions[lane]] as u32;
+        if states[lane] < RANS_L && word_positions[lane] < ctx.word_streams[lane].len() {
+            states[lane] =
+                (states[lane] << IO_BITS) | ctx.word_streams[lane][word_positions[lane]] as u32;
             word_positions[lane] += 1;
         }
 
@@ -796,7 +793,7 @@ mod tests {
 
         let combined = meta.combine_splits(4);
         assert!(combined.splits.len() <= 4);
-        assert!(combined.splits.len() >= 1);
+        assert!(!combined.splits.is_empty());
         assert_eq!(combined.splits[0].symbol_index, 0);
 
         // Combining to more splits than we have should return a clone.
