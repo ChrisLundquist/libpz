@@ -223,6 +223,84 @@ impl WebGpuEngine {
         self.complete_find_matches_lazy(pending, input)
     }
 
+    /// Find raw per-position matches using the GPU coop kernel (no dedup/resolve).
+    ///
+    /// Unlike `find_matches_coop()` which applies lazy resolve and dedup,
+    /// this returns raw per-position match data suitable for parlz conflict
+    /// resolution. Returns `Vec<Option<(u16, u16)>>` where each entry is
+    /// `Some((offset, length))` or `None`.
+    pub fn find_raw_matches_coop(&self, input: &[u8]) -> PzResult<Vec<Option<(u16, u16)>>> {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let input_len = input.len();
+        let padded = Self::pad_input_bytes(input);
+        let match_buf_size = (input_len * std::mem::size_of::<GpuMatch>()) as u64;
+
+        let input_buf =
+            self.create_buffer_init("parlz_find_input", &padded, wgpu::BufferUsages::STORAGE);
+
+        let workgroups = (input_len as u32).div_ceil(64);
+        let params = [input_len as u32, 0, 0, self.dispatch_width(workgroups, 64)];
+        let params_buf = self.create_buffer_init(
+            "parlz_find_params",
+            bytemuck::cast_slice(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
+        let raw_match_buf = self.create_buffer(
+            "parlz_raw_matches",
+            match_buf_size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        // Only run pass 1: cooperative match finding (no lazy resolve).
+        let find_bg_layout = self.pipeline_lz77_coop_find().get_bind_group_layout(0);
+        let find_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("parlz_find_bg"),
+            layout: &find_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: raw_match_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        self.dispatch(
+            self.pipeline_lz77_coop_find(),
+            &find_bg,
+            workgroups,
+            "parlz_coop_find",
+        )?;
+
+        // Read back raw matches and convert to Option<(u16, u16)>.
+        let raw = self.read_buffer(&raw_match_buf, match_buf_size);
+        let gpu_matches: &[GpuMatch] = bytemuck::cast_slice(&raw);
+
+        let result: Vec<Option<(u16, u16)>> = gpu_matches[..input_len]
+            .iter()
+            .map(|m| {
+                if m.length > 0 && m.offset > 0 {
+                    Some((m.offset as u16, m.length as u16))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Ok(result)
+    }
+
     /// Find LZ77 matches using the original greedy hash-table kernel (no lazy).
     pub fn find_matches_greedy(&self, input: &[u8]) -> PzResult<Vec<Match>> {
         if input.is_empty() {
