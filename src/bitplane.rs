@@ -58,6 +58,12 @@ fn bit_untranspose(planes: &[Vec<u8>; 8], n: usize) -> Vec<u8> {
     output
 }
 
+/// Public wrapper for GPU path: RLE encode a single bit-plane.
+#[cfg(feature = "webgpu")]
+pub fn rle_binary_for_gpu(data: &[u8], num_bits: usize) -> Vec<u8> {
+    rle_binary(data, num_bits)
+}
+
 /// Run-length encode a binary bit-stream (packed bytes).
 ///
 /// Encodes runs of identical bits. Output format:
