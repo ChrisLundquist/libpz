@@ -15,6 +15,7 @@ pub mod optimal;
 pub mod pipeline;
 pub mod pqueue;
 pub mod rans;
+pub mod recoil;
 pub mod rle;
 pub mod simd;
 pub mod streaming;

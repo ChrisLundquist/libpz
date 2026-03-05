@@ -1362,6 +1362,48 @@ fn test_lzssr_rans_interleaved_round_trip() {
     assert_eq!(decompressed, input);
 }
 
+/// Verify LZR pipeline round-trips with Recoil parallel rANS decode.
+#[test]
+fn test_lzr_recoil_round_trip() {
+    let mut input = Vec::new();
+    for _ in 0..2048 {
+        input.extend_from_slice(b"recoil-parallel-rans-decode-test-");
+    }
+
+    let opts = CompressOptions {
+        rans_interleaved: true,
+        rans_interleaved_min_bytes: 0,
+        rans_interleaved_states: 4,
+        rans_recoil: true,
+        rans_recoil_splits: 8,
+        ..Default::default()
+    };
+    let compressed = compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+/// Verify Recoil with 8-way interleaved rANS (wider interleave).
+#[test]
+fn test_lzr_recoil_wide_interleave_round_trip() {
+    let mut input = Vec::new();
+    for _ in 0..2048 {
+        input.extend_from_slice(b"recoil-wide-interleave-test-data-");
+    }
+
+    let opts = CompressOptions {
+        rans_interleaved: true,
+        rans_interleaved_min_bytes: 0,
+        rans_interleaved_states: 8,
+        rans_recoil: true,
+        rans_recoil_splits: 16,
+        ..Default::default()
+    };
+    let compressed = compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
 /// Verify Lzf pipeline benefits from extended match lengths on repetitive data.
 #[test]
 fn test_lzf_extended_match_length() {

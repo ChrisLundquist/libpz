@@ -103,6 +103,10 @@ pub(crate) fn stage_demux_decompress(
 const MULTISTREAM_HEADER_SIZE: usize = 7;
 /// High-bit flag on per-stream compressed length signaling interleaved rANS payload.
 const RANS_INTERLEAVED_FLAG: u32 = 1 << 31;
+/// Bit-30 flag signaling Recoil split-point metadata is appended to the payload.
+const RANS_RECOIL_FLAG: u32 = 1 << 30;
+/// Mask to extract the actual compressed length (bits 0-29).
+const RANS_COMP_LEN_MASK: u32 = !(RANS_INTERLEAVED_FLAG | RANS_RECOIL_FLAG);
 
 /// Encode N streams into a multi-stream container.
 ///
@@ -351,21 +355,45 @@ pub(crate) fn stage_rans_encode_with_options(
         pre_entropy_len,
         &block.metadata.demux_meta,
         |stream, output| {
-            let (rans_data, flagged_len) =
+            let (payload, flagged_len) =
                 if options.rans_interleaved && stream.len() >= options.rans_interleaved_min_bytes {
                     let data = rans::encode_interleaved_n(
                         stream,
                         options.rans_interleaved_states,
                         rans::DEFAULT_SCALE_BITS,
                     );
-                    if data.len() >= (1usize << 31) {
-                        return Err(PzError::InvalidInput);
+
+                    if options.rans_recoil {
+                        // Generate Recoil split metadata and append to payload.
+                        let meta = crate::recoil::recoil_generate_splits(
+                            &data,
+                            stream.len(),
+                            options.rans_recoil_splits,
+                        )?;
+                        let meta_bytes = meta.serialize();
+                        let mut combined =
+                            Vec::with_capacity(4 + data.len() + meta_bytes.len());
+                        combined
+                            .extend_from_slice(&(meta_bytes.len() as u32).to_le_bytes());
+                        combined.extend_from_slice(&data);
+                        combined.extend_from_slice(&meta_bytes);
+                        if combined.len() as u64 >= (1u64 << 30) {
+                            return Err(PzError::InvalidInput);
+                        }
+                        let len = (combined.len() as u32)
+                            | RANS_INTERLEAVED_FLAG
+                            | RANS_RECOIL_FLAG;
+                        (combined, len)
+                    } else {
+                        if data.len() >= (1usize << 30) {
+                            return Err(PzError::InvalidInput);
+                        }
+                        let len = (data.len() as u32) | RANS_INTERLEAVED_FLAG;
+                        (data, len)
                     }
-                    let len = (data.len() as u32) | RANS_INTERLEAVED_FLAG;
-                    (data, len)
                 } else {
                     let data = rans::encode(stream);
-                    if data.len() >= (1usize << 31) {
+                    if data.len() >= (1usize << 30) {
                         return Err(PzError::InvalidInput);
                     }
                     let len = data.len() as u32;
@@ -373,7 +401,7 @@ pub(crate) fn stage_rans_encode_with_options(
                 };
             output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
             output.extend_from_slice(&flagged_len.to_le_bytes());
-            output.extend_from_slice(&rans_data);
+            output.extend_from_slice(&payload);
             Ok(())
         },
     )?;
@@ -392,12 +420,34 @@ pub(crate) fn stage_rans_decode(mut block: StageBlock) -> PzResult<StageBlock> {
         let orig_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
         let comp_field = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let is_interleaved = (comp_field & RANS_INTERLEAVED_FLAG) != 0;
-        let comp_len = (comp_field & !RANS_INTERLEAVED_FLAG) as usize;
+        let is_recoil = (comp_field & RANS_RECOIL_FLAG) != 0;
+        let comp_len = (comp_field & RANS_COMP_LEN_MASK) as usize;
         if 8 + comp_len > data.len() {
             return Err(PzError::InvalidInput);
         }
         let payload = &data[8..8 + comp_len];
-        let decoded = if is_interleaved {
+        let decoded = if is_interleaved && is_recoil {
+            // Recoil payload: [meta_len:u32][rans_data][recoil_metadata]
+            if payload.len() < 4 {
+                return Err(PzError::InvalidInput);
+            }
+            let meta_len = u32::from_le_bytes([
+                payload[0], payload[1], payload[2], payload[3],
+            ]) as usize;
+            if 4 + meta_len > payload.len() {
+                return Err(PzError::InvalidInput);
+            }
+            let rans_data = &payload[4..payload.len() - meta_len];
+            let recoil_meta_bytes = &payload[payload.len() - meta_len..];
+            let recoil_meta =
+                crate::recoil::RecoilMetadata::deserialize(recoil_meta_bytes)?;
+            let num_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            crate::recoil::decode_recoil_parallel(
+                rans_data, &recoil_meta, orig_len, num_threads,
+            )?
+        } else if is_interleaved {
             rans::decode_interleaved(payload, orig_len)?
         } else {
             rans::decode(payload, orig_len)?

@@ -153,6 +153,14 @@ pub struct CompressOptions {
     pub rans_interleaved_min_bytes: usize,
     /// Number of interleaved rANS states when interleaved mode is active.
     pub rans_interleaved_states: usize,
+    /// Enable Recoil split-point metadata for parallel rANS decode.
+    ///
+    /// When enabled (and `rans_interleaved` is also enabled), the encoder
+    /// generates split-point metadata allowing the decoder to parallelize
+    /// across `rans_recoil_splits` independent segments without re-encoding.
+    pub rans_recoil: bool,
+    /// Number of Recoil split points to generate (default 64).
+    pub rans_recoil_splits: usize,
     /// LzSeq sliding window size in bytes. Must be a power of 2.
     ///
     /// `None` = use the default (128KB). Only affects the `LzSeqR`/`LzSeqH` pipelines;
@@ -182,6 +190,8 @@ impl Default for CompressOptions {
             rans_interleaved: false,
             rans_interleaved_min_bytes: 64 * 1024,
             rans_interleaved_states: crate::rans::DEFAULT_INTERLEAVE,
+            rans_recoil: false,
+            rans_recoil_splits: 64,
             seq_window_size: None,
             stage0_backend: BackendAssignment::Auto,
             stage1_backend: BackendAssignment::Auto,
