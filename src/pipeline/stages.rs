@@ -848,8 +848,30 @@ pub(crate) fn run_compress_stage(
         }
         (Pipeline::LzSeqH, 0) => stage_demux_compress(block, &LzDemuxer::LzSeq, options),
         (Pipeline::LzSeqH, 1) => stage_huffman_encode(block),
+        (Pipeline::Csbwt, 0) => stage_csbwt_compress(block),
+        (Pipeline::SortLz, 0) => stage_sortlz_compress(block),
         _ => Err(PzError::Unsupported),
     }
+}
+
+// ---------------------------------------------------------------------------
+// CSBWT pipeline stage (single-stage: does everything)
+// ---------------------------------------------------------------------------
+
+/// CSBWT single-stage compression: BWT + context segmentation + per-segment FSE.
+pub(crate) fn stage_csbwt_compress(mut block: StageBlock) -> PzResult<StageBlock> {
+    block.data = crate::csbwt::compress(&block.data, &crate::csbwt::CsbwtConfig::default())?;
+    Ok(block)
+}
+
+// ---------------------------------------------------------------------------
+// SortLZ pipeline stage (single-stage: does everything)
+// ---------------------------------------------------------------------------
+
+/// SortLZ single-stage compression: sort-based LZ77 + FSE.
+pub(crate) fn stage_sortlz_compress(mut block: StageBlock) -> PzResult<StageBlock> {
+    block.data = crate::sortlz::compress(&block.data, &crate::sortlz::SortLzConfig::default())?;
+    Ok(block)
 }
 
 #[cfg(test)]

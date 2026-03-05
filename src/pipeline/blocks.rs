@@ -46,6 +46,8 @@ pub(crate) fn compress_block(
         None => match pipeline {
             Pipeline::Bw => compress_block_bw(input, opts),
             Pipeline::Bbw => compress_block_bbw(input, opts),
+            Pipeline::Csbwt => compress_block_csbwt(input),
+            Pipeline::SortLz => compress_block_sortlz(input),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -63,6 +65,8 @@ pub(crate) fn decompress_block(
         None => match pipeline {
             Pipeline::Bw => decompress_block_bw(payload, orig_len),
             Pipeline::Bbw => decompress_block_bbw(payload, orig_len),
+            Pipeline::Csbwt => decompress_block_csbwt(payload, orig_len),
+            Pipeline::SortLz => decompress_block_sortlz(payload, orig_len),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -321,4 +325,32 @@ fn decompress_block_bbw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     }
 
     Ok(output)
+}
+
+// ---------------------------------------------------------------------------
+// CSBWT pipeline: Context-Segmented BWT + per-segment FSE
+// ---------------------------------------------------------------------------
+
+/// Compress a single block using the CSBWT pipeline (no container header).
+fn compress_block_csbwt(input: &[u8]) -> PzResult<Vec<u8>> {
+    crate::csbwt::compress(input, &crate::csbwt::CsbwtConfig::default())
+}
+
+/// Decompress a single CSBWT block (no container header).
+fn decompress_block_csbwt(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    crate::csbwt::decompress(payload, orig_len)
+}
+
+// ---------------------------------------------------------------------------
+// SortLZ pipeline: Sort-based LZ77 + FSE
+// ---------------------------------------------------------------------------
+
+/// Compress a single block using the SortLZ pipeline (no container header).
+fn compress_block_sortlz(input: &[u8]) -> PzResult<Vec<u8>> {
+    crate::sortlz::compress(input, &crate::sortlz::SortLzConfig::default())
+}
+
+/// Decompress a single SortLZ block (no container header).
+fn decompress_block_sortlz(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    crate::sortlz::decompress(payload, orig_len)
 }

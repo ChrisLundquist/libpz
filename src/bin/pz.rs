@@ -79,6 +79,12 @@ fn list_pipelines() {
         ("lz78r", "7", "LZ78 + rANS (experimental)"),
         ("lzseqr", "8", "LzSeq + rANS (zstd-style code+extra-bits)"),
         ("lzseqh", "9", "LzSeq + Huffman (fast decode)"),
+        (
+            "csbwt",
+            "10",
+            "Context-Segmented BWT + per-segment FSE (GPU experiment)",
+        ),
+        ("sortlz", "11", "Sort-based LZ77 + FSE (GPU experiment)"),
     ];
     for (name, id, desc) in pipelines {
         println!("  {name:10} {id:>2}  {desc}");
@@ -216,6 +222,8 @@ fn parse_args() -> Opts {
                     "lz78r" | "7" => Pipeline::Lz78R,
                     "lzseqr" | "8" => Pipeline::LzSeqR,
                     "lzseqh" | "9" => Pipeline::LzSeqH,
+                    "csbwt" | "10" => Pipeline::Csbwt,
+                    "sortlz" | "11" => Pipeline::SortLz,
                     other => {
                         eprintln!("pz: unknown pipeline '{other}'");
                         eprintln!("pz: run 'pz --list-pipelines' to see available pipelines");
@@ -408,6 +416,9 @@ fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
                 6 => "lzssr",
                 7 => "lz78r",
                 8 => "lzseqr",
+                9 => "lzseqh",
+                10 => "csbwt",
+                11 => "sortlz",
                 _ => "unknown",
             };
             let mut orig_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
