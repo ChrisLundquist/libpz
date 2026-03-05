@@ -266,7 +266,7 @@ impl WebGpuEngine {
         Ok(())
     }
 
-    fn run_inclusive_prefix_sum(
+    pub(crate) fn run_inclusive_prefix_sum(
         &self,
         input_buf: &wgpu::Buffer,
         output_buf: &mut wgpu::Buffer,

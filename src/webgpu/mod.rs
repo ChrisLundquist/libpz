@@ -100,6 +100,9 @@ const PARLZ_RESOLVE_KERNEL_SOURCE: &str = include_str!("../../kernels/parlz_reso
 /// Embedded WGSL kernel source: GPU Re-Pair operations (Experiment C).
 const REPAIR_OPS_KERNEL_SOURCE: &str = include_str!("../../kernels/repair_ops.wgsl");
 
+/// Embedded WGSL kernel source: GPU FWST radix key extraction (Experiment F).
+const FWST_RADIX_KERNEL_SOURCE: &str = include_str!("../../kernels/fwst_radix.wgsl");
+
 /// Number of candidates per position in the top-K kernel (must match K in lz77_topk.wgsl).
 const TOPK_K: usize = 4;
 
@@ -297,6 +300,11 @@ struct ParlzPipelines {
     classify: wgpu::ComputePipeline,
 }
 
+/// FWST radix key extraction pipeline (Experiment F).
+struct FwstRadixPipelines {
+    compute_keys: wgpu::ComputePipeline,
+}
+
 /// Repair grammar compression pipelines (Experiment C).
 #[allow(dead_code)] // replace used when GPU compaction is wired up
 struct RepairPipelines {
@@ -330,6 +338,7 @@ pub struct WebGpuEngine {
     rans_encode: OnceLock<RansEncodePipelines>,
     lzseq_demux: OnceLock<LzSeqPipelines>,
     bitplane: OnceLock<BitplanePipelines>,
+    fwst_radix: OnceLock<FwstRadixPipelines>,
     parlz: OnceLock<ParlzPipelines>,
     repair: OnceLock<RepairPipelines>,
     /// Device name for diagnostics.
@@ -488,6 +497,7 @@ impl WebGpuEngine {
             rans_encode: OnceLock::new(),
             lzseq_demux: OnceLock::new(),
             bitplane: OnceLock::new(),
+            fwst_radix: OnceLock::new(),
             parlz: OnceLock::new(),
             repair: OnceLock::new(),
             device_name,
@@ -1403,6 +1413,29 @@ impl WebGpuEngine {
                 group
             })
             .transpose
+    }
+
+    // --- Experiment F: FWST radix key extraction ---
+
+    fn pipeline_fwst_compute_keys(&self) -> &wgpu::ComputePipeline {
+        &self
+            .fwst_radix
+            .get_or_init(|| {
+                let t0 = std::time::Instant::now();
+                let group = FwstRadixPipelines {
+                    compute_keys: self.make_pipeline(
+                        "fwst_compute_keys",
+                        FWST_RADIX_KERNEL_SOURCE,
+                        "fwst_compute_keys",
+                    ),
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile fwst_radix.wgsl: {ms:.3} ms");
+                }
+                group
+            })
+            .compute_keys
     }
 
     // --- Experiment E: Parlz conflict resolution ---
