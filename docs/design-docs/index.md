@@ -84,11 +84,26 @@ NVIDIA nvcomp architecture analysis: how they achieve 90-320 GB/s, and which pat
 
 ## Research and Experiments
 
+### [gpu-experiments-wave2.md](gpu-experiments-wave2.md)
+**Status:** ✅ Active
+**Last reviewed:** 2026-03-05
+
+Wave 2 GPU experiments: four proposed experiments each answering a specific architectural question about GPU compression viability.
+
+**Key topics:**
+- D (bitplane): GPU throughput ceiling — what's the max MB/s with zero serial stages?
+- F (fwst): Context depth — how many bytes of BWT sort context actually matter?
+- E (parlz): Parallel parsing cost — can we remove serial LZ parsing without destroying ratio?
+- C (repair): Iterative dispatch — is GPU kernel dispatch latency × iteration count viable?
+- Cross-experiment synthesis: how results combine to inform GPU strategy
+
+---
+
 ### [experiments.md](experiments.md)
 **Status:** ⚠️ Historical
 **Last reviewed:** 2026-02-14
 
-Experimental results and dead ends. Kept for historical reference.
+Wave 1 experimental results and dead ends. Kept for historical reference.
 
 **Key topics:**
 - Algorithm experiments that didn't ship
