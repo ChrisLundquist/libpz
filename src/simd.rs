@@ -155,6 +155,27 @@ impl Dispatcher {
         unsafe { (self.compare_fn)(a.as_ptr(), b.as_ptr(), max_len) }
     }
 
+    /// Pointer-based variant of [`compare_bytes`] for hot callers that already
+    /// maintain precise bounds and want to avoid repeated slice construction.
+    ///
+    /// # Safety
+    /// Caller must guarantee that `max_len` bytes are readable from both `a`
+    /// and `b`, and that the dispatcher was created on a CPU supporting the
+    /// resolved SIMD function (guaranteed by `Dispatcher::new()`).
+    #[inline]
+    pub(crate) unsafe fn compare_bytes_ptr(
+        &self,
+        a: *const u8,
+        b: *const u8,
+        max_len: usize,
+    ) -> usize {
+        if max_len == 0 {
+            return 0;
+        }
+        // SAFETY: caller guarantees pointer validity and length bounds.
+        unsafe { (self.compare_fn)(a, b, max_len) }
+    }
+
     /// Sum all values in a u32 slice. Used for prefix sum verification
     /// and total bit length computation in Huffman encoding.
     pub fn sum_u32(&self, data: &[u32]) -> u64 {

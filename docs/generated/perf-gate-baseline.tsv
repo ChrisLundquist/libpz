@@ -1,0 +1,5 @@
+mode	pipeline	size	iterations	repeats	mbps_median	scheduler_overhead_pct_median	runs_median	total_ns_median	tracked_thread_time_ns_median	stage_compute_ns_median	queue_wait_ns_median	queue_admin_ns_median	gpu_handoff_ns_median	gpu_try_send_full_count_median	gpu_try_send_disconnected_count_median
+cpu	deflate	1048576	20	3	156.5	0.147518	20	127300346	474864432	402041984	70551775	148821	0	0	0
+cpu	lzr	1048576	20	3	163.2	0.150340	20	122067313	455555101	389395249	68034731	200576	0	0	0
+cpu	lzf	1048576	20	3	110.0	0.222353	20	181342901	701127351	541477567	159481517	176527	0	0	0
+cpu	lzseqr	1048576	20	3	71.2	0.204666	20	280579297	1093789168	866755934	223631273	257726	0	0	0
