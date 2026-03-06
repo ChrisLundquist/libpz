@@ -1925,6 +1925,204 @@ impl WebGpuEngine {
         Ok(last)
     }
 
+    /// Decode an interleaved rANS stream using Recoil split-point metadata on GPU.
+    ///
+    /// Each Recoil split is mapped to one GPU "chunk", with states rotated to
+    /// account for non-aligned split boundaries (split.symbol_index % num_lanes != 0).
+    /// All splits share the same frequency table and word stream data.
+    /// The existing `rans_decode_chunk_impl` kernel processes all splits in parallel.
+    pub fn rans_decode_recoil_gpu(
+        &self,
+        rans_data: &[u8],
+        metadata: &crate::recoil::RecoilMetadata,
+        original_len: usize,
+    ) -> PzResult<Vec<u8>> {
+        if original_len == 0 {
+            return Ok(Vec::new());
+        }
+        if metadata.splits.is_empty() {
+            return Err(PzError::InvalidInput);
+        }
+
+        // --- Parse the interleaved rANS header ---
+        if rans_data.len() < 1 + NUM_SYMBOLS * 2 + 1 {
+            return Err(PzError::InvalidInput);
+        }
+        let scale_bits = rans_data[0];
+        if !(MIN_SCALE_BITS..=MAX_SCALE_BITS).contains(&scale_bits) {
+            return Err(PzError::InvalidInput);
+        }
+        let norm = deserialize_freq_table(&rans_data[1..], scale_bits)?;
+
+        let mut cursor = 1 + NUM_SYMBOLS * 2;
+        let num_lanes = rans_data[cursor] as usize;
+        cursor += 1;
+        if num_lanes == 0 || num_lanes > 64 {
+            return Err(PzError::Unsupported);
+        }
+
+        if rans_data.len() < cursor + num_lanes * 4 {
+            return Err(PzError::InvalidInput);
+        }
+        // Skip initial states (Recoil provides per-split states).
+        cursor += num_lanes * 4;
+
+        if rans_data.len() < cursor + num_lanes * 4 {
+            return Err(PzError::InvalidInput);
+        }
+        let mut total_word_counts = vec![0u32; num_lanes];
+        for count in &mut total_word_counts {
+            *count = read_u32_le(rans_data, &mut cursor)?;
+        }
+
+        // Read word streams per lane.
+        let mut word_streams: Vec<Vec<u16>> = Vec::with_capacity(num_lanes);
+        for &count_u32 in &total_word_counts {
+            let count = count_u32 as usize;
+            if rans_data.len() < cursor + count * 2 {
+                return Err(PzError::InvalidInput);
+            }
+            let stream = bytes_as_u16_le(&rans_data[cursor..], count);
+            word_streams.push(stream.to_vec());
+            cursor += count * 2;
+        }
+
+        // --- Build per-split (chunk) buffers ---
+        let num_splits = metadata.splits.len();
+
+        // Compute per-split output ranges and word consumption.
+        struct SplitInfo {
+            sym_start: usize,
+            sym_end: usize,
+        }
+        let mut split_infos = Vec::with_capacity(num_splits);
+        for (i, split) in metadata.splits.iter().enumerate() {
+            let sym_start = split.symbol_index as usize;
+            let sym_end = if i + 1 < num_splits {
+                metadata.splits[i + 1].symbol_index as usize
+            } else {
+                original_len
+            };
+            if sym_start > original_len || sym_end > original_len || sym_start > sym_end {
+                return Err(PzError::InvalidInput);
+            }
+            split_infos.push(SplitInfo { sym_start, sym_end });
+        }
+
+        // Build next-split word positions (for computing per-split word counts).
+        // For the last split, use total_word_counts.
+        let mut next_word_positions: Vec<Vec<u32>> = Vec::with_capacity(num_splits);
+        for i in 0..num_splits {
+            if i + 1 < num_splits {
+                next_word_positions.push(metadata.splits[i + 1].word_positions.clone());
+            } else {
+                next_word_positions.push(total_word_counts.clone());
+            }
+        }
+
+        // Pack word streams and state buffers.
+        // Each split gets its own word region (right-aligned per lane) and state block.
+        let mut total_words_u16 = 0usize;
+        let mut chunk_word_sizes = Vec::with_capacity(num_splits);
+        for info in &split_infos {
+            let chunk_len = info.sym_end - info.sym_start;
+            let mwpl = max_words_per_lane_for_chunk(chunk_len.max(1), num_lanes)?;
+            let chunk_words = num_lanes.checked_mul(mwpl).ok_or(PzError::InvalidInput)?;
+            chunk_word_sizes.push((mwpl, chunk_words));
+            total_words_u16 = total_words_u16
+                .checked_add(chunk_words)
+                .ok_or(PzError::InvalidInput)?;
+        }
+
+        let mut words_packed = vec![0u32; total_words_u16.div_ceil(2).max(1)];
+        let mut state_words = vec![0u32; num_splits * num_lanes * 2];
+        let mut chunk_meta_words = Vec::with_capacity(num_splits * 4);
+        let mut running_words_u16 = 0usize;
+
+        for (split_idx, (info, split)) in split_infos.iter().zip(metadata.splits.iter()).enumerate()
+        {
+            let sym_start = info.sym_start;
+            let chunk_len = info.sym_end - info.sym_start;
+            let (mwpl, chunk_words) = chunk_word_sizes[split_idx];
+            let state_base = split_idx * num_lanes * 2;
+            let lane_offset = sym_start % num_lanes;
+
+            for kernel_lane in 0..num_lanes {
+                // Rotate: kernel lane l gets original lane (sym_start + l) % num_lanes
+                let orig_lane = (kernel_lane + lane_offset) % num_lanes;
+
+                // Set rotated state
+                state_words[state_base + kernel_lane] = split.states[orig_lane];
+
+                // Compute word count for this lane in this split
+                let wp_start = split.word_positions[orig_lane] as usize;
+                let wp_end = next_word_positions[split_idx][orig_lane] as usize;
+                let word_count = wp_end.saturating_sub(wp_start);
+
+                state_words[state_base + num_lanes + kernel_lane] = word_count as u32;
+
+                // Copy word slice, right-aligned in the lane's slot
+                if word_count > 0 && wp_start + word_count <= word_streams[orig_lane].len() {
+                    let src = &word_streams[orig_lane][wp_start..wp_start + word_count];
+                    let lane_start_u16 = running_words_u16 + kernel_lane * mwpl;
+                    let write_start_u16 = lane_start_u16 + (mwpl - word_count);
+                    write_packed_u16_slice(&mut words_packed, write_start_u16, src);
+                }
+            }
+
+            chunk_meta_words.extend_from_slice(&[
+                sym_start as u32,
+                chunk_len as u32,
+                running_words_u16 as u32,
+                (split_idx * num_lanes * 2) as u32,
+            ]);
+
+            running_words_u16 += chunk_words;
+        }
+
+        // --- Upload and dispatch ---
+        let words_buf = self.create_buffer_init(
+            "rans_recoil_words",
+            bytemuck::cast_slice(&words_packed),
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let words_dev = DeviceBuf {
+            buf: words_buf,
+            len: total_words_u16 * 2,
+        };
+
+        let states_buf = self.create_buffer_init(
+            "rans_recoil_states",
+            bytemuck::cast_slice(&state_words),
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let states_dev = DeviceBuf {
+            buf: states_buf,
+            len: state_words.len() * std::mem::size_of::<u32>(),
+        };
+
+        let tables_words = build_tables_words(&norm, scale_bits);
+        let tables = self.create_buffer_init(
+            "rans_recoil_tables",
+            bytemuck::cast_slice(&tables_words),
+            wgpu::BufferUsages::STORAGE,
+        );
+
+        let output = self.rans_decode_chunked_gpu_with_chunk_meta(
+            &words_dev,
+            &states_dev,
+            &tables,
+            &chunk_meta_words,
+            original_len,
+            RansChunkedDecodeParams {
+                num_lanes,
+                scale_bits,
+                chunk_size: 0, // unused by _with_chunk_meta
+            },
+        )?;
+        output.read_to_host(self)
+    }
+
     /// Encode chunked interleaved rANS payload on GPU using CPU wire format.
     ///
     /// Returns `(encoded, used_chunked)` with fallback behavior that mirrors

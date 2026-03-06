@@ -436,10 +436,7 @@ pub(crate) fn stage_rans_decode(mut block: StageBlock) -> PzResult<StageBlock> {
             let rans_data = &payload[4..payload.len() - meta_len];
             let recoil_meta_bytes = &payload[payload.len() - meta_len..];
             let recoil_meta = crate::recoil::RecoilMetadata::deserialize(recoil_meta_bytes)?;
-            let num_threads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
-            crate::recoil::decode_recoil_parallel(rans_data, &recoil_meta, orig_len, num_threads)?
+            decode_recoil_payload(rans_data, &recoil_meta, orig_len)?
         } else if is_interleaved {
             rans::decode_interleaved(payload, orig_len)?
         } else {
@@ -456,6 +453,67 @@ pub(crate) fn stage_rans_decode(mut block: StageBlock) -> PzResult<StageBlock> {
 }
 
 /// GPU batched rANS encoding stage (WebGPU): encode all streams in a single
+/// Decode a Recoil payload using CPU parallel threads.
+fn decode_recoil_payload(
+    rans_data: &[u8],
+    recoil_meta: &crate::recoil::RecoilMetadata,
+    orig_len: usize,
+) -> PzResult<Vec<u8>> {
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    crate::recoil::decode_recoil_parallel(rans_data, recoil_meta, orig_len, num_threads)
+}
+
+/// GPU-accelerated rANS decode stage that routes Recoil payloads to GPU.
+///
+/// Falls back to CPU for non-Recoil streams.
+#[cfg(feature = "webgpu")]
+pub(crate) fn stage_rans_decode_webgpu(
+    mut block: StageBlock,
+    engine: &crate::webgpu::WebGpuEngine,
+) -> PzResult<StageBlock> {
+    let (streams, pre_entropy_len, meta) = decode_multistream(&block.data, |data| {
+        if data.len() < 8 {
+            return Err(PzError::InvalidInput);
+        }
+        let orig_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let comp_field = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let is_interleaved = (comp_field & RANS_INTERLEAVED_FLAG) != 0;
+        let is_recoil = (comp_field & RANS_RECOIL_FLAG) != 0;
+        let comp_len = (comp_field & RANS_COMP_LEN_MASK) as usize;
+        if 8 + comp_len > data.len() {
+            return Err(PzError::InvalidInput);
+        }
+        let payload = &data[8..8 + comp_len];
+        let decoded = if is_interleaved && is_recoil {
+            if payload.len() < 4 {
+                return Err(PzError::InvalidInput);
+            }
+            let meta_len =
+                u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+            if 4 + meta_len > payload.len() {
+                return Err(PzError::InvalidInput);
+            }
+            let rans_data = &payload[4..payload.len() - meta_len];
+            let recoil_meta_bytes = &payload[payload.len() - meta_len..];
+            let recoil_meta = crate::recoil::RecoilMetadata::deserialize(recoil_meta_bytes)?;
+            engine.rans_decode_recoil_gpu(rans_data, &recoil_meta, orig_len)?
+        } else if is_interleaved {
+            rans::decode_interleaved(payload, orig_len)?
+        } else {
+            rans::decode(payload, orig_len)?
+        };
+        Ok((decoded, 8 + comp_len))
+    })?;
+
+    block.metadata.pre_entropy_len = Some(pre_entropy_len);
+    block.metadata.demux_meta = meta;
+    block.streams = Some(streams);
+    block.data.clear();
+    Ok(block)
+}
+
 /// batched GPU dispatch with ring-buffered submit/readback overlap.
 ///
 /// Per-stream framing: [orig_len: u32] [compressed_len: u32 | flags] [rans_data]
