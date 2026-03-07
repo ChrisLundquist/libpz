@@ -46,15 +46,15 @@ Per-file breakdown:
 
 ### Conclusions
 
-1. **The GPU throughput ceiling question is not meaningfully answered.** Bitplane throughput (2.0 MB/s) is the same as deflate/lzf because GPU dispatch and transfer overhead (~440ms per invocation) completely dominates the trivial bit-transpose compute. The pipeline has zero serial stages as designed, but the measurement tells us about GPU dispatch latency, not compute ceiling.
+1. **The GPU throughput ceiling question is not meaningfully answered.** Bitplane throughput (2.0 MB/s) is the same as deflate/lzf because the `pz` CLI's per-process overhead dominates. Profiling shows ~110ms process startup + ~260ms wgpu device init/shader compilation as fixed costs. Actual GPU compute scales modestly with input size (~120ms for 4MB). The pipeline has zero serial stages as designed, but the measurement tells us about device init, not compute ceiling.
 
 2. **Bit-plane decomposition is wrong for general compression.** Text files have no redundancy in bit planes. RLE on the binary streams produces more bytes than the original. The only file that compresses (ptt5) has inherent bit-plane structure (CCITT fax encoding).
 
-3. **Key takeaway for GPU strategy:** The ~440ms per-invocation overhead floor means GPU acceleration only breaks even on inputs where the CPU would take >440ms. For the existing BW pipeline, that's inputs larger than ~100KB at 8 MB/s CPU throughput. Small files will always be slower on GPU.
+3. **Key takeaway for GPU strategy:** The ~260ms device init overhead is a per-process cost, fully amortizable in a long-running process or library API. It is NOT a per-dispatch cost. Kernel dispatch itself is fast (<1ms). The bench.sh numbers are misleading because they fork a new `pz` process per file, paying device init every time.
 
 ### What we learned about the throughput ceiling
 
-The real throughput ceiling isn't bitplane's ratio — it's the **dispatch overhead floor of ~440ms** regardless of input size or algorithm complexity. This is the dominant constraint for all GPU compression work.
+The real constraint is **wgpu device initialization (~260ms)**, not dispatch overhead. In a persistent process (library, daemon, streaming), this cost is paid once. Effective GPU throughput for compute-only work is better estimated from the 3.7KB→4MB scaling: ~120ms of actual GPU work for 4MB, implying ~33 MB/s effective compute throughput (before accounting for CPU-side entropy coding).
 
 ---
 
@@ -129,11 +129,11 @@ Notable per-file results:
 
 ### Conclusions
 
-1. **Iterative GPU dispatch is not viable for small-to-medium inputs.** The ~440ms per-dispatch floor means 200 rounds × 5 dispatches = 1000 dispatches costs ~440 seconds of overhead alone (though batching into single command encoders reduces this). Actual wall time for the full corpus was 33.3 seconds at 0.4 MB/s.
+1. **Iterative GPU dispatch is slow due to per-round buffer allocation and readback.** Each round creates new buffers (histogram, scratch, replace output, prefix sum, compacted) and reads back the argmax result and compacted symbols. With 100+ rounds, this per-round host overhead (buffer creation + readback synchronization) accumulates. Actual wall time for the full corpus was 33.3 seconds at 0.4 MB/s.
 
 2. **Grammar compression finds different redundancy than LZ/BWT.** Repair's 24.6% on ptt5 (vs lzf's 13.2%) and 39.5% on kennedy.xls (vs lzf's 20.9%) show it captures some structure, but it's consistently worse than LZ on every file. Grammar compression's advantage (hierarchical patterns) doesn't overcome its disadvantage (greedy bigram selection without global optimization).
 
-3. **Dispatch overhead ratio:** Based on the throughput data, compute is a small fraction of wall time. The 0.4 MB/s throughput for repair vs 2.0 MB/s for simpler GPU pipelines (which also spend most time on dispatch) suggests repair's many rounds do add measurable compute overhead on top of the dispatch floor.
+3. **Per-round host overhead dominates.** The 0.4 MB/s throughput for repair vs 2.0 MB/s for single-dispatch pipelines reflects the cost of hundreds of GPU↔CPU synchronization points (buffer readbacks for argmax results and compacted arrays). Reducing round count via batched top-K replacement, or eliminating readbacks via persistent GPU-side state, would significantly improve throughput.
 
 4. **Early stopping opportunity:** The algorithm likely does most useful work in the first 20-50 rounds (when high-frequency bigrams are being replaced). After that, diminishing returns set in but dispatch costs remain constant. Batching multiple bigram replacements per round would reduce round count.
 
@@ -161,9 +161,9 @@ Per-file comparison:
 
 2. **SortLZ approaches BW pipeline quality on text.** Bible.txt: 39.3% vs 39.1% (BW). World192.txt: 37.7% vs 34.5%. This is remarkable because SortLZ is an LZ77 variant (not a BWT variant) — it achieves BWT-competitive ratios through exhaustive match finding.
 
-3. **GPU throughput is bottlenecked by dispatch overhead.** At 1.3 MB/s, SortLZ is slower than CPU lzf (2.0 MB/s in this GPU-enabled build). The radix sort itself is fast, but GPU buffer creation and dispatch overhead dominate.
+3. **GPU throughput is bottlenecked by per-process device init.** At 1.3 MB/s end-to-end (bench.sh), SortLZ is slower than CPU lzf. But ~260ms of this is one-time wgpu device init + shader compilation, not per-dispatch cost. In a persistent process, the radix sort + verify compute would dominate.
 
-4. **Most promising direction:** If dispatch overhead can be amortized (larger inputs, persistent buffers, batched dispatches), SortLZ's match quality advantage becomes a real differentiator. The algorithm is naturally GPU-parallel (radix sort + verification are both embarrassingly parallel).
+4. **Most promising direction:** In a library/daemon context where device init is amortized, SortLZ's match quality advantage becomes a real differentiator. The algorithm is naturally GPU-parallel (radix sort + verification are both embarrassingly parallel).
 
 ---
 
@@ -189,14 +189,14 @@ Per-file comparison:
 
 | Question | Answer |
 |----------|--------|
-| **D: What's the GPU throughput ceiling?** | ~2.0 MB/s with current dispatch overhead (~440ms floor). The ceiling is set by infrastructure, not algorithms. |
+| **D: What's the GPU throughput ceiling?** | Unmeasurable via CLI — ~260ms wgpu device init dominates. Kernel dispatch itself is fast (<1ms). Effective compute throughput ~33 MB/s on 4MB input. |
 | **F: How deep is data's statistical structure?** | Cannot measure — FWST's permutation overhead prevents meaningful comparison. Full suffix sort is structurally required for BWT invertibility. |
 | **E: Can we remove serial LZ parsing?** | **No.** 37.6% ratio gap is far too large. Hybrid GPU match finding + CPU parsing is the correct approach. |
-| **C: Can we iterate on GPU?** | **Not at current dispatch overhead.** Iterative algorithms need batching or persistent kernel patterns to amortize the ~440ms dispatch floor. |
+| **C: Can we iterate on GPU?** | Repair's iterative pattern is slow (0.4 MB/s) but the bottleneck is hundreds of rounds of buffer allocation + readback, not dispatch latency per se. Batching and persistent buffers would help. |
 
 ### GPU strategy implications
 
-1. **Dispatch overhead is the #1 bottleneck.** Every experiment hits the same ~440ms floor regardless of algorithm complexity. Optimizing algorithms is low-leverage until this is addressed.
+1. **Device init, not dispatch, is the CLI bottleneck.** The ~260ms wgpu device init is a per-process cost. In a library or daemon where the device persists, this vanishes. Kernel dispatch is fast. The bench.sh numbers are misleading because they fork a fresh process per file.
 
 2. **Hybrid is correct.** GPU for embarrassingly-parallel stages (BWT sort, LZ match finding), CPU for serial stages (parsing, entropy coding). The existing lzr/lzf/lzseqr architecture is on the right track.
 
@@ -206,10 +206,22 @@ Per-file comparison:
 
 ### Recommended next steps
 
-1. **Reduce GPU dispatch overhead.** Investigate persistent compute pipelines, buffer pooling, and batched multi-kernel command encoding.
+1. **Benchmark with persistent GPU device.** Write an in-process benchmark (Rust `criterion` or similar) that initializes wgpu once and compresses multiple files. This will reveal actual GPU compute throughput without device init noise.
 
 2. **Integrate SortLZ match finding into the LZ pipeline.** Use GPU radix sort for match finding, then CPU greedy/lazy parsing, then existing entropy coding. This combines SortLZ's match quality with serial parsing's compression efficiency.
 
 3. **Drop FWST, bitplane, CSBWT, repair from further GPU work.** These experiments have answered their questions — the answers are negative.
 
 4. **Keep parlz as a measurement baseline.** While its ratios are too poor for production, it's useful for measuring the "parallel parsing gap" on new data types.
+
+### Overhead breakdown (measured)
+
+```
+Component          Time      Notes
+───────────────    ───────   ─────────────────────────
+Process startup    ~110ms    Rust binary init, file I/O (same for CPU and GPU)
+wgpu device init   ~260ms    One-time per process; adapter + device + shader compile
+GPU compute (4MB)  ~120ms    Scales with input size; actual kernel work
+Kernel dispatch    <1ms      Per-dispatch cost is negligible
+PCIe transfer      <1ms      4MB at PCIe 5 speeds
+```
