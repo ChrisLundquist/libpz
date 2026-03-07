@@ -18,12 +18,17 @@
 //! | `Lz78R`       | LZ78 → rANS                      | experimental    |
 //! | `LzSeqR`      | LzSeq → rANS                     | zstd-style      |
 //! | `LzSeqH`      | LzSeq → Huffman                  | fast decode     |
+//! | `SortLz`      | SortLZ → FSE                     | GPU match find  |
+//!
+//! **Match finder selection:** All LZ-based pipelines accept `MatchFinder::SortLz`
+//! as an alternative to `MatchFinder::HashChain`. When SortLz is used as a match
+//! finder, the wire format is that of the host pipeline (fully compatible).
 //!
 //! **Container format (V2, multi-block):**
 //! Each compressed stream starts with a header:
 //! - Magic bytes: `PZ` (2 bytes)
 //! - Version: 2 (1 byte)
-//! - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 5=Lzfi, 6=LzssR, 7=Lz78R, 8=LzSeqR, 9=LzSeqH (1 byte)
+//! - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 5=Lzfi, 6=LzssR, 7=Lz78R, 8=LzSeqR, 9=LzSeqH, 10=SortLz (1 byte)
 //! - Original length: u32 little-endian (4 bytes)
 //! - num_blocks: u32 little-endian (4 bytes)
 //! - Block table: \[compressed_len: u32, original_len: u32\] \* num_blocks

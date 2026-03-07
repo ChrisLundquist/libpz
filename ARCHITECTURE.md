@@ -5,12 +5,13 @@ For day-to-day development instructions, see `CLAUDE.md`.
 
 ## Completed milestones (12/12)
 - **Algorithms:** LZ77 (brute, hashchain, lazy, parallel), LzSeq (code+extra-bits, repeat offsets, 128KB window), Huffman, BWT (SA-IS), MTF, RLE, FSE, rANS
-- **Pipelines:** Deflate (LZ77+Huffman), Bw (BWT+MTF+RLE+FSE), Lzr (LZ77+rANS), Lzf (LZ77+FSE), LzSeqR (LzSeq+rANS) — Deflate, Lzr, and Lzf use multi-stream entropy coding for ~16-18% better compression; LzSeqR uses zstd-style code+extra-bits encoding with 6-stream demux
+- **Pipelines:** Deflate (LZ77+Huffman), Bw (BWT+MTF+RLE+FSE), Lzr (LZ77+rANS), Lzf (LZ77+FSE), LzSeqR (LzSeq+rANS), LzSeqH (LzSeq+Huffman), SortLz (sort-LZ77+FSE) — Deflate, Lzr, and Lzf use multi-stream entropy coding for ~16-18% better compression; LzSeqR/LzSeqH use zstd-style code+extra-bits encoding with 6-stream demux; SortLz uses sort-based match finding (GPU-accelerated)
 - **Auto-selection:** Heuristic (`select_pipeline`) and trial-based (`select_pipeline_trial`) pipeline selection using data analysis (entropy, match density, run ratio, autocorrelation); LzSeqR included in trial candidates
 - **Data analysis:** `src/analysis.rs` — statistical profiling (Shannon entropy, autocorrelation, run ratio, match density, distribution shape) with sampling support
 - **Optimal parsing:** GPU top-K match table → CPU backward DP (4-6% better compression)
 - **Multi-threading:** Block-parallel and pipeline-parallel via V2 container format; within-block parallel LZ77 match finding (`compress_lazy_parallel`)
-- **GPU kernels:** LZ77 hash-table (fast), LZ77 batch/per-position (legacy), LZ77 top-K, BWT radix sort + parallel rank assignment, Huffman encode (two-pass with Blelloch prefix sum), GPU Deflate chaining (LZ77→Huffman on device)
+- **SortLZ:** Sort-based match finder — standalone pipeline (ID 10) and pluggable `MatchFinder::SortLz` for Deflate/Lzr/Lzf/LzSeqR/LzSeqH; GPU radix sort batched (single submit); adaptive `select_match_finder()` heuristic; u64-optimized `extend_match`; 39.6% ratio (beats Deflate 43.4%)
+- **GPU kernels:** LZ77 hash-table (fast), LZ77 batch/per-position (legacy), LZ77 top-K, BWT radix sort + parallel rank assignment, SortLZ radix sort + match verification, Huffman encode (two-pass with Blelloch prefix sum), GPU Deflate chaining (LZ77→Huffman on device)
 - **Tooling:** CLI (`pz` with `-a`/`--auto` and `--trial` flags), C FFI, Criterion benchmarks, CI (3 OS)
 - **Fuzz testing (M5.3):** `cargo-fuzz` infrastructure with 12 targets covering all algorithms and pipelines (roundtrip + crash resistance)
 
@@ -154,6 +155,73 @@ See `docs/exec-plans/tech-debt-tracker.md` for rANS SIMD decode and reciprocal m
 | aarch64     | NEON     | SVE      | Stubs (dispatch to scalar) |
 
 Runtime detection via `Dispatcher::new()` caches the best ISA level at first call. All SIMD implementations are verified against scalar reference in tests.
+
+## SortLZ: Sort-Based Match Finding
+
+SortLZ is a deterministic, GPU-friendly LZ77 match finder. It replaces hash-chain
+match finding with radix sort of (hash, position) pairs followed by adjacent-pair
+match verification. Zero atomics, fully deterministic — ideal for GPU execution.
+
+### Two modes of operation
+
+| Mode | Description | Wire format |
+|------|-------------|-------------|
+| **`Pipeline::SortLz` (ID 10)** | Standalone pipeline with its own wire format | SortLZ-specific (see below) |
+| **`MatchFinder::SortLz`** | Pluggable match finder for other pipelines | Host pipeline's format |
+
+When used as a `MatchFinder`, SortLZ is transparent to the wire format — the
+output is 100% compatible with the host pipeline (Deflate, Lzr, Lzf, LzSeqR,
+LzSeqH). The consumer and decompressor see no difference.
+
+### Pipeline::SortLz wire format (per block)
+
+```
+[num_tokens: u32 LE]       total token count (literals + matches)
+[num_literals: u32 LE]     literal count
+[flags_len: u32 LE]        ceil(num_tokens / 8)
+[flags: flags_len bytes]   bitfield (1 = literal, 0 = match, MSB-first)
+[fse_lit_len: u32 LE]      [fse_literals: ...]   FSE-encoded literal bytes
+[fse_off_len: u32 LE]      [fse_offsets: ...]    FSE-encoded u16 LE offsets
+[fse_len_len: u32 LE]      [fse_lengths: ...]    FSE-encoded u16 LE lengths
+```
+
+This is NOT wire-compatible with any other pipeline. It uses FSE entropy coding
+on three raw byte streams (literals, offsets as u16 LE, lengths as u16 LE),
+with a bitfield flag stream to interleave them during decompression.
+
+### Algorithm
+
+1. **Hash**: Compute 4-byte window hashes (u32 from LE bytes, no collisions for 4-byte matches)
+2. **Radix sort**: 4-pass 8-bit LSB radix sort on (hash, position) pairs
+3. **Verify**: Adjacent same-hash entries → extend match byte-by-byte (u64 chunk comparison)
+4. **Select**: Best match per position (longest wins, max_candidates=8 per sorted entry)
+5. **Parse**: Greedy or lazy token emission
+
+### GPU implementation (`src/webgpu/sortlz.rs`)
+
+Uses GPU radix sort (same kernels as BWT) + GPU match verification:
+- 4-pass radix sort batched into single command encoder (1 submit, not 16+)
+- `encoder.clear_buffer()` for histogram zeroing (no CPU↔GPU sync)
+- Separate submit for match verification (needs sort results)
+- 10.6x faster than CPU SortLZ at 4MB (89 vs 8.4 MB/s)
+
+### Adaptive match finder selection
+
+`select_match_finder()` in `src/pipeline/mod.rs` chooses SortLz when:
+- GPU available and input ≥ MIN_GPU_INPUT_SIZE
+- High match density (>0.3) and moderate entropy (<6.5 bits/byte)
+- Large input (≥64KB) with match density >0.2 and low entropy (<5.5)
+
+### Performance (AMD RX 9070 XT / RDNA4)
+
+| Size | CPU hashchain | CPU SortLZ | GPU SortLZ | GPU vs CPU SortLZ |
+|------|--------------|-----------|-----------|-------------------|
+| 8KB  | 244 MB/s     | 85 MB/s   | 4 MB/s    | GPU overhead |
+| 64KB | 140 MB/s     | 44 MB/s   | 31 MB/s   | 0.7x |
+| 256KB| 131 MB/s     | 31 MB/s   | 53 MB/s   | **1.7x faster** |
+| 4MB  | 142 MB/s     | 8 MB/s    | 89 MB/s   | **10.6x faster** |
+
+SortLZ compression ratio: **39.6%** (vs hashchain+Deflate 43.4%, BWT 32.7%).
 
 ## GPU stage chaining
 The Deflate GPU path chains LZ77 → Huffman on the GPU with minimized transfers:
