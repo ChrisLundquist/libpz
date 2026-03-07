@@ -618,9 +618,10 @@ fn emit_match(
 
 /// Encode a pre-computed match sequence into LzSeq token streams.
 ///
-/// Used by `encode_optimal` after the backward DP has selected matches.
-/// Applies the same repeat offset encoding as `encode_with_config`.
-fn encode_match_sequence(
+/// Used by `encode_optimal` after the backward DP has selected matches,
+/// and by the SortLZ match finder to feed pre-computed matches into the
+/// LzSeq 6-stream format. Applies repeat offset encoding.
+pub fn encode_match_sequence(
     _input: &[u8],
     matches: &[crate::lz77::Match],
     _config: &SeqConfig,

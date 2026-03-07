@@ -205,6 +205,46 @@ impl StreamDemuxer for LzDemuxer {
                 })
             }
             LzDemuxer::LzSeq => {
+                // SortLZ match finder path: use sort-based matches converted
+                // to LzSeq's 6-stream format via encode_match_sequence.
+                // Prefers GPU radix sort when available for large inputs.
+                if options.match_finder == super::MatchFinder::SortLz {
+                    let window = options
+                        .seq_window_size
+                        .unwrap_or_else(|| lzseq::SeqConfig::default().max_window);
+                    let config = crate::sortlz::SortLzConfig {
+                        max_window: window,
+                        ..crate::sortlz::SortLzConfig::default()
+                    };
+
+                    // GPU path for SortLZ match finding
+                    #[cfg(feature = "webgpu")]
+                    let raw_matches = if let Some(ref engine) = options.webgpu_engine {
+                        if input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
+                            && input.len() <= engine.max_dispatch_input_size()
+                        {
+                            engine.sortlz_find_matches(input, &config)?
+                        } else {
+                            crate::sortlz::find_matches(input, &config)
+                        }
+                    } else {
+                        crate::sortlz::find_matches(input, &config)
+                    };
+                    #[cfg(not(feature = "webgpu"))]
+                    let raw_matches = crate::sortlz::find_matches(input, &config);
+
+                    let lz_matches = crate::sortlz::matches_to_lz77_lazy(input, &raw_matches);
+                    let enc = lzseq::encode_match_sequence(
+                        input,
+                        &lz_matches,
+                        &lzseq::SeqConfig {
+                            max_window: window,
+                            ..lzseq::SeqConfig::default()
+                        },
+                    )?;
+                    return Ok(seq_encoded_to_demux(enc));
+                }
+
                 // GPU path: match finding + demux on-device
                 #[cfg(feature = "webgpu")]
                 if let Backend::WebGpu = options.backend {

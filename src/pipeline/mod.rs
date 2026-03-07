@@ -18,12 +18,17 @@
 //! | `Lz78R`       | LZ78 → rANS                      | experimental    |
 //! | `LzSeqR`      | LzSeq → rANS                     | zstd-style      |
 //! | `LzSeqH`      | LzSeq → Huffman                  | fast decode     |
+//! | `SortLz`      | SortLZ → FSE                     | GPU match find  |
+//!
+//! **Match finder selection:** All LZ-based pipelines accept `MatchFinder::SortLz`
+//! as an alternative to `MatchFinder::HashChain`. When SortLz is used as a match
+//! finder, the wire format is that of the host pipeline (fully compatible).
 //!
 //! **Container format (V2, multi-block):**
 //! Each compressed stream starts with a header:
 //! - Magic bytes: `PZ` (2 bytes)
 //! - Version: 2 (1 byte)
-//! - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 5=Lzfi, 6=LzssR, 7=Lz78R, 8=LzSeqR, 9=LzSeqH (1 byte)
+//! - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 5=Lzfi, 6=LzssR, 7=Lz78R, 8=LzSeqR, 9=LzSeqH, 10=SortLz (1 byte)
 //! - Original length: u32 little-endian (4 bytes)
 //! - num_blocks: u32 little-endian (4 bytes)
 //! - Block table: \[compressed_len: u32, original_len: u32\] \* num_blocks
@@ -120,6 +125,13 @@ pub enum QualityLevel {
 
 /// Default block size for multi-threaded compression (256KB).
 const DEFAULT_BLOCK_SIZE: usize = 256 * 1024;
+
+/// Default block size for BWT-based pipelines (512KB).
+///
+/// BWT benefits from larger blocks (better context grouping), but our FSE
+/// encoder degrades beyond ~1MB. 512KB balances BWT context quality against
+/// FSE table precision. Empirically optimal across Canterbury+Silesia corpus.
+const DEFAULT_BW_BLOCK_SIZE: usize = 512 * 1024;
 
 /// Default block size for GPU LZ77 pipelines (128KB).
 ///
@@ -397,16 +409,15 @@ pub fn compress_with_options(
         return Ok(Vec::new());
     }
 
-    // For GPU backends on LZ77 pipelines, use smaller blocks to keep
-    // the hash table within its quality sweet spot (≤128KB). Only
-    // override when the caller hasn't explicitly set a custom block size.
-    let options = &gpu_adjusted_options(pipeline, options);
+    // Adjust block size for pipeline characteristics when the caller
+    // is using defaults: BW→512KB, GPU LZ→128KB.
+    let options = &adjusted_options(pipeline, options);
 
     let num_threads = resolve_thread_count(options.threads);
     let block_size = options.block_size;
 
-    // Use single-block path if single-threaded or input fits in one block
-    if num_threads <= 1 || input.len() <= block_size {
+    // Single-block fast path: input fits in one block.
+    if input.len() <= block_size {
         let block_data = compress_block(input, pipeline, options)?;
         let mut output = Vec::new();
         write_header(&mut output, pipeline, input.len());
@@ -417,7 +428,39 @@ pub fn compress_with_options(
         return Ok(output);
     }
 
-    // Multi-block: unified scheduler dispatches all stages from a shared work queue.
+    // Single-threaded multi-block: split into blocks and compress sequentially.
+    // This matches the streaming path's behavior and is critical for BWT-based
+    // pipelines where FSE degrades on large inputs (>512KB).
+    if num_threads <= 1 {
+        let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
+        let num_blocks = blocks.len();
+
+        // Compress all blocks
+        let mut compressed_blocks = Vec::with_capacity(num_blocks);
+        for block in &blocks {
+            compressed_blocks.push(compress_block(block, pipeline, options)?);
+        }
+
+        // Build output with V2 table-mode container
+        let mut output = Vec::new();
+        write_header(&mut output, pipeline, input.len());
+        output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+
+        // Block table
+        for (i, cb) in compressed_blocks.iter().enumerate() {
+            output.extend_from_slice(&(cb.len() as u32).to_le_bytes());
+            output.extend_from_slice(&(blocks[i].len() as u32).to_le_bytes());
+        }
+
+        // Block data
+        for cb in &compressed_blocks {
+            output.extend_from_slice(cb);
+        }
+
+        return Ok(output);
+    }
+
+    // Multi-block parallel: unified scheduler dispatches all stages from a shared work queue.
     compress_parallel(input, pipeline, options, num_threads)
 }
 
@@ -556,6 +599,62 @@ pub fn select_pipeline(input: &[u8]) -> Pipeline {
     Pipeline::Deflate
 }
 
+/// Select the best match finder for the given input and options.
+///
+/// Returns `MatchFinder::SortLz` when data characteristics favor exhaustive
+/// sort-based match finding (text, structured data with moderate-to-high
+/// match density and moderate entropy). Returns `MatchFinder::HashChain`
+/// for near-random data, very small inputs, or when match finding speed
+/// matters more than ratio.
+///
+/// When a GPU is available and the input is large enough, always prefers
+/// SortLz since the GPU radix sort amortizes its cost at scale.
+pub fn select_match_finder(input: &[u8], options: &CompressOptions) -> MatchFinder {
+    // Tiny inputs: hashchain is fine, SortLZ overhead not worth it
+    if input.len() < 1024 {
+        return MatchFinder::HashChain;
+    }
+
+    let profile = crate::analysis::analyze(input);
+
+    // Near-random data: hashchain is fine, SortLZ adds cost without ratio benefit
+    if profile.byte_entropy > 7.5 {
+        return MatchFinder::HashChain;
+    }
+
+    // GPU available: use SortLZ when input is large enough to amortize dispatch
+    #[cfg(feature = "webgpu")]
+    if matches!(options.backend, Backend::WebGpu) {
+        if let Some(ref engine) = options.webgpu_engine {
+            if input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
+                && input.len() <= engine.max_dispatch_input_size()
+            {
+                return MatchFinder::SortLz;
+            }
+        }
+    }
+
+    // CPU: SortLZ shines on text/structured data where exhaustive match
+    // finding discovers long-range matches that hash-chains miss.
+    // Thresholds derived from experiment B results:
+    //   - bible.txt: match_density ~0.5, entropy ~4.6 → SortLZ 18% better
+    //   - world192.txt: match_density ~0.4, entropy ~5.1 → SortLZ 24% better
+    //   - random data: match_density <0.1, entropy >7.5 → no benefit
+    if profile.match_density > 0.3 && profile.byte_entropy < 6.5 {
+        return MatchFinder::SortLz;
+    }
+
+    // Large inputs with moderate structure: SortLZ's global sort still helps
+    if input.len() >= 64 * 1024 && profile.match_density > 0.2 && profile.byte_entropy < 5.5 {
+        return MatchFinder::SortLz;
+    }
+
+    // Suppress unused variable warning when webgpu is disabled
+    let _ = options;
+
+    MatchFinder::HashChain
+}
+
 /// Select the best pipeline by trial compression.
 ///
 /// Compresses the first `sample_size` bytes with each candidate pipeline,
@@ -588,15 +687,35 @@ pub fn select_pipeline_trial(
         Pipeline::Lz78R,
         Pipeline::LzSeqR,
         Pipeline::LzSeqH,
+        Pipeline::SortLz,
     ];
     let mut best_pipeline = Pipeline::Deflate;
     let mut best_size = usize::MAX;
 
+    // Also try SortLz match finder with LZ pipelines to find the best combo
+    let match_finders = [MatchFinder::HashChain, MatchFinder::SortLz];
+
     for &pipeline in &candidates {
-        if let Ok(compressed) = compress_with_options(sample, pipeline, &trial_opts) {
-            if compressed.len() < best_size {
-                best_size = compressed.len();
-                best_pipeline = pipeline;
+        // SortLz pipeline has its own match finder, only test default
+        let finders: &[MatchFinder] = if matches!(
+            pipeline,
+            Pipeline::Bw | Pipeline::Bbw | Pipeline::Lz78R | Pipeline::SortLz
+        ) {
+            &[MatchFinder::HashChain]
+        } else {
+            &match_finders
+        };
+
+        for &finder in finders {
+            let opts = CompressOptions {
+                match_finder: finder,
+                ..trial_opts.clone()
+            };
+            if let Ok(compressed) = compress_with_options(sample, pipeline, &opts) {
+                if compressed.len() < best_size {
+                    best_size = compressed.len();
+                    best_pipeline = pipeline;
+                }
             }
         }
     }
@@ -616,16 +735,27 @@ pub(crate) fn write_header(output: &mut Vec<u8>, pipeline: Pipeline, orig_len: u
     output.extend_from_slice(&(orig_len as u32).to_le_bytes());
 }
 
-/// Return options with GPU-optimal block size for LZ77-based pipelines.
+/// Return options with pipeline-optimal block size.
 ///
-/// When the caller is using the default block size (256KB) and a GPU backend
-/// on an LZ77 pipeline, shrinks blocks to 128KB. This keeps each block within
-/// the GPU hash table's quality sweet spot, and also produces more blocks for
-/// better GPU/CPU overlap pipelining.
+/// Adjusts block size based on pipeline characteristics when the caller
+/// is using the default (256KB):
+/// - BWT pipelines (Bw, Bbw): use 512KB for better BWT context grouping
+/// - GPU LZ77 pipelines: use 128KB for GPU hash table quality
 ///
 /// If the caller explicitly set a non-default block size, their choice is
 /// respected.
-fn gpu_adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> CompressOptions {
+fn adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> CompressOptions {
+    if options.block_size != DEFAULT_BLOCK_SIZE {
+        return options.clone();
+    }
+
+    let is_bw_pipeline = matches!(pipeline, Pipeline::Bw | Pipeline::Bbw);
+    if is_bw_pipeline {
+        let mut adjusted = options.clone();
+        adjusted.block_size = DEFAULT_BW_BLOCK_SIZE;
+        return adjusted;
+    }
+
     let is_lz_pipeline = matches!(
         pipeline,
         Pipeline::Deflate
@@ -646,7 +776,7 @@ fn gpu_adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> Compre
         gpu
     };
 
-    if is_lz_pipeline && is_gpu && options.block_size == DEFAULT_BLOCK_SIZE {
+    if is_lz_pipeline && is_gpu {
         let mut adjusted = options.clone();
         adjusted.block_size = DEFAULT_GPU_BLOCK_SIZE;
         adjusted
@@ -810,6 +940,9 @@ pub(crate) fn lz77_matches_with_backend(
 }
 
 /// SortLZ match finding with parse strategy dispatch.
+///
+/// Uses GPU radix sort when a WebGPU engine is available and input is large
+/// enough. Falls back to CPU sort otherwise.
 fn sortlz_matches_with_strategy(
     input: &[u8],
     options: &CompressOptions,
@@ -819,6 +952,23 @@ fn sortlz_matches_with_strategy(
 
     let config = SortLzConfig::for_lz77(max_match);
 
+    // GPU path: use GPU radix sort for match finding when available.
+    // The GPU kernel does the sort + verify in parallel, then we convert
+    // to lz77::Match on CPU (parsing is inherently serial).
+    #[cfg(feature = "webgpu")]
+    if let Some(ref engine) = options.webgpu_engine {
+        if input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
+            && input.len() <= engine.max_dispatch_input_size()
+        {
+            let raw_matches = engine.sortlz_find_matches(input, &config)?;
+            return match options.parse_strategy {
+                ParseStrategy::Greedy => Ok(sortlz::matches_to_lz77_greedy(input, &raw_matches)),
+                _ => Ok(sortlz::matches_to_lz77_lazy(input, &raw_matches)),
+            };
+        }
+    }
+
+    // CPU path.
     match options.parse_strategy {
         ParseStrategy::Optimal => {
             let table = sortlz::find_matches_topk(input, &config, crate::optimal::K);

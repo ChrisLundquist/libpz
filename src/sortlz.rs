@@ -21,6 +21,13 @@ const MAX_CANDIDATES: usize = 8;
 /// Default maximum window size for back-references.
 const DEFAULT_MAX_WINDOW: usize = 65535;
 
+/// Satisficing threshold: once a position has a match this long,
+/// skip further improvement attempts. Greatly reduces verification
+/// work on repetitive data where most positions have very long matches.
+/// 256 covers the full Deflate match range (258) and provides
+/// diminishing returns beyond this point.
+const SATISFICE_LEN: u16 = 256;
+
 /// Configuration for the SortLZ pipeline.
 #[derive(Debug, Clone)]
 pub struct SortLzConfig {
@@ -97,22 +104,29 @@ pub fn find_matches(input: &[u8], config: &SortLzConfig) -> Vec<Option<(u16, u16
     let mut best_match: Vec<Option<(u16, u16)>> = vec![None; n]; // (offset, length)
 
     for window_start in 0..pairs.len() {
-        let (hash_a, _) = pairs[window_start];
+        let (hash_a, pos_a_raw) = pairs[window_start];
+        let pos_a = pos_a_raw as usize;
+
+        // Skip if this position already has a good-enough match.
+        if let Some((_, len)) = best_match[pos_a] {
+            if len >= SATISFICE_LEN {
+                continue;
+            }
+        }
 
         // Look at adjacent entries with the same hash.
         let mut candidates_checked = 0;
-        for j in (window_start + 1)..pairs.len() {
-            if pairs[j].0 != hash_a {
+        for pair in pairs.iter().skip(window_start + 1) {
+            if pair.0 != hash_a {
                 break;
             }
             if candidates_checked >= config.max_candidates {
                 break;
             }
 
-            let pos_a = pairs[window_start].1 as usize;
-            let pos_b = pairs[j].1 as usize;
+            let pos_b = pair.1 as usize;
 
-            // Ensure pos_a < pos_b for valid back-reference (earlier position is source).
+            // Ensure earlier position is source for valid back-reference.
             let (src, dst) = if pos_a < pos_b {
                 (pos_a, pos_b)
             } else {
@@ -125,11 +139,25 @@ pub fn find_matches(input: &[u8], config: &SortLzConfig) -> Vec<Option<(u16, u16
                 continue;
             }
 
+            // Skip if destination already has a good-enough match.
+            if let Some((_, existing_len)) = best_match[dst] {
+                if existing_len >= SATISFICE_LEN {
+                    candidates_checked += 1;
+                    continue;
+                }
+            }
+
+            // Skip offsets that overflow u16 (lz77::Match.offset is u16).
+            if distance > u16::MAX as usize {
+                candidates_checked += 1;
+                continue;
+            }
+
             // Verify and extend match.
             let match_len = extend_match(input, src, dst);
             if match_len >= config.min_match {
                 let offset = distance as u16;
-                let length = match_len.min(u16::MAX as usize) as u16;
+                let length = match_len as u16; // already capped at u16::MAX in extend_match
 
                 // Update best match for the destination position.
                 if let Some((_, existing_len)) = best_match[dst] {
@@ -211,7 +239,7 @@ pub fn find_matches_topk(
             let match_len = extend_match(input, src, dst);
             if match_len >= config.min_match {
                 let offset = distance as u32;
-                let length = match_len.min(u16::MAX as usize) as u32;
+                let length = match_len as u32; // already capped at u16::MAX in extend_match
 
                 // Insert into top-K slot for the destination position,
                 // maintaining sorted-by-length-desc order.
@@ -265,11 +293,32 @@ fn insert_topk_candidate(
 }
 
 /// Extend a match starting at positions src and dst, return total match length.
+///
+/// Uses u64 chunk comparisons for 4-8x speedup on long matches.
+/// Capped at `u16::MAX` to avoid excessive scanning on highly repetitive data.
 fn extend_match(input: &[u8], src: usize, dst: usize) -> usize {
     let max_len = input.len() - dst;
-    let max_len = max_len.min(input.len() - src);
+    let max_len = max_len.min(input.len() - src).min(u16::MAX as usize);
+
+    // Fast path: compare 8 bytes at a time.
     let mut len = 0;
-    while len < max_len && input[src + len] == input[dst + len] {
+    let chunks = max_len / 8;
+    let src_ptr = &input[src..];
+    let dst_ptr = &input[dst..];
+    for _ in 0..chunks {
+        let a = u64::from_le_bytes(src_ptr[len..len + 8].try_into().unwrap());
+        let b = u64::from_le_bytes(dst_ptr[len..len + 8].try_into().unwrap());
+        if a != b {
+            // Find first differing byte within the u64.
+            let diff = a ^ b;
+            len += (diff.trailing_zeros() / 8) as usize;
+            return len;
+        }
+        len += 8;
+    }
+
+    // Tail: compare remaining bytes one at a time.
+    while len < max_len && src_ptr[len] == dst_ptr[len] {
         len += 1;
     }
     len
@@ -609,7 +658,11 @@ fn read_fse_stream(payload: &[u8], pos: &mut usize, orig_len: usize) -> PzResult
 }
 
 /// Radix sort (hash, position) pairs by hash value.
-/// Uses 4-pass 8-bit radix sort (LSB first).
+/// Uses 4-pass 8-bit radix sort (LSB first) with double-buffering
+/// to eliminate per-pass copies. Skips passes where all values share
+/// the same byte (single-bucket optimization).
+type PairSliceRefs<'a> = (&'a [(u32, u32)], &'a mut [(u32, u32)]);
+
 fn radix_sort_pairs(pairs: &mut [(u32, u32)]) {
     if pairs.len() <= 1 {
         return;
@@ -618,14 +671,33 @@ fn radix_sort_pairs(pairs: &mut [(u32, u32)]) {
     let n = pairs.len();
     let mut buf = vec![(0u32, 0u32); n];
 
+    // Double-buffer: alternate src/dst to avoid copies.
+    // After 4 passes (even), result is back in `pairs`.
+    let mut in_buf = false; // false = pairs is source, true = buf is source
+
     for byte_idx in 0..4u32 {
         let shift = byte_idx * 8;
+        let (src, dst): PairSliceRefs = if in_buf {
+            (buf.as_slice(), pairs)
+        } else {
+            (pairs, buf.as_mut_slice())
+        };
 
         // Count.
         let mut counts = [0u32; 256];
-        for &(hash, _) in pairs.iter() {
+        for &(hash, _) in src.iter() {
             let bucket = ((hash >> shift) & 0xFF) as usize;
             counts[bucket] += 1;
+        }
+
+        // Skip pass if all values are in one bucket (no reordering needed).
+        let mut nonzero = 0u32;
+        for &c in &counts {
+            nonzero += u32::from(c > 0);
+        }
+        if nonzero <= 1 {
+            // All same byte — no scatter needed, keep src as-is.
+            continue;
         }
 
         // Prefix sum.
@@ -637,13 +709,17 @@ fn radix_sort_pairs(pairs: &mut [(u32, u32)]) {
         }
 
         // Scatter.
-        for &pair in pairs.iter() {
+        for &pair in src.iter() {
             let bucket = ((pair.0 >> shift) & 0xFF) as usize;
-            buf[offsets[bucket] as usize] = pair;
+            dst[offsets[bucket] as usize] = pair;
             offsets[bucket] += 1;
         }
 
-        // Swap.
+        in_buf = !in_buf;
+    }
+
+    // If final result ended up in buf, copy back to pairs.
+    if in_buf {
         pairs.copy_from_slice(&buf);
     }
 }
@@ -866,5 +942,35 @@ mod tests {
         let compressed = pipeline::compress_with_options(&input, Pipeline::Deflate, &opts).unwrap();
         let decoded = pipeline::decompress(&compressed).unwrap();
         assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_pipeline_roundtrip_lzseqr_sortlz() {
+        use crate::pipeline::{self, CompressOptions, MatchFinder, Pipeline};
+        let input = test_data();
+
+        let opts = CompressOptions {
+            match_finder: MatchFinder::SortLz,
+            threads: 1,
+            ..Default::default()
+        };
+        let compressed = pipeline::compress_with_options(&input, Pipeline::LzSeqR, &opts).unwrap();
+        let decoded = pipeline::decompress(&compressed).unwrap();
+        assert_eq!(decoded, input, "LzSeqR + SortLz roundtrip failed");
+    }
+
+    #[test]
+    fn test_pipeline_roundtrip_lzseqh_sortlz() {
+        use crate::pipeline::{self, CompressOptions, MatchFinder, Pipeline};
+        let input = test_data();
+
+        let opts = CompressOptions {
+            match_finder: MatchFinder::SortLz,
+            threads: 1,
+            ..Default::default()
+        };
+        let compressed = pipeline::compress_with_options(&input, Pipeline::LzSeqH, &opts).unwrap();
+        let decoded = pipeline::decompress(&compressed).unwrap();
+        assert_eq!(decoded, input, "LzSeqH + SortLz roundtrip failed");
     }
 }
