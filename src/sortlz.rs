@@ -652,7 +652,11 @@ fn read_fse_stream(payload: &[u8], pos: &mut usize, orig_len: usize) -> PzResult
 }
 
 /// Radix sort (hash, position) pairs by hash value.
-/// Uses 4-pass 8-bit radix sort (LSB first).
+/// Uses 4-pass 8-bit radix sort (LSB first) with double-buffering
+/// to eliminate per-pass copies. Skips passes where all values share
+/// the same byte (single-bucket optimization).
+type PairSliceRefs<'a> = (&'a [(u32, u32)], &'a mut [(u32, u32)]);
+
 fn radix_sort_pairs(pairs: &mut [(u32, u32)]) {
     if pairs.len() <= 1 {
         return;
@@ -661,14 +665,33 @@ fn radix_sort_pairs(pairs: &mut [(u32, u32)]) {
     let n = pairs.len();
     let mut buf = vec![(0u32, 0u32); n];
 
+    // Double-buffer: alternate src/dst to avoid copies.
+    // After 4 passes (even), result is back in `pairs`.
+    let mut in_buf = false; // false = pairs is source, true = buf is source
+
     for byte_idx in 0..4u32 {
         let shift = byte_idx * 8;
+        let (src, dst): PairSliceRefs = if in_buf {
+            (buf.as_slice(), pairs)
+        } else {
+            (pairs, buf.as_mut_slice())
+        };
 
         // Count.
         let mut counts = [0u32; 256];
-        for &(hash, _) in pairs.iter() {
+        for &(hash, _) in src.iter() {
             let bucket = ((hash >> shift) & 0xFF) as usize;
             counts[bucket] += 1;
+        }
+
+        // Skip pass if all values are in one bucket (no reordering needed).
+        let mut nonzero = 0u32;
+        for &c in &counts {
+            nonzero += u32::from(c > 0);
+        }
+        if nonzero <= 1 {
+            // All same byte — no scatter needed, keep src as-is.
+            continue;
         }
 
         // Prefix sum.
@@ -680,13 +703,17 @@ fn radix_sort_pairs(pairs: &mut [(u32, u32)]) {
         }
 
         // Scatter.
-        for &pair in pairs.iter() {
+        for &pair in src.iter() {
             let bucket = ((pair.0 >> shift) & 0xFF) as usize;
-            buf[offsets[bucket] as usize] = pair;
+            dst[offsets[bucket] as usize] = pair;
             offsets[bucket] += 1;
         }
 
-        // Swap.
+        in_buf = !in_buf;
+    }
+
+    // If final result ended up in buf, copy back to pairs.
+    if in_buf {
         pairs.copy_from_slice(&buf);
     }
 }
