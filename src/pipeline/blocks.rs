@@ -46,12 +46,8 @@ pub(crate) fn compress_block(
         None => match pipeline {
             Pipeline::Bw => compress_block_bw(input, opts),
             Pipeline::Bbw => compress_block_bbw(input, opts),
-            Pipeline::Csbwt => compress_block_csbwt(input, opts),
             Pipeline::SortLz => compress_block_sortlz(input, opts),
-            Pipeline::Bitplane => compress_block_bitplane(input, opts),
-            Pipeline::Fwst => compress_block_fwst(input, opts),
             Pipeline::Parlz => compress_block_parlz(input, opts),
-            Pipeline::Repair => compress_block_repair(input, opts),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -69,12 +65,8 @@ pub(crate) fn decompress_block(
         None => match pipeline {
             Pipeline::Bw => decompress_block_bw(payload, orig_len),
             Pipeline::Bbw => decompress_block_bbw(payload, orig_len),
-            Pipeline::Csbwt => decompress_block_csbwt(payload, orig_len),
             Pipeline::SortLz => decompress_block_sortlz(payload, orig_len),
-            Pipeline::Bitplane => decompress_block_bitplane(payload, orig_len),
-            Pipeline::Fwst => decompress_block_fwst(payload, orig_len),
             Pipeline::Parlz => decompress_block_parlz(payload, orig_len),
-            Pipeline::Repair => decompress_block_repair(payload, orig_len),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -345,29 +337,6 @@ fn decompress_block_bbw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// CSBWT pipeline: Context-Segmented BWT + per-segment FSE
-// ---------------------------------------------------------------------------
-
-/// Compress a single block using the CSBWT pipeline (no container header).
-fn compress_block_csbwt(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    #[cfg(feature = "webgpu")]
-    {
-        if let Backend::WebGpu = options.backend {
-            if let Some(ref engine) = options.webgpu_engine {
-                return engine.csbwt_compress(input, &crate::csbwt::CsbwtConfig::default());
-            }
-        }
-    }
-    let _ = options;
-    crate::csbwt::compress(input, &crate::csbwt::CsbwtConfig::default())
-}
-
-/// Decompress a single CSBWT block (no container header).
-fn decompress_block_csbwt(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    crate::csbwt::decompress(payload, orig_len)
-}
-
-// ---------------------------------------------------------------------------
 // SortLZ pipeline: Sort-based LZ77 + FSE
 // ---------------------------------------------------------------------------
 
@@ -391,52 +360,6 @@ fn decompress_block_sortlz(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>>
 }
 
 // ---------------------------------------------------------------------------
-// Bitplane pipeline: bit-plane decomposition + RLE + FSE
-// ---------------------------------------------------------------------------
-
-/// Compress a single block using the Bitplane pipeline (no container header).
-fn compress_block_bitplane(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    #[cfg(feature = "webgpu")]
-    {
-        if let Backend::WebGpu = options.backend {
-            if let Some(ref engine) = options.webgpu_engine {
-                return engine.bitplane_compress(input);
-            }
-        }
-    }
-    let _ = options;
-    crate::bitplane::compress(input)
-}
-
-/// Decompress a single Bitplane block (no container header).
-fn decompress_block_bitplane(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    crate::bitplane::decompress(payload, orig_len)
-}
-
-// ---------------------------------------------------------------------------
-// FWST pipeline: fixed-window sort transform + MTF + RLE + FSE
-// ---------------------------------------------------------------------------
-
-/// Compress a single block using the FWST pipeline (no container header).
-fn compress_block_fwst(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    #[cfg(feature = "webgpu")]
-    {
-        if let Backend::WebGpu = options.backend {
-            if let Some(ref engine) = options.webgpu_engine {
-                return engine.fwst_compress(input, &crate::fwst::FwstConfig::default());
-            }
-        }
-    }
-    let _ = options;
-    crate::fwst::compress(input, &crate::fwst::FwstConfig::default())
-}
-
-/// Decompress a single FWST block (no container header).
-fn decompress_block_fwst(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    crate::fwst::decompress(payload, orig_len)
-}
-
-// ---------------------------------------------------------------------------
 // ParlZ pipeline: parallel-parse LZ + FSE
 // ---------------------------------------------------------------------------
 
@@ -457,27 +380,4 @@ fn compress_block_parlz(input: &[u8], options: &CompressOptions) -> PzResult<Vec
 /// Decompress a single ParlZ block (no container header).
 fn decompress_block_parlz(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     crate::parlz::decompress(payload, orig_len)
-}
-
-// ---------------------------------------------------------------------------
-// Repair pipeline: Re-Pair grammar compression + FSE
-// ---------------------------------------------------------------------------
-
-/// Compress a single block using the Repair pipeline (no container header).
-fn compress_block_repair(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    #[cfg(feature = "webgpu")]
-    {
-        if let Backend::WebGpu = options.backend {
-            if let Some(ref engine) = options.webgpu_engine {
-                return engine.repair_compress(input);
-            }
-        }
-    }
-    let _ = options;
-    crate::repair::compress(input)
-}
-
-/// Decompress a single Repair block (no container header).
-fn decompress_block_repair(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    crate::repair::decompress(payload, orig_len)
 }

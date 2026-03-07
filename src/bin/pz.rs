@@ -79,31 +79,11 @@ fn list_pipelines() {
         ("lz78r", "7", "LZ78 + rANS (experimental)"),
         ("lzseqr", "8", "LzSeq + rANS (zstd-style code+extra-bits)"),
         ("lzseqh", "9", "LzSeq + Huffman (fast decode)"),
-        (
-            "csbwt",
-            "10",
-            "Context-Segmented BWT + per-segment FSE (GPU experiment)",
-        ),
-        ("sortlz", "11", "Sort-based LZ77 + FSE (GPU experiment)"),
-        (
-            "bitplane",
-            "12",
-            "Bit-plane decomposition + RLE + FSE (throughput ceiling)",
-        ),
-        (
-            "fwst",
-            "13",
-            "Fixed-window sort + MTF + RLE + FSE (context depth)",
-        ),
+        ("sortlz", "10", "Sort-based LZ77 + FSE (GPU experiment)"),
         (
             "parlz",
-            "14",
+            "11",
             "Parallel-parse LZ + FSE (serial parsing cost)",
-        ),
-        (
-            "repair",
-            "15",
-            "Re-Pair grammar compression + FSE (iterative dispatch)",
         ),
     ];
     for (name, id, desc) in pipelines {
@@ -242,12 +222,8 @@ fn parse_args() -> Opts {
                     "lz78r" | "7" => Pipeline::Lz78R,
                     "lzseqr" | "8" => Pipeline::LzSeqR,
                     "lzseqh" | "9" => Pipeline::LzSeqH,
-                    "csbwt" | "10" => Pipeline::Csbwt,
-                    "sortlz" | "11" => Pipeline::SortLz,
-                    "bitplane" | "12" => Pipeline::Bitplane,
-                    "fwst" | "13" => Pipeline::Fwst,
-                    "parlz" | "14" => Pipeline::Parlz,
-                    "repair" | "15" => Pipeline::Repair,
+                    "sortlz" | "10" => Pipeline::SortLz,
+                    "parlz" | "11" => Pipeline::Parlz,
                     other => {
                         eprintln!("pz: unknown pipeline '{other}'");
                         eprintln!("pz: run 'pz --list-pipelines' to see available pipelines");
@@ -441,8 +417,8 @@ fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
                 7 => "lz78r",
                 8 => "lzseqr",
                 9 => "lzseqh",
-                10 => "csbwt",
-                11 => "sortlz",
+                10 => "sortlz",
+                11 => "parlz",
                 _ => "unknown",
             };
             let mut orig_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);

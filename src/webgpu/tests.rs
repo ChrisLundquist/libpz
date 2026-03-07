@@ -2755,41 +2755,7 @@ fn test_rans_recoil_decode_gpu_matches_cpu() {
     assert_eq!(gpu_decoded, cpu_decoded, "GPU Recoil must match CPU Recoil");
 }
 
-// --- Wave-2 GPU experiment roundtrip tests ---
-
-#[test]
-fn test_gpu_bitplane_roundtrip() {
-    let engine = match WebGpuEngine::new() {
-        Ok(e) => e,
-        Err(PzError::Unsupported) => return,
-        Err(e) => panic!("unexpected error: {:?}", e),
-    };
-
-    let input: Vec<u8> = (0..128).collect();
-    let compressed = engine.bitplane_compress(&input).unwrap();
-    assert!(!compressed.is_empty());
-    // Verify decompression (CPU) produces original.
-    let decompressed = crate::bitplane::decompress(&compressed, input.len()).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_gpu_fwst_roundtrip() {
-    let engine = match WebGpuEngine::new() {
-        Ok(e) => e,
-        Err(PzError::Unsupported) => return,
-        Err(e) => panic!("unexpected error: {:?}", e),
-    };
-
-    let input = b"banana_banana_banana_banana_test";
-    let config = crate::fwst::FwstConfig { window: 4 };
-    let compressed = engine.fwst_compress(input, &config).unwrap();
-    assert!(!compressed.is_empty());
-
-    // Verify the FWST encode produces valid output.
-    let fwst_result = engine.fwst_encode(input, 4).unwrap();
-    assert_eq!(fwst_result.data.len(), input.len());
-}
+// --- GPU parlz experiment roundtrip tests ---
 
 #[test]
 fn test_gpu_parlz_resolve_roundtrip() {
@@ -2827,22 +2793,5 @@ fn test_gpu_parlz_compress() {
     assert!(!compressed.is_empty());
     // Verify decompression produces original.
     let decompressed = crate::parlz::decompress(&compressed, input.len()).unwrap();
-    assert_eq!(&decompressed, &input[..]);
-}
-
-#[test]
-fn test_gpu_repair_compress() {
-    let engine = match WebGpuEngine::new() {
-        Ok(e) => e,
-        Err(PzError::Unsupported) => return,
-        Err(e) => panic!("unexpected error: {:?}", e),
-    };
-
-    // Test with input that doesn't trigger FSE encoding issues
-    let input = b"aaabbbcccdddeeefff";
-    let compressed = engine.repair_compress(input).unwrap();
-    assert!(!compressed.is_empty());
-    // Verify decompression produces original.
-    let decompressed = crate::repair::decompress(&compressed, input.len()).unwrap();
     assert_eq!(&decompressed, &input[..]);
 }

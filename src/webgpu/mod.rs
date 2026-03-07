@@ -36,17 +36,13 @@ use std::sync::OnceLock;
 
 use wgpu::util::DeviceExt;
 
-mod bitplane;
 mod bwt;
-mod csbwt;
 mod fse;
-mod fwst;
 mod huffman;
 pub(crate) mod lz77;
 pub(crate) mod lzseq;
 mod parlz;
 pub(crate) mod rans;
-mod repair;
 mod sortlz;
 
 #[cfg(test)]
@@ -92,24 +88,11 @@ const RANS_ENCODE_KERNEL_SOURCE: &str = include_str!("../../kernels/rans_encode.
 /// Embedded WGSL kernel source: GPU LzSeq demux (match buffer → 6 streams).
 const LZSEQ_DEMUX_KERNEL_SOURCE: &str = include_str!("../../kernels/lzseq_demux.wgsl");
 
-/// Embedded WGSL kernel source: GPU bit-plane transpose (Experiment D).
-const BITPLANE_TRANSPOSE_KERNEL_SOURCE: &str =
-    include_str!("../../kernels/bitplane_transpose.wgsl");
-
 /// Embedded WGSL kernel source: GPU parlz conflict resolution (Experiment E).
 const PARLZ_RESOLVE_KERNEL_SOURCE: &str = include_str!("../../kernels/parlz_resolve.wgsl");
 
-/// Embedded WGSL kernel source: GPU Re-Pair operations (Experiment C).
-const REPAIR_OPS_KERNEL_SOURCE: &str = include_str!("../../kernels/repair_ops.wgsl");
-
-/// Embedded WGSL kernel source: GPU FWST radix key extraction (Experiment F).
-const FWST_RADIX_KERNEL_SOURCE: &str = include_str!("../../kernels/fwst_radix.wgsl");
-
 /// Embedded WGSL kernel source: GPU SortLZ operations (Experiment B).
 const SORTLZ_OPS_KERNEL_SOURCE: &str = include_str!("../../kernels/sortlz_ops.wgsl");
-
-/// Embedded WGSL kernel source: GPU Re-Pair two-buffer replace + compact (Experiment C).
-const REPAIR_REPLACE_KERNEL_SOURCE: &str = include_str!("../../kernels/repair_replace.wgsl");
 
 /// Number of candidates per position in the top-K kernel (must match K in lz77_topk.wgsl).
 const TOPK_K: usize = 4;
@@ -295,11 +278,6 @@ struct LzSeqPipelines {
     demux: wgpu::ComputePipeline,
 }
 
-/// Bitplane transpose pipeline (Experiment D).
-struct BitplanePipelines {
-    transpose: wgpu::ComputePipeline,
-}
-
 /// Parlz conflict resolution pipelines (Experiment E).
 struct ParlzPipelines {
     init_coverage: wgpu::ComputePipeline,
@@ -308,30 +286,10 @@ struct ParlzPipelines {
     classify: wgpu::ComputePipeline,
 }
 
-/// FWST radix key extraction pipeline (Experiment F).
-struct FwstRadixPipelines {
-    compute_keys: wgpu::ComputePipeline,
-}
-
-/// Repair grammar compression pipelines (Experiment C).
-struct RepairPipelines {
-    histogram: wgpu::ComputePipeline,
-    argmax: wgpu::ComputePipeline,
-    #[allow(dead_code)]
-    // original single-buffer replace kept for reference; two-buffer version in RepairReplacePipelines
-    replace: wgpu::ComputePipeline,
-}
-
 /// SortLZ radix sort + match verification pipelines (Experiment B).
 struct SortLzPipelines {
     compute_keys: wgpu::ComputePipeline,
     verify_matches: wgpu::ComputePipeline,
-}
-
-/// Repair two-buffer replace + scatter pipelines (Experiment C, data-race fix).
-struct RepairReplacePipelines {
-    replace_twobuf: wgpu::ComputePipeline,
-    scatter: wgpu::ComputePipeline,
 }
 
 /// WebGPU compute engine.
@@ -358,12 +316,8 @@ pub struct WebGpuEngine {
     rans_decode: OnceLock<RansDecodePipelines>,
     rans_encode: OnceLock<RansEncodePipelines>,
     lzseq_demux: OnceLock<LzSeqPipelines>,
-    bitplane: OnceLock<BitplanePipelines>,
-    fwst_radix: OnceLock<FwstRadixPipelines>,
     parlz: OnceLock<ParlzPipelines>,
-    repair: OnceLock<RepairPipelines>,
     sortlz: OnceLock<SortLzPipelines>,
-    repair_replace: OnceLock<RepairReplacePipelines>,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum compute workgroup size.
@@ -519,12 +473,8 @@ impl WebGpuEngine {
             rans_decode: OnceLock::new(),
             rans_encode: OnceLock::new(),
             lzseq_demux: OnceLock::new(),
-            bitplane: OnceLock::new(),
-            fwst_radix: OnceLock::new(),
             parlz: OnceLock::new(),
-            repair: OnceLock::new(),
             sortlz: OnceLock::new(),
-            repair_replace: OnceLock::new(),
             device_name,
             max_work_group_size,
             max_workgroups_per_dim,
@@ -1417,52 +1367,6 @@ impl WebGpuEngine {
             .demux
     }
 
-    // --- Experiment D: Bitplane transpose ---
-
-    fn pipeline_bitplane_transpose(&self) -> &wgpu::ComputePipeline {
-        &self
-            .bitplane
-            .get_or_init(|| {
-                let t0 = std::time::Instant::now();
-                let group = BitplanePipelines {
-                    transpose: self.make_pipeline(
-                        "bitplane_transpose",
-                        BITPLANE_TRANSPOSE_KERNEL_SOURCE,
-                        "bitplane_transpose",
-                    ),
-                };
-                if self.profiling {
-                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("[pz-gpu] compile bitplane_transpose.wgsl: {ms:.3} ms");
-                }
-                group
-            })
-            .transpose
-    }
-
-    // --- Experiment F: FWST radix key extraction ---
-
-    fn pipeline_fwst_compute_keys(&self) -> &wgpu::ComputePipeline {
-        &self
-            .fwst_radix
-            .get_or_init(|| {
-                let t0 = std::time::Instant::now();
-                let group = FwstRadixPipelines {
-                    compute_keys: self.make_pipeline(
-                        "fwst_compute_keys",
-                        FWST_RADIX_KERNEL_SOURCE,
-                        "fwst_compute_keys",
-                    ),
-                };
-                if self.profiling {
-                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("[pz-gpu] compile fwst_radix.wgsl: {ms:.3} ms");
-                }
-                group
-            })
-            .compute_keys
-    }
-
     // --- Experiment E: Parlz conflict resolution ---
 
     fn parlz_pipelines(&self) -> &ParlzPipelines {
@@ -1561,97 +1465,6 @@ impl WebGpuEngine {
             if self.profiling {
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
                 eprintln!("[pz-gpu] compile parlz_resolve.wgsl: {ms:.3} ms");
-            }
-            group
-        })
-    }
-
-    // --- Experiment C: Repair grammar compression ---
-
-    fn repair_pipelines(&self) -> &RepairPipelines {
-        self.repair.get_or_init(|| {
-            let t0 = std::time::Instant::now();
-            let module = self
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("repair_ops"),
-                    source: wgpu::ShaderSource::Wgsl(REPAIR_OPS_KERNEL_SOURCE.into()),
-                });
-            // Explicit bind group layout: all entry points share the same 4 bindings
-            // even though individual entry points may not reference all of them.
-            let bgl = self
-                .device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("repair_bgl"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 3,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                });
-            let pipeline_layout =
-                self.device
-                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("repair_pipeline_layout"),
-                        bind_group_layouts: &[&bgl],
-                        push_constant_ranges: &[],
-                    });
-            let make = |label, entry| {
-                self.device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(label),
-                        layout: Some(&pipeline_layout),
-                        module: &module,
-                        entry_point: Some(entry),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    })
-            };
-            let group = RepairPipelines {
-                histogram: make("repair_histogram", "repair_histogram"),
-                argmax: make("repair_argmax", "repair_argmax"),
-                replace: make("repair_replace", "repair_replace"),
-            };
-            if self.profiling {
-                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                eprintln!("[pz-gpu] compile repair_ops.wgsl: {ms:.3} ms");
             }
             group
         })
@@ -1774,48 +1587,6 @@ impl WebGpuEngine {
             SortLzPipelines {
                 compute_keys,
                 verify_matches,
-            }
-        })
-    }
-
-    // --- Experiment C: Repair two-buffer replace ---
-
-    fn repair_replace_pipelines(&self) -> &RepairReplacePipelines {
-        self.repair_replace.get_or_init(|| {
-            let t0 = std::time::Instant::now();
-            let module = self
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("repair_replace"),
-                    source: wgpu::ShaderSource::Wgsl(REPAIR_REPLACE_KERNEL_SOURCE.into()),
-                });
-            let replace_twobuf =
-                self.device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some("repair_replace_twobuf"),
-                        layout: None,
-                        module: &module,
-                        entry_point: Some("repair_replace_twobuf"),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    });
-            let scatter = self
-                .device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("repair_scatter"),
-                    layout: None,
-                    module: &module,
-                    entry_point: Some("repair_scatter"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
-            if self.profiling {
-                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                eprintln!("[pz-gpu] compile repair_replace.wgsl: {ms:.3} ms");
-            }
-            RepairReplacePipelines {
-                replace_twobuf,
-                scatter,
             }
         })
     }

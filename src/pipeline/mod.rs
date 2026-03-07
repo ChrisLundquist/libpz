@@ -300,18 +300,10 @@ pub enum Pipeline {
     LzSeqR = 8,
     /// LzSeq + Huffman (fast decode, simpler entropy coding)
     LzSeqH = 9,
-    /// Context-Segmented BWT + per-segment FSE (GPU-parallel BWT, experimental)
-    Csbwt = 10,
     /// Sort-based LZ77 + FSE (deterministic GPU match finding, experimental)
-    SortLz = 11,
-    /// Bit-plane decomposition + RLE + FSE (GPU throughput ceiling experiment)
-    Bitplane = 12,
-    /// Fixed-window sort transform + MTF + RLE + FSE (context depth experiment)
-    Fwst = 13,
+    SortLz = 10,
     /// Parallel-parse LZ + FSE (serial parsing cost experiment)
-    Parlz = 14,
-    /// Re-Pair grammar compression + FSE (iterative GPU dispatch experiment)
-    Repair = 15,
+    Parlz = 11,
 }
 
 impl TryFrom<u8> for Pipeline {
@@ -329,12 +321,8 @@ impl TryFrom<u8> for Pipeline {
             7 => Ok(Self::Lz78R),
             8 => Ok(Self::LzSeqR),
             9 => Ok(Self::LzSeqH),
-            10 => Ok(Self::Csbwt),
-            11 => Ok(Self::SortLz),
-            12 => Ok(Self::Bitplane),
-            13 => Ok(Self::Fwst),
-            14 => Ok(Self::Parlz),
-            15 => Ok(Self::Repair),
+            10 => Ok(Self::SortLz),
+            11 => Ok(Self::Parlz),
             _ => Err(PzError::Unsupported),
         }
     }
