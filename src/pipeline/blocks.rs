@@ -179,6 +179,15 @@ fn entropy_decode(
     match pipeline {
         Pipeline::Deflate => stage_huffman_decode(block),
         Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R | Pipeline::LzSeqR => {
+            #[cfg(feature = "webgpu")]
+            {
+                if let Backend::WebGpu = options.backend {
+                    if let Some(ref engine) = options.webgpu_engine {
+                        return stage_rans_decode_webgpu(block, engine);
+                    }
+                }
+            }
+            let _ = options;
             stage_rans_decode(block)
         }
         Pipeline::LzSeqH => stage_huffman_decode(block),

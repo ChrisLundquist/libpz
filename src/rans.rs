@@ -68,11 +68,11 @@ pub(crate) const NUM_SYMBOLS: usize = 256;
 ///
 /// State invariant: after each encode/decode step, state ∈ [RANS_L, RANS_L << IO_BITS).
 /// With RANS_L = 2^16 and IO_BITS = 16, state ∈ [2^16, 2^32).
-const RANS_L: u32 = 1 << 16;
+pub(crate) const RANS_L: u32 = 1 << 16;
 
 /// I/O granularity: stream 16-bit words (not individual bits).
 /// Word-aligned I/O is what makes rANS GPU/SIMD friendly.
-const IO_BITS: u32 = 16;
+pub(crate) const IO_BITS: u32 = 16;
 
 /// Default number of interleaved states.
 pub const DEFAULT_INTERLEAVE: usize = 4;

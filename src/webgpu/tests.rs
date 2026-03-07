@@ -2671,3 +2671,86 @@ fn test_gpu_entropy_threshold_cpu_fallback_below_256kb() {
         }
     }
 }
+
+#[test]
+fn test_rans_recoil_decode_gpu_round_trip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..8192).map(|i| ((i * 41 + 61) % 251) as u8).collect();
+    let encoded = crate::rans::encode_interleaved_n(&input, 4, crate::rans::DEFAULT_SCALE_BITS);
+    let metadata = crate::recoil::recoil_generate_splits(&encoded, input.len(), 8).unwrap();
+
+    let decoded = engine
+        .rans_decode_recoil_gpu(&encoded, &metadata, input.len())
+        .unwrap();
+    assert_eq!(decoded, input, "Recoil GPU decode mismatch");
+}
+
+#[test]
+fn test_rans_recoil_decode_gpu_various_splits() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..16384).map(|i| ((i * 13 + 7) % 200) as u8).collect();
+    let encoded = crate::rans::encode_interleaved_n(&input, 4, crate::rans::DEFAULT_SCALE_BITS);
+
+    for num_splits in [1, 2, 4, 8, 16, 64] {
+        let metadata =
+            crate::recoil::recoil_generate_splits(&encoded, input.len(), num_splits).unwrap();
+        let decoded = engine
+            .rans_decode_recoil_gpu(&encoded, &metadata, input.len())
+            .unwrap();
+        assert_eq!(
+            decoded, input,
+            "Recoil GPU decode failed with {} splits",
+            num_splits
+        );
+    }
+}
+
+#[test]
+fn test_rans_recoil_decode_gpu_wide_interleave() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..8192).map(|i| ((i * 17 + 3) % 256) as u8).collect();
+    let encoded = crate::rans::encode_interleaved_n(&input, 8, crate::rans::DEFAULT_SCALE_BITS);
+    let metadata = crate::recoil::recoil_generate_splits(&encoded, input.len(), 16).unwrap();
+
+    let decoded = engine
+        .rans_decode_recoil_gpu(&encoded, &metadata, input.len())
+        .unwrap();
+    assert_eq!(
+        decoded, input,
+        "Recoil GPU decode failed with 8-way interleave"
+    );
+}
+
+#[test]
+fn test_rans_recoil_decode_gpu_matches_cpu() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input: Vec<u8> = (0..4096).map(|i| ((i * 31 + 11) % 251) as u8).collect();
+    let encoded = crate::rans::encode_interleaved_n(&input, 4, crate::rans::DEFAULT_SCALE_BITS);
+    let metadata = crate::recoil::recoil_generate_splits(&encoded, input.len(), 8).unwrap();
+
+    let cpu_decoded = crate::recoil::decode_recoil(&encoded, &metadata, input.len()).unwrap();
+    let gpu_decoded = engine
+        .rans_decode_recoil_gpu(&encoded, &metadata, input.len())
+        .unwrap();
+    assert_eq!(gpu_decoded, cpu_decoded, "GPU Recoil must match CPU Recoil");
+}
