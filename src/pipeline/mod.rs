@@ -409,9 +409,8 @@ pub fn compress_with_options(
         return Ok(Vec::new());
     }
 
-    // For GPU backends on LZ77 pipelines, use smaller blocks to keep
-    // the hash table within its quality sweet spot (≤128KB). Only
-    // override when the caller hasn't explicitly set a custom block size.
+    // Adjust block size for pipeline characteristics when the caller
+    // is using defaults: BW→512KB, GPU LZ→128KB.
     let options = &adjusted_options(pipeline, options);
 
     let num_threads = resolve_thread_count(options.threads);
