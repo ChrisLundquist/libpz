@@ -122,6 +122,11 @@ fn suffix_prefix_differs(input: &[u8], sa_a: usize, sa_b: usize, k: usize) -> bo
     false
 }
 
+/// Public wrapper for merge_small_segments (used by GPU path).
+pub fn merge_small_segments_public(boundaries: &[usize], min_size: usize) -> Vec<usize> {
+    merge_small_segments(boundaries, min_size)
+}
+
 /// Merge adjacent segments until each has at least `min_size` symbols.
 ///
 /// Scans left to right, accumulating segments until the cumulative size
@@ -251,6 +256,11 @@ pub fn decompress(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 
     // Inverse BWT to recover original data.
     bwt::decode(&bwt_data, primary_index)
+}
+
+/// Public wrapper for adaptive_accuracy_log (used by GPU path).
+pub fn adaptive_accuracy_log_public(data: &[u8]) -> u8 {
+    adaptive_accuracy_log(data)
 }
 
 /// Choose FSE accuracy_log based on distinct symbol count.

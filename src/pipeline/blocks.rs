@@ -46,8 +46,8 @@ pub(crate) fn compress_block(
         None => match pipeline {
             Pipeline::Bw => compress_block_bw(input, opts),
             Pipeline::Bbw => compress_block_bbw(input, opts),
-            Pipeline::Csbwt => compress_block_csbwt(input),
-            Pipeline::SortLz => compress_block_sortlz(input),
+            Pipeline::Csbwt => compress_block_csbwt(input, opts),
+            Pipeline::SortLz => compress_block_sortlz(input, opts),
             Pipeline::Bitplane => compress_block_bitplane(input, opts),
             Pipeline::Fwst => compress_block_fwst(input, opts),
             Pipeline::Parlz => compress_block_parlz(input, opts),
@@ -349,7 +349,16 @@ fn decompress_block_bbw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 /// Compress a single block using the CSBWT pipeline (no container header).
-fn compress_block_csbwt(input: &[u8]) -> PzResult<Vec<u8>> {
+fn compress_block_csbwt(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
+    #[cfg(feature = "webgpu")]
+    {
+        if let Backend::WebGpu = options.backend {
+            if let Some(ref engine) = options.webgpu_engine {
+                return engine.csbwt_compress(input, &crate::csbwt::CsbwtConfig::default());
+            }
+        }
+    }
+    let _ = options;
     crate::csbwt::compress(input, &crate::csbwt::CsbwtConfig::default())
 }
 
@@ -363,7 +372,16 @@ fn decompress_block_csbwt(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> 
 // ---------------------------------------------------------------------------
 
 /// Compress a single block using the SortLZ pipeline (no container header).
-fn compress_block_sortlz(input: &[u8]) -> PzResult<Vec<u8>> {
+fn compress_block_sortlz(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
+    #[cfg(feature = "webgpu")]
+    {
+        if let Backend::WebGpu = options.backend {
+            if let Some(ref engine) = options.webgpu_engine {
+                return engine.sortlz_compress(input, &crate::sortlz::SortLzConfig::default());
+            }
+        }
+    }
+    let _ = options;
     crate::sortlz::compress(input, &crate::sortlz::SortLzConfig::default())
 }
 

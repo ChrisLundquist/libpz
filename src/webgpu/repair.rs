@@ -1,7 +1,7 @@
 //! GPU Re-Pair grammar compression for Experiment C.
 //!
 //! Tests the viability of iterative GPU kernel dispatch.
-//! Each round dispatches 3 kernels: histogram, argmax, replace.
+//! Each round dispatches up to 5 kernels: histogram, argmax, replace, prefix_sum, scatter.
 //! The key measurement is dispatch_overhead / compute_time ratio.
 
 use super::*;
@@ -13,7 +13,9 @@ impl WebGpuEngine {
     /// while any bigram frequency > threshold:
     ///   1. GPU histogram: count all bigram frequencies
     ///   2. GPU argmax: find most frequent bigram
-    ///   3. GPU replace: replace all occurrences with new symbol
+    ///   3. GPU replace (two-buffer): replace occurrences, mark deletions
+    ///   4. GPU prefix sum: compute compaction offsets
+    ///   5. GPU scatter: compact symbols
     ///
     /// Returns compressed data in the same wire format as the CPU implementation.
     pub fn repair_compress(&self, input: &[u8]) -> PzResult<Vec<u8>> {
@@ -43,7 +45,6 @@ impl WebGpuEngine {
             // For large alphabets, histogram becomes too large for shared memory.
             // Fall back to CPU for alphabets > 512.
             if max_alphabet > 512 {
-                // CPU fallback for large alphabets.
                 let (best_a, best_b, best_freq) = cpu_find_best_bigram(&symbols);
                 if best_freq < min_freq {
                     break;
@@ -70,7 +71,7 @@ impl WebGpuEngine {
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             );
 
-            // Scratch buffer for argmax results and compaction.
+            // Scratch buffer for argmax results.
             let scratch_size = current_n.max(hist_size / 256 * 2 + 2);
             let scratch_buf = self.create_buffer_init(
                 "repair_scratch",
@@ -159,11 +160,7 @@ impl WebGpuEngine {
             )?;
 
             // Read back the argmax result.
-            // For single-level reduction, block 0's result is the global max.
-            // scratch[0] = max_freq, scratch[1] = max_idx (flat index into histogram).
             let num_argmax_blocks = (hist_size as u32).div_ceil(256) as usize;
-
-            // If multiple blocks, do a CPU-side final reduction over block results.
             let argmax_data = self.read_buffer(&scratch_buf, (num_argmax_blocks * 2 * 4) as u64);
             let argmax_u32s: &[u32] = bytemuck::cast_slice(&argmax_data);
 
@@ -185,13 +182,129 @@ impl WebGpuEngine {
             let best_a = best_idx / max_alphabet as u32;
             let best_b = best_idx % max_alphabet as u32;
 
-            // --- Phase 3: Replace + compact (CPU) ---
-            // The GPU replace kernel has a data race on the symbols array
-            // (threads read neighbors while other threads write). Use the
-            // CPU for replacement, which matches the CPU decompress path's
-            // left-to-right greedy semantics. GPU histogram + argmax still
-            // provide the dispatch-overhead measurement this experiment needs.
-            cpu_replace_bigram(&mut symbols, best_a, best_b, next_symbol);
+            // --- Phase 3: GPU two-buffer replace + compact ---
+            let replace_pips = self.repair_replace_pipelines();
+
+            // symbols_buf is the input (read-only for replace).
+            // Create output buffer for replaced symbols.
+            let symbols_out_buf = self.create_buffer(
+                "repair_symbols_out",
+                (current_n * 4) as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            );
+
+            // Keep flags buffer (1 = keep, 0 = delete).
+            let keep_flags_buf = self.create_buffer(
+                "repair_keep_flags",
+                (current_n * 4) as u64,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            );
+
+            let target_packed = best_a | (best_b << 16);
+            let replace_params = [current_n as u32, next_symbol, target_packed, 0u32];
+            let replace_params_buf = self.create_buffer_init(
+                "repair_replace_params",
+                bytemuck::cast_slice(&replace_params),
+                wgpu::BufferUsages::UNIFORM,
+            );
+
+            let replace_bg_layout = replace_pips.replace_twobuf.get_bind_group_layout(0);
+            let replace_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("repair_replace_bg"),
+                layout: &replace_bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: symbols_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: symbols_out_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: keep_flags_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: replace_params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            self.dispatch(
+                &replace_pips.replace_twobuf,
+                &replace_bg,
+                workgroups,
+                "repair_replace_twobuf",
+            )?;
+
+            // --- Phase 4: Prefix sum on keep_flags for compaction offsets ---
+            let mut prefix_sum_buf = self.create_buffer(
+                "repair_prefix_sum",
+                (current_n * 4) as u64,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            );
+            self.run_inclusive_prefix_sum(&keep_flags_buf, &mut prefix_sum_buf, current_n)?;
+
+            // Read back last element of prefix sum to get new length.
+            let new_n = self.read_buffer_scalar_u32(&prefix_sum_buf, current_n - 1) as usize;
+
+            if new_n == 0 || new_n >= current_n {
+                // No replacements happened or something went wrong — use CPU fallback.
+                cpu_replace_bigram(&mut symbols, best_a, best_b, next_symbol);
+                rules.push((next_symbol, best_a, best_b));
+                next_symbol += 1;
+                continue;
+            }
+
+            // --- Phase 5: Scatter compact ---
+            let compacted_buf = self.create_buffer(
+                "repair_compacted",
+                (new_n * 4) as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            );
+
+            // Reuse params for scatter (n is current_n).
+            let scatter_bg_layout = replace_pips.scatter.get_bind_group_layout(0);
+            let scatter_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("repair_scatter_bg"),
+                layout: &scatter_bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: symbols_out_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: compacted_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: prefix_sum_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: replace_params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            self.dispatch(
+                &replace_pips.scatter,
+                &scatter_bg,
+                workgroups,
+                "repair_scatter",
+            )?;
+
+            // Read back compacted symbols.
+            let compacted_bytes = self.read_buffer(&compacted_buf, (new_n * 4) as u64);
+            let compacted_u32s: &[u32] = bytemuck::cast_slice(&compacted_bytes);
+            symbols = compacted_u32s.to_vec();
 
             rules.push((next_symbol, best_a, best_b));
             next_symbol += 1;

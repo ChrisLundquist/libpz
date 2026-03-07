@@ -193,6 +193,19 @@ pub fn compress(input: &[u8], config: &SortLzConfig) -> PzResult<Vec<u8>> {
     }
 
     let matches = find_matches(input, config);
+    compress_with_matches(input, matches, config)
+}
+
+/// Compress using pre-computed matches (shared by CPU and GPU paths).
+pub fn compress_with_matches(
+    input: &[u8],
+    matches: Vec<Option<(u16, u16)>>,
+    config: &SortLzConfig,
+) -> PzResult<Vec<u8>> {
+    if input.is_empty() {
+        return Err(PzError::InvalidInput);
+    }
+
     let tokens = parse_matches(input, &matches, config.lazy_parsing);
 
     // Split tokens into streams.

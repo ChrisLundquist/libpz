@@ -365,4 +365,12 @@ mod tests {
         let result = replace_bigram(&symbols, 1, 2, 256);
         assert_eq!(result, vec![256, 256, 256]);
     }
+
+    #[test]
+    fn test_gpu_test_input() {
+        let input = b"abababababababab cdcdcdcdcdcdcdcd";
+        let compressed = compress(input).unwrap();
+        let decompressed = decompress(&compressed, input.len()).unwrap();
+        assert_eq!(&decompressed, &input[..]);
+    }
 }
