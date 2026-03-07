@@ -21,6 +21,13 @@ const MAX_CANDIDATES: usize = 8;
 /// Default maximum window size for back-references.
 const DEFAULT_MAX_WINDOW: usize = 65535;
 
+/// Satisficing threshold: once a position has a match this long,
+/// skip further improvement attempts. Greatly reduces verification
+/// work on repetitive data where most positions have very long matches.
+/// 256 covers the full Deflate match range (258) and provides
+/// diminishing returns beyond this point.
+const SATISFICE_LEN: u16 = 256;
+
 /// Configuration for the SortLZ pipeline.
 #[derive(Debug, Clone)]
 pub struct SortLzConfig {
@@ -100,9 +107,9 @@ pub fn find_matches(input: &[u8], config: &SortLzConfig) -> Vec<Option<(u16, u16
         let (hash_a, pos_a_raw) = pairs[window_start];
         let pos_a = pos_a_raw as usize;
 
-        // Skip if this position already has a max-length match.
+        // Skip if this position already has a good-enough match.
         if let Some((_, len)) = best_match[pos_a] {
-            if len == u16::MAX {
+            if len >= SATISFICE_LEN {
                 continue;
             }
         }
@@ -130,6 +137,14 @@ pub fn find_matches(input: &[u8], config: &SortLzConfig) -> Vec<Option<(u16, u16
             if distance > config.max_window || distance == 0 {
                 candidates_checked += 1;
                 continue;
+            }
+
+            // Skip if destination already has a good-enough match.
+            if let Some((_, existing_len)) = best_match[dst] {
+                if existing_len >= SATISFICE_LEN {
+                    candidates_checked += 1;
+                    continue;
+                }
             }
 
             // Verify and extend match.
