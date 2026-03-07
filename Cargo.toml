@@ -113,6 +113,10 @@ harness = false
 name = "rans_decode_bench"
 harness = false
 
+[[bench]]
+name = "stages_gpu_experiments"
+harness = false
+
 [profile.profiling]
 inherits = "release"
 debug = true
