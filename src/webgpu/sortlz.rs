@@ -80,7 +80,7 @@ impl WebGpuEngine {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("sortlz_radix_sort"),
+                label: Some("sortlz_sort_and_verify"),
             });
 
         self.record_sortlz_radix_sort(
@@ -94,10 +94,9 @@ impl WebGpuEngine {
             num_hashes as u32,
         )?;
 
-        self.profiler_resolve(&mut encoder);
-        self.queue.submit(Some(encoder.finish()));
-
-        // Step 4: Match verification (separate submit — needs sort results).
+        // Step 4: Match verification — fused into same encoder.
+        // WebGPU dispatches within an encoder execute in submission order,
+        // so the radix sort results are available for verification.
         let best_buf = self.create_buffer_init(
             "sortlz_best",
             &vec![0u8; n * 4],
@@ -147,12 +146,16 @@ impl WebGpuEngine {
         });
 
         let verify_wg = (padded_n as u32).div_ceil(256);
-        self.dispatch(
+        self.record_dispatch(
+            &mut encoder,
             self.pipeline_sortlz_verify_matches(),
             &vm_bg,
             verify_wg,
             "sortlz_verify",
         )?;
+
+        self.profiler_resolve(&mut encoder);
+        self.queue.submit(Some(encoder.finish()));
 
         // Step 5: Read back results.
         let best_bytes = self.read_buffer(&best_buf, (n * 4) as u64);
