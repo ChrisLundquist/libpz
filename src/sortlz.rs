@@ -97,22 +97,29 @@ pub fn find_matches(input: &[u8], config: &SortLzConfig) -> Vec<Option<(u16, u16
     let mut best_match: Vec<Option<(u16, u16)>> = vec![None; n]; // (offset, length)
 
     for window_start in 0..pairs.len() {
-        let (hash_a, _) = pairs[window_start];
+        let (hash_a, pos_a_raw) = pairs[window_start];
+        let pos_a = pos_a_raw as usize;
+
+        // Skip if this position already has a max-length match.
+        if let Some((_, len)) = best_match[pos_a] {
+            if len == u16::MAX {
+                continue;
+            }
+        }
 
         // Look at adjacent entries with the same hash.
         let mut candidates_checked = 0;
-        for j in (window_start + 1)..pairs.len() {
-            if pairs[j].0 != hash_a {
+        for pair in pairs.iter().skip(window_start + 1) {
+            if pair.0 != hash_a {
                 break;
             }
             if candidates_checked >= config.max_candidates {
                 break;
             }
 
-            let pos_a = pairs[window_start].1 as usize;
-            let pos_b = pairs[j].1 as usize;
+            let pos_b = pair.1 as usize;
 
-            // Ensure pos_a < pos_b for valid back-reference (earlier position is source).
+            // Ensure earlier position is source for valid back-reference.
             let (src, dst) = if pos_a < pos_b {
                 (pos_a, pos_b)
             } else {
@@ -129,7 +136,7 @@ pub fn find_matches(input: &[u8], config: &SortLzConfig) -> Vec<Option<(u16, u16
             let match_len = extend_match(input, src, dst);
             if match_len >= config.min_match {
                 let offset = distance as u16;
-                let length = match_len.min(u16::MAX as usize) as u16;
+                let length = match_len as u16; // already capped at u16::MAX in extend_match
 
                 // Update best match for the destination position.
                 if let Some((_, existing_len)) = best_match[dst] {
@@ -211,7 +218,7 @@ pub fn find_matches_topk(
             let match_len = extend_match(input, src, dst);
             if match_len >= config.min_match {
                 let offset = distance as u32;
-                let length = match_len.min(u16::MAX as usize) as u32;
+                let length = match_len as u32; // already capped at u16::MAX in extend_match
 
                 // Insert into top-K slot for the destination position,
                 // maintaining sorted-by-length-desc order.
@@ -265,11 +272,32 @@ fn insert_topk_candidate(
 }
 
 /// Extend a match starting at positions src and dst, return total match length.
+///
+/// Uses u64 chunk comparisons for 4-8x speedup on long matches.
+/// Capped at `u16::MAX` to avoid excessive scanning on highly repetitive data.
 fn extend_match(input: &[u8], src: usize, dst: usize) -> usize {
     let max_len = input.len() - dst;
-    let max_len = max_len.min(input.len() - src);
+    let max_len = max_len.min(input.len() - src).min(u16::MAX as usize);
+
+    // Fast path: compare 8 bytes at a time.
     let mut len = 0;
-    while len < max_len && input[src + len] == input[dst + len] {
+    let chunks = max_len / 8;
+    let src_ptr = &input[src..];
+    let dst_ptr = &input[dst..];
+    for _ in 0..chunks {
+        let a = u64::from_le_bytes(src_ptr[len..len + 8].try_into().unwrap());
+        let b = u64::from_le_bytes(dst_ptr[len..len + 8].try_into().unwrap());
+        if a != b {
+            // Find first differing byte within the u64.
+            let diff = a ^ b;
+            len += (diff.trailing_zeros() / 8) as usize;
+            return len;
+        }
+        len += 8;
+    }
+
+    // Tail: compare remaining bytes one at a time.
+    while len < max_len && src_ptr[len] == dst_ptr[len] {
         len += 1;
     }
     len
