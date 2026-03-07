@@ -147,6 +147,12 @@ pub fn find_matches(input: &[u8], config: &SortLzConfig) -> Vec<Option<(u16, u16
                 }
             }
 
+            // Skip offsets that overflow u16 (lz77::Match.offset is u16).
+            if distance > u16::MAX as usize {
+                candidates_checked += 1;
+                continue;
+            }
+
             // Verify and extend match.
             let match_len = extend_match(input, src, dst);
             if match_len >= config.min_match {
