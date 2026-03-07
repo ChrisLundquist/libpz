@@ -551,6 +551,31 @@ fn process_compress(opts: &Opts, path: &str, options: &CompressOptions) -> Resul
         opts.pipeline
     };
 
+    // Auto-select match finder when user hasn't explicitly chosen one.
+    // This allows SortLz to be picked automatically for data that benefits from it.
+    let options = if opts.auto_select && opts.match_finder == MatchFinder::HashChain {
+        let mut sample = vec![0u8; 65536];
+        let pos = file.stream_position().map_err(|e| format!("{path}: {e}"))?;
+        let n = file.read(&mut sample).map_err(|e| format!("{path}: {e}"))?;
+        sample.truncate(n);
+        file.seek(io::SeekFrom::Start(pos))
+            .map_err(|e| format!("{path}: cannot seek: {e}"))?;
+        let finder = pipeline::select_match_finder(&sample, options);
+        if finder != options.match_finder {
+            let mut opts = options.clone();
+            opts.match_finder = finder;
+            if opts.match_finder == MatchFinder::SortLz {
+                eprintln!("pz: auto-selected match finder: SortLz");
+            }
+            opts
+        } else {
+            options.clone()
+        }
+    } else {
+        options.clone()
+    };
+    let options = &options;
+
     let input = BufReader::new(file);
 
     if opts.to_stdout {

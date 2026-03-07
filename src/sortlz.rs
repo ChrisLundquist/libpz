@@ -867,4 +867,34 @@ mod tests {
         let decoded = pipeline::decompress(&compressed).unwrap();
         assert_eq!(decoded, input);
     }
+
+    #[test]
+    fn test_pipeline_roundtrip_lzseqr_sortlz() {
+        use crate::pipeline::{self, CompressOptions, MatchFinder, Pipeline};
+        let input = test_data();
+
+        let opts = CompressOptions {
+            match_finder: MatchFinder::SortLz,
+            threads: 1,
+            ..Default::default()
+        };
+        let compressed = pipeline::compress_with_options(&input, Pipeline::LzSeqR, &opts).unwrap();
+        let decoded = pipeline::decompress(&compressed).unwrap();
+        assert_eq!(decoded, input, "LzSeqR + SortLz roundtrip failed");
+    }
+
+    #[test]
+    fn test_pipeline_roundtrip_lzseqh_sortlz() {
+        use crate::pipeline::{self, CompressOptions, MatchFinder, Pipeline};
+        let input = test_data();
+
+        let opts = CompressOptions {
+            match_finder: MatchFinder::SortLz,
+            threads: 1,
+            ..Default::default()
+        };
+        let compressed = pipeline::compress_with_options(&input, Pipeline::LzSeqH, &opts).unwrap();
+        let decoded = pipeline::decompress(&compressed).unwrap();
+        assert_eq!(decoded, input, "LzSeqH + SortLz roundtrip failed");
+    }
 }

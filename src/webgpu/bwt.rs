@@ -307,7 +307,7 @@ impl WebGpuEngine {
     }
 
     /// Record inclusive prefix sum dispatches into an existing encoder (no submit).
-    fn record_inclusive_prefix_sum(
+    pub(crate) fn record_inclusive_prefix_sum(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         input_buf: &wgpu::Buffer,

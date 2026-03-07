@@ -556,6 +556,62 @@ pub fn select_pipeline(input: &[u8]) -> Pipeline {
     Pipeline::Deflate
 }
 
+/// Select the best match finder for the given input and options.
+///
+/// Returns `MatchFinder::SortLz` when data characteristics favor exhaustive
+/// sort-based match finding (text, structured data with moderate-to-high
+/// match density and moderate entropy). Returns `MatchFinder::HashChain`
+/// for near-random data, very small inputs, or when match finding speed
+/// matters more than ratio.
+///
+/// When a GPU is available and the input is large enough, always prefers
+/// SortLz since the GPU radix sort amortizes its cost at scale.
+pub fn select_match_finder(input: &[u8], options: &CompressOptions) -> MatchFinder {
+    // Tiny inputs: hashchain is fine, SortLZ overhead not worth it
+    if input.len() < 1024 {
+        return MatchFinder::HashChain;
+    }
+
+    let profile = crate::analysis::analyze(input);
+
+    // Near-random data: hashchain is fine, SortLZ adds cost without ratio benefit
+    if profile.byte_entropy > 7.5 {
+        return MatchFinder::HashChain;
+    }
+
+    // GPU available: use SortLZ when input is large enough to amortize dispatch
+    #[cfg(feature = "webgpu")]
+    if matches!(options.backend, Backend::WebGpu) {
+        if let Some(ref engine) = options.webgpu_engine {
+            if input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
+                && input.len() <= engine.max_dispatch_input_size()
+            {
+                return MatchFinder::SortLz;
+            }
+        }
+    }
+
+    // CPU: SortLZ shines on text/structured data where exhaustive match
+    // finding discovers long-range matches that hash-chains miss.
+    // Thresholds derived from experiment B results:
+    //   - bible.txt: match_density ~0.5, entropy ~4.6 → SortLZ 18% better
+    //   - world192.txt: match_density ~0.4, entropy ~5.1 → SortLZ 24% better
+    //   - random data: match_density <0.1, entropy >7.5 → no benefit
+    if profile.match_density > 0.3 && profile.byte_entropy < 6.5 {
+        return MatchFinder::SortLz;
+    }
+
+    // Large inputs with moderate structure: SortLZ's global sort still helps
+    if input.len() >= 64 * 1024 && profile.match_density > 0.2 && profile.byte_entropy < 5.5 {
+        return MatchFinder::SortLz;
+    }
+
+    // Suppress unused variable warning when webgpu is disabled
+    let _ = options;
+
+    MatchFinder::HashChain
+}
+
 /// Select the best pipeline by trial compression.
 ///
 /// Compresses the first `sample_size` bytes with each candidate pipeline,
@@ -588,15 +644,35 @@ pub fn select_pipeline_trial(
         Pipeline::Lz78R,
         Pipeline::LzSeqR,
         Pipeline::LzSeqH,
+        Pipeline::SortLz,
     ];
     let mut best_pipeline = Pipeline::Deflate;
     let mut best_size = usize::MAX;
 
+    // Also try SortLz match finder with LZ pipelines to find the best combo
+    let match_finders = [MatchFinder::HashChain, MatchFinder::SortLz];
+
     for &pipeline in &candidates {
-        if let Ok(compressed) = compress_with_options(sample, pipeline, &trial_opts) {
-            if compressed.len() < best_size {
-                best_size = compressed.len();
-                best_pipeline = pipeline;
+        // SortLz pipeline has its own match finder, only test default
+        let finders: &[MatchFinder] = if matches!(
+            pipeline,
+            Pipeline::Bw | Pipeline::Bbw | Pipeline::Lz78R | Pipeline::SortLz
+        ) {
+            &[MatchFinder::HashChain]
+        } else {
+            &match_finders
+        };
+
+        for &finder in finders {
+            let opts = CompressOptions {
+                match_finder: finder,
+                ..trial_opts.clone()
+            };
+            if let Ok(compressed) = compress_with_options(sample, pipeline, &opts) {
+                if compressed.len() < best_size {
+                    best_size = compressed.len();
+                    best_pipeline = pipeline;
+                }
             }
         }
     }
@@ -810,6 +886,9 @@ pub(crate) fn lz77_matches_with_backend(
 }
 
 /// SortLZ match finding with parse strategy dispatch.
+///
+/// Uses GPU radix sort when a WebGPU engine is available and input is large
+/// enough. Falls back to CPU sort otherwise.
 fn sortlz_matches_with_strategy(
     input: &[u8],
     options: &CompressOptions,
@@ -819,6 +898,23 @@ fn sortlz_matches_with_strategy(
 
     let config = SortLzConfig::for_lz77(max_match);
 
+    // GPU path: use GPU radix sort for match finding when available.
+    // The GPU kernel does the sort + verify in parallel, then we convert
+    // to lz77::Match on CPU (parsing is inherently serial).
+    #[cfg(feature = "webgpu")]
+    if let Some(ref engine) = options.webgpu_engine {
+        if input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
+            && input.len() <= engine.max_dispatch_input_size()
+        {
+            let raw_matches = engine.sortlz_find_matches(input, &config)?;
+            return match options.parse_strategy {
+                ParseStrategy::Greedy => Ok(sortlz::matches_to_lz77_greedy(input, &raw_matches)),
+                _ => Ok(sortlz::matches_to_lz77_lazy(input, &raw_matches)),
+            };
+        }
+    }
+
+    // CPU path.
     match options.parse_strategy {
         ParseStrategy::Optimal => {
             let table = sortlz::find_matches_topk(input, &config, crate::optimal::K);
