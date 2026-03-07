@@ -41,7 +41,9 @@ mod fse;
 mod huffman;
 pub(crate) mod lz77;
 pub(crate) mod lzseq;
+mod parlz;
 pub(crate) mod rans;
+mod sortlz;
 
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -85,6 +87,12 @@ const RANS_ENCODE_KERNEL_SOURCE: &str = include_str!("../../kernels/rans_encode.
 
 /// Embedded WGSL kernel source: GPU LzSeq demux (match buffer → 6 streams).
 const LZSEQ_DEMUX_KERNEL_SOURCE: &str = include_str!("../../kernels/lzseq_demux.wgsl");
+
+/// Embedded WGSL kernel source: GPU parlz conflict resolution (Experiment E).
+const PARLZ_RESOLVE_KERNEL_SOURCE: &str = include_str!("../../kernels/parlz_resolve.wgsl");
+
+/// Embedded WGSL kernel source: GPU SortLZ operations (Experiment B).
+const SORTLZ_OPS_KERNEL_SOURCE: &str = include_str!("../../kernels/sortlz_ops.wgsl");
 
 /// Number of candidates per position in the top-K kernel (must match K in lz77_topk.wgsl).
 const TOPK_K: usize = 4;
@@ -270,6 +278,20 @@ struct LzSeqPipelines {
     demux: wgpu::ComputePipeline,
 }
 
+/// Parlz conflict resolution pipelines (Experiment E).
+struct ParlzPipelines {
+    init_coverage: wgpu::ComputePipeline,
+    prefix_max_local: wgpu::ComputePipeline,
+    prefix_max_propagate: wgpu::ComputePipeline,
+    classify: wgpu::ComputePipeline,
+}
+
+/// SortLZ radix sort + match verification pipelines (Experiment B).
+struct SortLzPipelines {
+    compute_keys: wgpu::ComputePipeline,
+    verify_matches: wgpu::ComputePipeline,
+}
+
 /// WebGPU compute engine.
 ///
 /// Manages the wgpu device, queue, and lazily-compiled compute pipelines.
@@ -294,6 +316,8 @@ pub struct WebGpuEngine {
     rans_decode: OnceLock<RansDecodePipelines>,
     rans_encode: OnceLock<RansEncodePipelines>,
     lzseq_demux: OnceLock<LzSeqPipelines>,
+    parlz: OnceLock<ParlzPipelines>,
+    sortlz: OnceLock<SortLzPipelines>,
     /// Device name for diagnostics.
     device_name: String,
     /// Maximum compute workgroup size.
@@ -449,6 +473,8 @@ impl WebGpuEngine {
             rans_decode: OnceLock::new(),
             rans_encode: OnceLock::new(),
             lzseq_demux: OnceLock::new(),
+            parlz: OnceLock::new(),
+            sortlz: OnceLock::new(),
             device_name,
             max_work_group_size,
             max_workgroups_per_dim,
@@ -1339,6 +1365,230 @@ impl WebGpuEngine {
                 group
             })
             .demux
+    }
+
+    // --- Experiment E: Parlz conflict resolution ---
+
+    fn parlz_pipelines(&self) -> &ParlzPipelines {
+        self.parlz.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("parlz_resolve"),
+                    source: wgpu::ShaderSource::Wgsl(PARLZ_RESOLVE_KERNEL_SOURCE.into()),
+                });
+            // Explicit bind group layout: all entry points share the same 5 bindings
+            // even though individual entry points may not reference all of them.
+            // Auto-derived layouts only include referenced bindings, causing mismatches.
+            let bgl = self
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("parlz_bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+            let pipeline_layout =
+                self.device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("parlz_pipeline_layout"),
+                        bind_group_layouts: &[&bgl],
+                        push_constant_ranges: &[],
+                    });
+            let make = |label, entry| {
+                self.device
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some(label),
+                        layout: Some(&pipeline_layout),
+                        module: &module,
+                        entry_point: Some(entry),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    })
+            };
+            let group = ParlzPipelines {
+                init_coverage: make("parlz_init_coverage", "init_coverage"),
+                prefix_max_local: make("parlz_prefix_max_local", "prefix_max_local"),
+                prefix_max_propagate: make("parlz_prefix_max_propagate", "prefix_max_propagate"),
+                classify: make("parlz_classify", "classify"),
+            };
+            if self.profiling {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[pz-gpu] compile parlz_resolve.wgsl: {ms:.3} ms");
+            }
+            group
+        })
+    }
+
+    // --- Experiment B: SortLZ radix sort + match verification ---
+
+    fn pipeline_sortlz_compute_keys(&self) -> &wgpu::ComputePipeline {
+        &self.sortlz_pipelines().compute_keys
+    }
+
+    fn pipeline_sortlz_verify_matches(&self) -> &wgpu::ComputePipeline {
+        &self.sortlz_pipelines().verify_matches
+    }
+
+    fn sortlz_pipelines(&self) -> &SortLzPipelines {
+        self.sortlz.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("sortlz_ops"),
+                    source: wgpu::ShaderSource::Wgsl(SORTLZ_OPS_KERNEL_SOURCE.into()),
+                });
+            // Key extraction: same binding pattern as FWST (sa RO, hashes RO, keys RW, params).
+            // Uses auto-derived layout (layout: None) since all bindings are referenced.
+            let compute_keys =
+                self.device
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("sortlz_compute_keys"),
+                        layout: None,
+                        module: &module,
+                        entry_point: Some("sortlz_compute_keys"),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    });
+
+            // Match verification needs 5 bindings with explicit layout
+            // (sa RO, hashes RO, input RO, best RW+atomic, params).
+            let vm_bgl = self
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("sortlz_vm_bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+            let vm_layout = self
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("sortlz_vm_layout"),
+                    bind_group_layouts: &[&vm_bgl],
+                    push_constant_ranges: &[],
+                });
+            let verify_matches =
+                self.device
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("sortlz_verify_matches"),
+                        layout: Some(&vm_layout),
+                        module: &module,
+                        entry_point: Some("sortlz_verify_matches"),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    });
+
+            if self.profiling {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[pz-gpu] compile sortlz_ops.wgsl: {ms:.3} ms");
+            }
+
+            SortLzPipelines {
+                compute_keys,
+                verify_matches,
+            }
+        })
     }
 }
 

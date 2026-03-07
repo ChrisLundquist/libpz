@@ -553,6 +553,37 @@ impl HashChainFinder {
         found.truncate(k);
         found
     }
+
+    /// Find the best match at every position in `input`.
+    ///
+    /// Returns a vector where `result[i]` is `Some((offset, length))` if a match
+    /// was found at position `i`, or `None` otherwise. Unlike serial greedy parsing,
+    /// this evaluates every position independently (useful for parallel-parse LZ).
+    ///
+    /// Uses `find_match_wide` (no length reduction for next-byte) since the caller
+    /// handles literal/match classification separately.
+    ///
+    /// Builds hash chains incrementally (each position is inserted before the next
+    /// position is queried), so earlier positions can serve as match sources for
+    /// later ones.
+    #[allow(clippy::needless_range_loop)]
+    pub(crate) fn find_all(&mut self, input: &[u8]) -> Vec<Option<(u16, u16)>> {
+        let n = input.len();
+        let mut best: Vec<Option<(u16, u16)>> = vec![None; n];
+
+        for pos in 0..n {
+            // Insert this position into hash chains.
+            self.insert(input, pos);
+
+            // Find the best match looking back at already-inserted positions.
+            let m = self.find_match_wide(input, pos);
+            if m.length >= MIN_MATCH && m.offset > 0 {
+                best[pos] = Some((m.offset as u16, m.length));
+            }
+        }
+
+        best
+    }
 }
 
 /// Compress input using lazy matching, returning the match sequence.
@@ -567,6 +598,37 @@ impl HashChainFinder {
 /// For configurable max match length, use `compress_lazy_to_matches_with_limit`.
 pub fn compress_lazy_to_matches(input: &[u8]) -> PzResult<Vec<Match>> {
     compress_lazy_to_matches_with_limit(input, DEFLATE_MAX_MATCH)
+}
+
+/// Compress input using greedy matching: always take the longest match at
+/// each position without lookahead. Faster than lazy but slightly worse ratio.
+pub(crate) fn compress_greedy_to_matches_with_limit(
+    input: &[u8],
+    max_match_len: u16,
+) -> PzResult<Vec<Match>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut matches = Vec::with_capacity(input.len() / 4);
+    let mut finder = HashChainFinder::with_max_match_len(max_match_len);
+    let mut pos: usize = 0;
+
+    while pos < input.len() {
+        let m = finder.find_match(input, pos);
+        finder.insert(input, pos);
+
+        let advance = m.length as usize + 1;
+        let insert_count = advance.min(input.len() - pos).min(MAX_INSERT_LEN);
+        for i in 1..insert_count {
+            finder.insert(input, pos + i);
+        }
+
+        matches.push(m);
+        pos += advance;
+    }
+
+    Ok(matches)
 }
 
 /// Like `compress_lazy_to_matches` but with a caller-specified max match length.

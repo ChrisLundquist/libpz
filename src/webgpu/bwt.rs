@@ -164,28 +164,68 @@ impl WebGpuEngine {
         while k_step < n {
             let k_arg = k_step as u32;
 
-            // Phase 0: Radix sort
-            self.run_radix_sort(
-                &mut sa_buf,
-                &mut sa_buf_alt,
-                &rank_buf,
-                &keys_buf,
-                &histogram_buf,
-                &histogram_buf_scan,
-                padded_n,
-                n_arg,
-                k_arg,
-                max_rank,
-            )?;
-
-            // Phase 1: Rank compare
-            self.run_rank_compare(&sa_buf, &rank_buf, &diff_buf, n_arg, padded_n_arg, k_arg)?;
-
-            // Phase 2: Inclusive prefix sum
-            self.run_inclusive_prefix_sum(&diff_buf, &mut prefix_buf, padded_n)?;
-
-            // Phase 3: Scatter ranks
-            self.run_rank_scatter(&sa_buf, &prefix_buf, &rank_buf_alt, n_arg, padded_n_arg)?;
+            if self.profiling {
+                // Profiling path: per-dispatch submits for wall-clock timing
+                self.run_radix_sort(
+                    &mut sa_buf,
+                    &mut sa_buf_alt,
+                    &rank_buf,
+                    &keys_buf,
+                    &histogram_buf,
+                    &histogram_buf_scan,
+                    padded_n,
+                    n_arg,
+                    k_arg,
+                    max_rank,
+                )?;
+                self.run_rank_compare(&sa_buf, &rank_buf, &diff_buf, n_arg, padded_n_arg, k_arg)?;
+                self.run_inclusive_prefix_sum(&diff_buf, &mut prefix_buf, padded_n)?;
+                self.run_rank_scatter(&sa_buf, &prefix_buf, &rank_buf_alt, n_arg, padded_n_arg)?;
+            } else {
+                // Batched path: one encoder for entire doubling iteration
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("bwt_iteration"),
+                        });
+                self.record_radix_sort(
+                    &mut encoder,
+                    &mut sa_buf,
+                    &mut sa_buf_alt,
+                    &rank_buf,
+                    &keys_buf,
+                    &histogram_buf,
+                    padded_n,
+                    n_arg,
+                    k_arg,
+                    max_rank,
+                )?;
+                self.record_rank_compare(
+                    &mut encoder,
+                    &sa_buf,
+                    &rank_buf,
+                    &diff_buf,
+                    n_arg,
+                    padded_n_arg,
+                    k_arg,
+                )?;
+                self.record_inclusive_prefix_sum(
+                    &mut encoder,
+                    &diff_buf,
+                    &mut prefix_buf,
+                    padded_n,
+                )?;
+                self.record_rank_scatter(
+                    &mut encoder,
+                    &sa_buf,
+                    &prefix_buf,
+                    &rank_buf_alt,
+                    n_arg,
+                    padded_n_arg,
+                )?;
+                self.profiler_resolve(&mut encoder);
+                self.queue.submit(Some(encoder.finish()));
+            }
 
             // Read convergence scalar (4 bytes instead of full buffer)
             max_rank = self.read_buffer_scalar_u32(&prefix_buf, n - 1);
@@ -266,8 +306,10 @@ impl WebGpuEngine {
         Ok(())
     }
 
-    fn run_inclusive_prefix_sum(
+    /// Record inclusive prefix sum dispatches into an existing encoder (no submit).
+    fn record_inclusive_prefix_sum(
         &self,
+        encoder: &mut wgpu::CommandEncoder,
         input_buf: &wgpu::Buffer,
         output_buf: &mut wgpu::Buffer,
         count: usize,
@@ -316,7 +358,8 @@ impl WebGpuEngine {
         });
 
         let workgroups = num_blocks as u32;
-        self.dispatch(
+        self.record_dispatch(
+            encoder,
             self.pipeline_prefix_sum_local(),
             &bg,
             workgroups.max(1),
@@ -324,7 +367,6 @@ impl WebGpuEngine {
         )?;
 
         if num_blocks > 1 {
-            // Recursively scan block sums, then propagate
             let mut block_sums_scanned = self.create_buffer(
                 "ps_block_sums_scanned",
                 (num_blocks * 4) as u64,
@@ -332,9 +374,13 @@ impl WebGpuEngine {
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,
             );
-            self.run_inclusive_prefix_sum(&block_sums_buf, &mut block_sums_scanned, num_blocks)?;
+            self.record_inclusive_prefix_sum(
+                encoder,
+                &block_sums_buf,
+                &mut block_sums_scanned,
+                num_blocks,
+            )?;
 
-            // Propagate
             let prop_params = [count as u32, 0, 0, 0];
             let prop_params_buf = self.create_buffer_init(
                 "prop_params",
@@ -365,7 +411,8 @@ impl WebGpuEngine {
             });
 
             let prop_wg = (count as u32).div_ceil(256);
-            self.dispatch(
+            self.record_dispatch(
+                encoder,
                 self.pipeline_prefix_sum_propagate(),
                 &prop_bg,
                 prop_wg,
@@ -373,6 +420,24 @@ impl WebGpuEngine {
             )?;
         }
 
+        Ok(())
+    }
+
+    /// Run inclusive prefix sum with an internal encoder (backward-compatible wrapper).
+    pub(crate) fn run_inclusive_prefix_sum(
+        &self,
+        input_buf: &wgpu::Buffer,
+        output_buf: &mut wgpu::Buffer,
+        count: usize,
+    ) -> PzResult<()> {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("prefix_sum"),
+            });
+        self.record_inclusive_prefix_sum(&mut encoder, input_buf, output_buf, count)?;
+        self.profiler_resolve(&mut encoder);
+        self.queue.submit(Some(encoder.finish()));
         Ok(())
     }
 
@@ -642,6 +707,329 @@ impl WebGpuEngine {
             });
 
             self.dispatch(
+                self.pipeline_radix_scatter(),
+                &scat_bg,
+                num_groups as u32,
+                "radix_scatter",
+            )?;
+
+            // Swap sa buffers
+            std::mem::swap(sa_buf, sa_buf_alt);
+        }
+
+        Ok(())
+    }
+
+    /// Record rank compare dispatch into an existing encoder (no submit).
+    #[allow(clippy::too_many_arguments)]
+    fn record_rank_compare(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        sa_buf: &wgpu::Buffer,
+        rank_buf: &wgpu::Buffer,
+        diff_buf: &wgpu::Buffer,
+        n: u32,
+        padded_n: u32,
+        k: u32,
+    ) -> PzResult<()> {
+        let params = [n, padded_n, k, 0];
+        let params_buf = self.create_buffer_init(
+            "rank_compare_params",
+            bytemuck::cast_slice(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
+        let bg_layout = self.pipeline_rank_compare().get_bind_group_layout(0);
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rank_compare_bg"),
+            layout: &bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: sa_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: rank_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: diff_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let workgroups = padded_n.div_ceil(256);
+        self.record_dispatch(
+            encoder,
+            self.pipeline_rank_compare(),
+            &bg,
+            workgroups,
+            "rank_compare",
+        )
+    }
+
+    /// Record rank scatter dispatch into an existing encoder (no submit).
+    fn record_rank_scatter(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        sa_buf: &wgpu::Buffer,
+        prefix_buf: &wgpu::Buffer,
+        new_rank_buf: &wgpu::Buffer,
+        n: u32,
+        padded_n: u32,
+    ) -> PzResult<()> {
+        let params = [n, padded_n, 0, 0];
+        let params_buf = self.create_buffer_init(
+            "scatter_params",
+            bytemuck::cast_slice(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
+        let bg_layout = self.pipeline_rank_scatter().get_bind_group_layout(0);
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scatter_bg"),
+            layout: &bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: sa_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: prefix_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: new_rank_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let workgroups = padded_n.div_ceil(256);
+        self.record_dispatch(
+            encoder,
+            self.pipeline_rank_scatter(),
+            &bg,
+            workgroups,
+            "rank_scatter",
+        )
+    }
+
+    /// Record all radix sort dispatches into an existing encoder (no submit).
+    /// Uses encoder.clear_buffer() instead of queue.write_buffer() for histogram
+    /// zeroing, ensuring correct ordering within the batched command buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn record_radix_sort(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        sa_buf: &mut wgpu::Buffer,
+        sa_buf_alt: &mut wgpu::Buffer,
+        rank_buf: &wgpu::Buffer,
+        keys_buf: &wgpu::Buffer,
+        histogram_buf: &wgpu::Buffer,
+        padded_n: usize,
+        n: u32,
+        k_doubling: u32,
+        max_rank: u32,
+    ) -> PzResult<()> {
+        let wg = self.scan_workgroup_size;
+        let num_groups = padded_n.div_ceil(wg);
+        let histogram_len = 256 * num_groups;
+
+        let bytes_needed: u32 = if max_rank < 256 {
+            1
+        } else if max_rank < 65536 {
+            2
+        } else if max_rank < 16_777_216 {
+            3
+        } else {
+            4
+        };
+
+        let mut passes: Vec<u32> = (0..bytes_needed).chain(4..4 + bytes_needed).collect();
+        if !passes.len().is_multiple_of(2) {
+            passes.push(bytes_needed);
+        }
+
+        for &pass in passes.iter() {
+            let key_params = [n, padded_n as u32, k_doubling, pass];
+            let key_params_buf = self.create_buffer_init(
+                "rk_params",
+                bytemuck::cast_slice(&key_params),
+                wgpu::BufferUsages::UNIFORM,
+            );
+
+            let key_bg_layout = self.pipeline_radix_compute_keys().get_bind_group_layout(0);
+            let key_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rk_bg"),
+                layout: &key_bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: sa_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: rank_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: keys_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: key_params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let hist_params = [padded_n as u32, num_groups as u32, 0, 0];
+            let hist_params_buf = self.create_buffer_init(
+                "hist_params",
+                bytemuck::cast_slice(&hist_params),
+                wgpu::BufferUsages::UNIFORM,
+            );
+
+            // Zero histogram inline (ordered within the encoder's command stream)
+            encoder.clear_buffer(histogram_buf, 0, None);
+
+            let hist_bg_layout = self.pipeline_radix_histogram().get_bind_group_layout(0);
+            let hist_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("hist_bg"),
+                layout: &hist_bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: keys_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: histogram_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: hist_params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let global_wg = (padded_n as u32).div_ceil(256);
+            self.record_dispatch(
+                encoder,
+                self.pipeline_radix_compute_keys(),
+                &key_bg,
+                global_wg,
+                "radix_keys",
+            )?;
+            self.record_dispatch(
+                encoder,
+                self.pipeline_radix_histogram(),
+                &hist_bg,
+                num_groups as u32,
+                "radix_histogram",
+            )?;
+
+            // Prefix sum over histogram
+            let mut hist_scan_buf_temp = self.create_buffer(
+                "hist_scan_temp",
+                (histogram_len.max(1) * 4) as u64,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            );
+            self.record_inclusive_prefix_sum(
+                encoder,
+                histogram_buf,
+                &mut hist_scan_buf_temp,
+                histogram_len,
+            )?;
+
+            // inclusive_to_exclusive
+            let ite_params = [histogram_len as u32, 0, 0, 0];
+            let ite_params_buf = self.create_buffer_init(
+                "ite_params",
+                bytemuck::cast_slice(&ite_params),
+                wgpu::BufferUsages::UNIFORM,
+            );
+
+            let ite_bg_layout = self
+                .pipeline_inclusive_to_exclusive()
+                .get_bind_group_layout(0);
+            let ite_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ite_bg"),
+                layout: &ite_bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: hist_scan_buf_temp.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: histogram_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: ite_params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let ite_wg = (histogram_len as u32).div_ceil(256);
+            self.record_dispatch(
+                encoder,
+                self.pipeline_inclusive_to_exclusive(),
+                &ite_bg,
+                ite_wg,
+                "ite",
+            )?;
+
+            // Scatter
+            let scat_params = [padded_n as u32, num_groups as u32, 0, 0];
+            let scat_params_buf = self.create_buffer_init(
+                "scat_params",
+                bytemuck::cast_slice(&scat_params),
+                wgpu::BufferUsages::UNIFORM,
+            );
+
+            let scat_bg_layout = self.pipeline_radix_scatter().get_bind_group_layout(0);
+            let scat_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("scat_bg"),
+                layout: &scat_bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: sa_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: keys_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: histogram_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: sa_buf_alt.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: scat_params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            self.record_dispatch(
+                encoder,
                 self.pipeline_radix_scatter(),
                 &scat_bg,
                 num_groups as u32,

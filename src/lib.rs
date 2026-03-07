@@ -12,12 +12,14 @@ pub mod lzseq;
 pub mod lzss;
 pub mod mtf;
 pub mod optimal;
+pub mod parlz;
 pub mod pipeline;
 pub mod pqueue;
 pub mod rans;
 pub mod recoil;
 pub mod rle;
 pub mod simd;
+pub mod sortlz;
 pub mod streaming;
 
 #[allow(dead_code)]

@@ -77,6 +77,7 @@ enum UnifiedTask {
 fn unified_stage_count(pipeline: Pipeline) -> usize {
     match pipeline {
         Pipeline::Bw | Pipeline::Bbw => 4,
+        Pipeline::SortLz | Pipeline::Parlz => 1,
         _ => 2,
     }
 }
@@ -553,6 +554,8 @@ fn compress_parallel_unified(
                 let engine = opts.webgpu_engine.as_ref().unwrap();
                 let uses_lz77_demux =
                     matches!(pipeline, Pipeline::Deflate | Pipeline::Lzr | Pipeline::Lzf);
+                let uses_sortlz_match_finder =
+                    opts.match_finder == super::MatchFinder::SortLz && uses_lz77_demux;
 
                 while let Ok(first) = rx.recv() {
                     // Batch-collect: drain additional pending requests.
@@ -693,7 +696,53 @@ fn compress_parallel_unified(
 
                     // Process Stage 0 batch last to avoid starving queued StageN/Fused
                     // continuations when bursts arrive together.
-                    if !stage0_batch.is_empty() && uses_lz77_demux {
+                    if !stage0_batch.is_empty() && uses_sortlz_match_finder {
+                        // SortLZ GPU match finding: per-block dispatch with LZ77 conversion
+                        let sortlz_config = crate::sortlz::SortLzConfig::for_lz77(
+                            opts.max_match_len.unwrap_or(crate::lz77::DEFLATE_MAX_MATCH),
+                        );
+                        for block_idx in stage0_batch {
+                            let t0 = Instant::now();
+                            let result = engine
+                                .sortlz_find_matches(blocks[block_idx], &sortlz_config)
+                                .map(|raw_matches| {
+                                    let lz_matches = crate::sortlz::matches_to_lz77_lazy(
+                                        blocks[block_idx],
+                                        &raw_matches,
+                                    );
+                                    let demux = super::demux::demux_lz77_matches(lz_matches);
+                                    StageBlock {
+                                        block_index: block_idx,
+                                        original_len: blocks[block_idx].len(),
+                                        data: Vec::new(),
+                                        streams: Some(demux.streams),
+                                        metadata: StageMetadata {
+                                            pre_entropy_len: Some(demux.pre_entropy_len),
+                                            demux_meta: demux.meta,
+                                            ..StageMetadata::default()
+                                        },
+                                    }
+                                });
+                            if let Some(stats) = stats_ref.as_ref() {
+                                stats.add_stage_compute(t0.elapsed());
+                            }
+                            complete_gpu_stage(
+                                result,
+                                0,
+                                block_idx,
+                                last_stage,
+                                blocks,
+                                &opts,
+                                slots_ref,
+                                results_ref,
+                                queue_ref,
+                                cv_ref,
+                                stats_ref.as_deref(),
+                                gpu_pressure_ref.as_deref(),
+                                gpu_pressure_limit,
+                            );
+                        }
+                    } else if !stage0_batch.is_empty() && uses_lz77_demux {
                         let batch_blocks: Vec<&[u8]> =
                             stage0_batch.iter().map(|&b| blocks[b]).collect();
                         let t0 = Instant::now();
@@ -1025,11 +1074,21 @@ fn compress_parallel_unified(
                                 let backpressure_score = gpu_pressure_ref
                                     .as_ref()
                                     .map_or(0usize, |s| s.load(Ordering::Relaxed));
+                                let has_gpu = {
+                                    #[cfg(feature = "webgpu")]
+                                    {
+                                        opts.webgpu_engine.is_some()
+                                    }
+                                    #[cfg(not(feature = "webgpu"))]
+                                    {
+                                        false
+                                    }
+                                };
                                 let route_next_to_gpu = next_stage == last_stage
                                     && should_route_block_to_gpu_entropy_with_backpressure(
                                         blocks[block_idx].len(),
                                         opts.stage1_backend,
-                                        opts.webgpu_engine.is_some(),
+                                        has_gpu,
                                         backpressure_score,
                                         gpu_pressure_limit,
                                     );
@@ -1184,12 +1243,22 @@ fn complete_gpu_stage(
                     .expect("intermediate slot poisoned") = Some(sb);
                 let next_stage = stage_idx + 1;
                 let backpressure_score = gpu_pressure.map_or(0usize, |s| s.load(Ordering::Relaxed));
+                let has_gpu = {
+                    #[cfg(feature = "webgpu")]
+                    {
+                        options.webgpu_engine.is_some()
+                    }
+                    #[cfg(not(feature = "webgpu"))]
+                    {
+                        false
+                    }
+                };
                 next_task = Some(
                     if next_stage == last_stage
                         && should_route_block_to_gpu_entropy_with_backpressure(
                             blocks[block_idx].len(),
                             options.stage1_backend,
-                            options.webgpu_engine.is_some(),
+                            has_gpu,
                             backpressure_score,
                             gpu_pressure_limit,
                         )
