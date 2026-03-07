@@ -97,9 +97,17 @@ fn rle_binary(data: &[u8], num_bits: usize) -> Vec<u8> {
         let bit = get_bit(i);
         if bit == current_bit && run_len < u16::MAX {
             run_len += 1;
-        } else {
+        } else if bit != current_bit {
+            // Bit value changed — emit current run and start new one.
             runs.push(run_len);
             current_bit = bit;
+            run_len = 1;
+        } else {
+            // Same bit but run_len hit u16::MAX — split the run.
+            // Emit the full run, then a zero-length run for the opposite bit
+            // to keep the alternating protocol in sync.
+            runs.push(run_len);
+            runs.push(0); // zero-length run for opposite bit
             run_len = 1;
         }
     }
@@ -276,6 +284,23 @@ mod tests {
         let compressed = compress(input).unwrap();
         let decompressed = decompress(&compressed, input.len()).unwrap();
         assert_eq!(&decompressed, input);
+    }
+
+    #[test]
+    fn roundtrip_repetitive_text() {
+        // Highly repetitive data — triggers edge cases in RLE binary coding
+        let input: Vec<u8> = b"The quick brown fox. ".repeat(500);
+        let compressed = compress(&input).unwrap();
+        let decompressed = decompress(&compressed, input.len()).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn roundtrip_all_same_large() {
+        let input = vec![0x41u8; 10000]; // 10KB of 'A'
+        let compressed = compress(&input).unwrap();
+        let decompressed = decompress(&compressed, input.len()).unwrap();
+        assert_eq!(decompressed, input);
     }
 
     #[test]

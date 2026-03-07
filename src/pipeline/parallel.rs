@@ -1031,11 +1031,21 @@ fn compress_parallel_unified(
                                 let backpressure_score = gpu_pressure_ref
                                     .as_ref()
                                     .map_or(0usize, |s| s.load(Ordering::Relaxed));
+                                let has_gpu = {
+                                    #[cfg(feature = "webgpu")]
+                                    {
+                                        opts.webgpu_engine.is_some()
+                                    }
+                                    #[cfg(not(feature = "webgpu"))]
+                                    {
+                                        false
+                                    }
+                                };
                                 let route_next_to_gpu = next_stage == last_stage
                                     && should_route_block_to_gpu_entropy_with_backpressure(
                                         blocks[block_idx].len(),
                                         opts.stage1_backend,
-                                        opts.webgpu_engine.is_some(),
+                                        has_gpu,
                                         backpressure_score,
                                         gpu_pressure_limit,
                                     );
@@ -1190,12 +1200,22 @@ fn complete_gpu_stage(
                     .expect("intermediate slot poisoned") = Some(sb);
                 let next_stage = stage_idx + 1;
                 let backpressure_score = gpu_pressure.map_or(0usize, |s| s.load(Ordering::Relaxed));
+                let has_gpu = {
+                    #[cfg(feature = "webgpu")]
+                    {
+                        options.webgpu_engine.is_some()
+                    }
+                    #[cfg(not(feature = "webgpu"))]
+                    {
+                        false
+                    }
+                };
                 next_task = Some(
                     if next_stage == last_stage
                         && should_route_block_to_gpu_entropy_with_backpressure(
                             blocks[block_idx].len(),
                             options.stage1_backend,
-                            options.webgpu_engine.is_some(),
+                            has_gpu,
                             backpressure_score,
                             gpu_pressure_limit,
                         )

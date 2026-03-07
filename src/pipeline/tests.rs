@@ -1699,3 +1699,59 @@ fn test_backend_assignment_cpu_variant_always_available() {
     assert_eq!(opts.stage0_backend, BackendAssignment::Cpu);
     assert_eq!(opts.stage1_backend, BackendAssignment::Cpu);
 }
+
+// --- Wave-2 experiment pipeline roundtrip tests ---
+
+#[test]
+fn test_bitplane_pipeline_roundtrip_repetitive() {
+    let input: Vec<u8> = b"The quick brown fox. ".repeat(5000); // 100KB
+    let compressed = compress(&input, Pipeline::Bitplane).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(
+        decompressed.len(),
+        input.len(),
+        "length mismatch: got {} expected {}",
+        decompressed.len(),
+        input.len()
+    );
+    for (i, (&a, &b)) in input.iter().zip(decompressed.iter()).enumerate() {
+        if a != b {
+            panic!(
+                "first difference at byte {}: expected 0x{:02x} got 0x{:02x}",
+                i, a, b
+            );
+        }
+    }
+}
+
+#[test]
+fn test_fwst_pipeline_roundtrip_repetitive() {
+    let input: Vec<u8> = b"The quick brown fox. ".repeat(5000); // 100KB
+    let compressed = compress(&input, Pipeline::Fwst).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_fwst_pipeline_roundtrip_small_repetitive() {
+    // Reproduces CLI failure: small repetitive input (with trailing newline like echo)
+    let input =
+        b"Hello World! Some test data for compression pipelines. Repeated text Repeated text Repeated text\n";
+    let compressed = compress(input.as_slice(), Pipeline::Fwst).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(
+        decompressed.len(),
+        input.len(),
+        "length mismatch: got {} expected {}",
+        decompressed.len(),
+        input.len()
+    );
+    for (i, (&a, &b)) in input.iter().zip(decompressed.iter()).enumerate() {
+        if a != b {
+            panic!(
+                "first difference at byte {}: expected 0x{:02x} ({}) got 0x{:02x} ({})",
+                i, a, a as char, b, b as char
+            );
+        }
+    }
+}

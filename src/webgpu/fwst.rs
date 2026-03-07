@@ -24,6 +24,7 @@ impl WebGpuEngine {
             let bwt_result = self.bwt_encode(input)?;
             return Ok(crate::fwst::FwstResult {
                 data: bwt_result.data,
+                positions: Vec::new(), // empty = use BWT inverse
                 primary_index: bwt_result.primary_index,
             });
         }
@@ -53,6 +54,7 @@ impl WebGpuEngine {
 
         Ok(crate::fwst::FwstResult {
             data: result,
+            positions: sa.iter().map(|&p| p as u32).collect(),
             primary_index,
         })
     }
@@ -323,20 +325,8 @@ impl WebGpuEngine {
             return Err(PzError::InvalidInput);
         }
 
-        // Step 1: Fixed-window sort transform (GPU-accelerated).
+        // Use the shared compress function which handles wire format correctly.
         let fwst_result = self.fwst_encode(input, config.window)?;
-
-        // Steps 2-4: MTF → RLE → FSE (CPU, same as existing pipeline).
-        let mtf_data = crate::mtf::encode(&fwst_result.data);
-        let rle_data = crate::rle::encode(&mtf_data);
-        let fse_data = crate::fse::encode(&rle_data);
-
-        let mut output = Vec::new();
-        output.extend_from_slice(&fwst_result.primary_index.to_le_bytes());
-        output.extend_from_slice(&(rle_data.len() as u32).to_le_bytes());
-        output.extend_from_slice(&(config.window as u16).to_le_bytes());
-        output.extend_from_slice(&fse_data);
-
-        Ok(output)
+        crate::fwst::compress_from_result(&fwst_result, config)
     }
 }
