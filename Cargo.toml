@@ -117,6 +117,10 @@ harness = false
 name = "stages_gpu_experiments"
 harness = false
 
+[[bench]]
+name = "stages_match_finders"
+harness = false
+
 [profile.profiling]
 inherits = "release"
 debug = true

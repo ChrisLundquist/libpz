@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 
 use pz::gzip;
-use pz::pipeline::{self, CompressOptions, DecompressOptions, ParseStrategy, Pipeline};
+use pz::pipeline::{
+    self, CompressOptions, DecompressOptions, MatchFinder, ParseStrategy, Pipeline,
+};
 use pz::streaming;
 
 fn usage() {
@@ -106,6 +108,7 @@ struct Opts {
     auto_select: bool,
     trial_mode: bool,
     parse_strategy: ParseStrategy,
+    match_finder: MatchFinder,
     threads: usize,
     rans_interleaved: bool,
     rans_interleaved_min_bytes: usize,
@@ -128,6 +131,7 @@ fn parse_args() -> Opts {
         auto_select: false,
         trial_mode: false,
         parse_strategy: ParseStrategy::Auto,
+        match_finder: MatchFinder::HashChain,
         threads: 0,
         rans_interleaved: false,
         rans_interleaved_min_bytes: 64 * 1024,
@@ -155,12 +159,30 @@ fn parse_args() -> Opts {
             }
             "-O" | "--optimal" => opts.parse_strategy = ParseStrategy::Optimal,
             "--lazy" => opts.parse_strategy = ParseStrategy::Lazy,
-            "--greedy" => opts.parse_strategy = ParseStrategy::Lazy, // greedy removed; lazy is strictly better
+            "--greedy" => opts.parse_strategy = ParseStrategy::Greedy,
             "--speed" => opts.parse_strategy = ParseStrategy::Lazy,
             "--quality" => {
                 opts.parse_strategy = ParseStrategy::Optimal;
                 // Set a larger window size for quality mode (256KB)
                 // This is only used by LzSeq pipelines, ignored by others
+            }
+            "--match-finder" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("pz: missing argument for --match-finder");
+                    process::exit(1);
+                }
+                opts.match_finder = match args[i].as_str() {
+                    "hashchain" | "hash" => MatchFinder::HashChain,
+                    "sortlz" | "sort" => MatchFinder::SortLz,
+                    other => {
+                        eprintln!(
+                            "pz: unknown match finder '{}' (try hashchain or sortlz)",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                };
             }
             "--rans-interleaved" => opts.rans_interleaved = true,
             "--rans-interleaved-min-bytes" => {
@@ -376,6 +398,7 @@ fn build_cli_options(opts: &Opts) -> (CompressOptions, DecompressOptions) {
         backend: gpu.backend,
         threads: opts.threads,
         parse_strategy: opts.parse_strategy,
+        match_finder: opts.match_finder,
         rans_interleaved: opts.rans_interleaved,
         rans_interleaved_min_bytes: opts.rans_interleaved_min_bytes,
         rans_interleaved_states: opts.rans_interleaved_states,

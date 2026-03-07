@@ -600,6 +600,37 @@ pub fn compress_lazy_to_matches(input: &[u8]) -> PzResult<Vec<Match>> {
     compress_lazy_to_matches_with_limit(input, DEFLATE_MAX_MATCH)
 }
 
+/// Compress input using greedy matching: always take the longest match at
+/// each position without lookahead. Faster than lazy but slightly worse ratio.
+pub(crate) fn compress_greedy_to_matches_with_limit(
+    input: &[u8],
+    max_match_len: u16,
+) -> PzResult<Vec<Match>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut matches = Vec::with_capacity(input.len() / 4);
+    let mut finder = HashChainFinder::with_max_match_len(max_match_len);
+    let mut pos: usize = 0;
+
+    while pos < input.len() {
+        let m = finder.find_match(input, pos);
+        finder.insert(input, pos);
+
+        let advance = m.length as usize + 1;
+        let insert_count = advance.min(input.len() - pos).min(MAX_INSERT_LEN);
+        for i in 1..insert_count {
+            finder.insert(input, pos + i);
+        }
+
+        matches.push(m);
+        pos += advance;
+    }
+
+    Ok(matches)
+}
+
 /// Like `compress_lazy_to_matches` but with a caller-specified max match length.
 ///
 /// Non-Deflate pipelines (Lzr, Lzf) can pass `DEFAULT_MAX_MATCH` to find

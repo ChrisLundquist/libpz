@@ -554,6 +554,8 @@ fn compress_parallel_unified(
                 let engine = opts.webgpu_engine.as_ref().unwrap();
                 let uses_lz77_demux =
                     matches!(pipeline, Pipeline::Deflate | Pipeline::Lzr | Pipeline::Lzf);
+                let uses_sortlz_match_finder =
+                    opts.match_finder == super::MatchFinder::SortLz && uses_lz77_demux;
 
                 while let Ok(first) = rx.recv() {
                     // Batch-collect: drain additional pending requests.
@@ -694,7 +696,53 @@ fn compress_parallel_unified(
 
                     // Process Stage 0 batch last to avoid starving queued StageN/Fused
                     // continuations when bursts arrive together.
-                    if !stage0_batch.is_empty() && uses_lz77_demux {
+                    if !stage0_batch.is_empty() && uses_sortlz_match_finder {
+                        // SortLZ GPU match finding: per-block dispatch with LZ77 conversion
+                        let sortlz_config = crate::sortlz::SortLzConfig::for_lz77(
+                            opts.max_match_len.unwrap_or(crate::lz77::DEFLATE_MAX_MATCH),
+                        );
+                        for block_idx in stage0_batch {
+                            let t0 = Instant::now();
+                            let result = engine
+                                .sortlz_find_matches(blocks[block_idx], &sortlz_config)
+                                .map(|raw_matches| {
+                                    let lz_matches = crate::sortlz::matches_to_lz77_lazy(
+                                        blocks[block_idx],
+                                        &raw_matches,
+                                    );
+                                    let demux = super::demux::demux_lz77_matches(lz_matches);
+                                    StageBlock {
+                                        block_index: block_idx,
+                                        original_len: blocks[block_idx].len(),
+                                        data: Vec::new(),
+                                        streams: Some(demux.streams),
+                                        metadata: StageMetadata {
+                                            pre_entropy_len: Some(demux.pre_entropy_len),
+                                            demux_meta: demux.meta,
+                                            ..StageMetadata::default()
+                                        },
+                                    }
+                                });
+                            if let Some(stats) = stats_ref.as_ref() {
+                                stats.add_stage_compute(t0.elapsed());
+                            }
+                            complete_gpu_stage(
+                                result,
+                                0,
+                                block_idx,
+                                last_stage,
+                                blocks,
+                                &opts,
+                                slots_ref,
+                                results_ref,
+                                queue_ref,
+                                cv_ref,
+                                stats_ref.as_deref(),
+                                gpu_pressure_ref.as_deref(),
+                                gpu_pressure_limit,
+                            );
+                        }
+                    } else if !stage0_batch.is_empty() && uses_lz77_demux {
                         let batch_blocks: Vec<&[u8]> =
                             stage0_batch.iter().map(|&b| blocks[b]).collect();
                         let t0 = Instant::now();

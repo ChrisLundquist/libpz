@@ -45,6 +45,21 @@ impl Default for SortLzConfig {
     }
 }
 
+impl SortLzConfig {
+    /// Build config for use as a match source in LZ77 pipelines.
+    ///
+    /// Uses the LZ77 window size (32KB) and match constraints.
+    /// Note: SortLZ minimum match is 4 (hash-based), not LZ77's 3.
+    pub fn for_lz77(_max_match_len: u16) -> Self {
+        SortLzConfig {
+            max_window: crate::lz77::MAX_WINDOW,
+            lazy_parsing: false,  // parsing handled by caller
+            min_match: MIN_MATCH, // 4 (SortLZ hash minimum)
+            max_candidates: MAX_CANDIDATES,
+        }
+    }
+}
+
 /// A parsed LZ token: either a literal byte or a (length, offset) match.
 #[derive(Debug, Clone, Copy)]
 enum LzToken {
@@ -59,7 +74,7 @@ enum LzToken {
 /// 2. Sort (hash, position) pairs by hash.
 /// 3. For adjacent entries with equal hashes, verify and extend matches.
 /// 4. For each position, select the best match.
-fn find_matches(input: &[u8], config: &SortLzConfig) -> Vec<Option<(u16, u16)>> {
+pub fn find_matches(input: &[u8], config: &SortLzConfig) -> Vec<Option<(u16, u16)>> {
     let n = input.len();
     if n < 4 {
         return vec![None; n];
@@ -133,6 +148,122 @@ fn find_matches(input: &[u8], config: &SortLzConfig) -> Vec<Option<(u16, u16)>> 
     best_match
 }
 
+/// Find top-K match candidates per position using sort-based approach.
+///
+/// Like `find_matches()`, but returns up to `k` candidates per position
+/// sorted by length descending. Adjacent entries in the sorted array
+/// naturally provide multiple candidates when they share the same hash.
+///
+/// Returns a `MatchTable` compatible with `optimal::optimal_parse()`.
+pub fn find_matches_topk(
+    input: &[u8],
+    config: &SortLzConfig,
+    k: usize,
+) -> crate::optimal::MatchTable {
+    use crate::optimal::{MatchCandidate, MatchTable};
+
+    let n = input.len();
+    let mut table = MatchTable::new(n, k);
+
+    if n < 4 {
+        return table;
+    }
+
+    // Step 1: Hash every 4-byte window
+    let num_hashes = n.saturating_sub(3);
+    let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(num_hashes);
+    for i in 0..num_hashes {
+        let hash = u32::from_le_bytes([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+        pairs.push((hash, i as u32));
+    }
+
+    // Step 2: Radix sort by hash value
+    radix_sort_pairs(&mut pairs);
+
+    // Step 3: Adjacent-pair match verification with top-K collection
+    for window_start in 0..pairs.len() {
+        let (hash_a, _) = pairs[window_start];
+
+        let mut candidates_checked = 0;
+        for j in (window_start + 1)..pairs.len() {
+            if pairs[j].0 != hash_a {
+                break;
+            }
+            if candidates_checked >= config.max_candidates {
+                break;
+            }
+
+            let pos_a = pairs[window_start].1 as usize;
+            let pos_b = pairs[j].1 as usize;
+
+            let (src, dst) = if pos_a < pos_b {
+                (pos_a, pos_b)
+            } else {
+                (pos_b, pos_a)
+            };
+
+            let distance = dst - src;
+            if distance > config.max_window || distance == 0 {
+                candidates_checked += 1;
+                continue;
+            }
+
+            let match_len = extend_match(input, src, dst);
+            if match_len >= config.min_match {
+                let offset = distance as u32;
+                let length = match_len.min(u16::MAX as usize) as u32;
+
+                // Insert into top-K slot for the destination position,
+                // maintaining sorted-by-length-desc order.
+                let slot = table.at_mut(dst);
+                insert_topk_candidate(slot, MatchCandidate { offset, length });
+            }
+
+            candidates_checked += 1;
+        }
+    }
+
+    table
+}
+
+/// Insert a candidate into a top-K slot, maintaining length-descending order.
+/// If the slot is full and the new candidate is shorter than all existing ones,
+/// it is discarded.
+fn insert_topk_candidate(
+    slot: &mut [crate::optimal::MatchCandidate],
+    candidate: crate::optimal::MatchCandidate,
+) {
+    // Find insertion point (sorted by length descending)
+    let k = slot.len();
+
+    // Skip if duplicate offset (keep longer one)
+    for existing in slot.iter() {
+        if existing.length == 0 {
+            break;
+        }
+        if existing.offset == candidate.offset {
+            return; // same offset already present with >= length
+        }
+    }
+
+    // Find position to insert (first slot with shorter length)
+    let mut insert_pos = k;
+    for (i, existing) in slot.iter().enumerate() {
+        if existing.length < candidate.length {
+            insert_pos = i;
+            break;
+        }
+    }
+
+    if insert_pos < k {
+        // Shift shorter candidates down, dropping the last one
+        for i in (insert_pos + 1..k).rev() {
+            slot[i] = slot[i - 1];
+        }
+        slot[insert_pos] = candidate;
+    }
+}
+
 /// Extend a match starting at positions src and dst, return total match length.
 fn extend_match(input: &[u8], src: usize, dst: usize) -> usize {
     let max_len = input.len() - dst;
@@ -173,6 +304,132 @@ fn parse_matches(input: &[u8], matches: &[Option<(u16, u16)>], lazy: bool) -> Ve
     }
 
     tokens
+}
+
+// ---------------------------------------------------------------------------
+// SortLZ → LZ77 Match conversion (for feeding into LZ77 pipelines)
+// ---------------------------------------------------------------------------
+
+/// Convert position-indexed matches to an LZ77 match sequence using greedy parsing.
+///
+/// Takes the longest match at every position, emitting `lz77::Match` structs
+/// with the `next` byte. Produces the same format as `lz77::compress_lazy_to_matches()`.
+pub fn matches_to_lz77_greedy(
+    input: &[u8],
+    matches: &[Option<(u16, u16)>],
+) -> Vec<crate::lz77::Match> {
+    let n = input.len();
+    let mut result = Vec::with_capacity(n / 4);
+    let mut pos = 0;
+
+    while pos < n {
+        if let Some((offset, length)) = matches.get(pos).copied().flatten() {
+            let end = pos + length as usize;
+            if end < n {
+                result.push(crate::lz77::Match {
+                    offset,
+                    length,
+                    next: input[end],
+                });
+                pos = end + 1;
+            } else {
+                // Match extends to or past end of input; truncate to leave room for next byte
+                let adj_len = (n - 1 - pos) as u16;
+                if adj_len >= crate::lz77::MIN_MATCH {
+                    result.push(crate::lz77::Match {
+                        offset,
+                        length: adj_len,
+                        next: input[pos + adj_len as usize],
+                    });
+                    pos = pos + adj_len as usize + 1;
+                } else {
+                    result.push(crate::lz77::Match {
+                        offset: 0,
+                        length: 0,
+                        next: input[pos],
+                    });
+                    pos += 1;
+                }
+            }
+        } else {
+            result.push(crate::lz77::Match {
+                offset: 0,
+                length: 0,
+                next: input[pos],
+            });
+            pos += 1;
+        }
+    }
+
+    result
+}
+
+/// Convert position-indexed matches to an LZ77 match sequence using lazy parsing.
+///
+/// If the next position has a longer match, emits a literal for the current
+/// position and takes the longer match instead (gzip-style lazy evaluation).
+pub fn matches_to_lz77_lazy(
+    input: &[u8],
+    matches: &[Option<(u16, u16)>],
+) -> Vec<crate::lz77::Match> {
+    let n = input.len();
+    let mut result = Vec::with_capacity(n / 4);
+    let mut pos = 0;
+
+    while pos < n {
+        if let Some((offset, length)) = matches.get(pos).copied().flatten() {
+            // Lazy check: if next position has a longer match, emit literal here
+            if pos + 1 < n {
+                if let Some((_, next_len)) = matches.get(pos + 1).copied().flatten() {
+                    if next_len > length {
+                        result.push(crate::lz77::Match {
+                            offset: 0,
+                            length: 0,
+                            next: input[pos],
+                        });
+                        pos += 1;
+                        continue;
+                    }
+                }
+            }
+
+            let end = pos + length as usize;
+            if end < n {
+                result.push(crate::lz77::Match {
+                    offset,
+                    length,
+                    next: input[end],
+                });
+                pos = end + 1;
+            } else {
+                let adj_len = (n - 1 - pos) as u16;
+                if adj_len >= crate::lz77::MIN_MATCH {
+                    result.push(crate::lz77::Match {
+                        offset,
+                        length: adj_len,
+                        next: input[pos + adj_len as usize],
+                    });
+                    pos = pos + adj_len as usize + 1;
+                } else {
+                    result.push(crate::lz77::Match {
+                        offset: 0,
+                        length: 0,
+                        next: input[pos],
+                    });
+                    pos += 1;
+                }
+            }
+        } else {
+            result.push(crate::lz77::Match {
+                offset: 0,
+                length: 0,
+                next: input[pos],
+            });
+            pos += 1;
+        }
+    }
+
+    result
 }
 
 /// Compress using the SortLZ pipeline.
@@ -462,5 +719,152 @@ mod tests {
         let c1 = compress(input, &config).unwrap();
         let c2 = compress(input, &config).unwrap();
         assert_eq!(c1, c2, "SortLZ must be deterministic");
+    }
+
+    // -----------------------------------------------------------------------
+    // SortLZ → LZ77 pipeline integration tests
+    // -----------------------------------------------------------------------
+
+    fn test_data() -> Vec<u8> {
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.extend_from_slice(b"hello world! this is a test of sortlz match finding. ");
+        }
+        input
+    }
+
+    #[test]
+    fn test_lz77_greedy_roundtrip() {
+        let input = test_data();
+        let config = SortLzConfig::for_lz77(crate::lz77::DEFLATE_MAX_MATCH);
+        let matches = find_matches(&input, &config);
+        let lz_matches = matches_to_lz77_greedy(&input, &matches);
+
+        // Verify matches reconstruct the input via LZ77 decompress
+        let mut lz_bytes = Vec::new();
+        for m in &lz_matches {
+            lz_bytes.extend_from_slice(&m.to_bytes());
+        }
+        let decoded = crate::lz77::decompress(&lz_bytes).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_lz77_lazy_roundtrip() {
+        let input = test_data();
+        let config = SortLzConfig::for_lz77(crate::lz77::DEFLATE_MAX_MATCH);
+        let matches = find_matches(&input, &config);
+        let lz_matches = matches_to_lz77_lazy(&input, &matches);
+
+        let mut lz_bytes = Vec::new();
+        for m in &lz_matches {
+            lz_bytes.extend_from_slice(&m.to_bytes());
+        }
+        let decoded = crate::lz77::decompress(&lz_bytes).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_topk_roundtrip() {
+        let input = test_data();
+        let config = SortLzConfig::for_lz77(crate::lz77::DEFLATE_MAX_MATCH);
+        let table = find_matches_topk(&input, &config, 4);
+
+        // Verify table has valid candidates
+        let mut found_match = false;
+        for pos in 0..input.len() {
+            let candidates = table.at(pos);
+            if candidates[0].length >= 4 {
+                found_match = true;
+                assert!(candidates[0].offset > 0);
+                // Verify candidates are sorted by length descending
+                for i in 1..candidates.len() {
+                    if candidates[i].length == 0 {
+                        break;
+                    }
+                    assert!(candidates[i].length <= candidates[i - 1].length);
+                }
+            }
+        }
+        assert!(
+            found_match,
+            "should find at least one match in repetitive data"
+        );
+
+        // Verify optimal parse produces valid LZ77
+        let freq = crate::frequency::get_frequency(&input);
+        let cost_model = crate::optimal::CostModel::from_frequencies(&freq);
+        let lz_matches = crate::optimal::optimal_parse(&input, &table, &cost_model);
+
+        let mut lz_bytes = Vec::new();
+        for m in &lz_matches {
+            lz_bytes.extend_from_slice(&m.to_bytes());
+        }
+        let decoded = crate::lz77::decompress(&lz_bytes).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_pipeline_roundtrip_lzr_sortlz() {
+        use crate::pipeline::{self, CompressOptions, MatchFinder, ParseStrategy, Pipeline};
+        let input = test_data();
+
+        for strategy in [
+            ParseStrategy::Greedy,
+            ParseStrategy::Lazy,
+            ParseStrategy::Optimal,
+        ] {
+            let opts = CompressOptions {
+                match_finder: MatchFinder::SortLz,
+                parse_strategy: strategy,
+                threads: 1,
+                ..Default::default()
+            };
+            let compressed = pipeline::compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
+            let decoded = pipeline::decompress(&compressed).unwrap();
+            assert_eq!(
+                decoded, input,
+                "Lzr + SortLz + {:?} roundtrip failed",
+                strategy
+            );
+        }
+    }
+
+    #[test]
+    fn test_pipeline_roundtrip_lzf_sortlz() {
+        use crate::pipeline::{self, CompressOptions, MatchFinder, ParseStrategy, Pipeline};
+        let input = test_data();
+
+        for strategy in [ParseStrategy::Greedy, ParseStrategy::Lazy] {
+            let opts = CompressOptions {
+                match_finder: MatchFinder::SortLz,
+                parse_strategy: strategy,
+                threads: 1,
+                ..Default::default()
+            };
+            let compressed = pipeline::compress_with_options(&input, Pipeline::Lzf, &opts).unwrap();
+            let decoded = pipeline::decompress(&compressed).unwrap();
+            assert_eq!(
+                decoded, input,
+                "Lzf + SortLz + {:?} roundtrip failed",
+                strategy
+            );
+        }
+    }
+
+    #[test]
+    fn test_pipeline_roundtrip_deflate_sortlz() {
+        use crate::pipeline::{self, CompressOptions, MatchFinder, ParseStrategy, Pipeline};
+        let input = test_data();
+
+        let opts = CompressOptions {
+            match_finder: MatchFinder::SortLz,
+            parse_strategy: ParseStrategy::Lazy,
+            threads: 1,
+            ..Default::default()
+        };
+        let compressed = pipeline::compress_with_options(&input, Pipeline::Deflate, &opts).unwrap();
+        let decoded = pipeline::decompress(&compressed).unwrap();
+        assert_eq!(decoded, input);
     }
 }

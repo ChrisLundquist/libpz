@@ -82,10 +82,25 @@ pub enum ParseStrategy {
     /// - Equivalent to Lazy on CPU, HashTable on GPU.
     #[default]
     Auto,
+    /// Greedy: take the longest match at every position.
+    Greedy,
     /// Lazy: check if the next position has a longer match (gzip-style).
     Lazy,
     /// Optimal: backward DP to minimize total encoding cost.
     Optimal,
+}
+
+/// Match-finding algorithm selection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MatchFinder {
+    /// Hash-chain match finder (default). Uses sliding-window hash
+    /// chains with SIMD-accelerated comparison.
+    #[default]
+    HashChain,
+    /// Sort-based match finder (SortLZ). Uses radix sort of (hash, position)
+    /// pairs followed by adjacent-pair verification. Fully deterministic,
+    /// GPU-friendly. Minimum match length is 4 (vs 3 for hash-chain).
+    SortLz,
 }
 
 /// Compression quality preset for LzSeq pipelines.
@@ -175,6 +190,9 @@ pub struct CompressOptions {
     /// Backend assignment for stage 1 (entropy coding).
     /// Auto routes to GPU when block size >= GPU_ENTROPY_THRESHOLD and GPU available.
     pub stage1_backend: BackendAssignment,
+    /// Match-finding algorithm: HashChain (default) or SortLz.
+    /// Applies to all LZ-based pipelines (Deflate, Lzr, Lzf, Lzfi, LzssR, LzSeqR, LzSeqH).
+    pub match_finder: MatchFinder,
 }
 
 impl Default for CompressOptions {
@@ -195,6 +213,7 @@ impl Default for CompressOptions {
             seq_window_size: None,
             stage0_backend: BackendAssignment::Auto,
             stage1_backend: BackendAssignment::Auto,
+            match_finder: MatchFinder::HashChain,
         }
     }
 }
@@ -731,11 +750,30 @@ fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResu
     // CPU paths — lazy is the default (fastest single-thread + best ratio).
     // Multi-threading happens at the pipeline block level, not inside LZ77.
     let max_match = options.max_match_len.unwrap_or(lz77::DEFLATE_MAX_MATCH);
+
+    // SortLZ match finder: serialize match sequence to bytes
+    if options.match_finder == MatchFinder::SortLz {
+        let matches = sortlz_matches_with_strategy(input, options, max_match)?;
+        let mut out = Vec::with_capacity(matches.len() * lz77::Match::SERIALIZED_SIZE);
+        for m in &matches {
+            out.extend_from_slice(&m.to_bytes());
+        }
+        return Ok(out);
+    }
+
     match options.parse_strategy {
         ParseStrategy::Auto => {
             let max_chain = lz77::select_chain_depth(input.len(), true);
             let matches =
                 lz77::compress_lazy_to_matches_with_limit_and_chain(input, max_match, max_chain)?;
+            let mut out = Vec::with_capacity(matches.len() * lz77::Match::SERIALIZED_SIZE);
+            for m in &matches {
+                out.extend_from_slice(&m.to_bytes());
+            }
+            Ok(out)
+        }
+        ParseStrategy::Greedy => {
+            let matches = lz77::compress_greedy_to_matches_with_limit(input, max_match)?;
             let mut out = Vec::with_capacity(matches.len() * lz77::Match::SERIALIZED_SIZE);
             for m in &matches {
                 out.extend_from_slice(&m.to_bytes());
@@ -753,13 +791,49 @@ pub(crate) fn lz77_matches_with_backend(
     options: &CompressOptions,
 ) -> PzResult<Vec<lz77::Match>> {
     let max_match = options.max_match_len.unwrap_or(lz77::DEFLATE_MAX_MATCH);
+
+    // SortLZ match finder: radix sort + adjacent-pair verification
+    if options.match_finder == MatchFinder::SortLz {
+        return sortlz_matches_with_strategy(input, options, max_match);
+    }
+
+    // Hash-chain match finder (default)
     match options.parse_strategy {
         ParseStrategy::Auto => {
             let max_chain = lz77::select_chain_depth(input.len(), true);
             lz77::compress_lazy_to_matches_with_limit_and_chain(input, max_match, max_chain)
         }
+        ParseStrategy::Greedy => lz77::compress_greedy_to_matches_with_limit(input, max_match),
         ParseStrategy::Lazy => lz77::compress_lazy_to_matches_with_limit(input, max_match),
         ParseStrategy::Optimal => crate::optimal::optimal_matches_with_limit(input, max_match),
+    }
+}
+
+/// SortLZ match finding with parse strategy dispatch.
+fn sortlz_matches_with_strategy(
+    input: &[u8],
+    options: &CompressOptions,
+    max_match: u16,
+) -> PzResult<Vec<lz77::Match>> {
+    use crate::sortlz::{self, SortLzConfig};
+
+    let config = SortLzConfig::for_lz77(max_match);
+
+    match options.parse_strategy {
+        ParseStrategy::Optimal => {
+            let table = sortlz::find_matches_topk(input, &config, crate::optimal::K);
+            let freq = crate::frequency::get_frequency(input);
+            let cost_model = crate::optimal::CostModel::from_frequencies(&freq);
+            Ok(crate::optimal::optimal_parse(input, &table, &cost_model))
+        }
+        ParseStrategy::Greedy => {
+            let matches = sortlz::find_matches(input, &config);
+            Ok(sortlz::matches_to_lz77_greedy(input, &matches))
+        }
+        ParseStrategy::Auto | ParseStrategy::Lazy => {
+            let matches = sortlz::find_matches(input, &config);
+            Ok(sortlz::matches_to_lz77_lazy(input, &matches))
+        }
     }
 }
 

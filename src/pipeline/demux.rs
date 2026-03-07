@@ -103,10 +103,8 @@ impl StreamDemuxer for LzDemuxer {
                 // Fast path: CPU lazy/auto can demux directly from Match structs,
                 // avoiding an intermediate serialized LZ byte buffer.
                 let (offsets, lengths, literals, lz_len) = if options.backend == Backend::Cpu
-                    && matches!(
-                        options.parse_strategy,
-                        ParseStrategy::Auto | ParseStrategy::Lazy | ParseStrategy::Optimal
-                    ) {
+                    || options.match_finder == super::MatchFinder::SortLz
+                {
                     let matches = super::lz77_matches_with_backend(input, options)?;
                     let num_matches = matches.len();
                     let mut offsets = Vec::with_capacity(num_matches * 2);
