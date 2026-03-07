@@ -126,6 +126,13 @@ pub enum QualityLevel {
 /// Default block size for multi-threaded compression (256KB).
 const DEFAULT_BLOCK_SIZE: usize = 256 * 1024;
 
+/// Default block size for BWT-based pipelines (512KB).
+///
+/// BWT benefits from larger blocks (better context grouping), but our FSE
+/// encoder degrades beyond ~1MB. 512KB balances BWT context quality against
+/// FSE table precision. Empirically optimal across Canterbury+Silesia corpus.
+const DEFAULT_BW_BLOCK_SIZE: usize = 512 * 1024;
+
 /// Default block size for GPU LZ77 pipelines (128KB).
 ///
 /// The GPU hash table produces significantly better matches at ≤128KB than at
@@ -405,13 +412,13 @@ pub fn compress_with_options(
     // For GPU backends on LZ77 pipelines, use smaller blocks to keep
     // the hash table within its quality sweet spot (≤128KB). Only
     // override when the caller hasn't explicitly set a custom block size.
-    let options = &gpu_adjusted_options(pipeline, options);
+    let options = &adjusted_options(pipeline, options);
 
     let num_threads = resolve_thread_count(options.threads);
     let block_size = options.block_size;
 
-    // Use single-block path if single-threaded or input fits in one block
-    if num_threads <= 1 || input.len() <= block_size {
+    // Single-block fast path: input fits in one block.
+    if input.len() <= block_size {
         let block_data = compress_block(input, pipeline, options)?;
         let mut output = Vec::new();
         write_header(&mut output, pipeline, input.len());
@@ -422,7 +429,39 @@ pub fn compress_with_options(
         return Ok(output);
     }
 
-    // Multi-block: unified scheduler dispatches all stages from a shared work queue.
+    // Single-threaded multi-block: split into blocks and compress sequentially.
+    // This matches the streaming path's behavior and is critical for BWT-based
+    // pipelines where FSE degrades on large inputs (>512KB).
+    if num_threads <= 1 {
+        let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
+        let num_blocks = blocks.len();
+
+        // Compress all blocks
+        let mut compressed_blocks = Vec::with_capacity(num_blocks);
+        for block in &blocks {
+            compressed_blocks.push(compress_block(block, pipeline, options)?);
+        }
+
+        // Build output with V2 table-mode container
+        let mut output = Vec::new();
+        write_header(&mut output, pipeline, input.len());
+        output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+
+        // Block table
+        for (i, cb) in compressed_blocks.iter().enumerate() {
+            output.extend_from_slice(&(cb.len() as u32).to_le_bytes());
+            output.extend_from_slice(&(blocks[i].len() as u32).to_le_bytes());
+        }
+
+        // Block data
+        for cb in &compressed_blocks {
+            output.extend_from_slice(cb);
+        }
+
+        return Ok(output);
+    }
+
+    // Multi-block parallel: unified scheduler dispatches all stages from a shared work queue.
     compress_parallel(input, pipeline, options, num_threads)
 }
 
@@ -697,16 +736,27 @@ pub(crate) fn write_header(output: &mut Vec<u8>, pipeline: Pipeline, orig_len: u
     output.extend_from_slice(&(orig_len as u32).to_le_bytes());
 }
 
-/// Return options with GPU-optimal block size for LZ77-based pipelines.
+/// Return options with pipeline-optimal block size.
 ///
-/// When the caller is using the default block size (256KB) and a GPU backend
-/// on an LZ77 pipeline, shrinks blocks to 128KB. This keeps each block within
-/// the GPU hash table's quality sweet spot, and also produces more blocks for
-/// better GPU/CPU overlap pipelining.
+/// Adjusts block size based on pipeline characteristics when the caller
+/// is using the default (256KB):
+/// - BWT pipelines (Bw, Bbw): use 512KB for better BWT context grouping
+/// - GPU LZ77 pipelines: use 128KB for GPU hash table quality
 ///
 /// If the caller explicitly set a non-default block size, their choice is
 /// respected.
-fn gpu_adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> CompressOptions {
+fn adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> CompressOptions {
+    if options.block_size != DEFAULT_BLOCK_SIZE {
+        return options.clone();
+    }
+
+    let is_bw_pipeline = matches!(pipeline, Pipeline::Bw | Pipeline::Bbw);
+    if is_bw_pipeline {
+        let mut adjusted = options.clone();
+        adjusted.block_size = DEFAULT_BW_BLOCK_SIZE;
+        return adjusted;
+    }
+
     let is_lz_pipeline = matches!(
         pipeline,
         Pipeline::Deflate
@@ -727,7 +777,7 @@ fn gpu_adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> Compre
         gpu
     };
 
-    if is_lz_pipeline && is_gpu && options.block_size == DEFAULT_BLOCK_SIZE {
+    if is_lz_pipeline && is_gpu {
         let mut adjusted = options.clone();
         adjusted.block_size = DEFAULT_GPU_BLOCK_SIZE;
         adjusted

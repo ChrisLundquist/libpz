@@ -830,6 +830,14 @@ pub(crate) fn stage_rle_encode(mut block: StageBlock) -> PzResult<StageBlock> {
     Ok(block)
 }
 
+/// FSE accuracy log for BWT-based pipelines.
+///
+/// Post-BWT data (after MTF+RLE) has a highly skewed distribution that
+/// benefits from larger state tables. Accuracy log 10 (1024-entry table)
+/// gives ~10pp better compression than the default 7 (128-entry table),
+/// with negligible decode speed impact (table fits in L1 cache).
+const BW_ACCURACY_LOG: u8 = 10;
+
 /// Bw stage 3: FSE encoding + serialization.
 pub(crate) fn stage_fse_encode_bw(mut block: StageBlock) -> PzResult<StageBlock> {
     let primary_index = block
@@ -840,7 +848,7 @@ pub(crate) fn stage_fse_encode_bw(mut block: StageBlock) -> PzResult<StageBlock>
         .metadata
         .pre_entropy_len
         .ok_or(PzError::InvalidInput)?;
-    let fse_data = fse::encode(&block.data);
+    let fse_data = fse::encode_with_accuracy(&block.data, BW_ACCURACY_LOG);
 
     let mut output = Vec::new();
     output.extend_from_slice(&primary_index.to_le_bytes());
@@ -879,7 +887,7 @@ pub(crate) fn stage_fse_encode_bbw(mut block: StageBlock) -> PzResult<StageBlock
         .metadata
         .pre_entropy_len
         .ok_or(PzError::InvalidInput)?;
-    let fse_data = fse::encode(&block.data);
+    let fse_data = fse::encode_with_accuracy(&block.data, BW_ACCURACY_LOG);
 
     let mut output = Vec::new();
     output.extend_from_slice(&(factor_lengths.len() as u16).to_le_bytes());
