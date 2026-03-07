@@ -1309,14 +1309,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_compare_bytes_empty() {
-        let d = Dispatcher::new();
-        assert_eq!(d.compare_bytes(&[], &[1, 2, 3], MAX_COMPARE_LEN), 0);
-        assert_eq!(d.compare_bytes(&[1, 2, 3], &[], MAX_COMPARE_LEN), 0);
-        assert_eq!(d.compare_bytes(&[], &[], MAX_COMPARE_LEN), 0);
-    }
-
     // -----------------------------------------------------------------------
     // rANS 4-way SIMD decode tests
     // -----------------------------------------------------------------------

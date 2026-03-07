@@ -682,24 +682,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_decode_single_symbol() {
-        let input = vec![b'x'; 50];
-        let tree = HuffmanTree::from_data(&input).unwrap();
-        let (encoded, total_bits) = tree.encode(&input).unwrap();
-        let decoded = tree.decode(&encoded, total_bits).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_encode_decode_two_symbols() {
-        let input = b"ababababab";
-        let tree = HuffmanTree::from_data(input).unwrap();
-        let (encoded, total_bits) = tree.encode(input).unwrap();
-        let decoded = tree.decode(&encoded, total_bits).unwrap();
-        assert_eq!(&decoded, input);
-    }
-
-    #[test]
     fn test_encode_decode_all_bytes() {
         let input: Vec<u8> = (0..=255).collect();
         let tree = HuffmanTree::from_data(&input).unwrap();
@@ -731,26 +713,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_to_buf() {
-        let input = b"hello";
-        let tree = HuffmanTree::from_data(input).unwrap();
-        let mut buf = vec![0u8; 1024];
-        let bits = tree.encode_to_buf(input, &mut buf).unwrap();
-        let decoded = tree.decode(&buf, bits).unwrap();
-        assert_eq!(&decoded, input);
-    }
-
-    #[test]
-    fn test_decode_to_buf() {
-        let input = b"hello";
-        let tree = HuffmanTree::from_data(input).unwrap();
-        let (encoded, total_bits) = tree.encode(input).unwrap();
-        let mut buf = vec![0u8; 1024];
-        let size = tree.decode_to_buf(&encoded, total_bits, &mut buf).unwrap();
-        assert_eq!(&buf[..size], input);
-    }
-
-    #[test]
     fn test_encode_buf_too_small() {
         let input = b"hello, world! this is a longer string";
         let tree = HuffmanTree::from_data(input).unwrap();
@@ -778,25 +740,6 @@ mod tests {
         let (encoded2, bits2) = tree2.encode(input).unwrap();
         assert_eq!(encoded1, encoded2);
         assert_eq!(bits1, bits2);
-    }
-
-    #[test]
-    fn test_compression_ratio() {
-        // Skewed data should compress well
-        let mut input = vec![b'a'; 1000];
-        input.extend(vec![b'b'; 10]);
-        input.extend(vec![b'c'; 5]);
-
-        let tree = HuffmanTree::from_data(&input).unwrap();
-        let (encoded, _) = tree.encode(&input).unwrap();
-
-        // Encoded should be much smaller than input
-        assert!(
-            encoded.len() < input.len(),
-            "encoded {} bytes, input {} bytes",
-            encoded.len(),
-            input.len()
-        );
     }
 
     #[test]

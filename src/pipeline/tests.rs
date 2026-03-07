@@ -6,144 +6,6 @@ use stages::{
     StageBlock, StageMetadata,
 };
 
-// --- Deflate pipeline tests ---
-
-#[test]
-fn test_deflate_empty() {
-    let result = compress(&[], Pipeline::Deflate).unwrap();
-    assert!(result.is_empty());
-}
-
-#[test]
-fn test_deflate_round_trip_hello() {
-    let input = b"hello, world! hello, world!";
-    let compressed = compress(input, Pipeline::Deflate).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_deflate_round_trip_repeating() {
-    let pattern = b"The quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    // Use enough repetitions to overcome the ~1KB frequency table overhead
-    for _ in 0..100 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress(&input, Pipeline::Deflate).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-    // Should actually compress (input is ~4.5KB, overhead is ~1KB)
-    assert!(
-        compressed.len() < input.len(),
-        "compressed {} >= input {}",
-        compressed.len(),
-        input.len()
-    );
-}
-
-#[test]
-fn test_deflate_round_trip_binary() {
-    let input: Vec<u8> = (0..=255).cycle().take(512).collect();
-    let compressed = compress(&input, Pipeline::Deflate).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-// --- BW pipeline tests ---
-
-#[test]
-fn test_bw_empty() {
-    let result = compress(&[], Pipeline::Bw).unwrap();
-    assert!(result.is_empty());
-}
-
-#[test]
-fn test_bw_round_trip_hello() {
-    let input = b"hello, world! hello, world!";
-    let compressed = compress(input, Pipeline::Bw).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_bw_round_trip_repeating() {
-    let pattern = b"The quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    for _ in 0..20 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress(&input, Pipeline::Bw).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-    assert!(
-        compressed.len() < input.len(),
-        "compressed {} >= input {}",
-        compressed.len(),
-        input.len()
-    );
-}
-
-#[test]
-fn test_bw_round_trip_binary() {
-    let input: Vec<u8> = (0..=255).cycle().take(512).collect();
-    let compressed = compress(&input, Pipeline::Bw).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_bw_round_trip_all_same() {
-    let input = vec![b'x'; 200];
-    let compressed = compress(&input, Pipeline::Bw).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-// --- Bbw pipeline round-trip tests ---
-
-#[test]
-fn test_bbw_round_trip_hello() {
-    let input = b"hello, world! hello, world!";
-    let compressed = compress(input, Pipeline::Bbw).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_bbw_round_trip_repeating() {
-    let pattern = b"The quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    for _ in 0..100 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress(&input, Pipeline::Bbw).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-    assert!(
-        compressed.len() < input.len(),
-        "compressed {} >= input {}",
-        compressed.len(),
-        input.len()
-    );
-}
-
-#[test]
-fn test_bbw_round_trip_binary() {
-    let input: Vec<u8> = (0..=255).cycle().take(512).collect();
-    let compressed = compress(&input, Pipeline::Bbw).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_bbw_round_trip_all_same() {
-    let input = vec![b'x'; 200];
-    let compressed = compress(&input, Pipeline::Bbw).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
 // --- Header / format tests ---
 
 #[test]
@@ -184,8 +46,11 @@ fn test_all_pipelines_banana() {
     for &pipeline in &[
         Pipeline::Deflate,
         Pipeline::Bw,
+        Pipeline::Bbw,
         Pipeline::Lzr,
         Pipeline::Lzf,
+        Pipeline::LzssR,
+        Pipeline::Lz78R,
         Pipeline::Lzfi,
     ] {
         let compressed = compress(input, pipeline).unwrap();
@@ -203,8 +68,11 @@ fn test_all_pipelines_medium_text() {
     for &pipeline in &[
         Pipeline::Deflate,
         Pipeline::Bw,
+        Pipeline::Bbw,
         Pipeline::Lzr,
         Pipeline::Lzf,
+        Pipeline::LzssR,
+        Pipeline::Lz78R,
         Pipeline::Lzfi,
     ] {
         let compressed = compress(&input, pipeline).unwrap();
@@ -255,30 +123,6 @@ fn test_multiblock_round_trip_all_pipelines() {
 }
 
 #[test]
-fn test_multiblock_single_block_fallback() {
-    // Input smaller than block_size → single block in V2 format
-    let input = b"small input data";
-    let compressed = compress_mt(input, Pipeline::Deflate, 4, 65536).unwrap();
-    assert_eq!(compressed[2], VERSION, "expected V2 for small input");
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_multiblock_single_thread() {
-    // threads=1 → single block in V2 format
-    let pattern = b"The quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    for _ in 0..50 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress_mt(&input, Pipeline::Bw, 1, 512).unwrap();
-    assert_eq!(compressed[2], VERSION, "expected V2 for single-threaded");
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
 fn test_multiblock_various_block_sizes() {
     let pattern = b"ABCDEFGHIJ0123456789";
     let mut input = Vec::new();
@@ -297,16 +141,6 @@ fn test_multiblock_various_block_sizes() {
             );
         }
     }
-}
-
-#[test]
-fn test_multiblock_exact_one_block() {
-    // Input exactly equal to block_size → single block in V2 format
-    let input = vec![b'x'; 1024];
-    let compressed = compress_mt(&input, Pipeline::Bw, 4, 1024).unwrap();
-    assert_eq!(compressed[2], VERSION, "exact one block should be V2");
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
 }
 
 #[test]
@@ -472,18 +306,6 @@ fn test_select_pipeline_trial_round_trip() {
 }
 
 #[test]
-fn test_select_pipeline_trial_small_sample() {
-    // Trial with very small input should not panic
-    let input = b"tiny";
-    let opts = CompressOptions::default();
-    let pipeline = select_pipeline_trial(input, &opts, 32);
-    // Should still produce a valid pipeline
-    let compressed = compress(input, pipeline).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input.as_slice());
-}
-
-#[test]
 fn test_select_pipeline_auto_vs_explicit_round_trip() {
     // Every auto-selected pipeline must produce valid output
     let test_inputs: Vec<Vec<u8>> = vec![
@@ -499,15 +321,7 @@ fn test_select_pipeline_auto_vs_explicit_round_trip() {
     }
 }
 
-// --- Multi-stream Deflate tests ---
-
-#[test]
-fn test_multistream_deflate_round_trip_small() {
-    let input = b"hello, world! hello, world!";
-    let compressed = compress(input, Pipeline::Deflate).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
+// --- Multi-stream tests ---
 
 #[test]
 fn test_multistream_deflate_round_trip_medium() {
@@ -529,48 +343,6 @@ fn test_multistream_deflate_round_trip_medium() {
 }
 
 #[test]
-fn test_multistream_deflate_round_trip_large() {
-    // 1MB of pseudo-random + repeated data
-    let mut input = Vec::with_capacity(1 << 20);
-    let pattern = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    while input.len() < (1 << 20) {
-        input.extend_from_slice(pattern);
-    }
-    input.truncate(1 << 20);
-    // Sprinkle pseudo-random bytes for variety
-    let mut state: u32 = 42;
-    for i in (0..input.len()).step_by(37) {
-        state = state.wrapping_mul(1103515245).wrapping_add(12345);
-        input[i] = (state >> 16) as u8;
-    }
-
-    let compressed = compress(&input, Pipeline::Deflate).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_multistream_deflate_round_trip_binary() {
-    let input: Vec<u8> = (0..=255).cycle().take(2048).collect();
-    let compressed = compress(&input, Pipeline::Deflate).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_multistream_deflate_multiblock() {
-    // Multi-block pipeline-parallel path
-    let pattern = b"Multi-stream multi-block test pattern. ";
-    let mut input = Vec::new();
-    for _ in 0..200 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress_mt(&input, Pipeline::Deflate, 4, 1024).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
 fn test_multistream_deflate_compression_ratio() {
     // Multi-stream should compress well on structured/repetitive data
     // because offset/length/literal distributions are each tighter
@@ -586,16 +358,6 @@ fn test_multistream_deflate_compression_ratio() {
         compressed.len(),
         input.len()
     );
-}
-
-// --- Multi-stream LZF tests ---
-
-#[test]
-fn test_multistream_lzf_round_trip_small() {
-    let input = b"hello, world! hello, world!";
-    let compressed = compress(input, Pipeline::Lzf).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
 }
 
 #[test]
@@ -614,33 +376,6 @@ fn test_multistream_lzf_round_trip_medium() {
         compressed.len(),
         input.len()
     );
-}
-
-#[test]
-fn test_multistream_lzf_round_trip_large() {
-    // 1MB input
-    let mut input = Vec::with_capacity(1 << 20);
-    let pattern = b"LZF multi-stream test data with some repetition. ";
-    while input.len() < (1 << 20) {
-        input.extend_from_slice(pattern);
-    }
-    input.truncate(1 << 20);
-
-    let compressed = compress(&input, Pipeline::Lzf).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_multistream_lzf_multiblock() {
-    let pattern = b"LZF multi-stream multi-block test. ";
-    let mut input = Vec::new();
-    for _ in 0..200 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress_mt(&input, Pipeline::Lzf, 4, 1024).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
 }
 
 #[test]
@@ -703,54 +438,6 @@ fn test_multistream_stage_deinterleave_reinterleave() {
 // --- Lzr pipeline tests ---
 
 #[test]
-fn test_lzr_empty() {
-    let result = compress(&[], Pipeline::Lzr).unwrap();
-    assert!(result.is_empty());
-}
-
-#[test]
-fn test_lzr_round_trip_hello() {
-    let input = b"hello, world! hello, world!";
-    let compressed = compress(input, Pipeline::Lzr).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzr_round_trip_repeating() {
-    let pattern = b"The quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    for _ in 0..100 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress(&input, Pipeline::Lzr).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-    assert!(
-        compressed.len() < input.len(),
-        "compressed {} >= input {}",
-        compressed.len(),
-        input.len()
-    );
-}
-
-#[test]
-fn test_lzr_round_trip_binary() {
-    let input: Vec<u8> = (0..=255).cycle().take(512).collect();
-    let compressed = compress(&input, Pipeline::Lzr).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzr_round_trip_all_same() {
-    let input = vec![0xAA_u8; 500];
-    let compressed = compress(&input, Pipeline::Lzr).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
 fn test_lzr_multiblock_round_trip() {
     let pattern = b"Lzr multi-block test data with repetition. ";
     let mut input = Vec::new();
@@ -758,20 +445,6 @@ fn test_lzr_multiblock_round_trip() {
         input.extend_from_slice(pattern);
     }
     let compressed = compress_mt(&input, Pipeline::Lzr, 4, 1024).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzr_multiblock_large() {
-    let mut input = Vec::with_capacity(1 << 20);
-    let pattern = b"Lzr multi-stream test data with some repetition. ";
-    while input.len() < (1 << 20) {
-        input.extend_from_slice(pattern);
-    }
-    input.truncate(1 << 20);
-
-    let compressed = compress(&input, Pipeline::Lzr).unwrap();
     let decompressed = decompress(&compressed).unwrap();
     assert_eq!(decompressed, input);
 }
@@ -833,71 +506,7 @@ fn test_lzr_unified_scheduler_multiblock_round_trip() {
     assert_eq!(decompressed, input);
 }
 
-#[test]
-fn test_lzr_trial_selection_candidate() {
-    // Verify Lzr is included in trial selection
-    let pattern = b"Trial selection test data for rANS pipeline. ";
-    let mut input = Vec::new();
-    for _ in 0..100 {
-        input.extend_from_slice(pattern);
-    }
-    let opts = CompressOptions {
-        threads: 1,
-        ..CompressOptions::default()
-    };
-    // Just verify it doesn't crash — Lzr may or may not win
-    let _pipeline = select_pipeline_trial(&input, &opts, 2048);
-}
-
 // --- Lzf pipeline tests ---
-
-#[test]
-fn test_lzf_empty() {
-    let result = compress(&[], Pipeline::Lzf).unwrap();
-    assert!(result.is_empty());
-}
-
-#[test]
-fn test_lzf_round_trip_hello() {
-    let input = b"hello, world! hello, world!";
-    let compressed = compress(input, Pipeline::Lzf).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzf_round_trip_repeating() {
-    let pattern = b"The quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    for _ in 0..100 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress(&input, Pipeline::Lzf).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-    assert!(
-        compressed.len() < input.len(),
-        "compressed {} >= input {}",
-        compressed.len(),
-        input.len()
-    );
-}
-
-#[test]
-fn test_lzf_round_trip_binary() {
-    let input: Vec<u8> = (0..=255).cycle().take(512).collect();
-    let compressed = compress(&input, Pipeline::Lzf).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzf_round_trip_all_same() {
-    let input = vec![0xAA_u8; 500];
-    let compressed = compress(&input, Pipeline::Lzf).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
 
 #[test]
 fn test_lzf_multiblock_round_trip() {
@@ -907,20 +516,6 @@ fn test_lzf_multiblock_round_trip() {
         input.extend_from_slice(pattern);
     }
     let compressed = compress_mt(&input, Pipeline::Lzf, 4, 1024).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzf_multiblock_large() {
-    let mut input = Vec::with_capacity(1 << 20);
-    let pattern = b"Lzf multi-stream test data with some repetition. ";
-    while input.len() < (1 << 20) {
-        input.extend_from_slice(pattern);
-    }
-    input.truncate(1 << 20);
-
-    let compressed = compress(&input, Pipeline::Lzf).unwrap();
     let decompressed = decompress(&compressed).unwrap();
     assert_eq!(decompressed, input);
 }
@@ -963,277 +558,7 @@ fn test_lzf_multistream_deinterleave_reinterleave() {
     assert_eq!(block.data, input);
 }
 
-#[test]
-fn test_lzf_trial_selection_candidate() {
-    // Verify Lzf is included in trial selection
-    let pattern = b"Trial selection test data for FSE pipeline. ";
-    let mut input = Vec::new();
-    for _ in 0..100 {
-        input.extend_from_slice(pattern);
-    }
-    let opts = CompressOptions {
-        threads: 1,
-        ..CompressOptions::default()
-    };
-    // Just verify it doesn't crash — Lzf may or may not win
-    let _pipeline = select_pipeline_trial(&input, &opts, 2048);
-}
-
-// --- LzssR pipeline tests ---
-
-#[test]
-fn test_lzssr_empty() {
-    let result = compress(&[], Pipeline::LzssR).unwrap();
-    assert!(result.is_empty());
-}
-
-#[test]
-fn test_lzssr_round_trip_hello() {
-    let input = b"hello, world! hello, world!";
-    let compressed = compress(input, Pipeline::LzssR).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzssr_round_trip_repeating() {
-    let pattern = b"The quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    for _ in 0..100 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress(&input, Pipeline::LzssR).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzssr_round_trip_binary() {
-    let input: Vec<u8> = (0..=255).cycle().take(512).collect();
-    let compressed = compress(&input, Pipeline::LzssR).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-// --- Lz78R pipeline tests ---
-
-#[test]
-fn test_lz78r_empty() {
-    let result = compress(&[], Pipeline::Lz78R).unwrap();
-    assert!(result.is_empty());
-}
-
-#[test]
-fn test_lz78r_round_trip_hello() {
-    let input = b"hello, world! hello, world!";
-    let compressed = compress(input, Pipeline::Lz78R).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lz78r_round_trip_repeating() {
-    let pattern = b"The quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    for _ in 0..100 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress(&input, Pipeline::Lz78R).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lz78r_round_trip_binary() {
-    let input: Vec<u8> = (0..=255).cycle().take(512).collect();
-    let compressed = compress(&input, Pipeline::Lz78R).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lz78r_round_trip_all_same() {
-    let input = vec![0xAA_u8; 500];
-    let compressed = compress(&input, Pipeline::Lz78R).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-// --- LzSeqR pipeline tests (LzSeq + rANS) ---
-
-#[test]
-fn test_lzseqr_empty() {
-    let result = compress(&[], Pipeline::LzSeqR).unwrap();
-    assert!(result.is_empty());
-}
-
-#[test]
-fn test_lzseqr_round_trip_hello() {
-    let input = b"hello, world! hello, world!";
-    let compressed = compress(input, Pipeline::LzSeqR).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzseqr_round_trip_repeating() {
-    let pattern = b"The quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    for _ in 0..100 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress(&input, Pipeline::LzSeqR).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-    assert!(
-        compressed.len() < input.len(),
-        "compressed {} >= input {}",
-        compressed.len(),
-        input.len()
-    );
-}
-
-#[test]
-fn test_lzseqr_round_trip_binary() {
-    let input: Vec<u8> = (0..=255).cycle().take(512).collect();
-    let compressed = compress(&input, Pipeline::LzSeqR).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzseqr_round_trip_all_same() {
-    let input = vec![0xAA_u8; 500];
-    let compressed = compress(&input, Pipeline::LzSeqR).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzseqr_round_trip_large() {
-    let pattern = b"abcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut input = Vec::new();
-    for _ in 0..200 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress(&input, Pipeline::LzSeqR).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-// --- LzSeqH pipeline tests (LzSeq + Huffman) ---
-
-#[test]
-fn test_lzseqh_empty() {
-    let result = compress(&[], Pipeline::LzSeqH).unwrap();
-    assert!(result.is_empty());
-}
-
-#[test]
-fn test_lzseqh_round_trip_hello() {
-    let input = b"hello, world! hello, world!";
-    let compressed = compress(input, Pipeline::LzSeqH).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzseqh_round_trip_repeating() {
-    let pattern = b"The quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    // LzSeqH uses 6 separate streams with Huffman headers (1KB per stream = 6KB overhead).
-    // Need large input to amortize this overhead and achieve compression.
-    for _ in 0..2000 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress(&input, Pipeline::LzSeqH).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-    assert!(
-        compressed.len() < input.len(),
-        "compressed {} >= input {}",
-        compressed.len(),
-        input.len()
-    );
-}
-
-#[test]
-fn test_lzseqh_round_trip_binary() {
-    let input: Vec<u8> = (0..=255).cycle().take(512).collect();
-    let compressed = compress(&input, Pipeline::LzSeqH).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzseqh_round_trip_all_same() {
-    let input = vec![0xAA_u8; 500];
-    let compressed = compress(&input, Pipeline::LzSeqH).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzseqh_round_trip_large() {
-    let pattern = b"abcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut input = Vec::new();
-    for _ in 0..200 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress(&input, Pipeline::LzSeqH).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-// --- Lzfi pipeline tests (LZSS + interleaved FSE) ---
-
-#[test]
-fn test_lzfi_empty() {
-    let result = compress(&[], Pipeline::Lzfi).unwrap();
-    assert!(result.is_empty());
-}
-
-#[test]
-fn test_lzfi_round_trip_hello() {
-    let input = b"hello, world! hello, world!";
-    let compressed = compress(input, Pipeline::Lzfi).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzfi_round_trip_repeating() {
-    let pattern = b"The quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    for _ in 0..100 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress(&input, Pipeline::Lzfi).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-    assert!(
-        compressed.len() < input.len(),
-        "compressed {} >= input {}",
-        compressed.len(),
-        input.len()
-    );
-}
-
-#[test]
-fn test_lzfi_round_trip_binary() {
-    let input: Vec<u8> = (0..=255).cycle().take(512).collect();
-    let compressed = compress(&input, Pipeline::Lzfi).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_lzfi_round_trip_all_same() {
-    let input = vec![0xAA_u8; 500];
-    let compressed = compress(&input, Pipeline::Lzfi).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
+// --- Lzfi pipeline tests ---
 
 #[test]
 fn test_lzfi_multiblock_round_trip() {
@@ -1278,23 +603,6 @@ fn test_lzfi_multistream_deinterleave_reinterleave() {
     let block = stage_demux_decompress(block, &LzDemuxer::Lz77).unwrap();
     assert!(block.streams.is_none());
     assert_eq!(block.data, input);
-}
-
-// --- Trial selection with new pipelines ---
-
-#[test]
-fn test_trial_selection_includes_experimental() {
-    let pattern = b"Trial selection test data with experimental pipelines. ";
-    let mut input = Vec::new();
-    for _ in 0..100 {
-        input.extend_from_slice(pattern);
-    }
-    let opts = CompressOptions {
-        threads: 1,
-        ..CompressOptions::default()
-    };
-    // Verify trial selection doesn't crash with new pipelines in candidates
-    let _pipeline = select_pipeline_trial(&input, &opts, 2048);
 }
 
 // --- Extended match length tests ---

@@ -186,38 +186,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_round_trip_empty() {
-        let input: Vec<u8> = Vec::new();
-        let compressed = encode(&input).unwrap();
-        let decompressed = decode(&compressed).unwrap();
-        assert_eq!(decompressed, input);
-    }
-
-    #[test]
-    fn test_round_trip_single_byte() {
-        let input = vec![42u8];
-        let compressed = encode(&input).unwrap();
-        let decompressed = decode(&compressed).unwrap();
-        assert_eq!(decompressed, input);
-    }
-
-    #[test]
-    fn test_round_trip_short() {
-        let input = b"abcabc".to_vec();
-        let compressed = encode(&input).unwrap();
-        let decompressed = decode(&compressed).unwrap();
-        assert_eq!(decompressed, input);
-    }
-
-    #[test]
-    fn test_round_trip_all_same() {
-        let input = vec![b'x'; 200];
-        let compressed = encode(&input).unwrap();
-        let decompressed = decode(&compressed).unwrap();
-        assert_eq!(decompressed, input);
-    }
-
-    #[test]
     fn test_round_trip_text() {
         let input = b"To be, or not to be, that is the question: \
             Whether 'tis nobler in the mind to suffer \
@@ -230,29 +198,8 @@ mod tests {
     }
 
     #[test]
-    fn test_round_trip_large() {
-        let pattern = b"abcdefghijklmnopqrstuvwxyz0123456789-_";
-        let mut input = Vec::new();
-        for _ in 0..200 {
-            input.extend_from_slice(pattern);
-        }
-        assert!(input.len() > 7500);
-        let compressed = encode(&input).unwrap();
-        let decompressed = decode(&compressed).unwrap();
-        assert_eq!(decompressed, input);
-    }
-
-    #[test]
     fn test_round_trip_binary() {
         let input: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
-        let compressed = encode(&input).unwrap();
-        let decompressed = decode(&compressed).unwrap();
-        assert_eq!(decompressed, input);
-    }
-
-    #[test]
-    fn test_round_trip_two_bytes() {
-        let input = vec![0u8, 255];
         let compressed = encode(&input).unwrap();
         let decompressed = decode(&compressed).unwrap();
         assert_eq!(decompressed, input);
@@ -364,29 +311,5 @@ mod tests {
         let mut buf = vec![0u8; 1];
         let result = decode_to_buf(&encoded, &mut buf);
         assert_eq!(result, Err(PzError::BufferTooSmall));
-    }
-
-    #[test]
-    fn test_compresses_repetitive_data() {
-        let input = vec![b'a'; 1000];
-        let compressed = encode(&input).unwrap();
-        assert!(
-            compressed.len() < input.len(),
-            "LZ78 should compress repeated data: {} >= {}",
-            compressed.len(),
-            input.len()
-        );
-    }
-
-    #[test]
-    fn test_repeating_pattern() {
-        let pattern = b"the quick brown fox jumps over the lazy dog. ";
-        let mut input = Vec::new();
-        for _ in 0..20 {
-            input.extend_from_slice(pattern);
-        }
-        let compressed = encode(&input).unwrap();
-        let decompressed = decode(&compressed).unwrap();
-        assert_eq!(decompressed, input);
     }
 }

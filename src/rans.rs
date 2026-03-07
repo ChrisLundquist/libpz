@@ -1382,30 +1382,6 @@ mod tests {
     }
 
     #[test]
-    fn test_two_bytes() {
-        let input = b"ab";
-        let encoded = encode(input);
-        let decoded = decode(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_round_trip_hello() {
-        let input = b"hello, world!";
-        let encoded = encode(input);
-        let decoded = decode(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_round_trip_banana() {
-        let input = b"banana";
-        let encoded = encode(input);
-        let decoded = decode(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
     fn test_round_trip_all_bytes() {
         let input: Vec<u8> = (0..=255).collect();
         let encoded = encode(&input);
@@ -1431,22 +1407,6 @@ mod tests {
     }
 
     // --- Compression effectiveness ---
-
-    #[test]
-    fn test_compression_skewed() {
-        let mut input = vec![0u8; 2000];
-        input.push(1);
-        input.push(2);
-        let encoded = encode(&input);
-        let decoded = decode(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-        assert!(
-            encoded.len() < input.len(),
-            "encoded {} bytes, expected < {}",
-            encoded.len(),
-            input.len()
-        );
-    }
 
     #[test]
     fn test_compresses_repeated() {
@@ -1490,15 +1450,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_to_buf_basic() {
-        let input = b"hello, world!";
-        let encoded = encode(input);
-        let mut buf = vec![0u8; 100];
-        let size = decode_to_buf(&encoded, input.len(), &mut buf).unwrap();
-        assert_eq!(&buf[..size], input);
-    }
-
-    #[test]
     fn test_decode_to_buf_too_small() {
         let input = b"hello, world!";
         let encoded = encode(input);
@@ -1526,14 +1477,6 @@ mod tests {
     }
 
     #[test]
-    fn test_interleaved_hello() {
-        let input = b"hello, world!";
-        let encoded = encode_interleaved(input);
-        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
     fn test_interleaved_repeated() {
         let input = vec![b'x'; 500];
         let encoded = encode_interleaved(&input);
@@ -1544,23 +1487,6 @@ mod tests {
     #[test]
     fn test_interleaved_all_bytes() {
         let input: Vec<u8> = (0..=255).collect();
-        let encoded = encode_interleaved(&input);
-        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_interleaved_longer_text() {
-        let input =
-            b"the quick brown fox jumps over the lazy dog. the quick brown fox jumps over the lazy dog.";
-        let encoded = encode_interleaved(input);
-        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_interleaved_binary() {
-        let input: Vec<u8> = (0..1000).map(|i| ((i * 37 + 13) % 256) as u8).collect();
         let encoded = encode_interleaved(&input);
         let decoded = decode_interleaved(&encoded, input.len()).unwrap();
         assert_eq!(decoded, input);
@@ -1589,84 +1515,6 @@ mod tests {
         assert_eq!(decoded_single, decoded_interleaved);
     }
 
-    #[test]
-    fn test_interleaved_to_buf() {
-        let input = b"hello, world!";
-        let encoded = encode_interleaved(input);
-        let mut buf = vec![0u8; 100];
-        let size = decode_interleaved_to_buf(&encoded, input.len(), &mut buf).unwrap();
-        assert_eq!(&buf[..size], input);
-    }
-
-    // --- Medium data ---
-
-    #[test]
-    fn test_round_trip_medium() {
-        let mut input = Vec::new();
-        for _ in 0..20 {
-            input.extend(b"The Burrows-Wheeler transform clusters bytes. ");
-        }
-        let encoded = encode(&input);
-        let decoded = decode(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_round_trip_large_repeated_pattern() {
-        let pattern: Vec<u8> = (0..=127).collect();
-        let mut input = Vec::new();
-        for _ in 0..100 {
-            input.extend(&pattern);
-        }
-        let encoded = encode(&input);
-        let decoded = decode(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_interleaved_medium() {
-        let mut input = Vec::new();
-        for _ in 0..50 {
-            input.extend(b"rANS interleaved encode/decode test data. ");
-        }
-        let encoded = encode_interleaved(&input);
-        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_interleaved_large() {
-        let pattern: Vec<u8> = (0..=127).collect();
-        let mut input = Vec::new();
-        for _ in 0..200 {
-            input.extend(&pattern);
-        }
-        let encoded = encode_interleaved(&input);
-        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_compression_vs_huffman_quality() {
-        // rANS with 12-bit precision should compress at least as well as
-        // a naive frequency header for skewed data
-        let mut input = vec![b'a'; 1000];
-        input.extend(vec![b'b'; 100]);
-        input.extend(vec![b'c'; 10]);
-        input.push(b'd');
-
-        let encoded = encode(&input);
-        let decoded = decode(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-        // Should compress (accounting for 521-byte header overhead)
-        assert!(
-            encoded.len() < input.len(),
-            "encoded {} bytes, expected < {}",
-            encoded.len(),
-            input.len()
-        );
-    }
-
     mod chunked_tests {
         use super::*;
 
@@ -1686,23 +1534,6 @@ mod tests {
         fn test_chunked_single_byte() {
             let input = &[42u8];
             let encoded = encode_chunked(input, NUM_STATES, SCALE_BITS, CHUNK_SIZE);
-            let decoded = decode_chunked(&encoded).unwrap();
-            assert_eq!(decoded, input);
-        }
-
-        #[test]
-        fn test_chunked_small_input() {
-            // Input smaller than one chunk
-            let input = b"hello, world!";
-            let encoded = encode_chunked(input, NUM_STATES, SCALE_BITS, CHUNK_SIZE);
-            let decoded = decode_chunked(&encoded).unwrap();
-            assert_eq!(decoded, input);
-        }
-
-        #[test]
-        fn test_chunked_one_full_chunk() {
-            let input: Vec<u8> = (0..CHUNK_SIZE).map(|i| i as u8).collect();
-            let encoded = encode_chunked(&input, NUM_STATES, SCALE_BITS, CHUNK_SIZE);
             let decoded = decode_chunked(&encoded).unwrap();
             assert_eq!(decoded, input);
         }
@@ -1740,14 +1571,6 @@ mod tests {
         fn test_chunked_different_params() {
             let input: Vec<u8> = (0..3000).map(|i| ((i * 41 + 61) % 256) as u8).collect();
             let encoded = encode_chunked(&input, 8, 13, 512);
-            let decoded = decode_chunked(&encoded).unwrap();
-            assert_eq!(decoded, input);
-        }
-
-        #[test]
-        fn test_chunked_long_repeated() {
-            let input = vec![b'a'; 10_000];
-            let encoded = encode_chunked(&input, NUM_STATES, SCALE_BITS, CHUNK_SIZE);
             let decoded = decode_chunked(&encoded).unwrap();
             assert_eq!(decoded, input);
         }

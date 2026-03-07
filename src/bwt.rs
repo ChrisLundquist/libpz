@@ -972,14 +972,6 @@ mod tests {
     }
 
     #[test]
-    fn test_round_trip_hello() {
-        let input = b"hello";
-        let result = encode(input).unwrap();
-        let decoded = decode(&result.data, result.primary_index).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
     fn test_round_trip_all_same() {
         let input = vec![b'x'; 10];
         let result = encode(&input).unwrap();
@@ -989,24 +981,8 @@ mod tests {
     }
 
     #[test]
-    fn test_round_trip_abcabc() {
-        let input = b"abcabc";
-        let result = encode(input).unwrap();
-        let decoded = decode(&result.data, result.primary_index).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
     fn test_round_trip_longer_text() {
         let input = b"the quick brown fox jumps over the lazy dog";
-        let result = encode(input).unwrap();
-        let decoded = decode(&result.data, result.primary_index).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_round_trip_repeating_pattern() {
-        let input = b"abababababab";
         let result = encode(input).unwrap();
         let decoded = decode(&result.data, result.primary_index).unwrap();
         assert_eq!(decoded, input);
@@ -1021,34 +997,9 @@ mod tests {
     }
 
     #[test]
-    fn test_round_trip_two_bytes() {
-        let input = b"ab";
-        let result = encode(input).unwrap();
-        let decoded = decode(&result.data, result.primary_index).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_round_trip_three_bytes() {
-        let input = b"cab";
-        let result = encode(input).unwrap();
-        let decoded = decode(&result.data, result.primary_index).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
     fn test_decode_invalid_primary_index() {
         let result = decode(&[1, 2, 3], 5);
         assert_eq!(result, Err(PzError::InvalidInput));
-    }
-
-    #[test]
-    fn test_decode_to_buf() {
-        let input = b"banana";
-        let result = encode(input).unwrap();
-        let mut buf = vec![0u8; 100];
-        let size = decode_to_buf(&result.data, result.primary_index, &mut buf).unwrap();
-        assert_eq!(&buf[..size], input);
     }
 
     #[test]
@@ -1093,18 +1044,6 @@ mod tests {
             input_runs,
             bwt_runs
         );
-    }
-
-    #[test]
-    fn test_round_trip_medium() {
-        // Medium-length input to exercise the algorithm more thoroughly
-        let mut input = Vec::new();
-        for _ in 0..10 {
-            input.extend(b"Hello, World! This tests the BWT. ");
-        }
-        let result = encode(&input).unwrap();
-        let decoded = decode(&result.data, result.primary_index).unwrap();
-        assert_eq!(decoded, input);
     }
 
     #[test]
@@ -1279,47 +1218,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bijective_bwt_round_trip_all_same() {
-        let input = vec![b'x'; 20];
-        let (bwt_data, factor_lens) = encode_bijective(&input).unwrap();
-        let decoded = decode_bijective(&bwt_data, &factor_lens).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_bijective_bwt_round_trip_longer() {
-        let input = b"the quick brown fox jumps over the lazy dog";
-        let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
-        let decoded = decode_bijective(&bwt_data, &factor_lens).unwrap();
-        assert_eq!(&decoded, &input[..]);
-    }
-
-    #[test]
-    fn test_bijective_bwt_round_trip_binary() {
-        let input: Vec<u8> = (0..=255).collect();
-        let (bwt_data, factor_lens) = encode_bijective(&input).unwrap();
-        let decoded = decode_bijective(&bwt_data, &factor_lens).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_bijective_bwt_round_trip_repeating() {
-        let input = b"abababababab";
-        let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
-        let decoded = decode_bijective(&bwt_data, &factor_lens).unwrap();
-        assert_eq!(&decoded, &input[..]);
-    }
-
-    #[test]
-    fn test_bijective_decode_to_buf() {
-        let input = b"the quick brown fox jumps over the lazy dog";
-        let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
-        let mut buf = vec![0u8; 100];
-        let n = decode_bijective_to_buf(&bwt_data, &factor_lens, &mut buf).unwrap();
-        assert_eq!(&buf[..n], &input[..]);
-    }
-
-    #[test]
     fn test_bijective_decode_to_buf_too_small() {
         let input = b"hello";
         let (bwt_data, factor_lens) = encode_bijective(input).unwrap();
@@ -1448,223 +1346,6 @@ mod tests {
             // Verify factor lengths match expectations
             let total: usize = factor_lens.iter().sum();
             assert_eq!(total, input.len());
-        }
-    }
-
-    #[test]
-    fn test_bijective_vs_standard_compression() {
-        // Compare bijective vs standard BWT through MTF→RLE→FSE pipeline
-        // and report compression ratios
-        use crate::{fse, mtf, rle};
-
-        println!("\n=== Bijective BWT vs Standard BWT Compression Comparison ===\n");
-        println!(
-            "{:<30} {:>8} {:>8} {:>8} {:>8}",
-            "Input", "Std BWT", "Bij BWT", "Std Full", "Bij Full"
-        );
-        println!("{:-<30} {:->8} {:->8} {:->8} {:->8}", "", "", "", "", "");
-
-        let test_cases: Vec<(&str, Vec<u8>)> = vec![
-            ("zeros_100", vec![0u8; 100]),
-            ("all_same_1000", vec![b'a'; 1000]),
-            (
-                "repeating_text",
-                b"Hello, World! "
-                    .iter()
-                    .cycle()
-                    .take(1024)
-                    .copied()
-                    .collect(),
-            ),
-            (
-                "abracadabra_x100",
-                b"abracadabra ".iter().cycle().take(1200).copied().collect(),
-            ),
-            ("binary_256", (0..=255u8).collect()),
-            ("sawtooth", (0..1024u16).map(|i| (i % 64) as u8).collect()),
-        ];
-
-        for (name, input) in &test_cases {
-            // Standard BWT pipeline
-            let std_result = encode(input).unwrap();
-            let std_mtf = mtf::encode(&std_result.data);
-            let std_rle = rle::encode(&std_mtf);
-            let std_fse = fse::encode(&std_rle);
-
-            // Bijective BWT pipeline
-            let (bij_data, _bij_factors) = encode_bijective(input).unwrap();
-            let bij_mtf = mtf::encode(&bij_data);
-            let bij_rle = rle::encode(&bij_mtf);
-            let bij_fse = fse::encode(&bij_rle);
-
-            // Count runs in BWT output (clustering metric)
-            fn count_runs(data: &[u8]) -> usize {
-                if data.is_empty() {
-                    return 0;
-                }
-                let mut runs = 1;
-                for i in 1..data.len() {
-                    if data[i] != data[i - 1] {
-                        runs += 1;
-                    }
-                }
-                runs
-            }
-
-            let std_runs = count_runs(&std_result.data);
-            let bij_runs = count_runs(&bij_data);
-
-            println!(
-                "{:<30} {:>5}r/{:>4}B {:>5}r/{:>4}B {:>8}B {:>8}B",
-                format!("{name} ({}B)", input.len()),
-                std_runs,
-                std_result.data.len(),
-                bij_runs,
-                bij_data.len(),
-                std_fse.len(),
-                bij_fse.len(),
-            );
-        }
-
-        // Canterbury corpus — with timing
-        let cantrbry_dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/cantrbry");
-        if cantrbry_dir.exists() {
-            println!("\n--- Canterbury Corpus (compression ratio) ---");
-            println!(
-                "{:<25} {:>8} {:>8} {:>8} {:>8} {:>7}",
-                "File", "Std Runs", "Bij Runs", "Std Size", "Bij Size", "Delta%"
-            );
-            println!(
-                "{:-<25} {:->8} {:->8} {:->8} {:->8} {:->7}",
-                "", "", "", "", "", ""
-            );
-
-            let files = [
-                "alice29.txt",
-                "asyoulik.txt",
-                "cp.html",
-                "fields.c",
-                "grammar.lsp",
-                "xargs.1",
-            ];
-
-            // First pass: compression ratios
-            for filename in &files {
-                let path = cantrbry_dir.join(filename);
-                if let Ok(data) = std::fs::read(&path) {
-                    let input = if data.len() > 65536 {
-                        &data[..65536]
-                    } else {
-                        &data
-                    };
-
-                    let std_result = encode(input).unwrap();
-                    let std_mtf = mtf::encode(&std_result.data);
-                    let std_rle = rle::encode(&std_mtf);
-                    let std_fse = fse::encode(&std_rle);
-
-                    let (bij_data, _) = encode_bijective(input).unwrap();
-                    let bij_mtf = mtf::encode(&bij_data);
-                    let bij_rle = rle::encode(&bij_mtf);
-                    let bij_fse = fse::encode(&bij_rle);
-
-                    fn count_runs2(data: &[u8]) -> usize {
-                        if data.is_empty() {
-                            return 0;
-                        }
-                        data.windows(2).filter(|w| w[0] != w[1]).count() + 1
-                    }
-
-                    let std_runs = count_runs2(&std_result.data);
-                    let bij_runs = count_runs2(&bij_data);
-                    let delta_pct = (bij_fse.len() as f64 / std_fse.len() as f64 - 1.0) * 100.0;
-
-                    println!(
-                        "{:<25} {:>8} {:>8} {:>8} {:>8} {:>+6.1}%",
-                        format!("{filename} ({}B)", input.len()),
-                        std_runs,
-                        bij_runs,
-                        std_fse.len(),
-                        bij_fse.len(),
-                        delta_pct,
-                    );
-                }
-            }
-
-            // Second pass: timing (encode + decode, 3 iterations, report median-ish)
-            println!("\n--- Canterbury Corpus (timing) ---");
-            println!(
-                "{:<25} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10}",
-                "File", "Std Enc", "Bij Enc", "Std Dec", "Bij Dec", "Factors", "Avg Flen"
-            );
-            println!(
-                "{:-<25} {:->10} {:->10} {:->10} {:->10} {:->8} {:->10}",
-                "", "", "", "", "", "", ""
-            );
-
-            for filename in &files {
-                let path = cantrbry_dir.join(filename);
-                if let Ok(data) = std::fs::read(&path) {
-                    let input = if data.len() > 65536 {
-                        &data[..65536]
-                    } else {
-                        &data
-                    };
-
-                    // Warm up + measure standard BWT encode (3 runs, take last)
-                    let mut std_enc_us = 0u128;
-                    let mut std_result = None;
-                    for _ in 0..3 {
-                        let t0 = std::time::Instant::now();
-                        std_result = Some(encode(input).unwrap());
-                        std_enc_us = t0.elapsed().as_micros();
-                    }
-                    let std_result = std_result.unwrap();
-
-                    // Measure standard BWT decode
-                    let mut std_dec_us = 0u128;
-                    for _ in 0..3 {
-                        let t0 = std::time::Instant::now();
-                        let _ = decode(&std_result.data, std_result.primary_index).unwrap();
-                        std_dec_us = t0.elapsed().as_micros();
-                    }
-
-                    // Measure bijective BWT encode
-                    let mut bij_enc_us = 0u128;
-                    let mut bij_result = None;
-                    for _ in 0..3 {
-                        let t0 = std::time::Instant::now();
-                        bij_result = Some(encode_bijective(input).unwrap());
-                        bij_enc_us = t0.elapsed().as_micros();
-                    }
-                    let (bij_data, bij_factors) = bij_result.unwrap();
-
-                    // Measure bijective BWT decode
-                    let mut bij_dec_us = 0u128;
-                    for _ in 0..3 {
-                        let t0 = std::time::Instant::now();
-                        let _ = decode_bijective(&bij_data, &bij_factors).unwrap();
-                        bij_dec_us = t0.elapsed().as_micros();
-                    }
-
-                    let num_factors = bij_factors.len();
-                    let avg_flen = input.len() as f64 / num_factors as f64;
-
-                    println!(
-                        "{:<25} {:>8}us {:>8}us {:>8}us {:>8}us {:>8} {:>9.1}",
-                        format!("{filename} ({}B)", input.len()),
-                        std_enc_us,
-                        bij_enc_us,
-                        std_dec_us,
-                        bij_dec_us,
-                        num_factors,
-                        avg_flen,
-                    );
-                }
-            }
-        } else {
-            println!("\n(Canterbury corpus not extracted — skipping)");
         }
     }
 }

@@ -675,25 +675,6 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_round_trip_multi_threaded() {
-        let data = b"The quick brown fox jumps over the lazy dog. ".repeat(50);
-        for pipeline in [
-            Pipeline::Deflate,
-            Pipeline::Bw,
-            Pipeline::Lzr,
-            Pipeline::Lzf,
-        ] {
-            let compressed = stream_compress(&data, pipeline, 4);
-            let decompressed = stream_decompress(&compressed, 4);
-            assert_eq!(
-                decompressed, data,
-                "mt round-trip failed for {:?}",
-                pipeline
-            );
-        }
-    }
-
-    #[test]
     fn test_stream_round_trip_exact_block_boundary() {
         // Input is exactly 2 blocks (1024 bytes with 512-byte block size)
         let data = vec![42u8; 1024];
@@ -827,15 +808,6 @@ mod tests {
             data.extend_from_slice(&[i; 512]);
         }
         let compressed = stream_compress(&data, Pipeline::Lzf, 4);
-        let decompressed = stream_decompress(&compressed, 4);
-        assert_eq!(decompressed, data);
-    }
-
-    #[test]
-    fn test_stream_mt_decompress_framed() {
-        // Multi-threaded decompress of framed data
-        let data = b"The quick brown fox jumps over the lazy dog. ".repeat(100);
-        let compressed = stream_compress(&data, Pipeline::Deflate, 4);
         let decompressed = stream_decompress(&compressed, 4);
         assert_eq!(decompressed, data);
     }

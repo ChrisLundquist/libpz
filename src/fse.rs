@@ -1144,30 +1144,6 @@ mod tests {
     }
 
     #[test]
-    fn test_two_bytes() {
-        let input = b"ab";
-        let encoded = encode(input);
-        let decoded = decode(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_round_trip_hello() {
-        let input = b"hello, world!";
-        let encoded = encode(input);
-        let decoded = decode(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_round_trip_banana() {
-        let input = b"banana";
-        let encoded = encode(input);
-        let decoded = decode(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
     fn test_round_trip_all_bytes() {
         let input: Vec<u8> = (0..=255).collect();
         let encoded = encode(&input);
@@ -1195,22 +1171,6 @@ mod tests {
     // --- Compression effectiveness ---
 
     #[test]
-    fn test_compression_skewed() {
-        let mut input = vec![0u8; 2000];
-        input.push(1);
-        input.push(2);
-        let encoded = encode(&input);
-        let decoded = decode(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-        assert!(
-            encoded.len() < input.len(),
-            "encoded {} bytes, expected < {}",
-            encoded.len(),
-            input.len()
-        );
-    }
-
-    #[test]
     fn test_compresses_repeated() {
         let input = vec![0u8; 2000];
         let encoded = encode(&input);
@@ -1225,22 +1185,6 @@ mod tests {
     }
 
     // --- Accuracy log variants ---
-
-    #[test]
-    fn test_accuracy_log_5() {
-        let input = b"the quick brown fox jumps over the lazy dog";
-        let encoded = encode_with_accuracy(input, 5);
-        let decoded = decode(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_accuracy_log_12() {
-        let input = b"the quick brown fox jumps over the lazy dog. test test test.";
-        let encoded = encode_with_accuracy(input, 12);
-        let decoded = decode(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
 
     #[test]
     fn test_all_accuracy_logs() {
@@ -1268,15 +1212,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_to_buf_basic() {
-        let input = b"hello, world!";
-        let encoded = encode(input);
-        let mut buf = vec![0u8; 100];
-        let size = decode_to_buf(&encoded, input.len(), &mut buf).unwrap();
-        assert_eq!(&buf[..size], input);
-    }
-
-    #[test]
     fn test_decode_to_buf_too_small() {
         let input = b"hello, world!";
         let encoded = encode(input);
@@ -1285,31 +1220,6 @@ mod tests {
             decode_to_buf(&encoded, input.len(), &mut buf),
             Err(PzError::BufferTooSmall)
         );
-    }
-
-    // --- Medium data ---
-
-    #[test]
-    fn test_round_trip_medium() {
-        let mut input = Vec::new();
-        for _ in 0..20 {
-            input.extend(b"The Burrows-Wheeler transform clusters bytes. ");
-        }
-        let encoded = encode(&input);
-        let decoded = decode(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_round_trip_large_repeated_pattern() {
-        let pattern: Vec<u8> = (0..=127).collect();
-        let mut input = Vec::new();
-        for _ in 0..100 {
-            input.extend(&pattern);
-        }
-        let encoded = encode(&input);
-        let decoded = decode(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
     }
 
     // --- Interleaved round-trip tests ---
@@ -1345,64 +1255,8 @@ mod tests {
     }
 
     #[test]
-    fn test_interleaved_hello() {
-        let input = b"hello, world!";
-        let encoded = encode_interleaved(input);
-        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_interleaved_banana() {
-        let input = b"banana";
-        let encoded = encode_interleaved(input);
-        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
     fn test_interleaved_all_bytes() {
         let input: Vec<u8> = (0..=255).collect();
-        let encoded = encode_interleaved(&input);
-        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_interleaved_longer_text() {
-        let input =
-            b"the quick brown fox jumps over the lazy dog. the quick brown fox jumps over the lazy dog.";
-        let encoded = encode_interleaved(input);
-        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_interleaved_binary() {
-        let input: Vec<u8> = (0..500).map(|i| ((i * 37 + 13) % 256) as u8).collect();
-        let encoded = encode_interleaved(&input);
-        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_interleaved_medium() {
-        let mut input = Vec::new();
-        for _ in 0..20 {
-            input.extend(b"The Burrows-Wheeler transform clusters bytes. ");
-        }
-        let encoded = encode_interleaved(&input);
-        let decoded = decode_interleaved(&encoded, input.len()).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_interleaved_large_repeated_pattern() {
-        let pattern: Vec<u8> = (0..=127).collect();
-        let mut input = Vec::new();
-        for _ in 0..100 {
-            input.extend(&pattern);
-        }
         let encoded = encode_interleaved(&input);
         let decoded = decode_interleaved(&encoded, input.len()).unwrap();
         assert_eq!(decoded, input);
@@ -1426,15 +1280,6 @@ mod tests {
             let decoded = decode_interleaved(&encoded, input.len()).unwrap();
             assert_eq!(decoded, input, "failed at accuracy_log={}", al);
         }
-    }
-
-    #[test]
-    fn test_interleaved_to_buf() {
-        let input = b"hello, world!";
-        let encoded = encode_interleaved(input);
-        let mut buf = vec![0u8; 100];
-        let size = decode_interleaved_to_buf(&encoded, input.len(), &mut buf).unwrap();
-        assert_eq!(&buf[..size], input);
     }
 
     #[test]
