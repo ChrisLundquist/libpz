@@ -16,7 +16,7 @@
 @group(0) @binding(1) var<storage, read> sk_hashes: array<u32>;
 // Output keys (one byte per position, used by radix histogram + scatter).
 @group(0) @binding(2) var<storage, read_write> sk_keys: array<u32>;
-// Parameters: [n, padded_n, pass (0-3), unused]
+// Parameters: [n, padded_n, pass_idx (0-3), unused]
 @group(0) @binding(3) var<uniform> sk_params: vec4<u32>;
 
 @compute @workgroup_size(256)
@@ -24,7 +24,7 @@ fn sortlz_compute_keys(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     let n = sk_params.x;
     let padded_n = sk_params.y;
-    let pass = sk_params.z;
+    let pass_idx = sk_params.z;
 
     if (i >= padded_n) {
         return;
@@ -37,9 +37,9 @@ fn sortlz_compute_keys(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // Extract byte `pass` from the hash at position sa[i].
+    // Extract byte `pass_idx` from the hash at position sa[i].
     let hash = sk_hashes[sa_i];
-    sk_keys[i] = (hash >> (pass * 8u)) & 0xFFu;
+    sk_keys[i] = (hash >> (pass_idx * 8u)) & 0xFFu;
 }
 
 // ---------------------------------------------------------------------------
