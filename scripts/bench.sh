@@ -22,6 +22,7 @@ GPU_FLAG=""
 THREADS=""
 VERBOSE=false
 PARETO=false
+INCLUDE_SILESIA=false
 
 usage() {
     cat <<'EOF'
@@ -40,10 +41,12 @@ Options:
                          sorted by ratio. Implies --all and -t 1.
   --webgpu               Build with WebGPU feature and pass --gpu to pz
   --features FEAT        Cargo features to enable (e.g. webgpu)
+  --silesia              Include Silesia corpus files (samples/silesia/)
   -v, --verbose          Show detailed output (default: quiet, summary only)
   -h, --help             Show this help
 
 If no FILEs are given, benchmarks all files in samples/cantrbry and samples/large.
+Use --silesia to also include the larger Silesia corpus (211 MB).
 
 Examples:
   ./scripts/bench.sh                              # all corpus, all pipelines
@@ -98,12 +101,16 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --all)
-            PIPELINES=(deflate bw bbw lzr lzf lzfi lzseqr lzseqh)
+            PIPELINES=(deflate bw bbw lzr lzf lzfi lzseqr lzseqh sortlz)
+            shift
+            ;;
+        --silesia)
+            INCLUDE_SILESIA=true
             shift
             ;;
         --pareto)
             PARETO=true
-            PIPELINES=(deflate bw bbw lzr lzf lzfi lzseqr lzseqh)
+            PIPELINES=(deflate bw bbw lzr lzf lzfi lzseqr lzseqh sortlz)
             # Force single-thread for apples-to-apples comparison
             THREADS="1"
             shift
@@ -158,9 +165,16 @@ if [[ ${#FILES[@]} -eq 0 ]]; then
     for f in "$PROJECT_DIR"/samples/cantrbry/* "$PROJECT_DIR"/samples/large/*; do
         # Skip archives and compressed leftovers — only benchmark raw sample files
         [[ -f "$f" ]] || continue
-        case "$f" in *.tar.gz|*.pz|*.gz) continue ;; esac
+        case "$f" in *.tar.gz|*.pz|*.gz|.extracted) continue ;; esac
         FILES+=("$f")
     done
+    if [[ "$INCLUDE_SILESIA" == true ]] && [[ -d "$PROJECT_DIR/samples/silesia" ]]; then
+        for f in "$PROJECT_DIR"/samples/silesia/*; do
+            [[ -f "$f" ]] || continue
+            case "$f" in *.pz|*.gz) continue ;; esac
+            FILES+=("$f")
+        done
+    fi
     if [[ ${#FILES[@]} -eq 0 ]]; then
         echo "ERROR: No sample files found even after extraction" >&2
         exit 1
@@ -273,6 +287,36 @@ fmt_ratio() {
     awk "BEGIN { printf \"%.1f%%\", ($1/$2)*100; exit }" < /dev/null
 }
 
+# Measure GPU init overhead (per-process cost) when webgpu is enabled.
+# This is subtracted from per-file timings for accurate throughput reporting.
+GPU_INIT_NS=0
+if [[ -n "$GPU_FLAG" ]]; then
+    gpu_probe="$BENCH_TMPDIR/_gpu_probe"
+    printf 'x%.0s' {1..256} > "$gpu_probe"
+    # Warmup (shader compilation caching)
+    "$PZ" -k -f -p deflate $GPU_FLAG "$gpu_probe" >/dev/null 2>&1
+    rm -f "$gpu_probe.pz"
+    # Average 3 GPU runs on tiny data
+    gpu_total=0
+    for (( gi=0; gi<3; gi++ )); do
+        gpu_ns=$(time_ns "$PZ" -k -f -p deflate $GPU_FLAG "$gpu_probe")
+        gpu_total=$(( gpu_total + gpu_ns ))
+        rm -f "$gpu_probe.pz"
+    done
+    GPU_INIT_NS=$(( gpu_total / 3 ))
+    # CPU-only baseline on same data
+    cpu_total=0
+    for (( gi=0; gi<3; gi++ )); do
+        cpu_ns=$(time_ns "$PZ" -k -f -p deflate "$gpu_probe")
+        cpu_total=$(( cpu_total + cpu_ns ))
+        rm -f "$gpu_probe.pz"
+    done
+    CPU_INIT_NS=$(( cpu_total / 3 ))
+    GPU_INIT_NS=$(( GPU_INIT_NS - CPU_INIT_NS ))
+    if [[ $GPU_INIT_NS -lt 0 ]]; then GPU_INIT_NS=0; fi
+    rm -f "$gpu_probe"
+fi
+
 if [[ "$VERBOSE" == true ]]; then
     echo "Averaging over $ITERATIONS iterations per operation."
     echo "Pipelines: ${PIPELINES[*]}"
@@ -281,6 +325,9 @@ if [[ "$VERBOSE" == true ]]; then
     fi
     if [[ -n "$GPU_FLAG" ]]; then
         echo "GPU: $GPU_FLAG"
+        if [[ $GPU_INIT_NS -gt 0 ]]; then
+            echo "GPU init overhead: $(fmt_ms $GPU_INIT_NS) ms/invocation (subtracted)"
+        fi
     fi
     echo ""
 fi
@@ -382,6 +429,9 @@ for file in "${FILES[@]}"; do
         p="${PIPELINES[$pi]}"
         cp "$file" "$BENCH_TMPDIR/$name"
         pz_comp_ns=$(avg_ns "$PZ" -k -f -p "$p" ${THREADS:+-t "$THREADS"} $GPU_FLAG "$BENCH_TMPDIR/$name")
+        # Subtract GPU init overhead for accurate per-file throughput
+        pz_comp_ns=$(( pz_comp_ns - GPU_INIT_NS ))
+        if [[ $pz_comp_ns -lt 0 ]]; then pz_comp_ns=1000000; fi  # 1ms floor
         pz_size=$(stat -c%s "$BENCH_TMPDIR/$name.pz" 2>/dev/null || stat -f%z "$BENCH_TMPDIR/$name.pz" 2>/dev/null)
         rm -f "$BENCH_TMPDIR/$name" "$BENCH_TMPDIR/$name.pz"
 
@@ -468,6 +518,9 @@ for file in "${FILES[@]}"; do
     for (( pi=0; pi<${#PIPELINES[@]}; pi++ )); do
         p="${PIPELINES[$pi]}"
         pz_dec_ns=$(avg_ns "$PZ" -d -k -f ${THREADS:+-t "$THREADS"} $GPU_FLAG "$BENCH_TMPDIR/$name.$p.pz")
+        # Subtract GPU init overhead for accurate per-file throughput
+        pz_dec_ns=$(( pz_dec_ns - GPU_INIT_NS ))
+        if [[ $pz_dec_ns -lt 0 ]]; then pz_dec_ns=1000000; fi
         drow+=$(printf " | %7s %8s" \
             "$(fmt_ms $pz_dec_ns)" "$(fmt_throughput $orig_size $pz_dec_ns)")
         dt_pz_ns[$pi]=$(( ${dt_pz_ns[$pi]} + pz_dec_ns ))
@@ -511,7 +564,7 @@ if [[ "$VERBOSE" == false ]]; then
         echo "  Threads:    $THREADS"
     fi
     if [[ -n "$GPU_FLAG" ]]; then
-        echo "  GPU:        enabled"
+        echo "  GPU:        enabled (init overhead: $(fmt_ms $GPU_INIT_NS) ms subtracted)"
     fi
     echo ""
 
