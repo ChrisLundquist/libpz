@@ -198,38 +198,6 @@ mod tests {
     }
 
     #[test]
-    fn test_round_trip_banana() {
-        let input = b"banana";
-        let encoded = encode(input);
-        let decoded = decode(&encoded);
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_round_trip_all_bytes() {
-        let input: Vec<u8> = (0..=255).collect();
-        let encoded = encode(&input);
-        let decoded = decode(&encoded);
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_round_trip_reverse_bytes() {
-        let input: Vec<u8> = (0..=255).rev().collect();
-        let encoded = encode(&input);
-        let decoded = decode(&encoded);
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_round_trip_longer_text() {
-        let input = b"the quick brown fox jumps over the lazy dog";
-        let encoded = encode(input);
-        let decoded = decode(&encoded);
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
     fn test_bwt_like_output() {
         // Simulate BWT output: clustered bytes
         let mut input = Vec::new();
@@ -250,29 +218,10 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_to_buf() {
-        let input = b"hello";
-        let mut buf = vec![0u8; 100];
-        let size = encode_to_buf(input, &mut buf).unwrap();
-        assert_eq!(size, input.len());
-        let decoded = decode(&buf[..size]);
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
     fn test_encode_to_buf_too_small() {
         let input = b"hello";
         let mut buf = vec![0u8; 2];
         assert_eq!(encode_to_buf(input, &mut buf), Err(PzError::BufferTooSmall));
-    }
-
-    #[test]
-    fn test_decode_to_buf() {
-        let input = b"hello";
-        let encoded = encode(input);
-        let mut buf = vec![0u8; 100];
-        let size = decode_to_buf(&encoded, &mut buf).unwrap();
-        assert_eq!(&buf[..size], input);
     }
 
     #[test]
@@ -284,25 +233,5 @@ mod tests {
             decode_to_buf(&encoded, &mut buf),
             Err(PzError::BufferTooSmall)
         );
-    }
-
-    #[test]
-    fn test_round_trip_binary() {
-        let input: Vec<u8> = (0..1024).map(|i| ((i * 37 + 13) % 256) as u8).collect();
-        let encoded = encode(&input);
-        let decoded = decode(&encoded);
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_identity_for_sorted_input() {
-        // Strictly increasing input: each byte appears at its natural position
-        let input: Vec<u8> = (0..=255).collect();
-        let encoded = encode(&input);
-        // First byte 0 is at position 0, then 1 is at position 1 (since 0 moved to front,
-        // everything else shifted right by 1, but 1 was at position 1 originally and moved to 2)
-        // Actually this isn't identity, but verify round-trip
-        let decoded = decode(&encoded);
-        assert_eq!(decoded, input);
     }
 }

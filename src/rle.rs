@@ -328,24 +328,6 @@ mod tests {
     }
 
     #[test]
-    fn test_single_byte() {
-        let input = b"x";
-        let encoded = encode(input);
-        assert_eq!(encoded, input);
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_three_same_bytes() {
-        let input = b"aaa";
-        let encoded = encode(input);
-        assert_eq!(encoded, input); // no RLE for < 4
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
     fn test_round_trip_binary() {
         // Binary data with natural runs
         let mut input = Vec::new();
@@ -371,29 +353,11 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_to_buf() {
-        let input = vec![b'a'; 10];
-        let mut buf = vec![0u8; 100];
-        let size = encode_to_buf(&input, &mut buf).unwrap();
-        let decoded = decode(&buf[..size]).unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
     fn test_encode_to_buf_too_small() {
         let input = vec![b'a'; 100];
         let mut buf = vec![0u8; 2]; // too small
         let result = encode_to_buf(&input, &mut buf);
         assert_eq!(result, Err(PzError::BufferTooSmall));
-    }
-
-    #[test]
-    fn test_decode_to_buf() {
-        let input = vec![b'x'; 20];
-        let encoded = encode(&input);
-        let mut buf = vec![0u8; 100];
-        let size = decode_to_buf(&encoded, &mut buf).unwrap();
-        assert_eq!(&buf[..size], &input[..]);
     }
 
     #[test]

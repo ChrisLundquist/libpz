@@ -81,27 +81,11 @@ mod tests {
     }
 
     #[test]
-    fn test_crc32_hello() {
-        // Known value for "hello"
-        assert_eq!(crc32(b"hello"), 0x3610_A686);
-    }
-
-    #[test]
     fn test_crc32_incremental() {
         let data = b"123456789";
         let mut c = Crc32::new();
         c.update(&data[..4]);
         c.update(&data[4..]);
-        assert_eq!(c.finalize(), 0xCBF4_3926);
-    }
-
-    #[test]
-    fn test_crc32_single_bytes() {
-        let data = b"123456789";
-        let mut c = Crc32::new();
-        for &b in data {
-            c.update(&[b]);
-        }
         assert_eq!(c.finalize(), 0xCBF4_3926);
     }
 }

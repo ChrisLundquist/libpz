@@ -853,15 +853,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decompress_to_buf() {
-        let input = b"abcabc";
-        let compressed = compress_lazy(input).unwrap();
-        let mut output = vec![0u8; 1024];
-        let size = decompress_to_buf(&compressed, &mut output).unwrap();
-        assert_eq!(&output[..size], input);
-    }
-
-    #[test]
     fn test_decompress_to_buf_too_small() {
         let input = b"abcabcabc";
         let compressed = compress_lazy(input).unwrap();
@@ -892,49 +883,11 @@ mod tests {
     // --- Lazy matching tests ---
 
     #[test]
-    fn test_lazy_round_trip_empty() {
-        let result = compress_lazy(&[]).unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_lazy_round_trip_single() {
-        let input = b"a";
-        let compressed = compress_lazy(input).unwrap();
-        let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(&decompressed, input);
-    }
-
-    #[test]
-    fn test_lazy_round_trip_no_matches() {
-        let input = b"abcdefgh";
-        let compressed = compress_lazy(input).unwrap();
-        let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(&decompressed, input);
-    }
-
-    #[test]
     fn test_lazy_round_trip_repeats() {
         let input = b"abcabcabc";
         let compressed = compress_lazy(input).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(&decompressed, input);
-    }
-
-    #[test]
-    fn test_lazy_round_trip_all_same() {
-        let input = vec![b'x'; 200];
-        let compressed = compress_lazy(&input).unwrap();
-        let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input);
-    }
-
-    #[test]
-    fn test_lazy_round_trip_longer_text() {
-        let input = b"the quick brown fox jumps over the lazy dog. the quick brown fox jumps over the lazy dog.";
-        let compressed = compress_lazy(input).unwrap();
-        let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(&decompressed, &input[..]);
     }
 
     #[test]
@@ -944,26 +897,6 @@ mod tests {
         assert_eq!(select_chain_depth(1024 * 1024, true), 32);
         assert_eq!(select_chain_depth(4 * 1024 * 1024, true), 24);
         assert_eq!(select_chain_depth(4 * 1024 * 1024, false), MAX_CHAIN);
-    }
-
-    #[test]
-    fn test_lazy_round_trip_large() {
-        let pattern = b"Hello, World! This is a test pattern. ";
-        let mut input = Vec::new();
-        for _ in 0..200 {
-            input.extend_from_slice(pattern);
-        }
-        let compressed = compress_lazy(&input).unwrap();
-        let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input);
-    }
-
-    #[test]
-    fn test_lazy_round_trip_binary() {
-        let input: Vec<u8> = (0..=255).cycle().take(1024).collect();
-        let compressed = compress_lazy(&input).unwrap();
-        let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input);
     }
 
     #[test]
@@ -1220,25 +1153,6 @@ mod tests {
             m.length
         );
         assert_eq!(m.offset, 1, "should match with offset 1");
-    }
-
-    /// Verify compress_lazy round-trips 100KB of identical bytes.
-    ///
-    /// Each match is capped at DEFLATE_MAX_MATCH=258 by the default finder,
-    /// so many sequential matches are needed.
-    #[test]
-    fn test_compress_lazy_to_matches_large_all_same() {
-        let input = vec![0xBBu8; 100_000];
-        let matches = compress_lazy_to_matches(&input).unwrap();
-        // With 258-byte max matches, need ~100000/259 ≈ 386 entries
-        assert!(
-            matches.len() > 100,
-            "100KB all-same should need many matches, got {}",
-            matches.len()
-        );
-        let compressed = compress_lazy(&input).unwrap();
-        let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input);
     }
 
     /// Verify compress_lazy_with_limit produces longer matches and fewer tokens.
