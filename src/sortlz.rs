@@ -254,6 +254,140 @@ pub fn find_matches_topk(
     table
 }
 
+/// Find matches using 8-byte sort keys with neighbor scanning.
+///
+/// Unlike `find_matches` which uses 4-byte sort keys and only checks within
+/// same-key clusters, this sorts on 8-byte keys and scans `neighbor_radius`
+/// entries forward in sorted order. Lexicographic sorting on longer keys
+/// groups positions with similar (not just identical) prefixes together,
+/// enabling discovery of matches that 4-byte clustering misses due to
+/// candidate limits in large clusters.
+///
+/// When `cluster_bounded` is true, scanning stops at the 4-byte prefix
+/// cluster boundary. This guarantees all candidates share ≥4 byte prefixes
+/// (same coverage as 4-byte sort) while using the 8-byte sub-sort to
+/// prioritize the best candidates (those sharing the longest prefixes).
+///
+/// Conceptually a step toward suffix-array-based match finding:
+/// - 4-byte sort: only same-cluster matches
+/// - 8-byte sort + bounded neighbors: sub-sorted cluster scanning
+/// - 8-byte sort + unbounded neighbors: cross-cluster near-match discovery
+/// - Full suffix array: optimal match finding (limit case)
+pub fn find_matches_neighbor(
+    input: &[u8],
+    config: &SortLzConfig,
+    neighbor_radius: usize,
+    cluster_bounded: bool,
+) -> Vec<Option<(u16, u16)>> {
+    let n = input.len();
+    if n < 4 {
+        return vec![None; n];
+    }
+
+    // Step 1: Build 8-byte sort keys for all positions.
+    // Positions near the end that can't fill 8 bytes are zero-padded,
+    // preserving correct lexicographic order.
+    let num_hashes = n.saturating_sub(3);
+    let mut pairs: Vec<(u64, u32)> = Vec::with_capacity(num_hashes);
+    for i in 0..num_hashes {
+        let mut key_bytes = [0u8; 8];
+        let available = (n - i).min(8);
+        key_bytes[..available].copy_from_slice(&input[i..i + available]);
+        // Big-endian so that byte 0 is most significant → lexicographic sort
+        // order matches prefix ordering (byte 0, then byte 1, ...).
+        let key = u64::from_be_bytes(key_bytes);
+        pairs.push((key, i as u32));
+    }
+
+    // Step 2: Radix sort by 8-byte key (8 passes).
+    radix_sort_pairs_u64(&mut pairs);
+
+    // Step 3: Neighbor scanning match verification.
+    // For each position in sorted order, scan up to `neighbor_radius` entries
+    // forward. Adjacent entries share long common prefixes due to lexicographic
+    // ordering, so nearby entries are likely to produce long matches.
+    let mut best_match: Vec<Option<(u16, u16)>> = vec![None; n];
+
+    for i in 0..pairs.len() {
+        let pos_a = pairs[i].1 as usize;
+
+        // Skip if this position already has a good-enough match.
+        if let Some((_, len)) = best_match[pos_a] {
+            if len >= SATISFICE_LEN {
+                continue;
+            }
+        }
+
+        // Extract 4-byte prefix for cluster bounding (upper 32 bits of BE key).
+        let prefix_a = (pairs[i].0 >> 32) as u32;
+
+        let end = (i + neighbor_radius + 1).min(pairs.len());
+        let mut candidates_checked = 0;
+        for pair_b in &pairs[(i + 1)..end] {
+            if candidates_checked >= config.max_candidates {
+                break;
+            }
+
+            // If cluster-bounded, stop when we leave the 4-byte prefix cluster.
+            if cluster_bounded {
+                let prefix_b = (pair_b.0 >> 32) as u32;
+                if prefix_b != prefix_a {
+                    break;
+                }
+            }
+
+            let pos_b = pair_b.1 as usize;
+
+            // Ensure earlier position is source for valid back-reference.
+            let (src, dst) = if pos_a < pos_b {
+                (pos_a, pos_b)
+            } else {
+                (pos_b, pos_a)
+            };
+
+            let distance = dst - src;
+            if distance > config.max_window || distance == 0 {
+                candidates_checked += 1;
+                continue;
+            }
+
+            // Skip offsets that overflow u16 (lz77::Match.offset is u16).
+            if distance > u16::MAX as usize {
+                candidates_checked += 1;
+                continue;
+            }
+
+            // Skip if destination already has a good-enough match.
+            if let Some((_, existing_len)) = best_match[dst] {
+                if existing_len >= SATISFICE_LEN {
+                    candidates_checked += 1;
+                    continue;
+                }
+            }
+
+            // Verify and extend match (must share at least min_match bytes).
+            let match_len = extend_match(input, src, dst);
+            if match_len >= config.min_match {
+                let offset = distance as u16;
+                let length = match_len as u16;
+
+                // Update best match for the destination position.
+                if let Some((_, existing_len)) = best_match[dst] {
+                    if length > existing_len {
+                        best_match[dst] = Some((offset, length));
+                    }
+                } else {
+                    best_match[dst] = Some((offset, length));
+                }
+            }
+
+            candidates_checked += 1;
+        }
+    }
+
+    best_match
+}
+
 /// Insert a candidate into a top-K slot, maintaining length-descending order.
 /// If the slot is full and the new candidate is shorter than all existing ones,
 /// it is discarded.
@@ -724,6 +858,68 @@ fn radix_sort_pairs(pairs: &mut [(u32, u32)]) {
     }
 }
 
+/// Radix sort (key, position) pairs where key is u64.
+/// Uses 8-pass 8-bit radix sort (LSB first) with double-buffering.
+/// Same algorithm as `radix_sort_pairs` but for 64-bit sort keys.
+type Pair64SliceRefs<'a> = (&'a [(u64, u32)], &'a mut [(u64, u32)]);
+
+fn radix_sort_pairs_u64(pairs: &mut [(u64, u32)]) {
+    if pairs.len() <= 1 {
+        return;
+    }
+
+    let n = pairs.len();
+    let mut buf = vec![(0u64, 0u32); n];
+    let mut in_buf = false;
+
+    for byte_idx in 0..8u32 {
+        let shift = byte_idx * 8;
+        let (src, dst): Pair64SliceRefs = if in_buf {
+            (buf.as_slice(), pairs)
+        } else {
+            (pairs, buf.as_mut_slice())
+        };
+
+        // Count.
+        let mut counts = [0u32; 256];
+        for &(key, _) in src.iter() {
+            let bucket = ((key >> shift) & 0xFF) as usize;
+            counts[bucket] += 1;
+        }
+
+        // Skip pass if all values are in one bucket.
+        let mut nonzero = 0u32;
+        for &c in &counts {
+            nonzero += u32::from(c > 0);
+        }
+        if nonzero <= 1 {
+            continue;
+        }
+
+        // Prefix sum.
+        let mut offsets = [0u32; 256];
+        let mut sum = 0u32;
+        for i in 0..256 {
+            offsets[i] = sum;
+            sum += counts[i];
+        }
+
+        // Scatter.
+        for &pair in src.iter() {
+            let bucket = ((pair.0 >> shift) & 0xFF) as usize;
+            dst[offsets[bucket] as usize] = pair;
+            offsets[bucket] += 1;
+        }
+
+        in_buf = !in_buf;
+    }
+
+    // If final result ended up in buf, copy back (8 passes = even, should be in pairs).
+    if in_buf {
+        pairs.copy_from_slice(&buf);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,5 +1168,61 @@ mod tests {
         let compressed = pipeline::compress_with_options(&input, Pipeline::LzSeqH, &opts).unwrap();
         let decoded = pipeline::decompress(&compressed).unwrap();
         assert_eq!(decoded, input, "LzSeqH + SortLz roundtrip failed");
+    }
+
+    // -----------------------------------------------------------------------
+    // 8-byte neighbor scanning tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_radix_sort_u64() {
+        let mut pairs: Vec<(u64, u32)> = vec![(500, 0), (100, 1), (300, 2), (200, 3), (400, 4)];
+        radix_sort_pairs_u64(&mut pairs);
+        let keys: Vec<u64> = pairs.iter().map(|p| p.0).collect();
+        assert_eq!(keys, vec![100, 200, 300, 400, 500]);
+    }
+
+    #[test]
+    fn test_neighbor_roundtrip_simple() {
+        let input = b"abcabcabcabcabcabcabc";
+        let config = SortLzConfig::default();
+        let matches = find_matches_neighbor(input, &config, 16, false);
+        let compressed = compress_with_matches(input, matches, &config).unwrap();
+        let decompressed = decompress(&compressed, input.len()).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_neighbor_roundtrip_longer() {
+        let input = test_data();
+        let config = SortLzConfig::default();
+        let matches = find_matches_neighbor(&input, &config, 16, false);
+        let compressed = compress_with_matches(&input, matches, &config).unwrap();
+        let decompressed = decompress(&compressed, input.len()).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_neighbor_finds_matches() {
+        let input = test_data();
+        let config = SortLzConfig::default();
+
+        let matches_4b = find_matches(&input, &config);
+        let matches_8b = find_matches_neighbor(&input, &config, 16, false);
+
+        // Both should find matches in repetitive data
+        let count_4b = matches_4b.iter().filter(|m| m.is_some()).count();
+        let count_8b = matches_8b.iter().filter(|m| m.is_some()).count();
+        assert!(count_4b > 0, "4-byte should find matches");
+        assert!(count_8b > 0, "8-byte neighbor should find matches");
+    }
+
+    #[test]
+    fn test_neighbor_determinism() {
+        let input = b"the quick brown fox jumps over the lazy dog the quick brown fox";
+        let config = SortLzConfig::default();
+        let m1 = find_matches_neighbor(input, &config, 16, false);
+        let m2 = find_matches_neighbor(input, &config, 16, false);
+        assert_eq!(m1, m2, "neighbor scanning must be deterministic");
     }
 }
