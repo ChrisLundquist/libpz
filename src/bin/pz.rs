@@ -46,6 +46,9 @@ fn usage() {
     eprintln!("  --quality          Quality mode: optimal parsing + deep chains (slow encode, best ratio)");
     eprintln!("  --rans-interleaved Enable interleaved rANS on rANS pipelines");
     eprintln!(
+        "  --rans-shared-stream Use shared-stream rANS (faster decode, implies --rans-interleaved)"
+    );
+    eprintln!(
         "  --rans-interleaved-min-bytes N  Min stream size for interleaved rANS (default: 65536)"
     );
     eprintln!(
@@ -113,6 +116,7 @@ struct Opts {
     rans_interleaved: bool,
     rans_interleaved_min_bytes: usize,
     rans_interleaved_states: usize,
+    rans_shared_stream: bool,
     pipeline: Pipeline,
     files: Vec<String>,
 }
@@ -136,6 +140,7 @@ fn parse_args() -> Opts {
         rans_interleaved: false,
         rans_interleaved_min_bytes: 64 * 1024,
         rans_interleaved_states: pz::rans::DEFAULT_INTERLEAVE,
+        rans_shared_stream: false,
         pipeline: Pipeline::Deflate,
         files: Vec::new(),
     };
@@ -185,6 +190,10 @@ fn parse_args() -> Opts {
                 };
             }
             "--rans-interleaved" => opts.rans_interleaved = true,
+            "--rans-shared-stream" => {
+                opts.rans_shared_stream = true;
+                opts.rans_interleaved = true; // shared-stream implies interleaved
+            }
             "--rans-interleaved-min-bytes" => {
                 i += 1;
                 if i >= args.len() {
@@ -402,6 +411,7 @@ fn build_cli_options(opts: &Opts) -> (CompressOptions, DecompressOptions) {
         rans_interleaved: opts.rans_interleaved,
         rans_interleaved_min_bytes: opts.rans_interleaved_min_bytes,
         rans_interleaved_states: opts.rans_interleaved_states,
+        rans_shared_stream: opts.rans_shared_stream,
         #[cfg(feature = "webgpu")]
         webgpu_engine: gpu.webgpu_engine.clone(),
         ..Default::default()

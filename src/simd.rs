@@ -1233,7 +1233,7 @@ static WORD_COUNTS: [usize; 16] = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 
 /// # Safety
 /// Requires SSSE3 (for `_mm_shuffle_epi8`) and SSE4.1 (for `_mm_mullo_epi32`
 /// and `_mm_blendv_epi8`). Caller must ensure these features are available.
-/// `shared_words` must have at least 4 bytes of readable padding past the end
+/// `shared_words` must have at least 8 bytes of readable padding past the end
 /// (the encode format provides 8 bytes of zero padding).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3", enable = "sse4.1")]
@@ -1276,8 +1276,6 @@ pub unsafe fn rans_decode_4way_shared_ssse3(
     // Raw pointer into shared word stream (byte-addressed for _mm_loadl_epi64)
     let word_base = shared_words.as_ptr() as *const u8;
     let mut word_byte_pos: usize = 0;
-    // Safety limit: don't read past the actual word data (padding handles over-read)
-    let word_byte_end = shared_words.len() * 2;
 
     let full_quads = original_len / 4;
     let remainder = original_len % 4;
@@ -1355,8 +1353,8 @@ pub unsafe fn rans_decode_4way_shared_ssse3(
     // Scalar remainder for last < 4 symbols
     _mm_storeu_si128(state_arr.as_mut_ptr() as *mut __m128i, states);
     let mut wp = word_byte_pos / 2; // convert back to word index
-    for r in 0..remainder {
-        let lane = r;
+    #[allow(clippy::needless_range_loop)] // lane indexes state_arr + drives slot lookups
+    for lane in 0..remainder {
         let slot = state_arr[lane] & scale_mask;
         if slot as usize >= table_len {
             return None;
@@ -1374,7 +1372,169 @@ pub unsafe fn rans_decode_4way_shared_ssse3(
         out_pos += 1;
     }
 
-    let _ = word_byte_end; // suppress unused warning
+    Some(output)
+}
+
+// ---------------------------------------------------------------------------
+// rANS 4-way shared-stream AVX2 decode (hardware gather)
+// ---------------------------------------------------------------------------
+
+/// AVX2 4-way shared-stream rANS decode with hardware gather.
+///
+/// Replaces the scalar gather bottleneck that made the SSSE3 path slower
+/// than scalar (432 MiB/s vs 1.18 GiB/s). AVX2's `_mm_i32gather_epi32`
+/// does all 4 slot_table lookups in a single instruction, eliminating
+/// the extract→load→repack overhead.
+///
+/// Combines all four ryg_rans techniques:
+///
+/// 1. **Merged slot table**: single gather reads freq+bias per lane
+/// 2. **AVX2 hardware gather**: `_mm_i32gather_epi32` replaces 4 scalar loads
+/// 3. **SSE4.1 `_mm_mullo_epi32`**: 4-lane u32 multiply
+/// 4. **PSHUFB branchless renorm**: SSSE3 shuffle routes shared-stream words
+///
+/// # Safety
+/// Requires AVX2 (which implies SSSE3 + SSE4.1). `shared_words` must have
+/// at least 8 bytes of readable padding past the end (the encode format
+/// provides 8 bytes of zero padding).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn rans_decode_4way_shared_avx2(
+    shared_words: &[u16],
+    initial_states: &[u32],
+    slot2sym: &[u8],
+    slot_table: &[crate::rans::SlotEntry],
+    scale_bits: u32,
+    original_len: usize,
+    num_states: usize,
+) -> Option<Vec<u8>> {
+    use std::arch::x86_64::*;
+
+    if num_states != 4 || initial_states.len() != 4 {
+        return None;
+    }
+
+    let scale_mask = (1u32 << scale_bits) - 1;
+    let table_len = slot2sym.len();
+
+    // Load initial states into SSE register
+    let mut states = _mm_set_epi32(
+        initial_states[3] as i32,
+        initial_states[2] as i32,
+        initial_states[1] as i32,
+        initial_states[0] as i32,
+    );
+
+    // Constants
+    let scale_mask_vec = _mm_set1_epi32(scale_mask as i32);
+    let sign_bit = _mm_set1_epi32(0x80000000u32 as i32);
+    let threshold = _mm_set1_epi32(0x80010000u32 as i32);
+    let scale_vec = _mm_set_epi64x(0, scale_bits as i64);
+    let lo16_mask = _mm_set1_epi32(0xFFFF);
+
+    let mut output = vec![0u8; original_len];
+    let mut out_pos = 0;
+
+    // Raw pointer into shared word stream
+    let word_base = shared_words.as_ptr() as *const u8;
+    let mut word_byte_pos: usize = 0;
+
+    // Slot table base pointer for gather (each entry is 4 bytes = 1 i32)
+    let slot_base = slot_table.as_ptr() as *const i32;
+
+    let full_quads = original_len / 4;
+    let remainder = original_len % 4;
+
+    // Temporary for extracting slots for symbol lookup
+    let mut slot_arr = [0u32; 4];
+
+    for _ in 0..full_quads {
+        // Step 1: Compute slots = states & scale_mask (SIMD)
+        let slots = _mm_and_si128(states, scale_mask_vec);
+
+        // Step 2: Extract slots for bounds check + symbol lookup (scalar)
+        _mm_storeu_si128(slot_arr.as_mut_ptr() as *mut __m128i, slots);
+
+        // Bounds check all 4
+        if (slot_arr[0] as usize
+            | slot_arr[1] as usize
+            | slot_arr[2] as usize
+            | slot_arr[3] as usize)
+            >= table_len
+        {
+            return None;
+        }
+
+        // Scalar symbol lookup (slot2sym is u8[], not worth SIMD-gathering)
+        let s0 = *slot2sym.get_unchecked(slot_arr[0] as usize);
+        let s1 = *slot2sym.get_unchecked(slot_arr[1] as usize);
+        let s2 = *slot2sym.get_unchecked(slot_arr[2] as usize);
+        let s3 = *slot2sym.get_unchecked(slot_arr[3] as usize);
+
+        // Step 3: AVX2 hardware gather for freq_bias (THE key optimization)
+        // SCALE=4: byte_offset = slot * 4, matching SlotEntry's 4-byte stride
+        let fb_vec = _mm_i32gather_epi32::<4>(slot_base, slots);
+
+        // Step 4: Split freq (low 16) and bias (high 16)
+        let freq_vec = _mm_and_si128(fb_vec, lo16_mask);
+        let bias_vec = _mm_srli_epi32::<16>(fb_vec);
+
+        // Step 5: State transition — freq * (state >> scale_bits) + bias
+        let shifted = _mm_srl_epi32(states, scale_vec);
+        let products = _mm_mullo_epi32(freq_vec, shifted);
+        states = _mm_add_epi32(products, bias_vec);
+
+        // Step 6: Unsigned compare — which lanes need renormalization?
+        let xored = _mm_xor_si128(states, sign_bit);
+        let cmp = _mm_cmplt_epi32(xored, threshold);
+        let mask_4bit = _mm_movemask_ps(_mm_castsi128_ps(cmp)) as usize;
+
+        // Step 7: Load words from shared stream and shuffle to correct lanes
+        let raw_words = _mm_loadl_epi64(word_base.add(word_byte_pos) as *const __m128i);
+        let shuf_ctrl = _mm_load_si128(SHUFFLE_MASKS[mask_4bit].0.as_ptr() as *const __m128i);
+        let word_vec = _mm_shuffle_epi8(raw_words, shuf_ctrl);
+
+        // Step 8: Compute merged states — (state << 16) | word
+        let shifted_states = _mm_slli_epi32(states, 16);
+        let merged = _mm_or_si128(shifted_states, word_vec);
+
+        // Step 9: Conditional update — blend merged where renorm needed
+        states = _mm_blendv_epi8(states, merged, cmp);
+
+        // Step 10: Advance shared pointer by number of words consumed
+        word_byte_pos += WORD_COUNTS[mask_4bit] * 2;
+
+        // Step 11: Write output symbols
+        *output.get_unchecked_mut(out_pos) = s0;
+        *output.get_unchecked_mut(out_pos + 1) = s1;
+        *output.get_unchecked_mut(out_pos + 2) = s2;
+        *output.get_unchecked_mut(out_pos + 3) = s3;
+        out_pos += 4;
+    }
+
+    // Scalar remainder for last < 4 symbols
+    let mut state_arr = [0u32; 4];
+    _mm_storeu_si128(state_arr.as_mut_ptr() as *mut __m128i, states);
+    let mut wp = word_byte_pos / 2;
+    #[allow(clippy::needless_range_loop)] // lane indexes state_arr + drives slot lookups
+    for lane in 0..remainder {
+        let slot = state_arr[lane] & scale_mask;
+        if slot as usize >= table_len {
+            return None;
+        }
+        let s = *slot2sym.get_unchecked(slot as usize);
+        let e = slot_table.get_unchecked(slot as usize).freq_bias;
+        state_arr[lane] = (e & 0xFFFF) * (state_arr[lane] >> scale_bits) + (e >> 16);
+
+        if state_arr[lane] < (1 << 16) && wp < shared_words.len() {
+            state_arr[lane] = (state_arr[lane] << 16) | *shared_words.get_unchecked(wp) as u32;
+            wp += 1;
+        }
+
+        *output.get_unchecked_mut(out_pos) = s;
+        out_pos += 1;
+    }
+
     Some(output)
 }
 

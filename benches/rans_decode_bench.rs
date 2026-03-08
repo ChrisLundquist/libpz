@@ -32,12 +32,30 @@ fn bench_rans_decode_shared_stream(c: &mut Criterion) {
         .collect();
 
     let encoded = pz::rans::encode_shared_stream(&input_1mb);
+    let len = input_1mb.len();
 
     let mut g = c.benchmark_group("rans_decode_shared_stream");
-    g.throughput(Throughput::Bytes(input_1mb.len() as u64));
+    g.throughput(Throughput::Bytes(len as u64));
 
-    g.bench_function("decode_shared_stream", |b| {
-        b.iter(|| pz::rans::decode_shared_stream(&encoded, input_1mb.len()).unwrap())
+    // Side-by-side comparison of all implementations
+    g.bench_function("scalar", |b| {
+        b.iter(|| pz::rans::decode_shared_stream_force_scalar(&encoded, len).unwrap())
+    });
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        g.bench_function("ssse3_pshufb", |b| {
+            b.iter(|| pz::rans::decode_shared_stream_force_ssse3(&encoded, len).unwrap())
+        });
+
+        g.bench_function("avx2_gather", |b| {
+            b.iter(|| pz::rans::decode_shared_stream_force_avx2(&encoded, len).unwrap())
+        });
+    }
+
+    // Auto-dispatch (what the user gets by default)
+    g.bench_function("auto", |b| {
+        b.iter(|| pz::rans::decode_shared_stream(&encoded, len).unwrap())
     });
 
     g.finish();

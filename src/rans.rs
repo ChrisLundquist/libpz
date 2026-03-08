@@ -1468,23 +1468,45 @@ pub fn decode_shared_stream(input: &[u8], original_len: usize) -> PzResult<Vec<u
     // Build slot table for fast decode
     let (slot2sym, slot_table) = build_slot_table(&norm);
 
-    // SIMD dispatch: SSSE3+SSE4.1 PSHUFB path.
+    // SIMD dispatch: DISABLED — both paths are 2.7× slower than scalar.
     //
-    // Currently DISABLED: the scalar batched 4-way path (1.18 GiB/s) is 2.7x
-    // faster than the SIMD path (432 MiB/s) because the scalar gather
-    // (slot2sym + slot_table lookups) dominates, and SIMD pack/unpack for
-    // the gather adds overhead that exceeds the branchless renorm savings.
+    // Benchmark results (1 MB, 4-way, 100 symbols):
+    //   Scalar batched:    1.145 GiB/s  ← winner
+    //   SSSE3 PSHUFB:      429 MiB/s   (scalar gather bottleneck)
+    //   AVX2 hw gather:    422 MiB/s   (gather latency ≈ scalar gather)
     //
-    // The SIMD path will become viable when:
-    // - AVX2 _mm256_i32gather_epi32 eliminates the scalar gather bottleneck
-    // - 8-way interleaving amortizes SIMD overhead across more lanes
+    // The SIMD approach loses because:
+    // 1. SIMD state management (store→extract→reload) costs more than
+    //    keeping 4 states in scalar registers with OoO overlap
+    // 2. Branch prediction handles renorm well (~25% taken = predictable);
+    //    branchless PSHUFB saves almost no cycles while adding overhead
+    // 3. AVX2 gather has 12+ cycle latency — not faster than 4 scalar loads
     //
-    // The implementation is preserved and tested for future AVX2 work.
+    // Both implementations are preserved for benchmarking (`force_ssse3`,
+    // `force_avx2`) and will become viable if:
+    // - 8-way or wider interleaving amortizes SIMD overhead
+    // - Future CPUs have faster gather (sub-4-cycle)
+    #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::overly_complex_bool_expr)]
+    if false && num_states == 4 && is_x86_feature_detected!("avx2") {
+        if let Some(result) = unsafe {
+            crate::simd::rans_decode_4way_shared_avx2(
+                &word_slice,
+                &initial_states,
+                &slot2sym,
+                &slot_table,
+                norm.scale_bits as u32,
+                original_len,
+                num_states,
+            )
+        } {
+            return Ok(result);
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[allow(clippy::overly_complex_bool_expr)]
     if false && num_states == 4 && is_x86_feature_detected!("sse4.1") {
-        // SAFETY: feature detection checked above; shared_words has 8 bytes
-        // of zero padding for safe _mm_loadl_epi64 over-read at end
         if let Some(result) = unsafe {
             crate::simd::rans_decode_4way_shared_ssse3(
                 &word_slice,
@@ -1642,6 +1664,158 @@ fn rans_decode_shared_stream_scalar(
     }
 
     Ok(output)
+}
+
+// ---------------------------------------------------------------------------
+// Force-implementation decode helpers (for benchmarking)
+// ---------------------------------------------------------------------------
+
+/// Parsed shared-stream components for benchmarking individual decode paths.
+struct SharedStreamParts {
+    shared_words: Vec<u16>,
+    initial_states: Vec<u32>,
+    slot2sym: Vec<u8>,
+    slot_table: Vec<SlotEntry>,
+    scale_bits: u32,
+    num_states: usize,
+}
+
+/// Parse the shared-stream header and build slot tables.
+///
+/// Returns the components needed by the raw decode functions. Used by
+/// the benchmark harness to measure each implementation independently.
+fn parse_shared_stream_components(
+    input: &[u8],
+    original_len: usize,
+) -> PzResult<SharedStreamParts> {
+    if original_len == 0 {
+        return Err(PzError::InvalidInput);
+    }
+    if input.len() < 1 + NUM_SYMBOLS * 2 + 1 {
+        return Err(PzError::InvalidInput);
+    }
+
+    let scale_bits = input[0];
+    if !(MIN_SCALE_BITS..=MAX_SCALE_BITS).contains(&scale_bits) {
+        return Err(PzError::InvalidInput);
+    }
+
+    let norm = deserialize_freq_table(&input[1..], scale_bits)?;
+    let pos = 1 + NUM_SYMBOLS * 2;
+    let num_states = input[pos] as usize;
+    if num_states == 0 {
+        return Err(PzError::InvalidInput);
+    }
+
+    let mut cursor = pos + 1;
+    if input.len() < cursor + num_states * 4 {
+        return Err(PzError::InvalidInput);
+    }
+    let mut initial_states = Vec::with_capacity(num_states);
+    for _ in 0..num_states {
+        initial_states.push(u32::from_le_bytes([
+            input[cursor],
+            input[cursor + 1],
+            input[cursor + 2],
+            input[cursor + 3],
+        ]));
+        cursor += 4;
+    }
+
+    if input.len() < cursor + 4 {
+        return Err(PzError::InvalidInput);
+    }
+    let total_words = u32::from_le_bytes([
+        input[cursor],
+        input[cursor + 1],
+        input[cursor + 2],
+        input[cursor + 3],
+    ]) as usize;
+    cursor += 4;
+
+    if input.len() < cursor + total_words * 2 {
+        return Err(PzError::InvalidInput);
+    }
+    let word_slice = bytes_as_u16_le(&input[cursor..], total_words);
+    // Append 4 zero u16 words (= 8 bytes) of padding for safe SIMD over-reads.
+    // The SSSE3 and AVX2 decode functions use _mm_loadl_epi64 which loads 8
+    // bytes at a time; without padding the last load could read past the
+    // allocation. The original `decode_shared_stream` borrows directly from
+    // the input buffer where the encoder already appended 8 zero bytes, but
+    // this owned Vec needs its own padding.
+    let mut shared_words: Vec<u16> = Vec::with_capacity(total_words + 4);
+    shared_words.extend_from_slice(&word_slice);
+    shared_words.extend_from_slice(&[0u16; 4]);
+
+    let (slot2sym, slot_table) = build_slot_table(&norm);
+
+    Ok(SharedStreamParts {
+        shared_words,
+        initial_states,
+        slot2sym,
+        slot_table,
+        scale_bits: scale_bits as u32,
+        num_states,
+    })
+}
+
+/// Decode shared-stream rANS using the scalar batched 4-way path (no SIMD).
+#[doc(hidden)]
+pub fn decode_shared_stream_force_scalar(input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
+    let p = parse_shared_stream_components(input, original_len)?;
+    rans_decode_shared_stream_scalar(
+        &p.shared_words,
+        &p.initial_states,
+        &p.slot2sym,
+        &p.slot_table,
+        p.scale_bits,
+        original_len,
+        p.num_states,
+    )
+}
+
+/// Decode shared-stream rANS using the SSSE3+SSE4.1 PSHUFB path.
+#[doc(hidden)]
+#[cfg(target_arch = "x86_64")]
+pub fn decode_shared_stream_force_ssse3(input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
+    if !is_x86_feature_detected!("sse4.1") {
+        return Err(PzError::InvalidInput);
+    }
+    let p = parse_shared_stream_components(input, original_len)?;
+    unsafe {
+        crate::simd::rans_decode_4way_shared_ssse3(
+            &p.shared_words,
+            &p.initial_states,
+            &p.slot2sym,
+            &p.slot_table,
+            p.scale_bits,
+            original_len,
+            p.num_states,
+        )
+    }
+    .ok_or(PzError::InvalidInput)
+}
+
+/// Decode shared-stream rANS using the AVX2 hardware gather path.
+#[doc(hidden)]
+#[cfg(target_arch = "x86_64")]
+pub fn decode_shared_stream_force_avx2(input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
+    if !is_x86_feature_detected!("avx2") {
+        return Err(PzError::InvalidInput);
+    }
+    let p = parse_shared_stream_components(input, original_len)?;
+    unsafe {
+        crate::simd::rans_decode_4way_shared_avx2(
+            &p.shared_words,
+            &p.initial_states,
+            &p.slot2sym,
+            &p.slot_table,
+            p.scale_bits,
+            original_len,
+            p.num_states,
+        )
+    }
+    .ok_or(PzError::InvalidInput)
 }
 
 // ---------------------------------------------------------------------------
