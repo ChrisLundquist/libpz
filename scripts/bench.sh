@@ -165,7 +165,7 @@ if [[ ${#FILES[@]} -eq 0 ]]; then
     for f in "$PROJECT_DIR"/samples/cantrbry/* "$PROJECT_DIR"/samples/large/*; do
         # Skip archives and compressed leftovers — only benchmark raw sample files
         [[ -f "$f" ]] || continue
-        case "$f" in *.tar.gz|*.pz|*.gz|.extracted) continue ;; esac
+        case "$f" in *.tar.gz|*.pz|*.gz|*/.extracted) continue ;; esac
         FILES+=("$f")
     done
     if [[ "$INCLUDE_SILESIA" == true ]] && [[ -d "$PROJECT_DIR/samples/silesia" ]]; then

@@ -31,6 +31,7 @@ impl BufferFormula {
 /// Cost model for a single GPU kernel, parsed from `@pz_cost` annotations
 /// embedded as structured comments in kernel source files.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields read by tests and the cost-model scheduler
 pub(crate) struct KernelCost {
     /// GPU threads launched per input byte (e.g., 1.0 for per-position kernels).
     pub threads_per_element: f64,
@@ -105,6 +106,7 @@ impl KernelCost {
     }
 
     /// Total GPU threads across all passes.
+    #[cfg(test)]
     pub fn total_threads(&self, input_len: usize) -> usize {
         (self.threads_per_element * input_len as f64) as usize * self.passes
     }

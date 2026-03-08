@@ -12,7 +12,7 @@ Each experiment is named by a letter (C/D/E/F) and a short pipeline name usable 
 
 ### Implementation status
 
-CPU reference implementations exist for all 4 pipelines (`src/bitplane.rs`, `src/fwst.rs`, `src/parlz.rs`, `src/repair.rs`). These serve as correctness scaffolding and decompression paths. **The GPU kernels are the actual experiment** — the CPU versions exist only to validate round-trip correctness and provide baseline measurements. The experiments cannot answer their architectural questions without GPU-native implementations.
+CPU reference implementations originally existed for all 4 pipelines. After evaluation, `bitplane.rs`, `fwst.rs`, and `repair.rs` were removed as dead-end GPU experiments; only `src/parlz.rs` remains. The experiments below are retained for design context — see the refactor commit `b88887a` for removal details.
 
 ---
 

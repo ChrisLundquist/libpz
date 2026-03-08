@@ -67,12 +67,7 @@ impl SortLzConfig {
     }
 }
 
-/// A parsed LZ token: either a literal byte or a (length, offset) match.
-#[derive(Debug, Clone, Copy)]
-enum LzToken {
-    Literal(u8),
-    Match { offset: u16, length: u16 },
-}
+use crate::lz77::LzToken;
 
 /// Find matches using sort-based approach.
 ///

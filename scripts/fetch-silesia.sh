@@ -8,7 +8,10 @@
 
 set -euo pipefail
 
-DEST="samples/silesia"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+DEST="${PROJECT_DIR}/samples/silesia"
 URL="https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip"
 EXPECTED_FILES=12
 

@@ -14,7 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PZ="${PROJECT_DIR}/target/release/pz"
-SAMPLES_DIR="${PROJECT_DIR}/samples"
+SAMPLES_DIR="${PROJECT_DIR}/samples/cantrbry"
 
 ITERATIONS=3
 QUICK=false
@@ -72,7 +72,6 @@ PIPELINES=(
     lz78r
     lzseqr
     lzseqh
-    csbwt
     sortlz
 )
 

@@ -22,10 +22,10 @@ pub mod simd;
 pub mod sortlz;
 pub mod streaming;
 
-#[allow(dead_code)]
+#[cfg(feature = "webgpu")]
 mod gpu_cost;
 
-#[allow(dead_code)]
+#[cfg(feature = "webgpu")]
 mod gpu_common;
 
 #[cfg(feature = "webgpu")]

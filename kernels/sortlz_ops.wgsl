@@ -114,14 +114,20 @@ fn sortlz_verify_matches(@builtin(global_invocation_id) gid: vec3<u32>) {
             continue;
         }
 
-        // Extend match by comparing bytes. Hash guarantees first 4 match.
-        var match_len: u32 = 4u;
+        // Extend match by comparing bytes from position 0 (hash match does not
+        // guarantee byte equality on collision).
+        var match_len: u32 = 0u;
         let max_len = min(n - dst, min(n - src, 260u)); // cap extension at 260
-        for (var k: u32 = 4u; k < max_len; k++) {
+        for (var k: u32 = 0u; k < max_len; k++) {
             if (read_byte(src + k) != read_byte(dst + k)) {
                 break;
             }
             match_len = k + 1u;
+        }
+
+        // Require minimum match length of 4 (matches SortLzConfig::min_match).
+        if (match_len < 4u) {
+            continue;
         }
 
         // Pack (length, offset) into u32: length in high 16 bits so atomicMax prefers longer.
