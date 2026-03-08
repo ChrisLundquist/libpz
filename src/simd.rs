@@ -757,6 +757,125 @@ pub fn rans_decode_4way(
     Some(output)
 }
 
+// ---------------------------------------------------------------------------
+// rANS 4-way decode with merged slot table (ryg_rans-style)
+// ---------------------------------------------------------------------------
+
+/// Decode 4-way interleaved rANS using merged slot-indexed tables.
+///
+/// Eliminates the 2-hop gather (slot → symbol → freq/cum) by combining
+/// freq and bias into a single table lookup per lane.  The state
+/// transition per lane becomes:
+///
+/// ```text
+/// slot = state & mask
+/// sym  = slot2sym[slot]
+/// entry = slot_table[slot]
+/// freq  = entry.freq_bias & 0xFFFF
+/// bias  = entry.freq_bias >> 16
+/// new_state = freq * (state >> scale_bits) + bias
+/// ```
+pub fn rans_decode_4way_slot(
+    word_streams: &[&[u16]; 4],
+    initial_states: &[u32; 4],
+    slot2sym: &[u8],
+    slot_table: &[crate::rans::SlotEntry],
+    scale_bits: u32,
+    original_len: usize,
+) -> Option<Vec<u8>> {
+    let scale_mask = (1u32 << scale_bits) - 1;
+    let rans_l: u32 = 1 << 16;
+    let io_bits: u32 = 16;
+    let table_len = slot2sym.len();
+
+    let mut states = *initial_states;
+    let mut word_pos = [0usize; 4];
+    let mut output = vec![0u8; original_len];
+    let mut out_pos = 0;
+
+    let full_quads = original_len / 4;
+    let remainder = original_len % 4;
+
+    for _ in 0..full_quads {
+        // Extract slots
+        let slot0 = states[0] & scale_mask;
+        let slot1 = states[1] & scale_mask;
+        let slot2 = states[2] & scale_mask;
+        let slot3 = states[3] & scale_mask;
+
+        // Bounds check all 4 at once
+        if (slot0 as usize | slot1 as usize | slot2 as usize | slot3 as usize) >= table_len {
+            return None;
+        }
+
+        // Gather symbols (single-hop)
+        let s0 = slot2sym[slot0 as usize];
+        let s1 = slot2sym[slot1 as usize];
+        let s2 = slot2sym[slot2 as usize];
+        let s3 = slot2sym[slot3 as usize];
+
+        // Gather merged freq+bias (single-hop, eliminates sym→freq/cum indirection)
+        let e0 = slot_table[slot0 as usize].freq_bias;
+        let e1 = slot_table[slot1 as usize].freq_bias;
+        let e2 = slot_table[slot2 as usize].freq_bias;
+        let e3 = slot_table[slot3 as usize].freq_bias;
+
+        // State transition: new_state = freq * (state >> scale_bits) + bias
+        states[0] = (e0 & 0xFFFF) * (states[0] >> scale_bits) + (e0 >> 16);
+        states[1] = (e1 & 0xFFFF) * (states[1] >> scale_bits) + (e1 >> 16);
+        states[2] = (e2 & 0xFFFF) * (states[2] >> scale_bits) + (e2 >> 16);
+        states[3] = (e3 & 0xFFFF) * (states[3] >> scale_bits) + (e3 >> 16);
+
+        // Renormalize all 4 lanes
+        if states[0] < rans_l && word_pos[0] < word_streams[0].len() {
+            states[0] = (states[0] << io_bits) | word_streams[0][word_pos[0]] as u32;
+            word_pos[0] += 1;
+        }
+        if states[1] < rans_l && word_pos[1] < word_streams[1].len() {
+            states[1] = (states[1] << io_bits) | word_streams[1][word_pos[1]] as u32;
+            word_pos[1] += 1;
+        }
+        if states[2] < rans_l && word_pos[2] < word_streams[2].len() {
+            states[2] = (states[2] << io_bits) | word_streams[2][word_pos[2]] as u32;
+            word_pos[2] += 1;
+        }
+        if states[3] < rans_l && word_pos[3] < word_streams[3].len() {
+            states[3] = (states[3] << io_bits) | word_streams[3][word_pos[3]] as u32;
+            word_pos[3] += 1;
+        }
+
+        // Write output
+        output[out_pos] = s0;
+        output[out_pos + 1] = s1;
+        output[out_pos + 2] = s2;
+        output[out_pos + 3] = s3;
+        out_pos += 4;
+    }
+
+    // Handle remaining symbols (< 4)
+    for r in 0..remainder {
+        let lane = r;
+        let slot = states[lane] & scale_mask;
+        if slot as usize >= table_len {
+            return None;
+        }
+        let s = slot2sym[slot as usize];
+        let e = slot_table[slot as usize].freq_bias;
+
+        states[lane] = (e & 0xFFFF) * (states[lane] >> scale_bits) + (e >> 16);
+
+        if states[lane] < rans_l && word_pos[lane] < word_streams[lane].len() {
+            states[lane] = (states[lane] << io_bits) | word_streams[lane][word_pos[lane]] as u32;
+            word_pos[lane] += 1;
+        }
+
+        output[out_pos] = s;
+        out_pos += 1;
+    }
+
+    Some(output)
+}
+
 /// Like [`rans_decode_4way`] but writes into a provided buffer instead of allocating.
 ///
 /// Returns `Some(())` on success, `None` on invalid input.

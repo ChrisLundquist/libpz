@@ -217,6 +217,56 @@ pub(crate) fn build_symbol_lookup(norm: &NormalizedFreqs) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Merged slot-indexed table (ryg_rans-style)
+// ---------------------------------------------------------------------------
+
+/// Merged slot-indexed decode table entry.
+///
+/// Combines frequency and bias into a single `u32`, eliminating the 2-hop
+/// gather pattern (slot → symbol → freq/cum).  The decode step becomes:
+///
+/// ```text
+/// slot = state & scale_mask
+/// sym = slot2sym[slot]
+/// freq = slot_table[slot].freq_bias & 0xFFFF
+/// bias = slot_table[slot].freq_bias >> 16
+/// new_state = freq * (state >> scale_bits) + bias
+/// ```
+///
+/// Where `bias = slot - cum[sym]`, precomputed per slot.
+#[derive(Copy, Clone)]
+pub struct SlotEntry {
+    /// Low 16 bits: frequency.  High 16 bits: bias (= slot position
+    /// within this symbol's frequency range, i.e. `slot - cum[sym]`).
+    pub freq_bias: u32,
+}
+
+/// Build the merged slot-indexed decode table.
+///
+/// Returns `(slot2sym, slot_table)` where:
+/// - `slot2sym[slot]` = symbol byte (same as [`build_symbol_lookup`])
+/// - `slot_table[slot].freq_bias` = `freq | (bias << 16)`
+pub(crate) fn build_slot_table(norm: &NormalizedFreqs) -> (Vec<u8>, Vec<SlotEntry>) {
+    let table_size = 1usize << norm.scale_bits;
+    let mut slot2sym = vec![0u8; table_size];
+    let mut slot_table = vec![SlotEntry { freq_bias: 0 }; table_size];
+
+    for sym in 0..NUM_SYMBOLS {
+        let freq = norm.freq[sym] as u32;
+        let start = norm.cum[sym] as usize;
+        for offset in 0..freq as usize {
+            let slot = start + offset;
+            slot2sym[slot] = sym as u8;
+            slot_table[slot] = SlotEntry {
+                freq_bias: freq | ((offset as u32) << 16),
+            };
+        }
+    }
+
+    (slot2sym, slot_table)
+}
+
+// ---------------------------------------------------------------------------
 // Division helpers
 // ---------------------------------------------------------------------------
 
@@ -479,20 +529,14 @@ fn rans_decode_interleaved(
             initial_states[3],
         ];
 
-        // NOTE: SSE2 path (rans_decode_4way_sse2) benchmarks 32% slower than
-        // scalar on x86_64 due to gather serialization overhead. The scalar
-        // 4-way path exposes enough ILP for the CPU's out-of-order engine to
-        // overlap independent lane computations. See ryg_rans for techniques
-        // that would make SIMD worthwhile: merged slot-indexed tables,
-        // PSHUFB branchless renorm, single shared bitstream, SSE4.1 mullo.
-
-        // Scalar 4-way path (fastest measured)
-        return crate::simd::rans_decode_4way(
+        // Use merged slot-indexed table for faster decode (eliminates 2-hop
+        // gather: slot→symbol→freq/cum → single slot→freq_bias lookup).
+        let (slot2sym, slot_table) = build_slot_table(norm);
+        return crate::simd::rans_decode_4way_slot(
             &streams_arr,
             &states_arr,
-            &norm.freq,
-            &norm.cum,
-            lookup,
+            &slot2sym,
+            &slot_table,
             norm.scale_bits as u32,
             original_len,
         )
