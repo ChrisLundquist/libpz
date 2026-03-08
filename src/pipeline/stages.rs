@@ -340,7 +340,7 @@ pub(crate) fn stage_rans_encode_with_options(
 
 /// Parse a rANS per-stream header: [orig_len: u32] [compressed_len: u32 | flags].
 ///
-/// Returns (orig_len, is_interleaved, is_recoil, comp_len, payload_slice).
+/// Returns (orig_len, is_interleaved, is_recoil, payload_slice).
 fn parse_rans_stream_header(data: &[u8]) -> PzResult<(usize, bool, bool, &[u8])> {
     if data.len() < 8 {
         return Err(PzError::InvalidInput);
