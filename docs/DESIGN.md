@@ -132,9 +132,18 @@ Tests in `#[cfg(test)] mod tests` at bottom of file.
 
 ### GPU Module Organization
 
-- `src/webgpu/mod.rs` - Device initialization, shared utilities
-- `src/webgpu/lz77.rs` - LZ77 GPU kernels
-- `src/webgpu/huffman.rs` - Huffman GPU kernels
+- `src/webgpu/mod.rs` - Device initialization, engine struct, core dispatch helpers
+- `src/webgpu/kernels.rs` - Embedded WGSL kernel source constants and GPU config constants
+- `src/webgpu/pipelines.rs` - Pipeline group structs and lazy compilation accessors
+- `src/webgpu/buffers.rs` - `DeviceBuf`, `GpuMatchBuf`, GPU match deduplication
+- `src/webgpu/lz77.rs` - LZ77 GPU match finding (hash, lazy, coop, topk)
+- `src/webgpu/huffman.rs` - Huffman GPU encode
+- `src/webgpu/bwt.rs` - BWT GPU prefix-doubling
+- `src/webgpu/fse.rs` - FSE GPU encode/decode
+- `src/webgpu/rans.rs` - rANS GPU encode/decode
+- `src/webgpu/lzseq.rs` - LzSeq GPU demux
+- `src/webgpu/parlz.rs` - Parallel LZ conflict resolution
+- `src/webgpu/sortlz.rs` - SortLZ radix sort + match verification
 - `kernels/*.wgsl` - WGSL shader source
 
 GPU modules mirror CPU module structure.
@@ -147,6 +156,7 @@ Pipeline architecture:
 - `src/pipeline/demux.rs` - `StreamDemuxer` trait, `LzDemuxer` enum, `demuxer_for_pipeline()`
 - `src/pipeline/stages.rs` - Per-stage functions (`stage_lz77`, `stage_huffman_encode_gpu`, etc.)
 - `src/pipeline/parallel.rs` - Block-parallel, pipeline-parallel, GPU-batched multi-block
+- `src/pipeline/telemetry.rs` - Unified scheduler timing/counter stats
 
 **Adding a new LZ-based pipeline:**
 1. Add enum variant to `Pipeline` in `mod.rs`
