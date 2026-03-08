@@ -479,25 +479,14 @@ fn rans_decode_interleaved(
             initial_states[3],
         ];
 
-        // Dispatch to SSE2 path if available on x86_64
-        #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("sse2") {
-            // SAFETY: is_x86_feature_detected verified SSE2 is available
-            return unsafe {
-                crate::simd::rans_decode_4way_sse2(
-                    &streams_arr,
-                    &states_arr,
-                    &norm.freq,
-                    &norm.cum,
-                    lookup,
-                    norm.scale_bits as u32,
-                    original_len,
-                )
-            }
-            .ok_or(PzError::InvalidInput);
-        }
+        // NOTE: SSE2 path (rans_decode_4way_sse2) benchmarks 32% slower than
+        // scalar on x86_64 due to gather serialization overhead. The scalar
+        // 4-way path exposes enough ILP for the CPU's out-of-order engine to
+        // overlap independent lane computations. See ryg_rans for techniques
+        // that would make SIMD worthwhile: merged slot-indexed tables,
+        // PSHUFB branchless renorm, single shared bitstream, SSE4.1 mullo.
 
-        // Fallback to scalar path
+        // Scalar 4-way path (fastest measured)
         return crate::simd::rans_decode_4way(
             &streams_arr,
             &states_arr,
