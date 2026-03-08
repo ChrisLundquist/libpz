@@ -1468,8 +1468,41 @@ pub fn decode_shared_stream(input: &[u8], original_len: usize) -> PzResult<Vec<u
     // Build slot table for fast decode
     let (slot2sym, slot_table) = build_slot_table(&norm);
 
-    // Dispatch to scalar shared-stream decoder
-    // (Phase 3 will add SIMD dispatch here: is_x86_feature_detected!("sse4.1"))
+    // SIMD dispatch: SSSE3+SSE4.1 PSHUFB path.
+    //
+    // Currently DISABLED: the scalar batched 4-way path (1.18 GiB/s) is 2.7x
+    // faster than the SIMD path (432 MiB/s) because the scalar gather
+    // (slot2sym + slot_table lookups) dominates, and SIMD pack/unpack for
+    // the gather adds overhead that exceeds the branchless renorm savings.
+    //
+    // The SIMD path will become viable when:
+    // - AVX2 _mm256_i32gather_epi32 eliminates the scalar gather bottleneck
+    // - 8-way interleaving amortizes SIMD overhead across more lanes
+    //
+    // The implementation is preserved and tested for future AVX2 work.
+    #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::overly_complex_bool_expr)]
+    if false && num_states == 4 && is_x86_feature_detected!("sse4.1") {
+        // SAFETY: feature detection checked above; shared_words has 8 bytes
+        // of zero padding for safe _mm_loadl_epi64 over-read at end
+        if let Some(result) = unsafe {
+            crate::simd::rans_decode_4way_shared_ssse3(
+                &word_slice,
+                &initial_states,
+                &slot2sym,
+                &slot_table,
+                norm.scale_bits as u32,
+                original_len,
+                num_states,
+            )
+        } {
+            return Ok(result);
+        }
+    }
+
+    // Scalar batched 4-way decode (1.18 GiB/s — faster than SIMD due to
+    // gather bottleneck, better than interleaved 1.14 GiB/s due to single
+    // pointer cache locality)
     rans_decode_shared_stream_scalar(
         &word_slice,
         &initial_states,
@@ -1481,12 +1514,11 @@ pub fn decode_shared_stream(input: &[u8], original_len: usize) -> PzResult<Vec<u
     )
 }
 
-/// Scalar shared-stream rANS decoder.
+/// Scalar shared-stream rANS decoder with batched 4-way inner loop.
 ///
-/// All lanes read from a single shared word pointer. On each iteration
-/// the lane whose state drops below RANS_L consumes the next word from
-/// the shared pointer. This is the scalar reference — Phase 3 replaces
-/// the renormalization with PSHUFB branchless dispatch.
+/// All lanes read from a single shared word pointer. Processes 4 symbols
+/// per iteration (one per lane) for better ILP, matching the structure of
+/// `rans_decode_4way_slot` which achieves 1.14 GiB/s.
 fn rans_decode_shared_stream_scalar(
     shared_words: &[u16],
     initial_states: &[u32],
@@ -1499,11 +1531,96 @@ fn rans_decode_shared_stream_scalar(
     let scale_mask = (1u32 << scale_bits) - 1;
     let table_len = slot2sym.len();
 
-    let mut states: Vec<u32> = initial_states.to_vec();
-    let mut word_pos: usize = 0;
     let mut output = vec![0u8; original_len];
 
-    // Process symbols round-robin across lanes, same as interleaved decode
+    // Fast path: 4-way batched (same structure as rans_decode_4way_slot)
+    if num_states == 4 && initial_states.len() == 4 {
+        let mut states = [
+            initial_states[0],
+            initial_states[1],
+            initial_states[2],
+            initial_states[3],
+        ];
+        let mut word_pos: usize = 0;
+        let mut out_pos = 0;
+
+        let full_quads = original_len / 4;
+        let remainder = original_len % 4;
+
+        for _ in 0..full_quads {
+            let slot0 = states[0] & scale_mask;
+            let slot1 = states[1] & scale_mask;
+            let slot2 = states[2] & scale_mask;
+            let slot3 = states[3] & scale_mask;
+
+            if (slot0 as usize | slot1 as usize | slot2 as usize | slot3 as usize) >= table_len {
+                return Err(PzError::InvalidInput);
+            }
+
+            let s0 = slot2sym[slot0 as usize];
+            let s1 = slot2sym[slot1 as usize];
+            let s2 = slot2sym[slot2 as usize];
+            let s3 = slot2sym[slot3 as usize];
+
+            let e0 = slot_table[slot0 as usize].freq_bias;
+            let e1 = slot_table[slot1 as usize].freq_bias;
+            let e2 = slot_table[slot2 as usize].freq_bias;
+            let e3 = slot_table[slot3 as usize].freq_bias;
+
+            states[0] = (e0 & 0xFFFF) * (states[0] >> scale_bits) + (e0 >> 16);
+            states[1] = (e1 & 0xFFFF) * (states[1] >> scale_bits) + (e1 >> 16);
+            states[2] = (e2 & 0xFFFF) * (states[2] >> scale_bits) + (e2 >> 16);
+            states[3] = (e3 & 0xFFFF) * (states[3] >> scale_bits) + (e3 >> 16);
+
+            // Renorm from SHARED stream (sequential — word_pos advances serially)
+            if states[0] < RANS_L && word_pos < shared_words.len() {
+                states[0] = (states[0] << IO_BITS) | shared_words[word_pos] as u32;
+                word_pos += 1;
+            }
+            if states[1] < RANS_L && word_pos < shared_words.len() {
+                states[1] = (states[1] << IO_BITS) | shared_words[word_pos] as u32;
+                word_pos += 1;
+            }
+            if states[2] < RANS_L && word_pos < shared_words.len() {
+                states[2] = (states[2] << IO_BITS) | shared_words[word_pos] as u32;
+                word_pos += 1;
+            }
+            if states[3] < RANS_L && word_pos < shared_words.len() {
+                states[3] = (states[3] << IO_BITS) | shared_words[word_pos] as u32;
+                word_pos += 1;
+            }
+
+            output[out_pos] = s0;
+            output[out_pos + 1] = s1;
+            output[out_pos + 2] = s2;
+            output[out_pos + 3] = s3;
+            out_pos += 4;
+        }
+
+        // Remainder
+        for state in states.iter_mut().take(remainder) {
+            let slot = *state & scale_mask;
+            if slot as usize >= table_len {
+                return Err(PzError::InvalidInput);
+            }
+            let s = slot2sym[slot as usize];
+            let e = slot_table[slot as usize].freq_bias;
+            *state = (e & 0xFFFF) * (*state >> scale_bits) + (e >> 16);
+            if *state < RANS_L && word_pos < shared_words.len() {
+                *state = (*state << IO_BITS) | shared_words[word_pos] as u32;
+                word_pos += 1;
+            }
+            output[out_pos] = s;
+            out_pos += 1;
+        }
+
+        return Ok(output);
+    }
+
+    // Generic N-way fallback (1 symbol per iteration)
+    let mut states: Vec<u32> = initial_states.to_vec();
+    let mut word_pos: usize = 0;
+
     for (i, out) in output.iter_mut().enumerate() {
         let lane = i % num_states;
 
@@ -1514,11 +1631,8 @@ fn rans_decode_shared_stream_scalar(
 
         let s = slot2sym[slot as usize];
         let e = slot_table[slot as usize].freq_bias;
-
-        // State transition: freq * (state >> scale_bits) + bias
         states[lane] = (e & 0xFFFF) * (states[lane] >> scale_bits) + (e >> 16);
 
-        // Renormalize from the SHARED stream
         if states[lane] < RANS_L && word_pos < shared_words.len() {
             states[lane] = (states[lane] << IO_BITS) | shared_words[word_pos] as u32;
             word_pos += 1;
