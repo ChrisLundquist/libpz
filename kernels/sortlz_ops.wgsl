@@ -1,13 +1,13 @@
 // GPU kernels for SortLZ (sort-based LZ77 match finding).
 //
-// Two kernels:
-//   1. sortlz_compute_keys — extract one byte of the hash for radix sort
-//   2. sortlz_verify_matches — verify adjacent sorted pairs and find best match per position
+// Kernels:
+//   1. sortlz_compute_keys — extract one byte of a 4-byte hash for radix sort
+//   2. sortlz_verify_matches — verify adjacent sorted pairs (same-hash cluster)
 //
 // The radix sort itself reuses the BWT infrastructure (histogram, prefix sum, scatter).
 
 // ---------------------------------------------------------------------------
-// Kernel 1: Key extraction for radix sort
+// Kernel 1: Key extraction for 4-byte radix sort
 // ---------------------------------------------------------------------------
 
 // Sorted position array (reordered by radix sort each pass).
@@ -43,7 +43,7 @@ fn sortlz_compute_keys(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ---------------------------------------------------------------------------
-// Kernel 2: Match verification and best-match selection
+// Kernel 2: Match verification — same-hash cluster (4-byte)
 // ---------------------------------------------------------------------------
 
 // Sorted position array (after radix sort, adjacent entries share hashes).

@@ -200,6 +200,15 @@ impl WebGpuEngine {
         let num_groups = padded_n.div_ceil(wg);
         let histogram_len = 256 * num_groups;
 
+        // Pre-allocate temp buffer for prefix sum (reused across all 4 passes).
+        let mut hist_scan_buf_temp = self.create_buffer(
+            "sortlz_hist_scan_temp",
+            (histogram_len.max(1) * 4) as u64,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+
         for pass in 0u32..4 {
             // Phase 1: Key extraction.
             let key_params = [num_hashes, padded_n as u32, pass, 0u32];
@@ -280,14 +289,7 @@ impl WebGpuEngine {
                 "sortlz_histogram",
             )?;
 
-            // Phase 3: Prefix sum + inclusive-to-exclusive (recorded, not submitted).
-            let mut hist_scan_buf_temp = self.create_buffer(
-                "sortlz_hist_scan_temp",
-                (histogram_len.max(1) * 4) as u64,
-                wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-            );
+            // Phase 3: Prefix sum + inclusive-to-exclusive (reuses pre-allocated temp buffer).
             self.record_inclusive_prefix_sum(
                 encoder,
                 histogram_buf,
