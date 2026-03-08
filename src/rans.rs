@@ -1278,6 +1278,259 @@ pub fn decode_chunked(input: &[u8]) -> PzResult<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
+// Shared-stream N-way rANS encode / decode (ryg_rans-style)
+// ---------------------------------------------------------------------------
+//
+// In the shared-stream format, all N interleaved lanes push renormalization
+// words to a single shared word stream instead of N separate streams. This
+// is the prerequisite for PSHUFB branchless SIMD renormalization: the
+// decoder loads consecutive words from one pointer and routes them to the
+// correct lanes via a shuffle mask indexed by the renorm bitmask.
+//
+// Wire format:
+// ```text
+// [scale_bits: u8] [freq_table: 256 × u16 LE] [num_states: u8]
+// [final_states: N × u32 LE] [total_words: u32 LE]
+// [shared_word_stream: total_words × u16 LE]
+// [padding: 8 bytes of zeros]  ← safe over-read zone for SIMD loads
+// ```
+//
+// The 8-byte zero padding at the end allows `_mm_loadl_epi64` to safely
+// read up to 8 bytes past the last valid word without bounds checking.
+
+/// Encode input using N interleaved rANS streams with a single shared
+/// word stream.
+///
+/// Unlike [`rans_encode_interleaved`] which produces N separate word
+/// streams, this encoder pushes all renormalization words from all lanes
+/// into one shared buffer. The word order in the shared stream is
+/// determined by the reverse-order processing: the last symbol's lane
+/// pushes first, and so on backwards.
+///
+/// Returns (shared_word_stream, per-lane final_states).
+pub(crate) fn rans_encode_shared_stream(
+    input: &[u8],
+    norm: &NormalizedFreqs,
+    num_states: usize,
+) -> (Vec<u16>, Vec<u32>) {
+    let scale_bits = norm.scale_bits as u32;
+    let rcp_table = ReciprocalTable::from_normalized(norm);
+
+    let mut states = vec![RANS_L; num_states];
+
+    // All lanes push to a single shared buffer, filled backwards.
+    let shared_cap = input.len() * 2 + 4;
+    let mut shared_words = vec![0u16; shared_cap];
+    let mut cursor = shared_cap; // write position, decrements
+
+    // Process symbols in reverse (same as interleaved encoder)
+    for (i, &byte) in input.iter().enumerate().rev() {
+        let lane = i % num_states;
+        let s = byte as usize;
+        let freq = norm.freq[s] as u32;
+        let cum = norm.cum[s] as u32;
+
+        // Renormalize this lane's state — push to the SHARED buffer
+        let x_max = ((RANS_L as u64 >> scale_bits) << IO_BITS) * freq as u64;
+        while (states[lane] as u64) >= x_max {
+            cursor -= 1;
+            shared_words[cursor] = states[lane] as u16;
+            states[lane] >>= IO_BITS;
+        }
+
+        // Encode
+        let (q, r) = rans_div_rcp(states[lane], freq, rcp_table.rcp[s]);
+        states[lane] = (q << scale_bits) + r + cum;
+    }
+
+    // Extract the filled portion — already in forward order
+    let result = shared_words[cursor..].to_vec();
+    (result, states)
+}
+
+/// Encode data using 4-way shared-stream rANS (default).
+pub fn encode_shared_stream(input: &[u8]) -> Vec<u8> {
+    encode_shared_stream_n(input, DEFAULT_INTERLEAVE, DEFAULT_SCALE_BITS)
+}
+
+/// Encode data using N-way shared-stream rANS with configurable parameters.
+///
+/// `num_states`: number of interleaved rANS states (typically 4).
+/// `scale_bits`: frequency precision (9..14).
+pub fn encode_shared_stream_n(input: &[u8], num_states: usize, scale_bits: u8) -> Vec<u8> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+
+    let num_states = num_states.max(1);
+    let scale_bits = scale_bits.clamp(MIN_SCALE_BITS, MAX_SCALE_BITS);
+
+    let mut freq = FrequencyTable::new();
+    freq.count(input);
+
+    let mut sb = scale_bits;
+    while (1u32 << sb) < freq.used {
+        sb += 1;
+        if sb > MAX_SCALE_BITS {
+            break;
+        }
+    }
+
+    let norm = normalize_frequencies(&freq, sb).expect("valid non-empty input");
+    let (shared_words, final_states) = rans_encode_shared_stream(input, &norm, num_states);
+
+    // Serialize shared-stream format:
+    // [scale_bits: u8] [freq_table: 512] [num_states: u8]
+    // [final_states: N × u32 LE] [total_words: u32 LE]
+    // [shared_word_stream] [8 bytes zero padding]
+    let header_size = 1 + NUM_SYMBOLS * 2 + 1 + num_states * 4 + 4;
+    let padding = 8; // safe over-read zone for SIMD
+    let mut output = Vec::with_capacity(header_size + shared_words.len() * 2 + padding);
+
+    output.push(sb);
+    serialize_freq_table(&norm, &mut output);
+    output.push(num_states as u8);
+
+    for &state in &final_states {
+        output.extend_from_slice(&state.to_le_bytes());
+    }
+    output.extend_from_slice(&(shared_words.len() as u32).to_le_bytes());
+    serialize_u16_le_bulk(&shared_words, &mut output);
+
+    // Zero padding for safe SIMD over-reads at end of stream
+    output.extend_from_slice(&[0u8; 8]);
+
+    output
+}
+
+/// Decode shared-stream rANS-encoded data.
+///
+/// `original_len` is the number of bytes in the original uncompressed data.
+pub fn decode_shared_stream(input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
+    if original_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Minimum header: scale_bits(1) + freq_table(512) + num_states(1)
+    if input.len() < 1 + NUM_SYMBOLS * 2 + 1 {
+        return Err(PzError::InvalidInput);
+    }
+
+    let scale_bits = input[0];
+    if !(MIN_SCALE_BITS..=MAX_SCALE_BITS).contains(&scale_bits) {
+        return Err(PzError::InvalidInput);
+    }
+
+    let norm = deserialize_freq_table(&input[1..], scale_bits)?;
+
+    let pos = 1 + NUM_SYMBOLS * 2;
+    let num_states = input[pos] as usize;
+    if num_states == 0 {
+        return Err(PzError::InvalidInput);
+    }
+
+    let mut cursor = pos + 1;
+
+    // Read final states
+    if input.len() < cursor + num_states * 4 {
+        return Err(PzError::InvalidInput);
+    }
+    let mut initial_states = Vec::with_capacity(num_states);
+    for _ in 0..num_states {
+        let state = u32::from_le_bytes([
+            input[cursor],
+            input[cursor + 1],
+            input[cursor + 2],
+            input[cursor + 3],
+        ]);
+        initial_states.push(state);
+        cursor += 4;
+    }
+
+    // Read total word count
+    if input.len() < cursor + 4 {
+        return Err(PzError::InvalidInput);
+    }
+    let total_words = u32::from_le_bytes([
+        input[cursor],
+        input[cursor + 1],
+        input[cursor + 2],
+        input[cursor + 3],
+    ]) as usize;
+    cursor += 4;
+
+    // Read shared word stream (+ 8 bytes padding that follows)
+    if input.len() < cursor + total_words * 2 {
+        return Err(PzError::InvalidInput);
+    }
+    let word_slice = bytes_as_u16_le(&input[cursor..], total_words);
+
+    // Build slot table for fast decode
+    let (slot2sym, slot_table) = build_slot_table(&norm);
+
+    // Dispatch to scalar shared-stream decoder
+    // (Phase 3 will add SIMD dispatch here: is_x86_feature_detected!("sse4.1"))
+    rans_decode_shared_stream_scalar(
+        &word_slice,
+        &initial_states,
+        &slot2sym,
+        &slot_table,
+        norm.scale_bits as u32,
+        original_len,
+        num_states,
+    )
+}
+
+/// Scalar shared-stream rANS decoder.
+///
+/// All lanes read from a single shared word pointer. On each iteration
+/// the lane whose state drops below RANS_L consumes the next word from
+/// the shared pointer. This is the scalar reference — Phase 3 replaces
+/// the renormalization with PSHUFB branchless dispatch.
+fn rans_decode_shared_stream_scalar(
+    shared_words: &[u16],
+    initial_states: &[u32],
+    slot2sym: &[u8],
+    slot_table: &[SlotEntry],
+    scale_bits: u32,
+    original_len: usize,
+    num_states: usize,
+) -> PzResult<Vec<u8>> {
+    let scale_mask = (1u32 << scale_bits) - 1;
+    let table_len = slot2sym.len();
+
+    let mut states: Vec<u32> = initial_states.to_vec();
+    let mut word_pos: usize = 0;
+    let mut output = vec![0u8; original_len];
+
+    // Process symbols round-robin across lanes, same as interleaved decode
+    for (i, out) in output.iter_mut().enumerate() {
+        let lane = i % num_states;
+
+        let slot = states[lane] & scale_mask;
+        if slot as usize >= table_len {
+            return Err(PzError::InvalidInput);
+        }
+
+        let s = slot2sym[slot as usize];
+        let e = slot_table[slot as usize].freq_bias;
+
+        // State transition: freq * (state >> scale_bits) + bias
+        states[lane] = (e & 0xFFFF) * (states[lane] >> scale_bits) + (e >> 16);
+
+        // Renormalize from the SHARED stream
+        if states[lane] < RANS_L && word_pos < shared_words.len() {
+            states[lane] = (states[lane] << IO_BITS) | shared_words[word_pos] as u32;
+            word_pos += 1;
+        }
+
+        *out = s;
+    }
+
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1641,6 +1894,113 @@ mod tests {
             // Single chunk length exceeds u16 per-chunk-len header field.
             let input = vec![0u8; (u16::MAX as usize) + 1];
             let _ = encode_chunked(&input, NUM_STATES, SCALE_BITS, (u16::MAX as usize) + 1);
+        }
+    }
+
+    // --- Shared-stream round-trip tests ---
+
+    mod shared_stream_tests {
+        use super::*;
+
+        #[test]
+        fn test_shared_stream_empty() {
+            assert_eq!(encode_shared_stream(&[]), Vec::<u8>::new());
+            assert_eq!(decode_shared_stream(&[], 0).unwrap(), Vec::<u8>::new());
+        }
+
+        #[test]
+        fn test_shared_stream_single_byte() {
+            let input = &[42u8];
+            let encoded = encode_shared_stream(input);
+            let decoded = decode_shared_stream(&encoded, input.len()).unwrap();
+            assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn test_shared_stream_repeated() {
+            let input = vec![b'x'; 500];
+            let encoded = encode_shared_stream(&input);
+            let decoded = decode_shared_stream(&encoded, input.len()).unwrap();
+            assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn test_shared_stream_all_bytes() {
+            let input: Vec<u8> = (0..=255).collect();
+            let encoded = encode_shared_stream(&input);
+            let decoded = decode_shared_stream(&encoded, input.len()).unwrap();
+            assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn test_shared_stream_binary() {
+            let input: Vec<u8> = (0..500).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+            let encoded = encode_shared_stream(&input);
+            let decoded = decode_shared_stream(&encoded, input.len()).unwrap();
+            assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn test_shared_stream_large() {
+            let input: Vec<u8> = (0..100_000).map(|i| ((i * 41 + 61) % 256) as u8).collect();
+            let encoded = encode_shared_stream(&input);
+            let decoded = decode_shared_stream(&encoded, input.len()).unwrap();
+            assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn test_shared_stream_skewed_distribution() {
+            // Heavy skew: 90% one symbol, 10% spread
+            let mut input = vec![0u8; 9000];
+            for i in 0..1000 {
+                input.push(((i * 7 + 3) % 255 + 1) as u8);
+            }
+            let encoded = encode_shared_stream(&input);
+            let decoded = decode_shared_stream(&encoded, input.len()).unwrap();
+            assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn test_shared_stream_all_same() {
+            let input = vec![42u8; 10_000];
+            let encoded = encode_shared_stream(&input);
+            let decoded = decode_shared_stream(&encoded, input.len()).unwrap();
+            assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn test_shared_stream_small_sizes() {
+            // Test sizes around and below num_states to exercise remainder logic
+            for len in 1..=20 {
+                let input: Vec<u8> = (0..len).map(|i| (i * 3) as u8).collect();
+                let encoded = encode_shared_stream(&input);
+                let decoded = decode_shared_stream(&encoded, input.len()).unwrap();
+                assert_eq!(decoded, input, "round-trip failed at len={}", len);
+            }
+        }
+
+        #[test]
+        fn test_shared_stream_all_scale_bits() {
+            let input: Vec<u8> = (0..500).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+            for sb in MIN_SCALE_BITS..=MAX_SCALE_BITS {
+                let encoded = encode_shared_stream_n(&input, 4, sb);
+                let decoded = decode_shared_stream(&encoded, input.len()).unwrap();
+                assert_eq!(decoded, input, "failed at scale_bits={}", sb);
+            }
+        }
+
+        #[test]
+        fn test_shared_stream_matches_interleaved_output() {
+            // Shared-stream and interleaved should decode to the same original data
+            let input: Vec<u8> = (0..2048).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+            let encoded_shared = encode_shared_stream(&input);
+            let encoded_interleaved = encode_interleaved(&input);
+            let decoded_shared = decode_shared_stream(&encoded_shared, input.len()).unwrap();
+            let decoded_interleaved =
+                decode_interleaved(&encoded_interleaved, input.len()).unwrap();
+            assert_eq!(decoded_shared, input);
+            assert_eq!(decoded_interleaved, input);
+            assert_eq!(decoded_shared, decoded_interleaved);
         }
     }
 }

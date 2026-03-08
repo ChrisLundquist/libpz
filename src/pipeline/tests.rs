@@ -1007,3 +1007,68 @@ fn test_backend_assignment_cpu_variant_always_available() {
     assert_eq!(opts.stage0_backend, BackendAssignment::Cpu);
     assert_eq!(opts.stage1_backend, BackendAssignment::Cpu);
 }
+
+// --- Shared-stream rANS pipeline tests ---
+
+#[test]
+fn test_shared_stream_lzseqr_round_trip() {
+    let input: Vec<u8> = b"the quick brown fox jumps over the lazy dog. "
+        .iter()
+        .cycle()
+        .take(45_000)
+        .copied()
+        .collect();
+    let opts = CompressOptions {
+        rans_interleaved: true,
+        rans_shared_stream: true,
+        threads: 1,
+        ..CompressOptions::default()
+    };
+    let compressed = compress_with_options(&input, Pipeline::LzSeqR, &opts).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_shared_stream_lzr_round_trip() {
+    let input: Vec<u8> = (0..10_000).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+    let opts = CompressOptions {
+        rans_interleaved: true,
+        rans_shared_stream: true,
+        threads: 1,
+        ..CompressOptions::default()
+    };
+    let compressed = compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_shared_stream_backward_compat() {
+    // Data encoded with interleaved (non-shared) must still decode correctly
+    let input = b"backward compatibility test data ".repeat(500);
+    let opts_interleaved = CompressOptions {
+        rans_interleaved: true,
+        rans_shared_stream: false,
+        threads: 1,
+        ..CompressOptions::default()
+    };
+    let compressed = compress_with_options(&input, Pipeline::LzSeqR, &opts_interleaved).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn test_shared_stream_small_input() {
+    // Input smaller than rans_interleaved_min_bytes → falls back to basic rANS
+    let input = b"small";
+    let opts = CompressOptions {
+        rans_interleaved: true,
+        rans_shared_stream: true,
+        threads: 1,
+        ..CompressOptions::default()
+    };
+    let compressed = compress_with_options(input, Pipeline::Lzr, &opts).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}

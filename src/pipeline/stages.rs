@@ -105,8 +105,11 @@ const MULTISTREAM_HEADER_SIZE: usize = 7;
 const RANS_INTERLEAVED_FLAG: u32 = 1 << 31;
 /// Bit-30 flag signaling Recoil split-point metadata is appended to the payload.
 const RANS_RECOIL_FLAG: u32 = 1 << 30;
-/// Mask to extract the actual compressed length (bits 0-29).
-const RANS_COMP_LEN_MASK: u32 = !(RANS_INTERLEAVED_FLAG | RANS_RECOIL_FLAG);
+/// Bit-29 flag signaling shared-stream rANS payload (ryg_rans-style).
+const RANS_SHARED_STREAM_FLAG: u32 = 1 << 29;
+/// Mask to extract the actual compressed length (bits 0-28, max 512 MiB).
+const RANS_COMP_LEN_MASK: u32 =
+    !(RANS_INTERLEAVED_FLAG | RANS_RECOIL_FLAG | RANS_SHARED_STREAM_FLAG);
 
 /// Encode N streams into a multi-stream container.
 ///
@@ -287,8 +290,23 @@ pub(crate) fn stage_rans_encode_with_options(
         pre_entropy_len,
         &block.metadata.demux_meta,
         |stream, output| {
-            let (payload, flagged_len) = if options.rans_interleaved
+            let (payload, flagged_len) = if options.rans_shared_stream
+                && options.rans_interleaved
                 && stream.len() >= options.rans_interleaved_min_bytes
+            {
+                // Shared-stream rANS (ryg_rans-style): all lanes share one word stream.
+                // Incompatible with Recoil (shared-stream has no per-lane word boundaries).
+                let data = rans::encode_shared_stream_n(
+                    stream,
+                    options.rans_interleaved_states,
+                    rans::DEFAULT_SCALE_BITS,
+                );
+                if data.len() as u64 >= (1u64 << 29) {
+                    return Err(PzError::InvalidInput);
+                }
+                let len = (data.len() as u32) | RANS_SHARED_STREAM_FLAG;
+                (data, len)
+            } else if options.rans_interleaved && stream.len() >= options.rans_interleaved_min_bytes
             {
                 let data = rans::encode_interleaved_n(
                     stream,
@@ -308,13 +326,13 @@ pub(crate) fn stage_rans_encode_with_options(
                     combined.extend_from_slice(&(meta_bytes.len() as u32).to_le_bytes());
                     combined.extend_from_slice(&data);
                     combined.extend_from_slice(&meta_bytes);
-                    if combined.len() as u64 >= (1u64 << 30) {
+                    if combined.len() as u64 >= (1u64 << 29) {
                         return Err(PzError::InvalidInput);
                     }
                     let len = (combined.len() as u32) | RANS_INTERLEAVED_FLAG | RANS_RECOIL_FLAG;
                     (combined, len)
                 } else {
-                    if data.len() >= (1usize << 30) {
+                    if data.len() >= (1usize << 29) {
                         return Err(PzError::InvalidInput);
                     }
                     let len = (data.len() as u32) | RANS_INTERLEAVED_FLAG;
@@ -322,7 +340,7 @@ pub(crate) fn stage_rans_encode_with_options(
                 }
             } else {
                 let data = rans::encode(stream);
-                if data.len() >= (1usize << 30) {
+                if data.len() >= (1usize << 29) {
                     return Err(PzError::InvalidInput);
                 }
                 let len = data.len() as u32;
@@ -338,10 +356,19 @@ pub(crate) fn stage_rans_encode_with_options(
     Ok(block)
 }
 
+/// Parsed rANS per-stream header fields.
+struct RansStreamHeader<'a> {
+    orig_len: usize,
+    is_interleaved: bool,
+    is_recoil: bool,
+    is_shared_stream: bool,
+    payload: &'a [u8],
+}
+
 /// Parse a rANS per-stream header: [orig_len: u32] [compressed_len: u32 | flags].
 ///
-/// Returns (orig_len, is_interleaved, is_recoil, payload_slice).
-fn parse_rans_stream_header(data: &[u8]) -> PzResult<(usize, bool, bool, &[u8])> {
+/// Returns parsed header with flags and payload slice.
+fn parse_rans_stream_header(data: &[u8]) -> PzResult<RansStreamHeader<'_>> {
     if data.len() < 8 {
         return Err(PzError::InvalidInput);
     }
@@ -349,11 +376,18 @@ fn parse_rans_stream_header(data: &[u8]) -> PzResult<(usize, bool, bool, &[u8])>
     let comp_field = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
     let is_interleaved = (comp_field & RANS_INTERLEAVED_FLAG) != 0;
     let is_recoil = (comp_field & RANS_RECOIL_FLAG) != 0;
+    let is_shared_stream = (comp_field & RANS_SHARED_STREAM_FLAG) != 0;
     let comp_len = (comp_field & RANS_COMP_LEN_MASK) as usize;
     if 8 + comp_len > data.len() {
         return Err(PzError::InvalidInput);
     }
-    Ok((orig_len, is_interleaved, is_recoil, &data[8..8 + comp_len]))
+    Ok(RansStreamHeader {
+        orig_len,
+        is_interleaved,
+        is_recoil,
+        is_shared_stream,
+        payload: &data[8..8 + comp_len],
+    })
 }
 
 /// Parse a Recoil payload: [meta_len:u32][rans_data][recoil_metadata].
@@ -383,18 +417,21 @@ fn decode_recoil_payload(
     crate::recoil::decode_recoil_parallel(rans_data, recoil_meta, orig_len, num_threads)
 }
 
-/// Decode a single rANS stream using the appropriate method (basic/interleaved/recoil).
+/// Decode a single rANS stream using the appropriate method (basic/interleaved/shared/recoil).
 fn decode_rans_stream_cpu(data: &[u8]) -> PzResult<(Vec<u8>, usize)> {
-    let (orig_len, is_interleaved, is_recoil, payload) = parse_rans_stream_header(data)?;
-    let decoded = if is_interleaved && is_recoil {
-        let (rans_data, recoil_meta) = parse_recoil_payload(payload)?;
-        decode_recoil_payload(rans_data, &recoil_meta, orig_len)?
-    } else if is_interleaved {
-        rans::decode_interleaved(payload, orig_len)?
+    let hdr = parse_rans_stream_header(data)?;
+    let decoded = if hdr.is_shared_stream {
+        // Shared-stream decode (ryg_rans-style, single word pointer)
+        rans::decode_shared_stream(hdr.payload, hdr.orig_len)?
+    } else if hdr.is_interleaved && hdr.is_recoil {
+        let (rans_data, recoil_meta) = parse_recoil_payload(hdr.payload)?;
+        decode_recoil_payload(rans_data, &recoil_meta, hdr.orig_len)?
+    } else if hdr.is_interleaved {
+        rans::decode_interleaved(hdr.payload, hdr.orig_len)?
     } else {
-        rans::decode(payload, orig_len)?
+        rans::decode(hdr.payload, hdr.orig_len)?
     };
-    Ok((decoded, 8 + payload.len()))
+    Ok((decoded, 8 + hdr.payload.len()))
 }
 
 /// rANS decoding stage: parse multi-stream container + rANS decode each stream.
@@ -419,16 +456,19 @@ pub(crate) fn stage_rans_decode_webgpu(
     engine: &crate::webgpu::WebGpuEngine,
 ) -> PzResult<StageBlock> {
     let (streams, pre_entropy_len, meta) = decode_multistream(&block.data, |data| {
-        let (orig_len, is_interleaved, is_recoil, payload) = parse_rans_stream_header(data)?;
-        let decoded = if is_interleaved && is_recoil {
-            let (rans_data, recoil_meta) = parse_recoil_payload(payload)?;
-            engine.rans_decode_recoil_gpu(rans_data, &recoil_meta, orig_len)?
-        } else if is_interleaved {
-            rans::decode_interleaved(payload, orig_len)?
+        let hdr = parse_rans_stream_header(data)?;
+        let decoded = if hdr.is_shared_stream {
+            // Shared-stream: CPU decode (no GPU path yet)
+            rans::decode_shared_stream(hdr.payload, hdr.orig_len)?
+        } else if hdr.is_interleaved && hdr.is_recoil {
+            let (rans_data, recoil_meta) = parse_recoil_payload(hdr.payload)?;
+            engine.rans_decode_recoil_gpu(rans_data, &recoil_meta, hdr.orig_len)?
+        } else if hdr.is_interleaved {
+            rans::decode_interleaved(hdr.payload, hdr.orig_len)?
         } else {
-            rans::decode(payload, orig_len)?
+            rans::decode(hdr.payload, hdr.orig_len)?
         };
-        Ok((decoded, 8 + payload.len()))
+        Ok((decoded, 8 + hdr.payload.len()))
     })?;
 
     block.metadata.pre_entropy_len = Some(pre_entropy_len);

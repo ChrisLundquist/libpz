@@ -180,6 +180,16 @@ pub struct CompressOptions {
     pub rans_interleaved_min_bytes: usize,
     /// Number of interleaved rANS states when interleaved mode is active.
     pub rans_interleaved_states: usize,
+    /// Enable shared-stream rANS encoding (ryg_rans-style).
+    ///
+    /// When enabled (and `rans_interleaved` is also enabled), the encoder
+    /// writes all interleaved lanes' renormalization words to a single shared
+    /// word stream instead of per-lane streams. This is the prerequisite for
+    /// PSHUFB branchless SIMD renormalization on decode.
+    ///
+    /// Mutually exclusive with `rans_recoil` (shared-stream has no per-lane
+    /// word boundaries, so Recoil split-point metadata cannot be generated).
+    pub rans_shared_stream: bool,
     /// Enable Recoil split-point metadata for parallel rANS decode.
     ///
     /// When enabled (and `rans_interleaved` is also enabled), the encoder
@@ -220,6 +230,7 @@ impl Default for CompressOptions {
             rans_interleaved: false,
             rans_interleaved_min_bytes: 64 * 1024,
             rans_interleaved_states: crate::rans::DEFAULT_INTERLEAVE,
+            rans_shared_stream: false,
             rans_recoil: false,
             rans_recoil_splits: 64,
             seq_window_size: None,
