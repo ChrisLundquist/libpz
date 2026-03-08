@@ -48,8 +48,10 @@ impl WebGpuEngine {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
 
-        // Parameters.
-        let params = [n as u32, 256u32, 0u32, 0u32];
+        // Parameters: [n, workgroup_size, dispatch_width (X workgroups), 0].
+        let workgroups = (n as u32).div_ceil(256);
+        let dispatch_width = workgroups.min(self.max_workgroups_per_dim);
+        let params = [n as u32, 256u32, dispatch_width, 0u32];
         let params_buf = self.create_buffer_init(
             "parlz_params",
             bytemuck::cast_slice(&params),
@@ -84,8 +86,6 @@ impl WebGpuEngine {
                 },
             ],
         });
-
-        let workgroups = (n as u32).div_ceil(256);
 
         // Step 1: Initialize coverage array.
         self.dispatch(

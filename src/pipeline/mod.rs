@@ -180,6 +180,16 @@ pub struct CompressOptions {
     pub rans_interleaved_min_bytes: usize,
     /// Number of interleaved rANS states when interleaved mode is active.
     pub rans_interleaved_states: usize,
+    /// Enable shared-stream rANS encoding (ryg_rans-style).
+    ///
+    /// When enabled (and `rans_interleaved` is also enabled), the encoder
+    /// writes all interleaved lanes' renormalization words to a single shared
+    /// word stream instead of per-lane streams. This is the prerequisite for
+    /// PSHUFB branchless SIMD renormalization on decode.
+    ///
+    /// Mutually exclusive with `rans_recoil` (shared-stream has no per-lane
+    /// word boundaries, so Recoil split-point metadata cannot be generated).
+    pub rans_shared_stream: bool,
     /// Enable Recoil split-point metadata for parallel rANS decode.
     ///
     /// When enabled (and `rans_interleaved` is also enabled), the encoder
@@ -220,6 +230,7 @@ impl Default for CompressOptions {
             rans_interleaved: false,
             rans_interleaved_min_bytes: 64 * 1024,
             rans_interleaved_states: crate::rans::DEFAULT_INTERLEAVE,
+            rans_shared_stream: false,
             rans_recoil: false,
             rans_recoil_splits: 64,
             seq_window_size: None,
@@ -851,7 +862,7 @@ fn decompress_framed(
 // GPU/CPU backend dispatch helpers
 // ---------------------------------------------------------------------------
 
-/// Run LZ77 compression using the configured backend and parse strategy.
+/// Demux helpers can use this for parse-mode-aware LZ77 match generation.
 ///
 /// Backend/strategy selection logic:
 /// - `Auto` on GPU: hash-table kernel (best throughput at ≥256KB)
@@ -859,68 +870,32 @@ fn decompress_framed(
 /// - `Optimal` on GPU: GPU top-K match table → CPU backward DP
 /// - `Optimal` on CPU: CPU match table → CPU backward DP
 /// - GPU backend falls back to CPU when input < MIN_GPU_INPUT_SIZE
-fn lz77_compress_with_backend(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
+pub(crate) fn lz77_matches_with_backend(
+    input: &[u8],
+    options: &CompressOptions,
+) -> PzResult<Vec<lz77::Match>> {
+    let max_match = options.max_match_len.unwrap_or(lz77::DEFLATE_MAX_MATCH);
+
+    // GPU path: use GPU kernels when available and input is in range.
     #[cfg(feature = "webgpu")]
     {
         if let Backend::WebGpu = options.backend {
             if let Some(ref engine) = options.webgpu_engine {
                 if input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
                     && input.len() <= engine.max_dispatch_input_size()
+                    && options.match_finder != MatchFinder::SortLz
                 {
                     if options.parse_strategy == ParseStrategy::Optimal {
                         let table = engine.find_topk_matches(input)?;
-                        return crate::optimal::compress_optimal_with_table(input, &table);
+                        let bytes = crate::optimal::compress_optimal_with_table(input, &table)?;
+                        return Ok(lz77::deserialize_matches(&bytes));
                     }
-                    return engine.lz77_compress(input);
+                    let bytes = engine.lz77_compress(input)?;
+                    return Ok(lz77::deserialize_matches(&bytes));
                 }
             }
         }
     }
-
-    // CPU paths — lazy is the default (fastest single-thread + best ratio).
-    // Multi-threading happens at the pipeline block level, not inside LZ77.
-    let max_match = options.max_match_len.unwrap_or(lz77::DEFLATE_MAX_MATCH);
-
-    // SortLZ match finder: serialize match sequence to bytes
-    if options.match_finder == MatchFinder::SortLz {
-        let matches = sortlz_matches_with_strategy(input, options, max_match)?;
-        let mut out = Vec::with_capacity(matches.len() * lz77::Match::SERIALIZED_SIZE);
-        for m in &matches {
-            out.extend_from_slice(&m.to_bytes());
-        }
-        return Ok(out);
-    }
-
-    match options.parse_strategy {
-        ParseStrategy::Auto => {
-            let max_chain = lz77::select_chain_depth(input.len(), true);
-            let matches =
-                lz77::compress_lazy_to_matches_with_limit_and_chain(input, max_match, max_chain)?;
-            let mut out = Vec::with_capacity(matches.len() * lz77::Match::SERIALIZED_SIZE);
-            for m in &matches {
-                out.extend_from_slice(&m.to_bytes());
-            }
-            Ok(out)
-        }
-        ParseStrategy::Greedy => {
-            let matches = lz77::compress_greedy_to_matches_with_limit(input, max_match)?;
-            let mut out = Vec::with_capacity(matches.len() * lz77::Match::SERIALIZED_SIZE);
-            for m in &matches {
-                out.extend_from_slice(&m.to_bytes());
-            }
-            Ok(out)
-        }
-        ParseStrategy::Lazy => lz77::compress_lazy_with_limit(input, max_match),
-        ParseStrategy::Optimal => crate::optimal::compress_optimal_with_limit(input, max_match),
-    }
-}
-
-/// Demux helpers can use this for parse-mode-aware LZ77 match generation.
-pub(crate) fn lz77_matches_with_backend(
-    input: &[u8],
-    options: &CompressOptions,
-) -> PzResult<Vec<lz77::Match>> {
-    let max_match = options.max_match_len.unwrap_or(lz77::DEFLATE_MAX_MATCH);
 
     // SortLZ match finder: radix sort + adjacent-pair verification
     if options.match_finder == MatchFinder::SortLz {

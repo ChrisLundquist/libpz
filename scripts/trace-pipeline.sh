@@ -408,5 +408,5 @@ if [[ "$FORMAT" == "text" ]]; then
     echo "  - StageBlock.streams: optional multi-stream payload"
     echo "  - StageBlock.metadata: carries BWT index, pre-entropy len, etc."
     echo ""
-    echo "See CLAUDE.md 'Tracing data flow through pipelines' for details."
+    echo "See CLAUDE.md for details."
 fi

@@ -38,6 +38,14 @@ impl FrequencyTable {
         let d = DISPATCHER.get_or_init(crate::simd::Dispatcher::new);
         self.byte = d.byte_frequencies(input);
 
+        self.recompute_totals();
+    }
+
+    /// Recompute `total` and `used` from the `byte` array.
+    ///
+    /// Call this after directly assigning `byte` values (e.g., from a GPU histogram)
+    /// to ensure `total` and `used` are consistent.
+    pub fn recompute_totals(&mut self) {
         let mut total = 0u64;
         let mut used = 0u32;
         for &c in &self.byte {

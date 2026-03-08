@@ -757,6 +757,125 @@ pub fn rans_decode_4way(
     Some(output)
 }
 
+// ---------------------------------------------------------------------------
+// rANS 4-way decode with merged slot table (ryg_rans-style)
+// ---------------------------------------------------------------------------
+
+/// Decode 4-way interleaved rANS using merged slot-indexed tables.
+///
+/// Eliminates the 2-hop gather (slot → symbol → freq/cum) by combining
+/// freq and bias into a single table lookup per lane.  The state
+/// transition per lane becomes:
+///
+/// ```text
+/// slot = state & mask
+/// sym  = slot2sym[slot]
+/// entry = slot_table[slot]
+/// freq  = entry.freq_bias & 0xFFFF
+/// bias  = entry.freq_bias >> 16
+/// new_state = freq * (state >> scale_bits) + bias
+/// ```
+pub fn rans_decode_4way_slot(
+    word_streams: &[&[u16]; 4],
+    initial_states: &[u32; 4],
+    slot2sym: &[u8],
+    slot_table: &[crate::rans::SlotEntry],
+    scale_bits: u32,
+    original_len: usize,
+) -> Option<Vec<u8>> {
+    let scale_mask = (1u32 << scale_bits) - 1;
+    let rans_l: u32 = 1 << 16;
+    let io_bits: u32 = 16;
+    let table_len = slot2sym.len();
+
+    let mut states = *initial_states;
+    let mut word_pos = [0usize; 4];
+    let mut output = vec![0u8; original_len];
+    let mut out_pos = 0;
+
+    let full_quads = original_len / 4;
+    let remainder = original_len % 4;
+
+    for _ in 0..full_quads {
+        // Extract slots
+        let slot0 = states[0] & scale_mask;
+        let slot1 = states[1] & scale_mask;
+        let slot2 = states[2] & scale_mask;
+        let slot3 = states[3] & scale_mask;
+
+        // Bounds check all 4 at once
+        if (slot0 as usize | slot1 as usize | slot2 as usize | slot3 as usize) >= table_len {
+            return None;
+        }
+
+        // Gather symbols (single-hop)
+        let s0 = slot2sym[slot0 as usize];
+        let s1 = slot2sym[slot1 as usize];
+        let s2 = slot2sym[slot2 as usize];
+        let s3 = slot2sym[slot3 as usize];
+
+        // Gather merged freq+bias (single-hop, eliminates sym→freq/cum indirection)
+        let e0 = slot_table[slot0 as usize].freq_bias;
+        let e1 = slot_table[slot1 as usize].freq_bias;
+        let e2 = slot_table[slot2 as usize].freq_bias;
+        let e3 = slot_table[slot3 as usize].freq_bias;
+
+        // State transition: new_state = freq * (state >> scale_bits) + bias
+        states[0] = (e0 & 0xFFFF) * (states[0] >> scale_bits) + (e0 >> 16);
+        states[1] = (e1 & 0xFFFF) * (states[1] >> scale_bits) + (e1 >> 16);
+        states[2] = (e2 & 0xFFFF) * (states[2] >> scale_bits) + (e2 >> 16);
+        states[3] = (e3 & 0xFFFF) * (states[3] >> scale_bits) + (e3 >> 16);
+
+        // Renormalize all 4 lanes
+        if states[0] < rans_l && word_pos[0] < word_streams[0].len() {
+            states[0] = (states[0] << io_bits) | word_streams[0][word_pos[0]] as u32;
+            word_pos[0] += 1;
+        }
+        if states[1] < rans_l && word_pos[1] < word_streams[1].len() {
+            states[1] = (states[1] << io_bits) | word_streams[1][word_pos[1]] as u32;
+            word_pos[1] += 1;
+        }
+        if states[2] < rans_l && word_pos[2] < word_streams[2].len() {
+            states[2] = (states[2] << io_bits) | word_streams[2][word_pos[2]] as u32;
+            word_pos[2] += 1;
+        }
+        if states[3] < rans_l && word_pos[3] < word_streams[3].len() {
+            states[3] = (states[3] << io_bits) | word_streams[3][word_pos[3]] as u32;
+            word_pos[3] += 1;
+        }
+
+        // Write output
+        output[out_pos] = s0;
+        output[out_pos + 1] = s1;
+        output[out_pos + 2] = s2;
+        output[out_pos + 3] = s3;
+        out_pos += 4;
+    }
+
+    // Handle remaining symbols (< 4)
+    for r in 0..remainder {
+        let lane = r;
+        let slot = states[lane] & scale_mask;
+        if slot as usize >= table_len {
+            return None;
+        }
+        let s = slot2sym[slot as usize];
+        let e = slot_table[slot as usize].freq_bias;
+
+        states[lane] = (e & 0xFFFF) * (states[lane] >> scale_bits) + (e >> 16);
+
+        if states[lane] < rans_l && word_pos[lane] < word_streams[lane].len() {
+            states[lane] = (states[lane] << io_bits) | word_streams[lane][word_pos[lane]] as u32;
+            word_pos[lane] += 1;
+        }
+
+        output[out_pos] = s;
+        out_pos += 1;
+    }
+
+    Some(output)
+}
+
 /// Like [`rans_decode_4way`] but writes into a provided buffer instead of allocating.
 ///
 /// Returns `Some(())` on success, `None` on invalid input.
@@ -983,6 +1102,436 @@ pub unsafe fn rans_decode_4way_sse2(
         }
 
         output[out_pos] = s;
+        out_pos += 1;
+    }
+
+    Some(output)
+}
+
+// ---------------------------------------------------------------------------
+// rANS 4-way shared-stream SIMD decode (SSSE3 + SSE4.1, ryg_rans-style)
+// ---------------------------------------------------------------------------
+
+/// PSHUFB shuffle masks for branchless renormalization.
+///
+/// For each 4-bit renorm mask (which lanes need a word), maps consecutive
+/// u16 words from the shared stream to the correct 32-bit lane positions.
+/// Each word occupies the low 2 bytes of a 4-byte lane; upper 2 bytes are
+/// zero-filled (0x80 in PSHUFB = zero output byte).
+///
+/// Index: 4-bit mask where bit i means lane i needs renormalization.
+/// Entry: 16-byte PSHUFB control mask.
+#[cfg(target_arch = "x86_64")]
+#[repr(align(16))]
+struct AlignedMask([u8; 16]);
+
+#[cfg(target_arch = "x86_64")]
+static SHUFFLE_MASKS: [AlignedMask; 16] = [
+    // 0b0000: no lanes
+    AlignedMask([
+        0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+        0x80,
+    ]),
+    // 0b0001: lane 0
+    AlignedMask([
+        0x00, 0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+        0x80,
+    ]),
+    // 0b0010: lane 1
+    AlignedMask([
+        0x80, 0x80, 0x80, 0x80, 0x00, 0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+        0x80,
+    ]),
+    // 0b0011: lanes 0,1
+    AlignedMask([
+        0x00, 0x01, 0x80, 0x80, 0x02, 0x03, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+        0x80,
+    ]),
+    // 0b0100: lane 2
+    AlignedMask([
+        0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x01, 0x80, 0x80, 0x80, 0x80, 0x80,
+        0x80,
+    ]),
+    // 0b0101: lanes 0,2
+    AlignedMask([
+        0x00, 0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02, 0x03, 0x80, 0x80, 0x80, 0x80, 0x80,
+        0x80,
+    ]),
+    // 0b0110: lanes 1,2
+    AlignedMask([
+        0x80, 0x80, 0x80, 0x80, 0x00, 0x01, 0x80, 0x80, 0x02, 0x03, 0x80, 0x80, 0x80, 0x80, 0x80,
+        0x80,
+    ]),
+    // 0b0111: lanes 0,1,2
+    AlignedMask([
+        0x00, 0x01, 0x80, 0x80, 0x02, 0x03, 0x80, 0x80, 0x04, 0x05, 0x80, 0x80, 0x80, 0x80, 0x80,
+        0x80,
+    ]),
+    // 0b1000: lane 3
+    AlignedMask([
+        0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x01, 0x80,
+        0x80,
+    ]),
+    // 0b1001: lanes 0,3
+    AlignedMask([
+        0x00, 0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02, 0x03, 0x80,
+        0x80,
+    ]),
+    // 0b1010: lanes 1,3
+    AlignedMask([
+        0x80, 0x80, 0x80, 0x80, 0x00, 0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02, 0x03, 0x80,
+        0x80,
+    ]),
+    // 0b1011: lanes 0,1,3
+    AlignedMask([
+        0x00, 0x01, 0x80, 0x80, 0x02, 0x03, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x04, 0x05, 0x80,
+        0x80,
+    ]),
+    // 0b1100: lanes 2,3
+    AlignedMask([
+        0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x01, 0x80, 0x80, 0x02, 0x03, 0x80,
+        0x80,
+    ]),
+    // 0b1101: lanes 0,2,3
+    AlignedMask([
+        0x00, 0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02, 0x03, 0x80, 0x80, 0x04, 0x05, 0x80,
+        0x80,
+    ]),
+    // 0b1110: lanes 1,2,3
+    AlignedMask([
+        0x80, 0x80, 0x80, 0x80, 0x00, 0x01, 0x80, 0x80, 0x02, 0x03, 0x80, 0x80, 0x04, 0x05, 0x80,
+        0x80,
+    ]),
+    // 0b1111: all lanes
+    AlignedMask([
+        0x00, 0x01, 0x80, 0x80, 0x02, 0x03, 0x80, 0x80, 0x04, 0x05, 0x80, 0x80, 0x06, 0x07, 0x80,
+        0x80,
+    ]),
+];
+
+/// Number of u16 words consumed for each 4-bit renorm mask (popcount).
+#[cfg(target_arch = "x86_64")]
+static WORD_COUNTS: [usize; 16] = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
+
+/// SSSE3 + SSE4.1 branchless 4-way shared-stream rANS decode.
+///
+/// This is the high-performance decode path combining three ryg_rans techniques:
+///
+/// 1. **Merged slot table**: single `slot_table[slot].freq_bias` read per lane
+///    (eliminates 2-hop gather: slot→symbol→freq/cum)
+///
+/// 2. **SSE4.1 `_mm_mullo_epi32`**: 4-lane u32 multiply in one instruction
+///    (vs SSE2's awkward 2× `_mm_mul_epu32` with interleave)
+///
+/// 3. **PSHUFB branchless renorm**: `_mm_shuffle_epi8` routes consecutive words
+///    from the shared stream to the correct lanes based on a 4-bit renorm mask.
+///    No per-lane branches — the renorm pattern is a table lookup.
+///
+/// The inner loop is fully branchless: the only data-dependent value is the
+/// 4-bit renorm mask (0..15), which selects from precomputed shuffle tables.
+///
+/// # Safety
+/// Requires SSSE3 (for `_mm_shuffle_epi8`) and SSE4.1 (for `_mm_mullo_epi32`
+/// and `_mm_blendv_epi8`). Caller must ensure these features are available.
+/// `shared_words` must have at least 8 bytes of readable padding past the end
+/// (the encode format provides 8 bytes of zero padding).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3", enable = "sse4.1")]
+pub unsafe fn rans_decode_4way_shared_ssse3(
+    shared_words: &[u16],
+    initial_states: &[u32],
+    slot2sym: &[u8],
+    slot_table: &[crate::rans::SlotEntry],
+    scale_bits: u32,
+    original_len: usize,
+    num_states: usize,
+) -> Option<Vec<u8>> {
+    use std::arch::x86_64::*;
+
+    if num_states != 4 || initial_states.len() != 4 {
+        return None;
+    }
+
+    let scale_mask = (1u32 << scale_bits) - 1;
+    let table_len = slot2sym.len();
+
+    // Load initial states into SSE register
+    let mut states = _mm_set_epi32(
+        initial_states[3] as i32,
+        initial_states[2] as i32,
+        initial_states[1] as i32,
+        initial_states[0] as i32,
+    );
+
+    // Constants
+    let sign_bit = _mm_set1_epi32(0x80000000u32 as i32);
+    // RANS_L = 0x10000, threshold for signed compare = 0x10000 ^ 0x80000000 = 0x80010000
+    let threshold = _mm_set1_epi32(0x80010000u32 as i32);
+    // Vector shift count for _mm_srl_epi32 (runtime scale_bits → register operand)
+    let scale_vec = _mm_set_epi64x(0, scale_bits as i64);
+
+    let mut output = vec![0u8; original_len];
+    let mut out_pos = 0;
+
+    // Raw pointer into shared word stream (byte-addressed for _mm_loadl_epi64)
+    let word_base = shared_words.as_ptr() as *const u8;
+    let mut word_byte_pos: usize = 0;
+
+    let full_quads = original_len / 4;
+    let remainder = original_len % 4;
+
+    // Temporary array for extracting states
+    let mut state_arr = [0u32; 4];
+
+    for _ in 0..full_quads {
+        // Step 1: Extract individual states for scalar gather
+        _mm_storeu_si128(state_arr.as_mut_ptr() as *mut __m128i, states);
+
+        let slot0 = state_arr[0] & scale_mask;
+        let slot1 = state_arr[1] & scale_mask;
+        let slot2 = state_arr[2] & scale_mask;
+        let slot3 = state_arr[3] & scale_mask;
+
+        // Bounds check
+        if (slot0 as usize | slot1 as usize | slot2 as usize | slot3 as usize) >= table_len {
+            return None;
+        }
+
+        // Step 2: Scalar gather — symbols and merged freq+bias
+        let s0 = *slot2sym.get_unchecked(slot0 as usize);
+        let s1 = *slot2sym.get_unchecked(slot1 as usize);
+        let s2 = *slot2sym.get_unchecked(slot2 as usize);
+        let s3 = *slot2sym.get_unchecked(slot3 as usize);
+
+        let e0 = slot_table.get_unchecked(slot0 as usize).freq_bias;
+        let e1 = slot_table.get_unchecked(slot1 as usize).freq_bias;
+        let e2 = slot_table.get_unchecked(slot2 as usize).freq_bias;
+        let e3 = slot_table.get_unchecked(slot3 as usize).freq_bias;
+
+        // Step 3: Pack freq_bias into SIMD, split into freq (low 16) and bias (high 16)
+        let fb_vec = _mm_set_epi32(e3 as i32, e2 as i32, e1 as i32, e0 as i32);
+        let freq_vec = _mm_and_si128(fb_vec, _mm_set1_epi32(0xFFFF));
+        let bias_vec = _mm_srli_epi32::<16>(fb_vec);
+
+        // Step 4: State transition — freq * (state >> scale_bits) + bias
+        // _mm_srl_epi32 uses a register operand (not immediate), so scale_bits
+        // can be a runtime value — single psrld instruction vs scalar fallback
+        let shifted = _mm_srl_epi32(states, scale_vec);
+        let products = _mm_mullo_epi32(freq_vec, shifted); // SSE4.1
+        states = _mm_add_epi32(products, bias_vec);
+
+        // Step 5: Unsigned compare — which lanes need renormalization?
+        // state < RANS_L ⟺ (state ^ 0x80000000) < (RANS_L ^ 0x80000000) [signed]
+        let xored = _mm_xor_si128(states, sign_bit);
+        let cmp = _mm_cmplt_epi32(xored, threshold); // -1 where state < RANS_L
+        let mask_4bit = _mm_movemask_ps(_mm_castsi128_ps(cmp)) as usize;
+
+        // Step 6: Load words from shared stream and shuffle to correct lanes
+        // _mm_loadl_epi64 loads 8 bytes (up to 4 u16 words) — safe due to padding
+        let raw_words = _mm_loadl_epi64(word_base.add(word_byte_pos) as *const __m128i);
+        let shuf_ctrl = _mm_load_si128(SHUFFLE_MASKS[mask_4bit].0.as_ptr() as *const __m128i);
+        let word_vec = _mm_shuffle_epi8(raw_words, shuf_ctrl); // SSSE3
+
+        // Step 7: Compute merged states — (state << 16) | word
+        let shifted_states = _mm_slli_epi32(states, 16);
+        let merged = _mm_or_si128(shifted_states, word_vec);
+
+        // Step 8: Conditional update — blend merged where renorm needed
+        states = _mm_blendv_epi8(states, merged, cmp); // SSE4.1
+
+        // Step 9: Advance shared pointer by number of words consumed
+        word_byte_pos += WORD_COUNTS[mask_4bit] * 2;
+
+        // Step 10: Write output symbols
+        *output.get_unchecked_mut(out_pos) = s0;
+        *output.get_unchecked_mut(out_pos + 1) = s1;
+        *output.get_unchecked_mut(out_pos + 2) = s2;
+        *output.get_unchecked_mut(out_pos + 3) = s3;
+        out_pos += 4;
+    }
+
+    // Scalar remainder for last < 4 symbols
+    _mm_storeu_si128(state_arr.as_mut_ptr() as *mut __m128i, states);
+    let mut wp = word_byte_pos / 2; // convert back to word index
+    #[allow(clippy::needless_range_loop)] // lane indexes state_arr + drives slot lookups
+    for lane in 0..remainder {
+        let slot = state_arr[lane] & scale_mask;
+        if slot as usize >= table_len {
+            return None;
+        }
+        let s = *slot2sym.get_unchecked(slot as usize);
+        let e = slot_table.get_unchecked(slot as usize).freq_bias;
+        state_arr[lane] = (e & 0xFFFF) * (state_arr[lane] >> scale_bits) + (e >> 16);
+
+        if state_arr[lane] < (1 << 16) && wp < shared_words.len() {
+            state_arr[lane] = (state_arr[lane] << 16) | *shared_words.get_unchecked(wp) as u32;
+            wp += 1;
+        }
+
+        *output.get_unchecked_mut(out_pos) = s;
+        out_pos += 1;
+    }
+
+    Some(output)
+}
+
+// ---------------------------------------------------------------------------
+// rANS 4-way shared-stream AVX2 decode (hardware gather)
+// ---------------------------------------------------------------------------
+
+/// AVX2 4-way shared-stream rANS decode with hardware gather.
+///
+/// Replaces the scalar gather bottleneck that made the SSSE3 path slower
+/// than scalar (432 MiB/s vs 1.18 GiB/s). AVX2's `_mm_i32gather_epi32`
+/// does all 4 slot_table lookups in a single instruction, eliminating
+/// the extract→load→repack overhead.
+///
+/// Combines all four ryg_rans techniques:
+///
+/// 1. **Merged slot table**: single gather reads freq+bias per lane
+/// 2. **AVX2 hardware gather**: `_mm_i32gather_epi32` replaces 4 scalar loads
+/// 3. **SSE4.1 `_mm_mullo_epi32`**: 4-lane u32 multiply
+/// 4. **PSHUFB branchless renorm**: SSSE3 shuffle routes shared-stream words
+///
+/// # Safety
+/// Requires AVX2 (which implies SSSE3 + SSE4.1). `shared_words` must have
+/// at least 8 bytes of readable padding past the end (the encode format
+/// provides 8 bytes of zero padding).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn rans_decode_4way_shared_avx2(
+    shared_words: &[u16],
+    initial_states: &[u32],
+    slot2sym: &[u8],
+    slot_table: &[crate::rans::SlotEntry],
+    scale_bits: u32,
+    original_len: usize,
+    num_states: usize,
+) -> Option<Vec<u8>> {
+    use std::arch::x86_64::*;
+
+    if num_states != 4 || initial_states.len() != 4 {
+        return None;
+    }
+
+    let scale_mask = (1u32 << scale_bits) - 1;
+    let table_len = slot2sym.len();
+
+    // Load initial states into SSE register
+    let mut states = _mm_set_epi32(
+        initial_states[3] as i32,
+        initial_states[2] as i32,
+        initial_states[1] as i32,
+        initial_states[0] as i32,
+    );
+
+    // Constants
+    let scale_mask_vec = _mm_set1_epi32(scale_mask as i32);
+    let sign_bit = _mm_set1_epi32(0x80000000u32 as i32);
+    let threshold = _mm_set1_epi32(0x80010000u32 as i32);
+    let scale_vec = _mm_set_epi64x(0, scale_bits as i64);
+    let lo16_mask = _mm_set1_epi32(0xFFFF);
+
+    let mut output = vec![0u8; original_len];
+    let mut out_pos = 0;
+
+    // Raw pointer into shared word stream
+    let word_base = shared_words.as_ptr() as *const u8;
+    let mut word_byte_pos: usize = 0;
+
+    // Slot table base pointer for gather (each entry is 4 bytes = 1 i32)
+    let slot_base = slot_table.as_ptr() as *const i32;
+
+    let full_quads = original_len / 4;
+    let remainder = original_len % 4;
+
+    // Temporary for extracting slots for symbol lookup
+    let mut slot_arr = [0u32; 4];
+
+    for _ in 0..full_quads {
+        // Step 1: Compute slots = states & scale_mask (SIMD)
+        let slots = _mm_and_si128(states, scale_mask_vec);
+
+        // Step 2: Extract slots for bounds check + symbol lookup (scalar)
+        _mm_storeu_si128(slot_arr.as_mut_ptr() as *mut __m128i, slots);
+
+        // Bounds check all 4
+        if (slot_arr[0] as usize
+            | slot_arr[1] as usize
+            | slot_arr[2] as usize
+            | slot_arr[3] as usize)
+            >= table_len
+        {
+            return None;
+        }
+
+        // Scalar symbol lookup (slot2sym is u8[], not worth SIMD-gathering)
+        let s0 = *slot2sym.get_unchecked(slot_arr[0] as usize);
+        let s1 = *slot2sym.get_unchecked(slot_arr[1] as usize);
+        let s2 = *slot2sym.get_unchecked(slot_arr[2] as usize);
+        let s3 = *slot2sym.get_unchecked(slot_arr[3] as usize);
+
+        // Step 3: AVX2 hardware gather for freq_bias (THE key optimization)
+        // SCALE=4: byte_offset = slot * 4, matching SlotEntry's 4-byte stride
+        let fb_vec = _mm_i32gather_epi32::<4>(slot_base, slots);
+
+        // Step 4: Split freq (low 16) and bias (high 16)
+        let freq_vec = _mm_and_si128(fb_vec, lo16_mask);
+        let bias_vec = _mm_srli_epi32::<16>(fb_vec);
+
+        // Step 5: State transition — freq * (state >> scale_bits) + bias
+        let shifted = _mm_srl_epi32(states, scale_vec);
+        let products = _mm_mullo_epi32(freq_vec, shifted);
+        states = _mm_add_epi32(products, bias_vec);
+
+        // Step 6: Unsigned compare — which lanes need renormalization?
+        let xored = _mm_xor_si128(states, sign_bit);
+        let cmp = _mm_cmplt_epi32(xored, threshold);
+        let mask_4bit = _mm_movemask_ps(_mm_castsi128_ps(cmp)) as usize;
+
+        // Step 7: Load words from shared stream and shuffle to correct lanes
+        let raw_words = _mm_loadl_epi64(word_base.add(word_byte_pos) as *const __m128i);
+        let shuf_ctrl = _mm_load_si128(SHUFFLE_MASKS[mask_4bit].0.as_ptr() as *const __m128i);
+        let word_vec = _mm_shuffle_epi8(raw_words, shuf_ctrl);
+
+        // Step 8: Compute merged states — (state << 16) | word
+        let shifted_states = _mm_slli_epi32(states, 16);
+        let merged = _mm_or_si128(shifted_states, word_vec);
+
+        // Step 9: Conditional update — blend merged where renorm needed
+        states = _mm_blendv_epi8(states, merged, cmp);
+
+        // Step 10: Advance shared pointer by number of words consumed
+        word_byte_pos += WORD_COUNTS[mask_4bit] * 2;
+
+        // Step 11: Write output symbols
+        *output.get_unchecked_mut(out_pos) = s0;
+        *output.get_unchecked_mut(out_pos + 1) = s1;
+        *output.get_unchecked_mut(out_pos + 2) = s2;
+        *output.get_unchecked_mut(out_pos + 3) = s3;
+        out_pos += 4;
+    }
+
+    // Scalar remainder for last < 4 symbols
+    let mut state_arr = [0u32; 4];
+    _mm_storeu_si128(state_arr.as_mut_ptr() as *mut __m128i, states);
+    let mut wp = word_byte_pos / 2;
+    #[allow(clippy::needless_range_loop)] // lane indexes state_arr + drives slot lookups
+    for lane in 0..remainder {
+        let slot = state_arr[lane] & scale_mask;
+        if slot as usize >= table_len {
+            return None;
+        }
+        let s = *slot2sym.get_unchecked(slot as usize);
+        let e = slot_table.get_unchecked(slot as usize).freq_bias;
+        state_arr[lane] = (e & 0xFFFF) * (state_arr[lane] >> scale_bits) + (e >> 16);
+
+        if state_arr[lane] < (1 << 16) && wp < shared_words.len() {
+            state_arr[lane] = (state_arr[lane] << 16) | *shared_words.get_unchecked(wp) as u32;
+            wp += 1;
+        }
+
+        *output.get_unchecked_mut(out_pos) = s;
         out_pos += 1;
     }
 

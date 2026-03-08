@@ -73,6 +73,41 @@ impl Match {
     }
 }
 
+/// Serialize a slice of matches to bytes.
+pub(crate) fn serialize_matches(matches: &[Match]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(matches.len() * Match::SERIALIZED_SIZE);
+    for m in matches {
+        out.extend_from_slice(&m.to_bytes());
+    }
+    out
+}
+
+/// Deserialize bytes back into a vector of matches.
+#[cfg(feature = "webgpu")]
+pub(crate) fn deserialize_matches(data: &[u8]) -> Vec<Match> {
+    let num = data.len() / Match::SERIALIZED_SIZE;
+    let mut matches = Vec::with_capacity(num);
+    for i in 0..num {
+        let base = i * Match::SERIALIZED_SIZE;
+        matches.push(Match::from_bytes(
+            data[base..base + Match::SERIALIZED_SIZE]
+                .try_into()
+                .unwrap(),
+        ));
+    }
+    matches
+}
+
+/// A parsed LZ token: either a literal byte or a (length, offset) match.
+///
+/// Shared across LZ modules (sortlz, parlz) that need to classify positions
+/// as literals or matches during encoding.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LzToken {
+    Literal(u8),
+    Match { offset: u16, length: u16 },
+}
+
 /// Decompress LZ77-compressed data.
 ///
 /// The input must be a sequence of serialized Match structs.
@@ -715,11 +750,7 @@ pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
 /// Like `compress_lazy` but with a caller-specified max match length.
 pub(crate) fn compress_lazy_with_limit(input: &[u8], max_match_len: u16) -> PzResult<Vec<u8>> {
     let matches = compress_lazy_to_matches_with_limit(input, max_match_len)?;
-    let mut output = Vec::with_capacity(matches.len() * Match::SERIALIZED_SIZE);
-    for m in &matches {
-        output.extend_from_slice(&m.to_bytes());
-    }
-    Ok(output)
+    Ok(serialize_matches(&matches))
 }
 
 /// Parse-mode-aware chain-depth heuristic.

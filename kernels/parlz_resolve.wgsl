@@ -24,7 +24,7 @@
 // Packed as u32 flags (one bit per position).
 @group(0) @binding(3) var<storage, read_write> flags: array<atomic<u32>>;
 
-// Parameters: [n, workgroup_size, 0, 0]
+// Parameters: [n, workgroup_size, dispatch_width (X workgroups), 0]
 @group(0) @binding(4) var<uniform> params: vec4<u32>;
 
 var<workgroup> shared_data: array<u32, 512>;
@@ -33,7 +33,8 @@ var<workgroup> shared_data: array<u32, 512>;
 @compute @workgroup_size(256)
 fn init_coverage(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = params.x;
-    let pos = gid.x + gid.y * 65535u * 256u;
+    let dispatch_width = params.z;
+    let pos = gid.x + gid.y * dispatch_width * 256u;
     if pos >= n {
         return;
     }
@@ -54,7 +55,8 @@ fn prefix_max_local(@builtin(local_invocation_id) lid: vec3<u32>,
                     @builtin(workgroup_id) wgid: vec3<u32>) {
     let n = params.x;
     let wg_size = 256u;
-    let block_start = (wgid.x + wgid.y * 65535u) * wg_size;
+    let dispatch_width = params.z;
+    let block_start = (wgid.x + wgid.y * dispatch_width) * wg_size;
     let tid = lid.x;
     let global_idx = block_start + tid;
 
@@ -91,7 +93,7 @@ fn prefix_max_local(@builtin(local_invocation_id) lid: vec3<u32>,
 
     // Last thread writes block maximum for propagation.
     if tid == wg_size - 1u {
-        let block_idx = wgid.x + wgid.y * 65535u;
+        let block_idx = wgid.x + wgid.y * dispatch_width;
         let last_valid = min(block_start + wg_size - 1u, n - 1u);
         block_maxima[block_idx] = coverage[last_valid];
     }
@@ -104,14 +106,15 @@ fn prefix_max_propagate(@builtin(global_invocation_id) gid: vec3<u32>,
                         @builtin(workgroup_id) wgid: vec3<u32>) {
     let n = params.x;
     let wg_size = 256u;
-    let block_idx = wgid.x + wgid.y * 65535u;
+    let dispatch_width = params.z;
+    let block_idx = wgid.x + wgid.y * dispatch_width;
 
     // First block doesn't need propagation.
     if block_idx == 0u {
         return;
     }
 
-    let global_idx = gid.x + gid.y * 65535u * 256u;
+    let global_idx = gid.x + gid.y * dispatch_width * 256u;
     if global_idx >= n {
         return;
     }
@@ -131,7 +134,8 @@ fn prefix_max_propagate(@builtin(global_invocation_id) gid: vec3<u32>,
 @compute @workgroup_size(256)
 fn classify(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = params.x;
-    let pos = gid.x + gid.y * 65535u * 256u;
+    let dispatch_width = params.z;
+    let pos = gid.x + gid.y * dispatch_width * 256u;
     if pos >= n {
         return;
     }

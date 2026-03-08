@@ -23,12 +23,7 @@ use crate::{PzError, PzResult};
 /// Minimum match length (must match lz77::MIN_MATCH).
 const MIN_MATCH: usize = lz77::MIN_MATCH as usize;
 
-/// A parsed LZ token.
-#[derive(Debug, Clone, Copy)]
-enum LzToken {
-    Literal(u8),
-    Match { offset: u16, length: u16 },
-}
+use lz77::LzToken;
 
 /// Find best match at every position using hash chains.
 ///

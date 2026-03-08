@@ -241,7 +241,7 @@ Ensures implementations produce identical output.
 
 ### Validation Corpus
 
-Real-world data in `validation/`:
+Real-world data in `samples/` (`cantrbry.tar.gz` and `large.tar.gz`, extracted at test time by `src/validation.rs`):
 - Canterbury corpus (11 files, 2.8MB)
 - Large corpus (3 files, 10.5MB)
 - All pipelines tested on all files
@@ -250,12 +250,11 @@ Run via `cargo test validation`.
 
 ### Property Tests
 
-Fuzz testing (M5.3) not yet implemented. See `exec-plans/tech-debt-tracker.md` for the plan.
+Fuzz testing infrastructure complete (M5.3). See `fuzz/` directory for fuzz targets.
 
 ## Related Documents
 
 - **CLAUDE.md** - Day-to-day development instructions
 - **ARCHITECTURE.md** - Technical architecture, benchmarks, roadmap
 - **design-docs/core-beliefs.md** - Agent-first operating principles
-- **GOLDEN_PRINCIPLES.md** - Mechanically-enforced coding standards
 - **design-docs/** - Detailed design docs (GPU memory model, pipeline architecture, etc.)
