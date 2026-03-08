@@ -8,6 +8,7 @@ use pz::lz77;
 use pz::sortlz::{self, SortLzConfig};
 
 const SIZES: &[usize] = &[8192, 65536, 262_144];
+#[cfg(feature = "webgpu")]
 const GPU_SIZES: &[usize] = &[8192, 65536, 262_144, 4_194_304];
 
 /// Raw match-finding throughput: hash-chain vs sortlz.

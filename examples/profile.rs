@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use pz::pipeline::{self, CompressOptions, Pipeline};
 
 const DEFAULT_RANS_CHUNK_BYTES: usize = 8192;
+#[cfg(feature = "webgpu")]
 const DEFAULT_RANS_GPU_CHUNK_BYTES: usize = 2048;
 const DEFAULT_RANS_GPU_BATCH: usize = 6;
 
@@ -106,6 +107,7 @@ fn load_data(size: usize) -> Vec<u8> {
     full[..size].to_vec()
 }
 
+#[cfg(feature = "webgpu")]
 fn split_independent_blocks(data: &[u8], block_bytes: usize) -> Vec<&[u8]> {
     if block_bytes == 0 || block_bytes >= data.len() {
         return vec![data];
@@ -616,6 +618,7 @@ fn main() {
         };
 
         // Warm up once
+        #[allow(unused_mut)]
         let mut opts = CompressOptions {
             threads,
             rans_interleaved,

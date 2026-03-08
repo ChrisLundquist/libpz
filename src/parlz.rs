@@ -286,6 +286,7 @@ fn read_fse_stream(payload: &[u8], pos: &mut usize, expected_len: usize) -> PzRe
 }
 
 /// Parallel parse + encode in one step (avoids exposing LzToken).
+#[cfg(feature = "webgpu")]
 pub(crate) fn parallel_parse_and_encode(
     input: &[u8],
     matches: &[Option<(u16, u16)>],

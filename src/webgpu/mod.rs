@@ -54,7 +54,6 @@ use kernels::*;
 use pipelines::*;
 
 #[cfg(test)]
-#[path = "tests.rs"]
 mod tests;
 
 /// Minimum input size below which GPU overhead exceeds benefit.

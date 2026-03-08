@@ -72,6 +72,7 @@ pub(crate) fn demuxer_for_pipeline(pipeline: super::Pipeline) -> Option<LzDemuxe
 /// This is the demux-only counterpart to `LzDemuxer::Lz77::compress_and_demux()`.
 /// Used by the GPU coordinator to demux matches returned from
 /// `find_matches_batched()` without re-running match-finding.
+#[cfg(feature = "webgpu")]
 pub(crate) fn demux_lz77_matches(matches: Vec<lz77::Match>) -> DemuxOutput {
     let num_matches = matches.len();
     let mut offsets = Vec::with_capacity(num_matches * 2);
