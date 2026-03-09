@@ -52,6 +52,15 @@ Specialized agents in `.claude/agents/` run on cheaper models and keep verbose o
 - `scripts/` — test, bench, profile, setup, and analysis tools
 - `docs/` — design docs, quality status, exec plans, references
 
+## Known dead ends
+
+Before optimizing GPU code paths, read this first — multiple agents have spent full sessions rediscovering these:
+
+- **GPU entropy (rANS/FSE) is slower than CPU** — 0.77x on encode, 0.54x on decode. This has been proven across 500+ optimization iterations. The serial state dependency in rANS limits GPU to ~300 threads; saturation needs ~8K-16K. Do not attempt to batch, parallelize, or "pipeline" GPU entropy encoding.
+- **`gpu_fused_span()` returning `Some((0,1))` is counterproductive** — it routes entropy to GPU (slower). It exists as architectural prep for if GPU entropy ever becomes competitive. The `GPU_ENTROPY_THRESHOLD` (256KB > default GPU block size 128KB) intentionally prevents this path from activating.
+- **The CLI uses `streaming::compress_stream`, not `pipeline::compress_with_options`** — the parallel scheduler's GPU coordinator is not invoked by the CLI. The streaming path deliberately uses CPU rANS for entropy.
+- **The real GPU win (ring-buffered LZ77 batching) is already shipped** — delivers +7-17% throughput. See `docs/design-docs/gpu-strategy.md`.
+
 ## Key conventions
 
 See **docs/DESIGN.md** for full design principles and **docs/design-docs/core-beliefs.md** for agent-first operating principles.

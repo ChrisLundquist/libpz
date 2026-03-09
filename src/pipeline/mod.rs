@@ -143,8 +143,11 @@ const DEFAULT_BW_BLOCK_SIZE: usize = 512 * 1024;
 /// which also improves throughput on streaming GPU paths.
 const DEFAULT_GPU_BLOCK_SIZE: usize = 128 * 1024;
 
-/// Minimum block size for GPU entropy to win over CPU (empirical from Phase 4).
-/// Applies to both individual blocks and total stream byte count.
+/// Gate that **prevents** routing entropy to the GPU, which is slower than CPU
+/// (0.77x encode, 0.54x decode — see `docs/design-docs/gpu-strategy.md`).
+/// Set deliberately above `DEFAULT_GPU_BLOCK_SIZE` (128KB) so GPU blocks never
+/// qualify for the fused entropy path. Do NOT lower this threshold — it will
+/// regress throughput by ~10-15x. See "Known dead ends" in CLAUDE.md.
 /// 256KB = 262144 bytes (aligns with AC3.2 threshold).
 pub const GPU_ENTROPY_THRESHOLD: usize = 256 * 1024;
 
