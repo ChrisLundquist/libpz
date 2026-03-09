@@ -75,15 +75,18 @@ impl LocalSchedulerStats {
             .fetch_add(duration_to_ns(d), Ordering::Relaxed);
     }
 
+    #[cfg(feature = "webgpu")]
     pub(super) fn add_gpu_handoff(&self, d: Duration) {
         self.gpu_handoff_ns
             .fetch_add(duration_to_ns(d), Ordering::Relaxed);
     }
 
+    #[cfg(feature = "webgpu")]
     pub(super) fn inc_gpu_try_send_full(&self) {
         self.gpu_try_send_full_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(feature = "webgpu")]
     pub(super) fn inc_gpu_try_send_disconnected(&self) {
         self.gpu_try_send_disconnected_count
             .fetch_add(1, Ordering::Relaxed);

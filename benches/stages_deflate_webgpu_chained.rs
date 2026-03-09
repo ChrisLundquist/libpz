@@ -1,7 +1,11 @@
 #[path = "stages_common.rs"]
+#[cfg_attr(not(feature = "webgpu"), allow(dead_code))]
 mod stages_common;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion};
+#[cfg(feature = "webgpu")]
+use criterion::{BenchmarkId, Throughput};
+#[cfg(feature = "webgpu")]
 use stages_common::{cap, get_test_data};
 
 #[cfg(feature = "webgpu")]

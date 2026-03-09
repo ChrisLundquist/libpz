@@ -5,6 +5,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use stages_common::{cap, get_test_data};
 
 const SIZES_SMALL: &[usize] = &[8192, 65536];
+#[cfg(feature = "webgpu")]
 const SIZES_ALL: &[usize] = &[8192, 65536, 4_194_304];
 const SIZES_LARGE: &[usize] = &[262_144, 4_194_304];
 
