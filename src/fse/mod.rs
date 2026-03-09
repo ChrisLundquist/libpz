@@ -527,21 +527,22 @@ impl<'a> BitReader<'a> {
 /// - Encode: from encoding_state `next_state`, find `c` for this symbol where
 ///   `base <= next_state < base + 2^bits`, output `next_state - base` as
 ///   `bits` bits, transition to `c`.
-fn fse_encode_internal(input: &[u8], table: &FseTable) -> (Vec<u8>, u16, u32) {
-    // Initial encoding state: 0. After encoding all symbols in reverse,
-    // the final state becomes the decoder's initial state.
-    let mut state: usize = 0;
+///
+/// Threshold below which FSE encode uses stack-allocated scratch buffers.
+const FSE_STACK_ENCODE_LIMIT: usize = 8192;
 
-    // Store bit values and bit counts in separate arrays to reduce memory
-    // bandwidth during the write pass.
-    let mut bit_values = vec![0u32; input.len()];
-    let mut bit_counts = vec![0u8; input.len()];
+fn fse_encode_core(
+    input: &[u8],
+    table: &FseTable,
+    bit_values: &mut [u32],
+    bit_counts: &mut [u8],
+) -> (Vec<u8>, u16, u32) {
+    let mut state: usize = 0;
 
     for (j, &byte) in input.iter().enumerate().rev() {
         let s = byte as usize;
         let mapping = table.encode_tables[s].find(state);
-        let value = state as u32 - mapping.base as u32;
-        bit_values[j] = value;
+        bit_values[j] = state as u32 - mapping.base as u32;
         bit_counts[j] = mapping.bits;
         state = mapping.compressed_state as usize;
     }
@@ -553,6 +554,23 @@ fn fse_encode_internal(input: &[u8], table: &FseTable) -> (Vec<u8>, u16, u32) {
 
     let (bitstream, total_bits) = writer.finish();
     (bitstream, state as u16, total_bits)
+}
+
+fn fse_encode_internal(input: &[u8], table: &FseTable) -> (Vec<u8>, u16, u32) {
+    if input.len() <= FSE_STACK_ENCODE_LIMIT {
+        let mut bit_values = [0u32; FSE_STACK_ENCODE_LIMIT];
+        let mut bit_counts = [0u8; FSE_STACK_ENCODE_LIMIT];
+        fse_encode_core(
+            input,
+            table,
+            &mut bit_values[..input.len()],
+            &mut bit_counts[..input.len()],
+        )
+    } else {
+        let mut bit_values = vec![0u32; input.len()];
+        let mut bit_counts = vec![0u8; input.len()];
+        fse_encode_core(input, table, &mut bit_values, &mut bit_counts)
+    }
 }
 
 /// Decode FSE-encoded bitstream. Returns the decoded byte sequence.
