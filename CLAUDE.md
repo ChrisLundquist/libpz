@@ -63,6 +63,13 @@ Before optimizing GPU code paths, read this first — multiple agents have spent
 - **GPU device init time skews throughput benchmarks** — first-call GPU init adds significant overhead that `bench.sh` captures but Criterion amortizes across iterations. When comparing GPU vs CPU throughput, use Criterion (`cargo bench`) for apples-to-apples; `bench.sh` reflects real-world cold-start cost. Don't chase "GPU is slower" regressions that are really just init time.
 - **Compression ratio is limited by 5-byte match encoding, not match quality** — the LZ match-finder finds good matches, but the 5-byte serialized match format creates overhead on short matches. Improving ratio means fixing the encoding format, not tuning the matcher.
 - **GPU Huffman is a dead end** — Huffman coding requires bit-level alignment, but GPU throughput depends on byte-aligned memory access patterns. This is a fundamental architectural mismatch; do not attempt to port Huffman to GPU.
+- **GPU hash tables for LZ matching don't work** — GPU atomics don't preserve insertion order, so hash chains lose recency information. Match quality collapses to ~6% vs CPU's 99.6% on repetitive data. Tried twice (global atomics + shared-memory variant), both catastrophically failed. See `docs/design-docs/experiments.md`.
+- **SSE2 rANS decode is 32% slower than scalar** — scalar 4-lane decode gets good ILP from out-of-order execution. SSE2 extract operations serialize and lose that parallelism. Proper SIMD rANS would need merged slot-indexed tables and SSE4.1+. The dispatch is disabled; don't re-enable it.
+- **Fully parallel GPU LZ parsing (ParlZ) has unacceptable ratio loss** — 37.6% compression gap vs serial parsing. Forward-max-propagation conflict resolution is too aggressive. Hybrid GPU match-finding + CPU serial parsing is the correct architecture.
+- **Iterative GPU algorithms have quadratic host overhead** — Repair grammar compression hit 0.4 MB/s due to 100+ rounds of buffer alloc + readback. Avoid per-round GPU↔CPU synchronization; prefer single-dispatch or persistent-buffer designs.
+- **Window-capped suffix sorts break BWT invertibility** — FWST produced 433% ratio (massive expansion). Full suffix sort is structurally required for LF-mapping; there's no shortcut.
+
+For detailed history of all failed experiments, see `docs/design-docs/gpu-experiments-wave2-conclusions.md` and `docs/design-docs/experiments.md`.
 
 ## Key conventions
 
