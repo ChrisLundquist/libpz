@@ -73,11 +73,28 @@ impl HuffmanTree {
         let mut freq = FrequencyTable::new();
         freq.count(input);
 
-        Self::from_frequency_table(&freq)
+        Self::from_frequency_table_encode_only(&freq)
     }
 
     /// Build a Huffman tree from a pre-computed frequency table.
+    ///
+    /// Includes the fast decode table for O(1) per-symbol decoding.
     pub fn from_frequency_table(freq: &FrequencyTable) -> Option<Self> {
+        let mut tree = Self::build_tree(freq)?;
+        tree.decode_table = Self::build_decode_table(&tree.lookup);
+        Some(tree)
+    }
+
+    /// Build a Huffman tree from a frequency table, encode-only (no decode table).
+    ///
+    /// Skips the 4096-entry decode lookup table allocation. The resulting tree
+    /// can only be used for encoding. Decode methods will fall back to tree walk.
+    pub fn from_frequency_table_encode_only(freq: &FrequencyTable) -> Option<Self> {
+        Self::build_tree(freq)
+    }
+
+    /// Shared tree construction: builds nodes, lookup table, but no decode table.
+    fn build_tree(freq: &FrequencyTable) -> Option<Self> {
         if freq.used == 0 {
             return None;
         }
@@ -105,9 +122,7 @@ impl HuffmanTree {
 
         // Special case: only one distinct symbol
         if freq.used == 1 {
-            // Find the one leaf with nonzero weight
             let leaf_idx = heap.pop().unwrap();
-            // Create a dummy internal node as root with the leaf as left child
             let root_idx = nodes.len();
             nodes.push(HuffmanNode {
                 weight: nodes[leaf_idx].weight,
@@ -119,18 +134,16 @@ impl HuffmanTree {
             });
 
             let mut lookup = [(0u32, 0u8); 256];
-            // Assign code 0 with 1 bit to the single symbol
             nodes[leaf_idx].codeword = 0;
             nodes[leaf_idx].code_bits = 1;
             lookup[nodes[leaf_idx].value as usize] = (0, 1);
 
-            let decode_table = Self::build_decode_table(&lookup);
             return Some(HuffmanTree {
                 nodes,
                 root: Some(root_idx),
                 lookup,
                 leaf_count: 1,
-                decode_table,
+                decode_table: Vec::new(),
             });
         }
 
@@ -158,13 +171,12 @@ impl HuffmanTree {
         let mut lookup = [(0u32, 0u8); 256];
         Self::generate_codes(&mut nodes, root_idx, 0, 0, &mut lookup);
 
-        let decode_table = Self::build_decode_table(&lookup);
         Some(HuffmanTree {
             nodes,
             root: Some(root_idx),
             lookup,
             leaf_count: freq.used,
-            decode_table,
+            decode_table: Vec::new(),
         })
     }
 
@@ -370,7 +382,7 @@ impl HuffmanTree {
                 byte_pos += 1;
             }
 
-            if bits_avail >= DECODE_TABLE_BITS as u32 {
+            if !self.decode_table.is_empty() && bits_avail >= DECODE_TABLE_BITS as u32 {
                 // Fast path: peek top DECODE_TABLE_BITS bits
                 let peek = (accumulator >> (64 - DECODE_TABLE_BITS as u32)) as usize;
                 let (sym, len) = self.decode_table[peek];
@@ -383,8 +395,8 @@ impl HuffmanTree {
                 }
             }
 
-            // Slow path: tree walk for codes > DECODE_TABLE_BITS or
-            // when accumulator is nearly empty
+            // Slow path: tree walk for codes > DECODE_TABLE_BITS,
+            // when accumulator is nearly empty, or no decode table
             return self.decode_tree_walk(input, total_bits, bits_consumed, output);
         }
 
@@ -423,7 +435,7 @@ impl HuffmanTree {
                 byte_pos += 1;
             }
 
-            if bits_avail >= DECODE_TABLE_BITS as u32 {
+            if !self.decode_table.is_empty() && bits_avail >= DECODE_TABLE_BITS as u32 {
                 let peek = (accumulator >> (64 - DECODE_TABLE_BITS as u32)) as usize;
                 let (sym, len) = self.decode_table[peek];
                 if len > 0 {
@@ -439,7 +451,7 @@ impl HuffmanTree {
                 }
             }
 
-            // Slow path: tree walk for remaining symbols
+            // Slow path: tree walk for remaining symbols or no decode table
             let remaining = self.decode_tree_walk(input, total_bits, bits_consumed, Vec::new())?;
             for &sym in &remaining {
                 if out_pos >= output.len() {
