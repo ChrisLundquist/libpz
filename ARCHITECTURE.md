@@ -283,6 +283,33 @@ GPU Huffman with Blelloch prefix sum crosses over ~128KB. At 256KB the GPU scan 
 
 GPU BWT radix sort is 7-14x faster than the old bitonic sort. Still slower than CPU SA-IS at small sizes but becoming competitive at 64KB+ (CPU SA-IS ~1ms at 64KB vs GPU 4.1ms). The gap narrows at larger sizes where GPU parallelism helps more.
 
+## GPU/CPU strategy (settled)
+
+The optimal split for libpz is **GPU for LZ77 match-finding, CPU for entropy coding**,
+overlapped via the unified scheduler with ring-buffered streaming.
+
+**Why GPU wins on LZ77:** Match-finding is embarrassingly parallel — each position's
+search is independent. The cooperative-stitch kernel does 1,788 probes/position and
+is 2x faster than CPU at 256KB+. Ring-buffered batching (`find_matches_batched`)
+adds +7-17% throughput by amortizing buffer allocation and overlapping GPU compute
+with CPU readback.
+
+**Why CPU wins on entropy:** rANS/FSE/Huffman are serial state machines — each
+symbol depends on the previous state. GPU entropy has been tried extensively
+(500+ iterations: single-stream, independent blocks, Recoil checkpoints, batched
+cross-block) and is 0.77x CPU on encode, 0.54x on decode. The serial dependency
+limits GPU to ~300 useful threads when saturation needs ~8K-16K. PCIe transfer
+overhead dominates at typical block sizes (128KB-256KB).
+
+**Architecture:** The unified scheduler dispatches LZ77 to GPU and entropy to CPU
+workers in parallel. While CPU thread N entropy-encodes block K, the GPU is already
+match-finding block K+1. The `GPU_ENTROPY_THRESHOLD` (256KB) is deliberately set
+above `DEFAULT_GPU_BLOCK_SIZE` (128KB) to prevent routing entropy to the slower
+GPU path.
+
+See `docs/design-docs/gpu-strategy.md` for full analysis and `CLAUDE.md` "Known
+dead ends" for the complete list of GPU optimization attempts that failed.
+
 ## Remaining GPU bottlenecks
 
 1. **GPU BWT still slower than CPU SA-IS** — Radix sort improved 7-14x over bitonic
@@ -304,31 +331,37 @@ GPU BWT radix sort is 7-14x faster than the old bitonic sort. Still slower than 
 
 ## Next steps
 
-### Priority 0: rANS SIMD completion
+### Priority 0: Close the gzip compression ratio gap
 
-See `docs/exec-plans/tech-debt-tracker.md` for full details. Two items: SIMD decode paths (SSE2/AVX2 intrinsics for interleaved decode) and reciprocal multiplication (eliminate data-dependent division in encode).
+LzSeqR is our best pipeline at 35.1% vs gzip's 28.6% (6.5pp gap). The gap is
+encoding efficiency, not match quality (see `CLAUDE.md` "Known dead ends"). The
+format is pre-release so all changes are free. Key opportunities:
 
-### Priority 1: Use local/shared memory in LZ77 hash kernel
-- Load hash buckets into `__local` memory for faster repeated access
-- Could improve GPU LZ77 performance at mid-range sizes (64KB-256KB)
-- May lower the GPU crossover point from 256KB toward 64-128KB
+- **Zstd-style literal-run sequences** — replace per-token flags with
+  `(literal_run_length, offset, match_length)` tuples, eliminating the flags
+  stream entirely. Highest ceiling.
+- **Larger repeat offset cache** (4→8) — each additional repeat saves all extra
+  bits for that match.
+- **Entropy-code the extra bits** — `offset_extra` and `length_extra` currently
+  bypass rANS; if values are skewed, 5-15% savings.
+- **Sparse frequency tables** — 512 bytes per rANS stream → ~61 bytes for
+  narrow-alphabet streams. Saves ~1.3KB/block.
 
-### Priority 3: Chunk-based Huffman bit packing
-- Replace per-bit `atomic_or` in WriteCodes with work-group-local packing
-- Each work-group packs its chunk into local memory (no atomics within WG)
-- Single copy from local → global per chunk
-- Could 5-10x GPU Huffman throughput
+### Priority 1: rANS SIMD decode wiring
 
-### Priority 4: Fuzz testing
-- Set up `cargo-fuzz` for round-trip correctness on all pipelines
-- Target edge cases in LZ77, Huffman, BWT decode paths
+SSE2/AVX2 decode paths exist in `src/simd.rs` but are not wired into the main
+decode loop. The interleaved N-way rANS is naturally SIMD-friendly. Note: the
+naive SSE2 4-way dispatch was 32% slower than scalar (extract operations
+serialize) — proper implementation needs merged slot-indexed tables and SSE4.1+
+`_mm_mullo_epi32`. See `docs/exec-plans/tech-debt-tracker.md`.
 
-### Priority 5: Auto-selection threshold tuning
-- Run all 3 pipelines on Canterbury + Silesia corpora
-- Measure actual compression ratios vs analysis metrics
-- Tune heuristic decision tree thresholds empirically
+### Priority 2: LzSeq-specific optimal parser
 
-### Priority 6: aarch64 NEON/SVE SIMD implementation
+The optimal parser currently uses LZ77's `match_cost` approximation. A dedicated
+LzSeq optimal parser that tracks repeat offset state through the backward DP would
+find more repeat matches, directly improving ratio.
+
+### Priority 3: aarch64 NEON/SVE SIMD implementation
 - Replace scalar stubs in `src/simd.rs` with actual NEON intrinsics
 - `compare_bytes`: `vceqq_u8` + `vmovn_u16` for 16-byte comparison
 - `byte_frequencies`: 4-bank unrolled (NEON lacks efficient gather/scatter)
