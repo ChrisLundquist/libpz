@@ -316,16 +316,10 @@ dead ends" for the complete list of GPU optimization attempts that failed.
    sort, but CPU SA-IS (O(n)) remains faster at small/medium sizes. GPU catches up
    at 64KB+ but prefix-doubling's O(n log n) work is inherently more than SA-IS's O(n).
 
-2. **No shared memory usage** — LZ77 hash kernel uses only global memory.
-   Loading hash buckets into `__local` memory could help at larger sizes.
-
-3. **Hash bucket overflow** — Fixed BUCKET_CAP=64 means highly repetitive data
+2. **Hash bucket overflow** — Fixed BUCKET_CAP=64 means highly repetitive data
    may miss good matches. Adaptive bucket sizing could help.
 
-4. **Huffman WriteCodes atomic contention** — Per-bit atomic_or on the output
-   buffer limits scaling. Chunk-based packing could reduce contention.
-
-5. **LZ77 match array still downloaded for dedupe** — GPU match dedup is sequential
+3. **LZ77 match array still downloaded for dedupe** — GPU match dedup is sequential
    and runs on CPU. Keeping serialized LZ77 bytes on GPU for histogram+Huffman
    is already done (ByteHistogram optimization), but the match download is unavoidable.
 
@@ -347,21 +341,13 @@ format is pre-release so all changes are free. Key opportunities:
 - **Sparse frequency tables** — 512 bytes per rANS stream → ~61 bytes for
   narrow-alphabet streams. Saves ~1.3KB/block.
 
-### Priority 1: rANS SIMD decode wiring
-
-SSE2/AVX2 decode paths exist in `src/simd.rs` but are not wired into the main
-decode loop. The interleaved N-way rANS is naturally SIMD-friendly. Note: the
-naive SSE2 4-way dispatch was 32% slower than scalar (extract operations
-serialize) — proper implementation needs merged slot-indexed tables and SSE4.1+
-`_mm_mullo_epi32`. See `docs/exec-plans/tech-debt-tracker.md`.
-
-### Priority 2: LzSeq-specific optimal parser
+### Priority 1: LzSeq-specific optimal parser
 
 The optimal parser currently uses LZ77's `match_cost` approximation. A dedicated
 LzSeq optimal parser that tracks repeat offset state through the backward DP would
 find more repeat matches, directly improving ratio.
 
-### Priority 3: aarch64 NEON/SVE SIMD implementation
+### Priority 2: aarch64 NEON/SVE SIMD implementation
 - Replace scalar stubs in `src/simd.rs` with actual NEON intrinsics
 - `compare_bytes`: `vceqq_u8` + `vmovn_u16` for 16-byte comparison
 - `byte_frequencies`: 4-bank unrolled (NEON lacks efficient gather/scatter)
