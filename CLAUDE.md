@@ -60,6 +60,9 @@ Before optimizing GPU code paths, read this first — multiple agents have spent
 - **`gpu_fused_span()` returning `Some((0,1))` is counterproductive** — it routes entropy to GPU (slower). It exists as architectural prep for if GPU entropy ever becomes competitive. The `GPU_ENTROPY_THRESHOLD` (256KB > default GPU block size 128KB) intentionally prevents this path from activating.
 - **The CLI uses `streaming::compress_stream`, not `pipeline::compress_with_options`** — the parallel scheduler's GPU coordinator is not invoked by the CLI. The streaming path deliberately uses CPU rANS for entropy.
 - **The real GPU win (ring-buffered LZ77 batching) is already shipped** — delivers +7-17% throughput. See `docs/design-docs/gpu-strategy.md`.
+- **GPU device init time skews throughput benchmarks** — first-call GPU init adds significant overhead that `bench.sh` captures but Criterion amortizes across iterations. When comparing GPU vs CPU throughput, use Criterion (`cargo bench`) for apples-to-apples; `bench.sh` reflects real-world cold-start cost. Don't chase "GPU is slower" regressions that are really just init time.
+- **Compression ratio is limited by 5-byte match encoding, not match quality** — the LZ match-finder finds good matches, but the 5-byte serialized match format creates overhead on short matches. Improving ratio means fixing the encoding format, not tuning the matcher.
+- **GPU Huffman is a dead end** — Huffman coding requires bit-level alignment, but GPU throughput depends on byte-aligned memory access patterns. This is a fundamental architectural mismatch; do not attempt to port Huffman to GPU.
 
 ## Key conventions
 
