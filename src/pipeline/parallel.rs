@@ -543,7 +543,7 @@ fn compress_parallel_unified(
                     // Process Stage 0 batch last to avoid starving queued StageN/Fused
                     // continuations when bursts arrive together.
                     if !stage0_batch.is_empty() && uses_sortlz_match_finder {
-                        // SortLZ GPU match finding: per-block dispatch with LZ77 conversion
+                        // SortLZ GPU match finding: per-block dispatch → parse_matches → demux_tokens
                         let sortlz_config = crate::sortlz::SortLzConfig::for_lz77(
                             opts.max_match_len.unwrap_or(crate::lz77::LZ77_MAX_MATCH),
                         );
@@ -552,13 +552,14 @@ fn compress_parallel_unified(
                             let result = engine
                                 .sortlz_find_matches(blocks[block_idx], &sortlz_config)
                                 .and_then(|raw_matches| {
-                                    let lz_matches = crate::sortlz::matches_to_lz77_lazy(
+                                    let tokens = crate::sortlz::parse_matches(
                                         blocks[block_idx],
                                         &raw_matches,
+                                        true, // lazy parsing
                                     );
-                                    let demux = super::demux::demux_lz77_matches(
+                                    let demux = super::demux::demux_tokens(
                                         blocks[block_idx],
-                                        lz_matches,
+                                        &tokens,
                                         pipeline,
                                     )?;
                                     Ok(StageBlock {

@@ -364,128 +364,6 @@ pub(crate) fn parse_matches(
 // SortLZ → LZ77 Match conversion (for feeding into LZ77 pipelines)
 // ---------------------------------------------------------------------------
 
-/// Convert position-indexed matches to an LZ77 match sequence using greedy parsing.
-///
-/// Takes the longest match at every position, emitting `lz77::Match` structs
-/// with the `next` byte. Produces the same format as `lz77::compress_lazy_to_matches()`.
-pub fn matches_to_lz77_greedy(
-    input: &[u8],
-    matches: &[Option<(u16, u16)>],
-) -> Vec<crate::lz77::Match> {
-    let n = input.len();
-    let mut result = Vec::with_capacity(n / 4);
-    let mut pos = 0;
-
-    while pos < n {
-        if let Some((offset, length)) = matches.get(pos).copied().flatten() {
-            let end = pos + length as usize;
-            if end < n {
-                result.push(crate::lz77::Match {
-                    offset,
-                    length,
-                    next: input[end],
-                });
-                pos = end + 1;
-            } else {
-                // Match extends to or past end of input; truncate to leave room for next byte
-                let adj_len = (n - 1 - pos) as u16;
-                if adj_len >= crate::lz77::MIN_MATCH {
-                    result.push(crate::lz77::Match {
-                        offset,
-                        length: adj_len,
-                        next: input[pos + adj_len as usize],
-                    });
-                    pos = pos + adj_len as usize + 1;
-                } else {
-                    result.push(crate::lz77::Match {
-                        offset: 0,
-                        length: 0,
-                        next: input[pos],
-                    });
-                    pos += 1;
-                }
-            }
-        } else {
-            result.push(crate::lz77::Match {
-                offset: 0,
-                length: 0,
-                next: input[pos],
-            });
-            pos += 1;
-        }
-    }
-
-    result
-}
-
-/// Convert position-indexed matches to an LZ77 match sequence using lazy parsing.
-///
-/// If the next position has a longer match, emits a literal for the current
-/// position and takes the longer match instead (gzip-style lazy evaluation).
-pub fn matches_to_lz77_lazy(
-    input: &[u8],
-    matches: &[Option<(u16, u16)>],
-) -> Vec<crate::lz77::Match> {
-    let n = input.len();
-    let mut result = Vec::with_capacity(n / 4);
-    let mut pos = 0;
-
-    while pos < n {
-        if let Some((offset, length)) = matches.get(pos).copied().flatten() {
-            // Lazy check: if next position has a longer match, emit literal here
-            if pos + 1 < n {
-                if let Some((_, next_len)) = matches.get(pos + 1).copied().flatten() {
-                    if next_len > length {
-                        result.push(crate::lz77::Match {
-                            offset: 0,
-                            length: 0,
-                            next: input[pos],
-                        });
-                        pos += 1;
-                        continue;
-                    }
-                }
-            }
-
-            let end = pos + length as usize;
-            if end < n {
-                result.push(crate::lz77::Match {
-                    offset,
-                    length,
-                    next: input[end],
-                });
-                pos = end + 1;
-            } else {
-                let adj_len = (n - 1 - pos) as u16;
-                if adj_len >= crate::lz77::MIN_MATCH {
-                    result.push(crate::lz77::Match {
-                        offset,
-                        length: adj_len,
-                        next: input[pos + adj_len as usize],
-                    });
-                    pos = pos + adj_len as usize + 1;
-                } else {
-                    result.push(crate::lz77::Match {
-                        offset: 0,
-                        length: 0,
-                        next: input[pos],
-                    });
-                    pos += 1;
-                }
-            }
-        } else {
-            result.push(crate::lz77::Match {
-                offset: 0,
-                length: 0,
-                next: input[pos],
-            });
-            pos += 1;
-        }
-    }
-
-    result
-}
-
 /// Compress using the SortLZ pipeline.
 ///
 /// Wire format (v2 — LzSeq-encoded streams + FSE):
@@ -749,33 +627,33 @@ mod tests {
     }
 
     #[test]
-    fn test_lz77_greedy_roundtrip() {
+    fn test_parse_matches_greedy_roundtrip() {
         let input = test_data();
         let config = SortLzConfig::for_lz77(crate::lz77::LZ77_MAX_MATCH);
         let matches = find_matches(&input, &config);
-        let lz_matches = matches_to_lz77_greedy(&input, &matches);
+        let tokens = parse_matches(&input, &matches, false); // greedy
 
-        // Verify matches reconstruct the input via LZ77 decompress
-        let mut lz_bytes = Vec::new();
-        for m in &lz_matches {
-            lz_bytes.extend_from_slice(&m.to_bytes());
-        }
-        let decoded = crate::lz77::decompress(&lz_bytes).unwrap();
+        // Verify tokens reconstruct the input via Lz77Encoder round-trip.
+        let encoder = crate::lz_token::Lz77Encoder;
+        let encoded = encoder.encode(&input, &tokens).unwrap();
+        let decoded = encoder
+            .decode(encoded.streams, &encoded.meta, input.len())
+            .unwrap();
         assert_eq!(decoded, input);
     }
 
     #[test]
-    fn test_lz77_lazy_roundtrip() {
+    fn test_parse_matches_lazy_roundtrip() {
         let input = test_data();
         let config = SortLzConfig::for_lz77(crate::lz77::LZ77_MAX_MATCH);
         let matches = find_matches(&input, &config);
-        let lz_matches = matches_to_lz77_lazy(&input, &matches);
+        let tokens = parse_matches(&input, &matches, true); // lazy
 
-        let mut lz_bytes = Vec::new();
-        for m in &lz_matches {
-            lz_bytes.extend_from_slice(&m.to_bytes());
-        }
-        let decoded = crate::lz77::decompress(&lz_bytes).unwrap();
+        let encoder = crate::lz_token::Lz77Encoder;
+        let encoded = encoder.encode(&input, &tokens).unwrap();
+        let decoded = encoder
+            .decode(encoded.streams, &encoded.meta, input.len())
+            .unwrap();
         assert_eq!(decoded, input);
     }
 

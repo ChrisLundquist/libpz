@@ -84,12 +84,8 @@ fn encoder_for_demuxer(demuxer: &LzDemuxer) -> Box<dyn lz_token::TokenEncoder> {
 
 /// Demux pre-computed LZ77 matches into encoder streams for the GPU coordinator.
 ///
-/// Used by the GPU coordinator to demux matches returned from
-/// `find_matches_batched()` without re-running match-finding.
-/// Converts `Vec<Match>` → `Vec<LzToken>` → encoder.encode().
-///
-/// `input` is the original block data — needed by `Lz77Encoder` to look up
-/// trailing literal bytes when consecutive matches appear.
+/// Used by the batched LZ77 GPU path (`find_matches_batched`) which returns
+/// `Vec<lz77::Match>`. Converts Match → LzToken → encoder.encode().
 #[cfg(feature = "webgpu")]
 pub(crate) fn demux_lz77_matches(
     input: &[u8],
@@ -97,9 +93,22 @@ pub(crate) fn demux_lz77_matches(
     pipeline: super::Pipeline,
 ) -> PzResult<DemuxOutput> {
     let tokens = lz_token::matches_to_tokens(&matches);
+    demux_tokens(input, &tokens, pipeline)
+}
+
+/// Demux a universal token stream into encoder streams.
+///
+/// Used by GPU SortLZ coordinator and LzSeq SortLZ CPU path, which produce
+/// `Vec<LzToken>` directly via `sortlz::parse_matches()`.
+#[cfg(feature = "webgpu")]
+pub(crate) fn demux_tokens(
+    input: &[u8],
+    tokens: &[lz_token::LzToken],
+    pipeline: super::Pipeline,
+) -> PzResult<DemuxOutput> {
     let demuxer = demuxer_for_pipeline(pipeline).ok_or(PzError::InvalidInput)?;
     let encoder = encoder_for_demuxer(&demuxer);
-    Ok(encoder.encode(input, &tokens)?.into())
+    Ok(encoder.encode(input, tokens)?.into())
 }
 
 impl StreamDemuxer for LzDemuxer {
@@ -167,8 +176,8 @@ impl StreamDemuxer for LzDemuxer {
                 })
             }
             LzDemuxer::LzSeq => {
-                // SortLZ match finder path: use sort-based matches converted
-                // to LzSeq's 6-stream format via encode_match_sequence.
+                // SortLZ match finder path: sort-based matches → LzToken →
+                // LzSeq 6-stream format via encode_from_tokens.
                 // Prefers GPU radix sort when available for large inputs.
                 if options.match_finder == super::MatchFinder::SortLz {
                     let window = options
@@ -195,10 +204,9 @@ impl StreamDemuxer for LzDemuxer {
                     #[cfg(not(feature = "webgpu"))]
                     let raw_matches = crate::sortlz::find_matches(input, &config);
 
-                    let lz_matches = crate::sortlz::matches_to_lz77_lazy(input, &raw_matches);
-                    let enc = lzseq::encode_match_sequence(
-                        input,
-                        &lz_matches,
+                    let tokens = crate::sortlz::parse_matches(input, &raw_matches, true);
+                    let enc = lzseq::encode_from_tokens(
+                        &tokens,
                         &lzseq::SeqConfig {
                             max_window: window,
                             ..lzseq::SeqConfig::default()

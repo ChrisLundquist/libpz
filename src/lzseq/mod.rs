@@ -622,66 +622,6 @@ fn emit_match(
     length_extra_writer.write_bits(lev, leb);
 }
 
-/// Encode a pre-computed match sequence into LzSeq token streams.
-///
-/// Used by `encode_optimal` after the backward DP has selected matches,
-/// and by the SortLZ match finder to feed pre-computed matches into the
-/// LzSeq 6-stream format. Applies repeat offset encoding.
-pub fn encode_match_sequence(
-    _input: &[u8],
-    matches: &[crate::lz77::Match],
-    _config: &SeqConfig,
-) -> PzResult<SeqEncoded> {
-    let mut repeats = RepeatOffsets::new();
-    let mut flags_vec: Vec<bool> = Vec::new();
-    let mut literals: Vec<u8> = Vec::new();
-    let mut offset_codes: Vec<u8> = Vec::new();
-    let mut length_codes: Vec<u8> = Vec::new();
-    let mut offset_extra_writer = BitWriter::new();
-    let mut length_extra_writer = BitWriter::new();
-
-    for m in matches {
-        if m.length == 0 {
-            // Literal token from optimal parser
-            flags_vec.push(true);
-            literals.push(m.next);
-        } else {
-            emit_match(
-                m.offset as u32,
-                m.length,
-                &mut repeats,
-                &mut flags_vec,
-                &mut offset_codes,
-                &mut offset_extra_writer,
-                &mut length_codes,
-                &mut length_extra_writer,
-            );
-            // Emit the 'next' byte as a separate literal token.
-            // The DP forward trace produces Match structs where each match covers
-            // `length` bytes plus a "next" byte. The cost model accounts for the
-            // next byte in the match cost, but the actual token stream must emit
-            // the next byte as a literal to avoid data loss.
-            flags_vec.push(true);
-            literals.push(m.next);
-        }
-    }
-
-    let num_tokens = flags_vec.len() as u32;
-    let num_matches = offset_codes.len() as u32;
-    let flags = pack_flags(&flags_vec);
-
-    Ok(SeqEncoded {
-        flags,
-        literals,
-        offset_codes,
-        offset_extra: offset_extra_writer.finish(),
-        length_codes,
-        length_extra: length_extra_writer.finish(),
-        num_tokens,
-        num_matches,
-    })
-}
-
 /// Encode a universal `LzToken` stream into LzSeq's 6-stream format.
 ///
 /// Like `encode_match_sequence` but takes `LzToken` directly instead of
@@ -774,8 +714,9 @@ pub fn encode_optimal(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncoded> 
     );
     let matches = crate::optimal::optimal_parse_lzseq(input, &table)?;
 
-    // Encode the optimal match sequence into LzSeq token streams.
-    encode_match_sequence(input, &matches, config)
+    // Convert optimal parse output to universal tokens, then encode.
+    let tokens = crate::lz_token::matches_to_tokens(&matches);
+    encode_from_tokens(&tokens, config)
 }
 
 /// Compress input using LzSeq with lazy matching and configurable window.
