@@ -95,11 +95,11 @@ pub(crate) fn demux_lz77_matches(
     input: &[u8],
     matches: Vec<lz77::Match>,
     pipeline: super::Pipeline,
-) -> DemuxOutput {
+) -> PzResult<DemuxOutput> {
     let tokens = lz_token::matches_to_tokens(&matches);
-    let demuxer = demuxer_for_pipeline(pipeline).expect("GPU LZ pipeline must have a demuxer");
+    let demuxer = demuxer_for_pipeline(pipeline).ok_or(PzError::InvalidInput)?;
     let encoder = encoder_for_demuxer(&demuxer);
-    encoder.encode(input, &tokens).unwrap().into()
+    Ok(encoder.encode(input, &tokens)?.into())
 }
 
 impl StreamDemuxer for LzDemuxer {

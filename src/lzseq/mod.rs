@@ -688,10 +688,11 @@ pub fn encode_match_sequence(
 /// `lz77::Match`. Used by the `LzSeqEncoder` wire encoder.
 pub(crate) fn encode_from_tokens(
     tokens: &[crate::lz_token::LzToken],
-    _config: &SeqConfig,
+    config: &SeqConfig,
 ) -> PzResult<SeqEncoded> {
     use crate::lz_token::LzToken;
 
+    let max_len = config.max_match_len;
     let mut repeats = RepeatOffsets::new();
     let mut flags_vec: Vec<bool> = Vec::new();
     let mut literals: Vec<u8> = Vec::new();
@@ -709,7 +710,7 @@ pub(crate) fn encode_from_tokens(
             LzToken::Match { offset, length } => {
                 emit_match(
                     *offset,
-                    (*length).min(u16::MAX as u32) as u16,
+                    (*length).min(max_len as u32) as u16,
                     &mut repeats,
                     &mut flags_vec,
                     &mut offset_codes,

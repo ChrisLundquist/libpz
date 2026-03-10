@@ -69,6 +69,11 @@ impl TokenEncoder for Lz77Encoder {
         let mut input_pos = 0usize;
         let mut i = 0;
         while i < tokens.len() {
+            debug_assert!(
+                input_pos <= input.len(),
+                "Lz77Encoder: input_pos ({input_pos}) overran input ({})",
+                input.len()
+            );
             match tokens[i] {
                 LzToken::Match { offset, length } => {
                     let offset_u16 = offset.min(u16::MAX as u32) as u16;
