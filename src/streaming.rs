@@ -646,12 +646,7 @@ mod tests {
     #[test]
     fn test_stream_round_trip_single_block() {
         let data = b"hello, world!".repeat(10);
-        for pipeline in [
-            Pipeline::Deflate,
-            Pipeline::Bw,
-            Pipeline::Lzr,
-            Pipeline::Lzf,
-        ] {
+        for pipeline in [Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
             let compressed = stream_compress(&data, pipeline, 1);
             let decompressed = stream_decompress(&compressed, 1);
             assert_eq!(decompressed, data, "round-trip failed for {:?}", pipeline);
@@ -662,12 +657,7 @@ mod tests {
     fn test_stream_round_trip_multi_block() {
         // 2KB input with 512-byte blocks = 4 blocks
         let data = b"The quick brown fox jumps over the lazy dog. ".repeat(50);
-        for pipeline in [
-            Pipeline::Deflate,
-            Pipeline::Bw,
-            Pipeline::Lzr,
-            Pipeline::Lzf,
-        ] {
+        for pipeline in [Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
             let compressed = stream_compress(&data, pipeline, 1);
             let decompressed = stream_decompress(&compressed, 1);
             assert_eq!(decompressed, data, "round-trip failed for {:?}", pipeline);
@@ -733,12 +723,7 @@ mod tests {
     #[test]
     fn test_stream_single_byte() {
         let data = vec![0xAB];
-        for pipeline in [
-            Pipeline::Deflate,
-            Pipeline::Bw,
-            Pipeline::Lzr,
-            Pipeline::Lzf,
-        ] {
+        for pipeline in [Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
             let compressed = stream_compress(&data, pipeline, 1);
             let decompressed = stream_decompress(&compressed, 1);
             assert_eq!(decompressed, data, "single-byte failed for {:?}", pipeline);

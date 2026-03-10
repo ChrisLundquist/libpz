@@ -33,7 +33,7 @@
 ///   Code 1: length 4       (0 extra bits)
 ///   Code 2: length 5-6     (1 extra bit)
 ///   Code 3: length 7-10    (2 extra bits)
-use crate::lz77::{HashChainFinder, DEFAULT_MAX_MATCH, MIN_MATCH};
+use crate::lz77::{HashChainFinder, MIN_MATCH};
 use crate::{PzError, PzResult};
 
 /// Match length threshold above which lazy evaluation is skipped.
@@ -59,6 +59,9 @@ pub struct SeqConfig {
     /// Speeds up encoding on incompressible data with minimal ratio cost.
     /// Default: false.
     pub adaptive_chain: bool,
+    /// Maximum match length. Default: `u16::MAX` (extended matches).
+    /// Set to 258 to emulate DEFLATE constraints.
+    pub max_match_len: u16,
 }
 
 impl Default for SeqConfig {
@@ -68,6 +71,7 @@ impl Default for SeqConfig {
             hash_prefix_len: 3,
             max_chain: crate::lz77::MAX_CHAIN,
             adaptive_chain: false,
+            max_match_len: crate::lz77::DEFAULT_MAX_MATCH,
         }
     }
 }
@@ -80,6 +84,7 @@ impl SeqConfig {
             hash_prefix_len: 3,
             max_chain: 32,
             adaptive_chain: false,
+            max_match_len: crate::lz77::DEFAULT_MAX_MATCH,
         }
     }
 
@@ -97,6 +102,7 @@ impl SeqConfig {
             hash_prefix_len: 4,
             max_chain: 128,
             adaptive_chain: false,
+            max_match_len: crate::lz77::DEFAULT_MAX_MATCH,
         }
     }
 }
@@ -676,6 +682,61 @@ pub fn encode_match_sequence(
     })
 }
 
+/// Encode a universal `LzToken` stream into LzSeq's 6-stream format.
+///
+/// Like `encode_match_sequence` but takes `LzToken` directly instead of
+/// `lz77::Match`. Used by the `LzSeqEncoder` wire encoder.
+pub(crate) fn encode_from_tokens(
+    tokens: &[crate::lz_token::LzToken],
+    _config: &SeqConfig,
+) -> PzResult<SeqEncoded> {
+    use crate::lz_token::LzToken;
+
+    let mut repeats = RepeatOffsets::new();
+    let mut flags_vec: Vec<bool> = Vec::new();
+    let mut literals: Vec<u8> = Vec::new();
+    let mut offset_codes: Vec<u8> = Vec::new();
+    let mut length_codes: Vec<u8> = Vec::new();
+    let mut offset_extra_writer = BitWriter::new();
+    let mut length_extra_writer = BitWriter::new();
+
+    for token in tokens {
+        match token {
+            LzToken::Literal(b) => {
+                flags_vec.push(true);
+                literals.push(*b);
+            }
+            LzToken::Match { offset, length } => {
+                emit_match(
+                    *offset,
+                    (*length).min(u16::MAX as u32) as u16,
+                    &mut repeats,
+                    &mut flags_vec,
+                    &mut offset_codes,
+                    &mut offset_extra_writer,
+                    &mut length_codes,
+                    &mut length_extra_writer,
+                );
+            }
+        }
+    }
+
+    let num_tokens = flags_vec.len() as u32;
+    let num_matches = offset_codes.len() as u32;
+    let flags = pack_flags(&flags_vec);
+
+    Ok(SeqEncoded {
+        flags,
+        literals,
+        offset_codes,
+        offset_extra: offset_extra_writer.finish(),
+        length_codes,
+        length_extra: length_extra_writer.finish(),
+        num_tokens,
+        num_matches,
+    })
+}
+
 /// Compress input using LzSeq with optimal parsing.
 ///
 /// Uses backward DP (`optimal.rs`) to select matches, then encodes them with
@@ -734,14 +795,11 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
         });
     }
 
+    let match_limit = config.max_match_len;
     let mut finder = if config.hash_prefix_len == 4 {
-        HashChainFinder::with_hash4(config.max_window, DEFAULT_MAX_MATCH, config.max_chain)
+        HashChainFinder::with_hash4(config.max_window, match_limit, config.max_chain)
     } else {
-        HashChainFinder::with_window_and_chain(
-            config.max_window,
-            DEFAULT_MAX_MATCH,
-            config.max_chain,
-        )
+        HashChainFinder::with_window_and_chain(config.max_window, match_limit, config.max_chain)
     };
     let mut repeats = RepeatOffsets::new();
     let mut flags_vec: Vec<bool> = Vec::new();
@@ -751,7 +809,7 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
     let mut offset_extra_writer = BitWriter::new();
     let mut length_extra_writer = BitWriter::new();
     let mut pos: usize = 0;
-    let max_match_len = DEFAULT_MAX_MATCH as usize;
+    let max_match_len = match_limit as usize;
 
     // Adaptive chain depth tracking
     let base_chain = config.max_chain;

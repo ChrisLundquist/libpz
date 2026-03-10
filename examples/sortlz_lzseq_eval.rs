@@ -59,8 +59,6 @@ fn main() {
     let configs: Vec<(Pipeline, MatchFinder, &str)> = vec![
         (Pipeline::Deflate, MatchFinder::HashChain, "deflate"),
         (Pipeline::Bw, MatchFinder::HashChain, "bw"),
-        (Pipeline::Lzr, MatchFinder::HashChain, "lzr-hc"),
-        (Pipeline::Lzr, MatchFinder::SortLz, "lzr-slz"),
         (Pipeline::LzSeqR, MatchFinder::HashChain, "lzseqr-hc"),
         (Pipeline::LzSeqR, MatchFinder::SortLz, "lzseqr-slz"),
         (Pipeline::LzSeqH, MatchFinder::HashChain, "lzseqh-hc"),

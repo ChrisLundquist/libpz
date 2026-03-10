@@ -2,6 +2,7 @@
 //! for entropy coding, and re-merges them on decompression.
 
 use crate::lz77;
+use crate::lz_token;
 use crate::lzseq;
 use crate::lzss;
 use crate::{PzError, PzResult};
@@ -18,6 +19,16 @@ pub(crate) struct DemuxOutput {
     pub pre_entropy_len: usize,
     /// Opaque metadata that must round-trip through the entropy container.
     pub meta: Vec<u8>,
+}
+
+impl From<lz_token::EncodedStreams> for DemuxOutput {
+    fn from(enc: lz_token::EncodedStreams) -> Self {
+        DemuxOutput {
+            streams: enc.streams,
+            pre_entropy_len: enc.pre_entropy_len,
+            meta: enc.meta,
+        }
+    }
 }
 
 /// Describes how a pre-entropy stage (LZ77, LZSS, LzSeq, etc.) splits its
@@ -53,9 +64,8 @@ pub(crate) enum LzDemuxer {
 /// Returns `None` for BWT-based pipelines (Bw, Bbw).
 pub(crate) fn demuxer_for_pipeline(pipeline: super::Pipeline) -> Option<LzDemuxer> {
     match pipeline {
-        super::Pipeline::Deflate | super::Pipeline::Lzr | super::Pipeline::Lzf => {
-            Some(LzDemuxer::Lz77)
-        }
+        super::Pipeline::Deflate => Some(LzDemuxer::Lz77),
+        super::Pipeline::Lzf => Some(LzDemuxer::LzSeq),
         super::Pipeline::Lzfi | super::Pipeline::LzssR => Some(LzDemuxer::Lzss),
         super::Pipeline::LzSeqR | super::Pipeline::LzSeqH => Some(LzDemuxer::LzSeq),
         super::Pipeline::Bw | super::Pipeline::Bbw => None,
@@ -63,27 +73,33 @@ pub(crate) fn demuxer_for_pipeline(pipeline: super::Pipeline) -> Option<LzDemuxe
     }
 }
 
-/// Demux pre-computed LZ77 matches into (offsets, lengths, literals) streams.
+/// Get the TokenEncoder for a given demuxer variant.
+fn encoder_for_demuxer(demuxer: &LzDemuxer) -> Box<dyn lz_token::TokenEncoder> {
+    match demuxer {
+        LzDemuxer::Lz77 => Box::new(lz_token::Lz77Encoder),
+        LzDemuxer::Lzss => Box::new(lz_token::LzssEncoder),
+        LzDemuxer::LzSeq => Box::new(lz_token::LzSeqEncoder::default()),
+    }
+}
+
+/// Demux pre-computed LZ77 matches into encoder streams for the GPU coordinator.
 ///
-/// This is the demux-only counterpart to `LzDemuxer::Lz77::compress_and_demux()`.
 /// Used by the GPU coordinator to demux matches returned from
 /// `find_matches_batched()` without re-running match-finding.
+/// Converts `Vec<Match>` → `Vec<LzToken>` → encoder.encode().
+///
+/// `input` is the original block data — needed by `Lz77Encoder` to look up
+/// trailing literal bytes when consecutive matches appear.
 #[cfg(feature = "webgpu")]
-pub(crate) fn demux_lz77_matches(matches: Vec<lz77::Match>) -> DemuxOutput {
-    let num_matches = matches.len();
-    let mut offsets = Vec::with_capacity(num_matches * 2);
-    let mut lengths = Vec::with_capacity(num_matches * 2);
-    let mut literals = Vec::with_capacity(num_matches);
-    for m in matches {
-        offsets.extend_from_slice(&m.offset.to_le_bytes());
-        lengths.extend_from_slice(&m.length.to_le_bytes());
-        literals.push(m.next);
-    }
-    DemuxOutput {
-        streams: vec![offsets, lengths, literals],
-        pre_entropy_len: num_matches * lz77::Match::SERIALIZED_SIZE,
-        meta: Vec::new(),
-    }
+pub(crate) fn demux_lz77_matches(
+    input: &[u8],
+    matches: Vec<lz77::Match>,
+    pipeline: super::Pipeline,
+) -> DemuxOutput {
+    let tokens = lz_token::matches_to_tokens(&matches);
+    let demuxer = demuxer_for_pipeline(pipeline).expect("GPU LZ pipeline must have a demuxer");
+    let encoder = encoder_for_demuxer(&demuxer);
+    encoder.encode(input, &tokens).unwrap().into()
 }
 
 impl StreamDemuxer for LzDemuxer {
@@ -98,25 +114,10 @@ impl StreamDemuxer for LzDemuxer {
     fn compress_and_demux(&self, input: &[u8], options: &CompressOptions) -> PzResult<DemuxOutput> {
         match self {
             LzDemuxer::Lz77 => {
-                // Fast path: CPU lazy/auto can demux directly from Match structs,
-                // avoiding an intermediate serialized LZ byte buffer.
-                let matches = super::lz77_matches_with_backend(input, options)?;
-                let num_matches = matches.len();
-                let mut offsets = Vec::with_capacity(num_matches * 2);
-                let mut lengths = Vec::with_capacity(num_matches * 2);
-                let mut literals = Vec::with_capacity(num_matches);
-                for m in &matches {
-                    offsets.extend_from_slice(&m.offset.to_le_bytes());
-                    lengths.extend_from_slice(&m.length.to_le_bytes());
-                    literals.push(m.next);
-                }
-                let lz_len = num_matches * lz77::Match::SERIALIZED_SIZE;
-
-                Ok(DemuxOutput {
-                    streams: vec![offsets, lengths, literals],
-                    pre_entropy_len: lz_len,
-                    meta: Vec::new(),
-                })
+                // Token-based path: tokenize → wire-encode.
+                let tokens = super::tokenize(input, options)?;
+                let encoder = encoder_for_demuxer(self);
+                Ok(encoder.encode(input, &tokens)?.into())
             }
             LzDemuxer::Lzss => {
                 let encoded = lzss::encode(input)?;
@@ -220,11 +221,11 @@ impl StreamDemuxer for LzDemuxer {
                 }
 
                 // CPU path
+                let defaults = lzseq::SeqConfig::default();
                 let config = lzseq::SeqConfig {
-                    max_window: options
-                        .seq_window_size
-                        .unwrap_or_else(|| lzseq::SeqConfig::default().max_window),
-                    ..lzseq::SeqConfig::default()
+                    max_window: options.seq_window_size.unwrap_or(defaults.max_window),
+                    max_match_len: options.max_match_len.unwrap_or(defaults.max_match_len),
+                    ..defaults
                 };
                 let enc = match options.parse_strategy {
                     ParseStrategy::Optimal => lzseq::encode_optimal(input, &config)?,

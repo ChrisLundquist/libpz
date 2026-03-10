@@ -34,10 +34,6 @@ name = "throughput_bbw"
 harness = false
 
 [[bench]]
-name = "throughput_lzr"
-harness = false
-
-[[bench]]
 name = "throughput_lzf"
 harness = false
 

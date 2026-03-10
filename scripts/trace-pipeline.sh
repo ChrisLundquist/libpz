@@ -24,7 +24,7 @@ USAGE:
 
 OPTIONS:
     -p, --pipeline NAME     Pipeline to trace (default: deflate)
-                            Options: deflate, lzr, lzf, lzfi, lzssr, lz78r, bw, bbw
+                            Options: deflate, lzf, lzfi, lzssr, bw, bbw, lzseqr, lzseqh, sortlz
     --format FORMAT         Output format: text (default) or mermaid
     -h, --help              Show this help
 
@@ -79,10 +79,10 @@ done
 
 # Validate pipeline
 case "$PIPELINE" in
-    deflate|lzr|lzf|lzfi|lzssr|lz78r|bw|bbw) ;;
+    deflate|lzf|lzfi|lzssr|bw|bbw|lzseqr|lzseqh|sortlz) ;;
     *)
         echo "ERROR: unknown pipeline '$PIPELINE'" >&2
-        echo "Valid pipelines: deflate, lzr, lzf, lzfi, lzssr, lz78r, bw, bbw" >&2
+        echo "Valid pipelines: deflate, lzf, lzfi, lzssr, bw, bbw, lzseqr, lzseqh, sortlz" >&2
         exit 1
         ;;
 esac
@@ -109,14 +109,9 @@ case "$PIPELINE" in
         STREAM_COUNT=3
         ENTROPY="Huffman"
         ;;
-    lzr)
-        DEMUXER="Lz77"
-        STREAM_COUNT=3
-        ENTROPY="rANS"
-        ;;
     lzf)
-        DEMUXER="Lz77"
-        STREAM_COUNT=3
+        DEMUXER="LzSeq"
+        STREAM_COUNT=6
         ENTROPY="FSE"
         ;;
     lzfi)
@@ -129,10 +124,20 @@ case "$PIPELINE" in
         STREAM_COUNT=4
         ENTROPY="rANS"
         ;;
-    lz78r)
-        DEMUXER="Lz78"
-        STREAM_COUNT=1
+    lzseqr)
+        DEMUXER="LzSeq"
+        STREAM_COUNT=6
         ENTROPY="rANS"
+        ;;
+    lzseqh)
+        DEMUXER="LzSeq"
+        STREAM_COUNT=6
+        ENTROPY="Huffman"
+        ;;
+    sortlz)
+        DEMUXER="N/A"
+        STREAM_COUNT=0
+        ENTROPY="FSE"
         ;;
     bw)
         DEMUXER="N/A"
@@ -160,7 +165,7 @@ if [[ "$FORMAT" == "mermaid" ]]; then
     emit_mermaid "    Start([\"Input: raw bytes\"]) --> CompressBlock"
 fi
 
-# Trace LZ-based pipelines (Deflate, Lzr, Lzf, Lzfi, LzssR, Lz78R)
+# Trace LZ-based pipelines (Deflate, Lzf, Lzfi, LzssR, LzSeqR, LzSeqH)
 trace_lz_pipeline() {
     local pipeline=$1
     local demuxer=$2
@@ -204,12 +209,7 @@ trace_lz_pipeline() {
                 emit_text "  metadata: num_tokens (u32 LE)"
                 emit_text "  See src/pipeline/demux.rs:99-144"
                 ;;
-            Lz78)
-                emit_text ""
-                emit_text "  LZ78 stream layout (1 stream):"
-                emit_text "    [0]: flat LZ78 encoded blob (no splitting)"
-                emit_text "  See src/pipeline/demux.rs:146-155"
-                ;;
+
         esac
 
         emit_text ""
@@ -391,7 +391,7 @@ trace_bwt_pipeline() {
 
 # Main trace dispatch
 case "$PIPELINE" in
-    deflate|lzr|lzf|lzfi|lzssr|lz78r)
+    deflate|lzf|lzfi|lzssr|lzseqr|lzseqh|sortlz)
         trace_lz_pipeline "$PIPELINE" "$DEMUXER" "$STREAM_COUNT" "$ENTROPY"
         ;;
     bw|bbw)

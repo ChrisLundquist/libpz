@@ -34,7 +34,7 @@ Usage:
 Options:
   -n, --iters N          Number of iterations per operation (default: 3)
   -p, --pipelines LIST   Comma-separated list of pipelines to benchmark
-                         (default: deflate,lzr,lzf)
+                         (default: deflate,lzf,lzseqr)
   -t, --threads N        Pass thread count to pz (-t N; 0=auto, 1=single-threaded)
   --all                  Benchmark all available pipelines
   --pareto               Single-thread Pareto table: all pipelines + all competitors,
@@ -52,7 +52,7 @@ Examples:
   ./scripts/bench.sh                              # all corpus, all pipelines
   ./scripts/bench.sh myfile.bin                   # specific file
   ./scripts/bench.sh -p deflate,lzf               # subset of pipelines
-  ./scripts/bench.sh -t 1 -p lzr                  # force single-threaded pz
+  ./scripts/bench.sh -t 1 -p lzseqr                # force single-threaded pz
   ./scripts/bench.sh -n 10                        # more iterations
   ./scripts/bench.sh --webgpu -p bw,bbw           # GPU-accelerated via WebGPU
   ./scripts/bench.sh --all                         # benchmark every pipeline
@@ -101,7 +101,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --all)
-            PIPELINES=(deflate bw bbw lzr lzf lzfi lzseqr lzseqh sortlz)
+            PIPELINES=(deflate bw bbw lzf lzfi lzseqr lzseqh sortlz)
             shift
             ;;
         --silesia)
@@ -110,7 +110,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --pareto)
             PARETO=true
-            PIPELINES=(deflate bw bbw lzr lzf lzfi lzseqr lzseqh sortlz)
+            PIPELINES=(deflate bw bbw lzf lzfi lzseqr lzseqh sortlz)
             # Force single-thread for apples-to-apples comparison
             THREADS="1"
             shift
@@ -151,7 +151,7 @@ done
 
 # Default pipelines if none specified
 if [[ ${#PIPELINES[@]} -eq 0 ]]; then
-    PIPELINES=(deflate lzr lzf)
+    PIPELINES=(deflate lzf lzseqr)
 fi
 
 # Collect input files from corpus if none given on command line

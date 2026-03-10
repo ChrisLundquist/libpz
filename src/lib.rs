@@ -7,6 +7,7 @@ pub mod fse;
 pub mod gzip;
 pub mod huffman;
 pub mod lz77;
+pub(crate) mod lz_token;
 pub mod lzseq;
 pub mod lzss;
 pub mod mtf;

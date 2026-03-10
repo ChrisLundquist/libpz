@@ -65,11 +65,9 @@ PIPELINES=(
     deflate
     bw
     bbw
-    lzr
     lzf
     lzfi
     lzssr
-    lz78r
     lzseqr
     lzseqh
     sortlz
