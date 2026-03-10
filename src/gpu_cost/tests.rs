@@ -220,10 +220,6 @@ fn parse_triple_slash_comments() {
 fn parse_all_kernels() {
     let sources: &[(&str, &str)] = &[
         (
-            "lz77_hash.wgsl",
-            include_str!("../../kernels/lz77_hash.wgsl"),
-        ),
-        (
             "lz77_lazy.wgsl",
             include_str!("../../kernels/lz77_lazy.wgsl"),
         ),
@@ -285,44 +281,6 @@ fn count_entry_points_wgsl() {
 // ---------------------------------------------------------------------------
 // Cross-validation: verify @pz_cost annotations match kernel constants
 // ---------------------------------------------------------------------------
-
-#[test]
-fn cross_validate_lz77_hash_wgsl() {
-    let src = include_str!("../../kernels/lz77_hash.wgsl");
-    let cost = KernelCost::parse(src).expect("parse lz77_hash.wgsl");
-
-    let hash_size = extract_constant(src, "HASH_SIZE").expect("HASH_SIZE in lz77_hash.wgsl");
-    let bucket_cap = extract_constant(src, "BUCKET_CAP").expect("BUCKET_CAP in lz77_hash.wgsl");
-
-    let expected_hash_counts = hash_size * 4;
-    assert_eq!(
-        find_buffer(&cost, "hash_counts"),
-        Some(&BufferFormula::Fixed(expected_hash_counts)),
-        "lz77_hash.wgsl: hash_counts mismatch"
-    );
-
-    let expected_hash_table = hash_size * bucket_cap * 4;
-    assert_eq!(
-        find_buffer(&cost, "hash_table"),
-        Some(&BufferFormula::Fixed(expected_hash_table)),
-        "lz77_hash.wgsl: hash_table mismatch"
-    );
-
-    assert_eq!(
-        find_buffer(&cost, "output"),
-        Some(&BufferFormula::Linear {
-            scale: 12,
-            offset: 0
-        }),
-        "lz77_hash.wgsl: output should be N*12 (sizeof Lz77Match = 3×u32 = 12)"
-    );
-
-    let entry_points = count_entry_points(src);
-    assert_eq!(
-        cost.passes, entry_points,
-        "lz77_hash.wgsl: passes vs entry points"
-    );
-}
 
 #[test]
 fn cross_validate_lz77_lazy_wgsl() {

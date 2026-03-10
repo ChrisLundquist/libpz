@@ -43,7 +43,6 @@ mod huffman;
 mod kernels;
 pub(crate) mod lz77;
 pub(crate) mod lzseq;
-mod parlz;
 mod pipelines;
 pub(crate) mod rans;
 mod sortlz;
@@ -128,7 +127,6 @@ pub struct WebGpuEngine {
     queue: wgpu::Queue,
     // Lazily-compiled pipeline groups (one OnceLock per WGSL shader module).
     lz77_topk: OnceLock<Lz77TopkPipelines>,
-    lz77_hash: OnceLock<Lz77HashPipelines>,
     #[allow(dead_code)]
     lz77_lazy: OnceLock<Lz77LazyPipelines>,
     lz77_coop: OnceLock<Lz77CoopPipelines>,
@@ -141,7 +139,6 @@ pub struct WebGpuEngine {
     rans_decode: OnceLock<RansDecodePipelines>,
     rans_encode: OnceLock<RansEncodePipelines>,
     lzseq_demux: OnceLock<LzSeqPipelines>,
-    parlz: OnceLock<ParlzPipelines>,
     sortlz: OnceLock<SortLzPipelines>,
     /// Device name for diagnostics.
     device_name: String,
@@ -286,7 +283,6 @@ impl WebGpuEngine {
             device,
             queue,
             lz77_topk: OnceLock::new(),
-            lz77_hash: OnceLock::new(),
             lz77_lazy: OnceLock::new(),
             lz77_coop: OnceLock::new(),
             bwt_rank: OnceLock::new(),
@@ -298,7 +294,6 @@ impl WebGpuEngine {
             rans_decode: OnceLock::new(),
             rans_encode: OnceLock::new(),
             lzseq_demux: OnceLock::new(),
-            parlz: OnceLock::new(),
             sortlz: OnceLock::new(),
             device_name,
             max_work_group_size,

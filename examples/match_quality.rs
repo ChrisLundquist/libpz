@@ -240,22 +240,8 @@ fn main() {
 
                         all_stats.push(analyze_matches("GPU lazy", &gpu_matches, size));
 
-                        // Also test GPU greedy for comparison
-                        let gpu_greedy = engine.find_matches_greedy(&data).unwrap();
-                        {
-                            let mut serialized = Vec::with_capacity(gpu_greedy.len() * 5);
-                            for m in &gpu_greedy {
-                                serialized.extend_from_slice(&m.to_bytes());
-                            }
-                            let decompressed = pz::lz77::decompress(&serialized).unwrap();
-                            assert_eq!(
-                                decompressed.len(),
-                                data.len(),
-                                "GPU greedy round-trip length mismatch at size {}",
-                                size
-                            );
-                        }
-                        all_stats.push(analyze_matches("GPU greedy", &gpu_greedy, size));
+                        // GPU hash-table greedy kernel removed (dead end —
+                        // atomic ordering breaks match quality). Only coop kernel remains.
                     }
                 }
                 Err(e) => {

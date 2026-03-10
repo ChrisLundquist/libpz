@@ -348,8 +348,8 @@ pub enum Pipeline {
     LzSeqH = 9,
     /// Sort-based LZ77 + FSE (deterministic GPU match finding, experimental)
     SortLz = 10,
-    /// Parallel-parse LZ + FSE (serial parsing cost experiment)
-    Parlz = 11,
+    // ID 11 was Parlz (parallel-parse LZ experiment) — removed as confirmed
+    // dead end (37.6% ratio gap vs serial greedy). See gpu-experiments-wave2-conclusions.md.
 }
 
 impl TryFrom<u8> for Pipeline {
@@ -368,7 +368,7 @@ impl TryFrom<u8> for Pipeline {
             8 => Ok(Self::LzSeqR),
             9 => Ok(Self::LzSeqH),
             10 => Ok(Self::SortLz),
-            11 => Ok(Self::Parlz),
+            // 11 was Parlz — removed
             _ => Err(PzError::Unsupported),
         }
     }

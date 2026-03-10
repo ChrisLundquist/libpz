@@ -1,7 +1,10 @@
 # Unified Scheduler North Star: CPU/GPU Full-Pipeline Compression
 
 **Created:** 2026-02-15
-**Status:** Partially complete — see status table below
+**Status:** PARKED (2026-03-09) — Phases 3–4 done and in production. Phases 2
+and 5 blocked indefinitely: GPU entropy (rANS) cannot reach CPU parity.
+The full on-device pipeline goal is not achievable without a different GPU
+entropy approach (e.g. Huffman sync-point decode).
 **Priority:** P1
 **Owner:** Engineering team
 

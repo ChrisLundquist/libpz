@@ -75,46 +75,6 @@ fn test_lz77_lazy_round_trip_binary() {
 }
 
 #[test]
-fn test_lz77_lazy_improves_over_greedy() {
-    let engine = match WebGpuEngine::new() {
-        Ok(e) => e,
-        Err(PzError::Unsupported) => return,
-        Err(e) => panic!("unexpected error: {:?}", e),
-    };
-
-    // Repetitive text where lazy matching should produce fewer sequences
-    let pattern = b"the quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    for _ in 0..50 {
-        input.extend_from_slice(pattern);
-    }
-
-    let lazy_compressed = engine.lz77_compress(&input).unwrap();
-    let greedy_compressed = {
-        let matches = engine.find_matches_greedy(&input).unwrap();
-        let mut out = Vec::with_capacity(matches.len() * Match::SERIALIZED_SIZE);
-        for m in &matches {
-            out.extend_from_slice(&m.to_bytes());
-        }
-        out
-    };
-
-    // Both should round-trip correctly
-    let lazy_dec = crate::lz77::decompress(&lazy_compressed).unwrap();
-    let greedy_dec = crate::lz77::decompress(&greedy_compressed).unwrap();
-    assert_eq!(lazy_dec, input);
-    assert_eq!(greedy_dec, input);
-
-    // Lazy should produce <= sequences than greedy (fewer = better)
-    let lazy_seqs = lazy_compressed.len() / Match::SERIALIZED_SIZE;
-    let greedy_seqs = greedy_compressed.len() / Match::SERIALIZED_SIZE;
-    assert!(
-        lazy_seqs <= greedy_seqs,
-        "lazy ({lazy_seqs}) should produce <= sequences than greedy ({greedy_seqs})"
-    );
-}
-
-#[test]
 fn test_find_matches_batched_empty() {
     let engine = match WebGpuEngine::new() {
         Ok(e) => e,
@@ -308,7 +268,7 @@ fn test_lz77_no_matches() {
 }
 
 #[test]
-fn test_lz77_hash_round_trip_longer() {
+fn test_lz77_round_trip_longer() {
     let engine = match WebGpuEngine::new() {
         Ok(e) => e,
         Err(PzError::Unsupported) => return,

@@ -12,7 +12,6 @@ pub mod lzseq;
 pub mod lzss;
 pub mod mtf;
 pub mod optimal;
-pub mod parlz;
 pub mod pipeline;
 pub mod pqueue;
 pub mod rans;

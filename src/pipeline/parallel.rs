@@ -81,7 +81,7 @@ enum UnifiedTask {
 fn unified_stage_count(pipeline: Pipeline) -> usize {
     match pipeline {
         Pipeline::Bw | Pipeline::Bbw => 4,
-        Pipeline::SortLz | Pipeline::Parlz => 1,
+        Pipeline::SortLz => 1,
         _ => 2,
     }
 }

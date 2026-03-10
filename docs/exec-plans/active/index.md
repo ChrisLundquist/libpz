@@ -1,29 +1,33 @@
 # Active Execution Plans
 
-**Last Updated:** 2026-03-02
+**Last Updated:** 2026-03-09
 
 ## Active Plans
 
 ### [PLAN-competitive-roadmap.md](PLAN-competitive-roadmap.md)
-**Status:** In Progress (Phases 0–1 complete, Phase 2 active) | **Priority:** P0
-
-### [PLAN-p0a-gpu-rans-vertical-slice.md](PLAN-p0a-gpu-rans-vertical-slice.md)
-**Status:** In Progress (Slices 0–3 complete; Slice 4 perf gate open as of 2026-02-17) | **Priority:** P0
-
-### [PLAN-interleaved-rans.md](PLAN-interleaved-rans.md)
-**Status:** In Progress (Phase A merged in PR #91) | **Priority:** P1
-
-### [PLAN-unified-scheduler-north-star.md](PLAN-unified-scheduler-north-star.md)
-**Status:** In Progress (prototype merged; GPU Phases 1–5 pending P0-A perf gate) | **Priority:** P1
+**Status:** In Progress (Phases 0–1 complete, Phase 2 active; Phases 3–4 blocked on GPU entropy) | **Priority:** P0
 
 ### [PLAN-unified-scheduler-perf-validation.md](PLAN-unified-scheduler-perf-validation.md)
 **Status:** In Progress (Phases 0-1 landed; local baseline captured; Phase 2 optimization started) | **Priority:** P0
 
-### [agent-harness-implementation.md](agent-harness-implementation.md)
-**Status:** In Progress (Phase 1 complete 2026-02-14, Phases 2–8 deferred) | **Priority:** P1
+## Parked Plans
+
+### [PLAN-interleaved-rans.md](PLAN-interleaved-rans.md)
+**Status:** PARKED — Phase A merged (PR #91); Phase D cancelled (GPU rANS dead end); Phases B–C need new owner | **Priority:** P1
+
+### [PLAN-unified-scheduler-north-star.md](PLAN-unified-scheduler-north-star.md)
+**Status:** PARKED — Phases 3–4 done and in production; Phases 2+5 blocked indefinitely (GPU entropy not competitive) | **Priority:** P1
 
 ### [TODO-huffman-sync-decode.md](TODO-huffman-sync-decode.md)
-**Status:** Planned | **Priority:** P2
+**Status:** PARKED — valid approach, zero implementation progress, awaiting LzSeq encoding work | **Priority:** P2
+
+### [agent-harness-implementation.md](agent-harness-implementation.md)
+**Status:** PARKED — Phase 1 complete; Phases 2–8 deferred | **Priority:** P1
+
+## Closed Plans
+
+### [PLAN-p0a-gpu-rans-vertical-slice.md](PLAN-p0a-gpu-rans-vertical-slice.md)
+**Status:** CLOSED — Slice 4 perf gate failed; GPU rANS 0.54–0.77x CPU after 29+ iterations; structural dead end | **Priority:** was P0
 
 ## Completed Plans (in ../completed/)
 

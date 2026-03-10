@@ -4,6 +4,5 @@ mod fse;
 mod huffman;
 mod lz77;
 mod lzseq;
-mod parlz;
 mod pipelines;
 mod rans;

@@ -928,7 +928,6 @@ pub(crate) fn run_compress_stage(
         (Pipeline::LzSeqH, 0) => stage_demux_compress(block, &LzDemuxer::LzSeq, options),
         (Pipeline::LzSeqH, 1) => stage_huffman_encode(block),
         (Pipeline::SortLz, 0) => stage_sortlz_compress(block),
-        (Pipeline::Parlz, 0) => stage_parlz_compress(block),
         _ => Err(PzError::Unsupported),
     }
 }
@@ -940,16 +939,6 @@ pub(crate) fn run_compress_stage(
 /// SortLZ single-stage compression: sort-based LZ77 + FSE.
 pub(crate) fn stage_sortlz_compress(mut block: StageBlock) -> PzResult<StageBlock> {
     block.data = crate::sortlz::compress(&block.data, &crate::sortlz::SortLzConfig::default())?;
-    Ok(block)
-}
-
-// ---------------------------------------------------------------------------
-// ParlZ pipeline stage (single-stage: does everything)
-// ---------------------------------------------------------------------------
-
-/// ParlZ single-stage compression: parallel-parse LZ + FSE.
-pub(crate) fn stage_parlz_compress(mut block: StageBlock) -> PzResult<StageBlock> {
-    block.data = crate::parlz::compress(&block.data)?;
     Ok(block)
 }
 

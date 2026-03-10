@@ -27,6 +27,8 @@ The pre-commit hook (auto-configured by `scripts/setup.sh`) runs fmt, clippy, an
 
 All scripts support `--help`. Optimization workflow: measure (`bench.sh`) → identify (`profile.sh --stage <stage>`) → change → validate (`cargo test`) → re-measure (`cargo bench -- <stage>`) → confirm (`bench.sh`). Prefer delegating benchmark runs to the **benchmarker** agent.
 
+**Benchmark caveat:** `bench.sh` runs `pz` as a subprocess, so results include ~260ms wgpu device init per invocation. Criterion benchmarks use pre-allocated buffers with zero I/O overhead, so they report up to ~18x higher throughput. Neither is wrong — they measure different things. When comparing, be explicit about which you're using.
+
 ## Agents
 
 Specialized agents in `.claude/agents/` run on cheaper models and keep verbose output out of your context:

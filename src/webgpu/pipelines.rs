@@ -17,12 +17,6 @@ pub(super) struct Lz77TopkPipelines {
     pub(super) topk: wgpu::ComputePipeline,
 }
 
-/// LZ77 hash-table pipelines (2 pipelines from lz77_hash.wgsl).
-pub(super) struct Lz77HashPipelines {
-    pub(super) build: wgpu::ComputePipeline,
-    pub(super) find: wgpu::ComputePipeline,
-}
-
 /// LZ77 lazy-matching pipelines (2 pipelines from lz77_lazy.wgsl).
 /// Retained for A/B benchmarking against the coop kernel.
 #[allow(dead_code)]
@@ -98,14 +92,6 @@ pub(super) struct LzSeqPipelines {
     pub(super) demux: wgpu::ComputePipeline,
 }
 
-/// Parlz conflict resolution pipelines (Experiment E).
-pub(super) struct ParlzPipelines {
-    pub(super) init_coverage: wgpu::ComputePipeline,
-    pub(super) prefix_max_local: wgpu::ComputePipeline,
-    pub(super) prefix_max_propagate: wgpu::ComputePipeline,
-    pub(super) classify: wgpu::ComputePipeline,
-}
-
 /// SortLZ radix sort + match verification pipelines (Experiment B).
 pub(super) struct SortLzPipelines {
     pub(super) compute_keys: wgpu::ComputePipeline,
@@ -156,46 +142,6 @@ impl WebGpuEngine {
                 group
             })
             .topk
-    }
-
-    pub(super) fn lz77_hash_pipelines(&self) -> &Lz77HashPipelines {
-        self.lz77_hash.get_or_init(|| {
-            let t0 = std::time::Instant::now();
-            let module = self
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("lz77_hash"),
-                    source: wgpu::ShaderSource::Wgsl(LZ77_HASH_KERNEL_SOURCE.into()),
-                });
-            let make = |label, entry| {
-                self.device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(label),
-                        layout: None,
-                        module: &module,
-                        entry_point: Some(entry),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    })
-            };
-            let group = Lz77HashPipelines {
-                build: make("lz77_hash_build", "build_hash_table"),
-                find: make("lz77_hash_find", "find_matches"),
-            };
-            if self.profiling {
-                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                eprintln!("[pz-gpu] compile lz77_hash.wgsl: {ms:.3} ms");
-            }
-            group
-        })
-    }
-
-    pub(super) fn pipeline_lz77_hash_build(&self) -> &wgpu::ComputePipeline {
-        &self.lz77_hash_pipelines().build
-    }
-
-    pub(super) fn pipeline_lz77_hash_find(&self) -> &wgpu::ComputePipeline {
-        &self.lz77_hash_pipelines().find
     }
 
     #[allow(dead_code)]
@@ -664,109 +610,6 @@ impl WebGpuEngine {
                 group
             })
             .demux
-    }
-
-    // --- Experiment E: Parlz conflict resolution ---
-
-    pub(super) fn parlz_pipelines(&self) -> &ParlzPipelines {
-        self.parlz.get_or_init(|| {
-            let t0 = std::time::Instant::now();
-            let module = self
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("parlz_resolve"),
-                    source: wgpu::ShaderSource::Wgsl(PARLZ_RESOLVE_KERNEL_SOURCE.into()),
-                });
-            // Explicit bind group layout: all entry points share the same 5 bindings
-            // even though individual entry points may not reference all of them.
-            // Auto-derived layouts only include referenced bindings, causing mismatches.
-            let bgl = self
-                .device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("parlz_bgl"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 3,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 4,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                });
-            let pipeline_layout =
-                self.device
-                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("parlz_pipeline_layout"),
-                        bind_group_layouts: &[&bgl],
-                        push_constant_ranges: &[],
-                    });
-            let make = |label, entry| {
-                self.device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(label),
-                        layout: Some(&pipeline_layout),
-                        module: &module,
-                        entry_point: Some(entry),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    })
-            };
-            let group = ParlzPipelines {
-                init_coverage: make("parlz_init_coverage", "init_coverage"),
-                prefix_max_local: make("parlz_prefix_max_local", "prefix_max_local"),
-                prefix_max_propagate: make("parlz_prefix_max_propagate", "prefix_max_propagate"),
-                classify: make("parlz_classify", "classify"),
-            };
-            if self.profiling {
-                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                eprintln!("[pz-gpu] compile parlz_resolve.wgsl: {ms:.3} ms");
-            }
-            group
-        })
     }
 
     // --- Experiment B: SortLZ radix sort + match verification ---
