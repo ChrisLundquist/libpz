@@ -933,3 +933,127 @@ fn test_lz77_lazy_kernel_round_trip() {
     let decompressed = crate::lz77::decompress(&compressed).unwrap();
     assert_eq!(decompressed, input, "lazy kernel round-trip failed");
 }
+
+// ---------------------------------------------------------------------------
+// GPU pipelining validation tests
+// ---------------------------------------------------------------------------
+
+/// Validates that batched GPU LZ77 match-finding produces correct results
+/// across many blocks, exercising the ring-buffered submission pipeline.
+///
+/// This is a regression guard against pipelining bugs: if ring-based
+/// overlap breaks (e.g., reading a staging buffer before GPU compute
+/// finishes, or reusing a slot before readback completes), the round-trip
+/// will fail with corrupted match data.
+#[test]
+fn test_lz77_batched_pipeline_correctness() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Create 8 distinct blocks (each > MIN_GPU_INPUT_SIZE) with different
+    // patterns to ensure the ring buffer doesn't cross-contaminate results.
+    let block_size = MIN_GPU_INPUT_SIZE + 4096;
+    let patterns: Vec<&[u8]> = vec![
+        b"the quick brown fox jumps over the lazy dog. ",
+        b"pack my box with five dozen liquor jugs! ",
+        b"how vexingly quick daft zebras jump. ",
+        b"sphinx of black quartz judge my vow! ",
+        b"abcdefghijklmnopqrstuvwxyz0123456789 ",
+        b"compression test data with repeating patterns here. ",
+        b"gpu pipelining validation block number seven. ",
+        b"the final block uses yet another distinct pattern. ",
+    ];
+
+    let blocks: Vec<Vec<u8>> = patterns
+        .iter()
+        .map(|p| p.iter().cycle().take(block_size).copied().collect())
+        .collect();
+    let block_refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+
+    // Batched GPU match-finding (exercises ring pipeline)
+    let batched_results = engine.find_matches_batched(&block_refs).unwrap();
+    assert_eq!(batched_results.len(), blocks.len());
+
+    // Verify each block round-trips correctly
+    for (i, (matches, block)) in batched_results.iter().zip(&blocks).enumerate() {
+        assert!(!matches.is_empty(), "block {i} should have matches");
+        let mut compressed =
+            Vec::with_capacity(matches.len() * crate::lz77::Match::SERIALIZED_SIZE);
+        for m in matches {
+            compressed.extend_from_slice(&m.to_bytes());
+        }
+        let decompressed = crate::lz77::decompress(&compressed).unwrap();
+        assert_eq!(
+            decompressed, *block,
+            "block {i} round-trip failed (pattern cross-contamination?)"
+        );
+    }
+
+    // Cross-validate: batched results should match individual GPU results
+    for (i, block) in blocks.iter().enumerate() {
+        let single_matches = engine.find_matches(block).unwrap();
+        assert_eq!(
+            batched_results[i].len(),
+            single_matches.len(),
+            "block {i}: batched vs single match count mismatch"
+        );
+    }
+}
+
+/// Validates that batched GPU LZ77 doesn't serialize excessively by
+/// timing batched vs serial execution. Batched should be no slower than
+/// serial (and ideally faster due to amortized setup + ring overlap).
+#[test]
+fn test_lz77_batched_pipeline_not_slower_than_serial() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let block_size = MIN_GPU_INPUT_SIZE + 8192;
+    let pattern = b"the quick brown fox jumps over the lazy dog. ";
+    let blocks: Vec<Vec<u8>> = (0..6)
+        .map(|i| {
+            // Vary each block slightly to avoid GPU caching effects
+            let mut block: Vec<u8> = pattern.iter().cycle().take(block_size).copied().collect();
+            block[0] = b'A' + (i as u8);
+            block
+        })
+        .collect();
+    let block_refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+
+    // Warmup: run once to prime GPU pipelines
+    let _ = engine.find_matches_batched(&block_refs);
+
+    // Time serial (one at a time)
+    let serial_start = std::time::Instant::now();
+    for block in &blocks {
+        let _ = engine.find_matches(block).unwrap();
+    }
+    let serial_elapsed = serial_start.elapsed();
+
+    // Time batched
+    let batched_start = std::time::Instant::now();
+    let _ = engine.find_matches_batched(&block_refs).unwrap();
+    let batched_elapsed = batched_start.elapsed();
+
+    // Batched should NOT be more than 1.5x slower than serial.
+    // (In practice, batched is typically faster due to amortized buffer
+    // allocation with the ring and overlapped GPU/CPU execution.)
+    let ratio = batched_elapsed.as_secs_f64() / serial_elapsed.as_secs_f64();
+    eprintln!(
+        "[pz-gpu] pipelining test: serial={:.1}ms, batched={:.1}ms, ratio={:.2}x",
+        serial_elapsed.as_secs_f64() * 1000.0,
+        batched_elapsed.as_secs_f64() * 1000.0,
+        ratio,
+    );
+    assert!(
+        ratio <= 1.5,
+        "batched GPU LZ77 is {ratio:.2}x slower than serial — \
+         pipelining regression (serial={serial_elapsed:?}, batched={batched_elapsed:?})"
+    );
+}

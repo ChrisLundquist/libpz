@@ -191,12 +191,23 @@ fn should_route_block_to_gpu_stage0(
 /// Returns `Some((start, end))` when every stage in `start..=end` has a GPU
 /// implementation, allowing the GPU coordinator to run them sequentially
 /// without intermediate queue round-trips or CPU readback.
+///
+/// **WARNING — GPU entropy is currently SLOWER than CPU** (0.77x encode, 0.54x decode).
+/// This function exists as architectural preparation for when GPU entropy becomes
+/// competitive. In practice, `GPU_ENTROPY_THRESHOLD` (256KB) is deliberately set above
+/// `DEFAULT_GPU_BLOCK_SIZE` (128KB) so the fused path is never activated for GPU blocks.
+/// Lowering the threshold or bypassing it will REGRESS throughput by ~10-15x because
+/// it serializes all work onto the single coordinator thread AND uses the slower GPU
+/// entropy path. See `docs/design-docs/gpu-strategy.md` and
+/// `.claude/feedback/2026-03-01-gpu-wins-on-lz77-loses-on-entropy.md`.
 #[cfg(feature = "webgpu")]
 fn gpu_fused_span(pipeline: Pipeline) -> Option<(usize, usize)> {
     match pipeline {
         // Both stages have GPU paths: LZ77 match-finding + rANS encode
+        // NOTE: GPU rANS is slower than CPU — fused path is gated by GPU_ENTROPY_THRESHOLD
         Pipeline::Lzr => Some((0, 1)),
         // Both stages have GPU paths: LzSeq fused match+demux + rANS encode
+        // NOTE: GPU rANS is slower than CPU — fused path is gated by GPU_ENTROPY_THRESHOLD
         Pipeline::LzSeqR => Some((0, 1)),
         _ => None,
     }

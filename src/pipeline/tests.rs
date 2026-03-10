@@ -899,6 +899,59 @@ mod gpu_batched_tests {
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
+
+    /// Multi-block pipeline pipelining regression test.
+    ///
+    /// Creates input large enough to produce many blocks (>= 8), then
+    /// compresses with GPU and verifies the round-trip. This exercises
+    /// the full GPU coordinator pipeline: ring-buffered LZ77 stage 0
+    /// batching, StageN entropy encoding, and result assembly.
+    ///
+    /// Correctness failures here indicate pipelining bugs (e.g., staging
+    /// buffer reuse before readback, ring slot cross-contamination, or
+    /// incomplete synchronization between GPU compute and CPU readback).
+    #[test]
+    fn test_gpu_pipeline_multiblock_correctness() {
+        let engine = match crate::webgpu::WebGpuEngine::new() {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(_) => return,
+        };
+        let opts = CompressOptions {
+            backend: Backend::WebGpu,
+            webgpu_engine: Some(engine),
+            block_size: 64 * 1024, // 64KB blocks → 8 blocks for 512KB input
+            threads: 2,
+            ..CompressOptions::default()
+        };
+
+        // 512KB input with distinct pattern per 64KB region to detect
+        // cross-contamination between blocks.
+        let mut input = Vec::with_capacity(512 * 1024);
+        let patterns: Vec<&[u8]> = vec![
+            b"alpha pattern block one data here. ",
+            b"beta different content for block two. ",
+            b"gamma third block uses gamma pattern. ",
+            b"delta fourth block with delta stuff. ",
+            b"epsilon five five five five five. ",
+            b"zeta block six zeta zeta zeta. ",
+            b"eta seventh block eta eta eta. ",
+            b"theta eighth block theta theta. ",
+        ];
+        for p in &patterns {
+            let block: Vec<u8> = p.iter().cycle().take(64 * 1024).copied().collect();
+            input.extend_from_slice(&block);
+        }
+
+        for pipeline in [Pipeline::Deflate, Pipeline::Lzr, Pipeline::LzSeqR] {
+            let compressed = compress_with_options(&input, pipeline, &opts).unwrap();
+            let decompressed = decompress(&compressed).unwrap();
+            assert_eq!(
+                decompressed, input,
+                "{:?} multi-block GPU pipeline round-trip failed",
+                pipeline
+            );
+        }
+    }
 }
 
 // --- LzSeqR optimal parsing tests (Task 6) ---
