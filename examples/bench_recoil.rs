@@ -187,7 +187,7 @@ fn main() {
             ..Default::default()
         };
         let compressed_std =
-            pipeline::compress_with_options(data, Pipeline::Lzr, &opts_std).unwrap();
+            pipeline::compress_with_options(data, Pipeline::LzSeqR, &opts_std).unwrap();
         let cref = &compressed_std;
         eprintln!(
             "    compressed: {:.1} KB (ratio {:.1}%)",
@@ -213,7 +213,7 @@ fn main() {
             ..Default::default()
         };
         let compressed_recoil =
-            pipeline::compress_with_options(data, Pipeline::Lzr, &opts_recoil).unwrap();
+            pipeline::compress_with_options(data, Pipeline::LzSeqR, &opts_recoil).unwrap();
         let cref_r = &compressed_recoil;
         bench_decode_fn(
             "LZR + Recoil (16 splits, CPU thread::scope)",

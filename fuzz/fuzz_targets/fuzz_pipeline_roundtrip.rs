@@ -14,7 +14,6 @@ fuzz_target!(|data: &[u8]| {
         Pipeline::Deflate,
         Pipeline::Bw,
         Pipeline::Bbw,
-        Pipeline::Lzr,
         Pipeline::Lzf,
         Pipeline::Lzfi,
         Pipeline::LzssR,

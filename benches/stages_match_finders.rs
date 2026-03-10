@@ -35,11 +35,11 @@ fn bench_match_finding(c: &mut Criterion) {
     group.finish();
 }
 
-/// Pipeline roundtrip: {hashchain, sortlz} x {greedy, lazy, optimal} on Lzr.
-fn bench_pipeline_lzr(c: &mut Criterion) {
+/// Pipeline roundtrip: {hashchain, sortlz} x {greedy, lazy, optimal} on LzSeqR.
+fn bench_pipeline_lzseqr(c: &mut Criterion) {
     use pz::pipeline::{self, CompressOptions, MatchFinder, ParseStrategy, Pipeline};
 
-    let mut group = c.benchmark_group("lzr_match_finders");
+    let mut group = c.benchmark_group("lzseqr_match_finders");
     cap(&mut group);
 
     let size = 65536;
@@ -63,7 +63,7 @@ fn bench_pipeline_lzr(c: &mut Criterion) {
                 ..Default::default()
             };
             group.bench_with_input(BenchmarkId::new(&label, size), &data, |b, data| {
-                b.iter(|| pipeline::compress_with_options(data, Pipeline::Lzr, &opts).unwrap());
+                b.iter(|| pipeline::compress_with_options(data, Pipeline::LzSeqR, &opts).unwrap());
             });
         }
     }
@@ -98,7 +98,7 @@ fn bench_ratio_comparison(c: &mut Criterion) {
             ..Default::default()
         };
         group.bench_with_input(BenchmarkId::new(name, size), &data, |b, data| {
-            b.iter(|| pipeline::compress_with_options(data, Pipeline::Lzr, &opts).unwrap());
+            b.iter(|| pipeline::compress_with_options(data, Pipeline::LzSeqR, &opts).unwrap());
         });
     }
     group.finish();
@@ -154,25 +154,25 @@ fn bench_gpu_match_finding(c: &mut Criterion) {
     }
     group.finish();
 
-    // --- Part 2: Full Lzr pipeline with GPU sortlz match finder ---
-    let mut group = c.benchmark_group("lzr_gpu_match_finders");
+    // --- Part 2: Full LzSeqR pipeline with GPU sortlz match finder ---
+    let mut group = c.benchmark_group("lzseqr_gpu_match_finders");
     cap(&mut group);
 
     for &size in GPU_SIZES {
         let data = get_test_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
-        // CPU hashchain + Lzr
+        // CPU hashchain + LzSeqR
         let opts = CompressOptions {
             parse_strategy: ParseStrategy::Lazy,
             threads: 1,
             ..Default::default()
         };
         group.bench_with_input(BenchmarkId::new("cpu_hashchain", size), &data, |b, data| {
-            b.iter(|| pipeline::compress_with_options(data, Pipeline::Lzr, &opts).unwrap());
+            b.iter(|| pipeline::compress_with_options(data, Pipeline::LzSeqR, &opts).unwrap());
         });
 
-        // CPU sortlz + Lzr
+        // CPU sortlz + LzSeqR
         let opts = CompressOptions {
             match_finder: MatchFinder::SortLz,
             parse_strategy: ParseStrategy::Lazy,
@@ -180,10 +180,10 @@ fn bench_gpu_match_finding(c: &mut Criterion) {
             ..Default::default()
         };
         group.bench_with_input(BenchmarkId::new("cpu_sortlz", size), &data, |b, data| {
-            b.iter(|| pipeline::compress_with_options(data, Pipeline::Lzr, &opts).unwrap());
+            b.iter(|| pipeline::compress_with_options(data, Pipeline::LzSeqR, &opts).unwrap());
         });
 
-        // GPU sortlz + Lzr (GPU match finding, CPU parse + entropy)
+        // GPU sortlz + LzSeqR (GPU match finding, CPU parse + entropy)
         let eng = engine.clone();
         group.bench_with_input(
             BenchmarkId::new("gpu_sortlz", size),
@@ -197,13 +197,13 @@ fn bench_gpu_match_finding(c: &mut Criterion) {
                     threads: 1,
                     ..Default::default()
                 };
-                b.iter(|| pipeline::compress_with_options(data, Pipeline::Lzr, &opts).unwrap());
+                b.iter(|| pipeline::compress_with_options(data, Pipeline::LzSeqR, &opts).unwrap());
             },
         );
     }
     group.finish();
 
-    // --- Part 3: Cross-pipeline GPU sortlz (Deflate, Lzr, Lzf) at 256K ---
+    // --- Part 3: Cross-pipeline GPU sortlz (Deflate, LzSeqR, Lzf) at 256K ---
     let mut group = c.benchmark_group("gpu_sortlz_pipelines");
     cap(&mut group);
 
@@ -213,7 +213,7 @@ fn bench_gpu_match_finding(c: &mut Criterion) {
 
     for (name, pipeline) in [
         ("deflate", Pipeline::Deflate),
-        ("lzr", Pipeline::Lzr),
+        ("lzseqr", Pipeline::LzSeqR),
         ("lzf", Pipeline::Lzf),
     ] {
         // CPU hashchain baseline
@@ -257,7 +257,7 @@ fn bench_gpu_match_finding(_c: &mut Criterion) {}
 criterion_group!(
     benches,
     bench_match_finding,
-    bench_pipeline_lzr,
+    bench_pipeline_lzseqr,
     bench_ratio_comparison,
     bench_gpu_match_finding
 );

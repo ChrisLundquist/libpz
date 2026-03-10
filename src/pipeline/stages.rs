@@ -893,9 +893,7 @@ pub(crate) fn run_compress_stage(
         (Pipeline::Bbw, 1) => stage_mtf_encode(block),
         (Pipeline::Bbw, 2) => stage_rle_encode(block),
         (Pipeline::Bbw, 3) => stage_fse_encode_bbw(block),
-        (Pipeline::Lzr, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
-        (Pipeline::Lzr, 1) => stage_rans_encode_with_options(block, options),
-        (Pipeline::Lzf, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
+        (Pipeline::Lzf, 0) => stage_demux_compress(block, &LzDemuxer::LzSeq, options),
         (Pipeline::Lzf, 1) => stage_fse_encode(block),
         (Pipeline::Lzfi, 0) => stage_demux_compress(block, &LzDemuxer::Lzss, options),
         (Pipeline::Lzfi, 1) => {

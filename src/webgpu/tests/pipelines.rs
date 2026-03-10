@@ -96,14 +96,14 @@ fn test_modular_gpu_deflate_round_trip() {
 }
 
 #[test]
-fn test_gpu_lz77_cpu_rans_round_trip() {
-    // GPU LZ77 → CPU rANS
+fn test_gpu_lzseq_cpu_rans_round_trip() {
+    // GPU LzSeq → CPU rANS
     let pattern = b"Hello, World! This is a test pattern for GPU+CPU composition. ";
     let mut input = Vec::new();
     for _ in 0..100 {
         input.extend_from_slice(pattern);
     }
-    gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Lzr);
+    gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::LzSeqR);
 }
 
 #[test]

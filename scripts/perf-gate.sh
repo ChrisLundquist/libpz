@@ -18,7 +18,7 @@ SIZE=1048576
 ITERATIONS=20
 REPEATS=3
 THREADS=0
-PIPELINES_CSV="deflate,lzr,lzf,lzseqr"
+PIPELINES_CSV="deflate,lzf,lzseqr"
 CPU_ONLY=false
 UPDATE_BASELINE=false
 THROUGHPUT_REGRESSION_PCT=4.0
@@ -39,7 +39,7 @@ Options:
   --iterations N              profile-example loop iterations per run (default: 20)
   --repeats N                 repeated runs per case; must be odd (default: 3)
   --threads N                 pass thread count to profile (0=auto, default: 0)
-  --pipelines LIST            comma-separated pipelines (default: deflate,lzr,lzf,lzseqr)
+  --pipelines LIST            comma-separated pipelines (default: deflate,lzf,lzseqr)
   --cpu-only                  skip WebGPU matrix
   --cargo-profile NAME        cargo profile for example binary (default: profiling)
   --baseline FILE             baseline TSV path

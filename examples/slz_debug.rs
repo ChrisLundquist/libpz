@@ -60,16 +60,16 @@ fn main() {
         Err(e) => println!("two 128KB hc: COMPRESS ERROR {:?}", e),
     }
 
-    // Test 4: Multi-block LzR with sortlz (this works in benchmark)
-    match pipeline::compress_with_options(two_blocks, Pipeline::Lzr, &opts2) {
+    // Test 4: Multi-block LzSeqR with sortlz
+    match pipeline::compress_with_options(two_blocks, Pipeline::LzSeqR, &opts2) {
         Ok(c) => match pipeline::decompress(&c) {
             Ok(d) if d == two_blocks => println!(
-                "two 128KB lzr-slz: OK {:.1}%",
+                "two 128KB lzseqr-slz: OK {:.1}%",
                 c.len() as f64 / two_blocks.len() as f64 * 100.0
             ),
-            Ok(d) => println!("two 128KB lzr-slz: MISMATCH len={}", d.len()),
-            Err(e) => println!("two 128KB lzr-slz: DECOMPRESS ERROR {:?}", e),
+            Ok(d) => println!("two 128KB lzseqr-slz: MISMATCH len={}", d.len()),
+            Err(e) => println!("two 128KB lzseqr-slz: DECOMPRESS ERROR {:?}", e),
         },
-        Err(e) => println!("two 128KB lzr-slz: COMPRESS ERROR {:?}", e),
+        Err(e) => println!("two 128KB lzseqr-slz: COMPRESS ERROR {:?}", e),
     }
 }

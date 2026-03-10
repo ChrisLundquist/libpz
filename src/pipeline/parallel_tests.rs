@@ -652,7 +652,7 @@ fn test_heterogeneous_mixed_block_sizes_with_gpu() {
     );
 }
 
-// GPU unified scheduler tests for LZ77-based pipelines (Deflate, Lzr, Lzf).
+// GPU unified scheduler tests for LZ-based pipelines (Deflate, Lzf).
 // These exercise the Stage 0 GPU routing and batch-collect path.
 
 #[test]
@@ -678,27 +678,6 @@ fn test_gpu_roundtrip_deflate() {
 
 #[test]
 #[cfg(feature = "webgpu")]
-fn test_gpu_roundtrip_lzr() {
-    use crate::webgpu::WebGpuEngine;
-    let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
-    let engine = match WebGpuEngine::new() {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    let opts = CompressOptions {
-        backend: super::super::Backend::WebGpu,
-        threads: 2,
-        block_size: 256 * 1024,
-        webgpu_engine: Some(std::sync::Arc::new(engine)),
-        ..CompressOptions::default()
-    };
-    let compressed = super::super::compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
-    let decompressed = super::super::decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input, "GPU Lzr round-trip failed");
-}
-
-#[test]
-#[cfg(feature = "webgpu")]
 fn test_gpu_roundtrip_lzf() {
     use crate::webgpu::WebGpuEngine;
     let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
@@ -720,7 +699,7 @@ fn test_gpu_roundtrip_lzf() {
 
 #[test]
 #[cfg(feature = "webgpu")]
-fn test_lzr_backend_assignments_are_interchangeable() {
+fn test_lzseqr_backend_assignments_are_interchangeable() {
     use crate::pipeline::{Backend, BackendAssignment};
     use crate::webgpu::WebGpuEngine;
 
@@ -751,11 +730,12 @@ fn test_lzr_backend_assignments_are_interchangeable() {
             webgpu_engine: Some(engine.clone()),
             ..CompressOptions::default()
         };
-        let compressed = super::super::compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
+        let compressed =
+            super::super::compress_with_options(&input, Pipeline::LzSeqR, &opts).unwrap();
         let decompressed = super::super::decompress(&compressed).unwrap();
         assert_eq!(
             decompressed, input,
-            "Lzr round-trip failed for interchangeable backends: {label}"
+            "LzSeqR round-trip failed for interchangeable backends: {label}"
         );
     }
 }

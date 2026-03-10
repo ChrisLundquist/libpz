@@ -279,7 +279,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
                 Pipeline::LzssR,
@@ -295,7 +294,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
                 Pipeline::LzssR,
@@ -311,7 +309,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
                 Pipeline::LzssR,
@@ -327,7 +324,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
                 Pipeline::LzssR,
@@ -343,7 +339,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
                 Pipeline::LzssR,
@@ -359,7 +354,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
                 Pipeline::LzssR,
@@ -375,7 +369,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
                 Pipeline::LzssR,
@@ -599,7 +592,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
             ] {
@@ -705,7 +697,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
             ] {
@@ -732,7 +723,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
             ] {
@@ -762,7 +752,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
             ] {
@@ -780,7 +769,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
             ] {
@@ -798,7 +786,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
             ] {
@@ -824,7 +811,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
             ] {
@@ -841,7 +827,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
             ] {
@@ -859,7 +844,6 @@ mod tests {
                 Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
-                Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
             ] {
@@ -925,7 +909,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "webgpu")]
-    fn webgpu_compress_cpu_decompress_lzr() {
+    fn webgpu_compress_cpu_decompress_lzseqr() {
         use crate::pipeline::{Backend, CompressOptions};
         let engine = match crate::webgpu::WebGpuEngine::new() {
             Ok(e) => std::sync::Arc::new(e),
@@ -938,9 +922,10 @@ mod tests {
             webgpu_engine: Some(engine),
             ..Default::default()
         };
-        let compressed = pipeline::compress_with_options(&input, Pipeline::Lzr, &options).unwrap();
+        let compressed =
+            pipeline::compress_with_options(&input, Pipeline::LzSeqR, &options).unwrap();
         let decompressed = pipeline::decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input, "WebGPU Lzr GPU→CPU round-trip");
+        assert_eq!(decompressed, input, "WebGPU LzSeqR GPU→CPU round-trip");
     }
 
     #[test]

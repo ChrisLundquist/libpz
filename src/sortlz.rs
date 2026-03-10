@@ -10,6 +10,7 @@
 /// The approach is fully deterministic and uses no atomic operations,
 /// making it ideal for GPU execution.
 use crate::fse;
+use crate::lz_token::{LzSeqEncoder, LzToken, TokenEncoder};
 use crate::{PzError, PzResult};
 
 /// Minimum match length.
@@ -39,6 +40,8 @@ pub struct SortLzConfig {
     pub min_match: usize,
     /// Maximum match candidates per position.
     pub max_candidates: usize,
+    /// Maximum match length (e.g., 258 for Deflate, u16::MAX for others).
+    pub max_match_len: u16,
 }
 
 impl Default for SortLzConfig {
@@ -48,6 +51,7 @@ impl Default for SortLzConfig {
             lazy_parsing: true,
             min_match: MIN_MATCH,
             max_candidates: MAX_CANDIDATES,
+            max_match_len: u16::MAX,
         }
     }
 }
@@ -57,17 +61,16 @@ impl SortLzConfig {
     ///
     /// Uses the LZ77 window size (32KB) and match constraints.
     /// Note: SortLZ minimum match is 4 (hash-based), not LZ77's 3.
-    pub fn for_lz77(_max_match_len: u16) -> Self {
+    pub fn for_lz77(max_match_len: u16) -> Self {
         SortLzConfig {
             max_window: crate::lz77::MAX_WINDOW,
             lazy_parsing: false,  // parsing handled by caller
             min_match: MIN_MATCH, // 4 (SortLZ hash minimum)
             max_candidates: MAX_CANDIDATES,
+            max_match_len,
         }
     }
 }
-
-use crate::lz77::LzToken;
 
 /// Find matches using sort-based approach.
 ///
@@ -149,10 +152,10 @@ pub fn find_matches(input: &[u8], config: &SortLzConfig) -> Vec<Option<(u16, u16
             }
 
             // Verify and extend match.
-            let match_len = extend_match(input, src, dst);
+            let match_len = extend_match(input, src, dst, config.max_match_len);
             if match_len >= config.min_match {
                 let offset = distance as u16;
-                let length = match_len as u16; // already capped at u16::MAX in extend_match
+                let length = match_len as u16; // already capped at max_match_len in extend_match
 
                 // Update best match for the destination position.
                 if let Some((_, existing_len)) = best_match[dst] {
@@ -231,10 +234,10 @@ pub fn find_matches_topk(
                 continue;
             }
 
-            let match_len = extend_match(input, src, dst);
+            let match_len = extend_match(input, src, dst, config.max_match_len);
             if match_len >= config.min_match {
                 let offset = distance as u32;
-                let length = match_len as u32; // already capped at u16::MAX in extend_match
+                let length = match_len as u32; // already capped at max_match_len in extend_match
 
                 // Insert into top-K slot for the destination position,
                 // maintaining sorted-by-length-desc order.
@@ -291,9 +294,9 @@ fn insert_topk_candidate(
 ///
 /// Uses u64 chunk comparisons for 4-8x speedup on long matches.
 /// Capped at `u16::MAX` to avoid excessive scanning on highly repetitive data.
-fn extend_match(input: &[u8], src: usize, dst: usize) -> usize {
+fn extend_match(input: &[u8], src: usize, dst: usize, max_match_len: u16) -> usize {
     let max_len = input.len() - dst;
-    let max_len = max_len.min(input.len() - src).min(u16::MAX as usize);
+    let max_len = max_len.min(input.len() - src).min(max_match_len as usize);
 
     // Fast path: compare 8 bytes at a time.
     let mut len = 0;
@@ -320,7 +323,11 @@ fn extend_match(input: &[u8], src: usize, dst: usize) -> usize {
 }
 
 /// Parse matches into tokens using greedy or lazy strategy.
-fn parse_matches(input: &[u8], matches: &[Option<(u16, u16)>], lazy: bool) -> Vec<LzToken> {
+pub(crate) fn parse_matches(
+    input: &[u8],
+    matches: &[Option<(u16, u16)>],
+    lazy: bool,
+) -> Vec<LzToken> {
     let n = input.len();
     let mut tokens = Vec::new();
     let mut pos = 0;
@@ -339,7 +346,10 @@ fn parse_matches(input: &[u8], matches: &[Option<(u16, u16)>], lazy: bool) -> Ve
                 }
             }
 
-            tokens.push(LzToken::Match { offset, length });
+            tokens.push(LzToken::Match {
+                offset: offset as u32,
+                length: length as u32,
+            });
             pos += length as usize;
         } else {
             tokens.push(LzToken::Literal(input[pos]));
@@ -478,15 +488,11 @@ pub fn matches_to_lz77_lazy(
 
 /// Compress using the SortLZ pipeline.
 ///
-/// Wire format:
+/// Wire format (v2 — LzSeq-encoded streams + FSE):
 /// ```text
-/// [num_tokens: u32]
-/// [num_literals: u32]
-/// [flags_len: u32]
-/// [flags: ceil(num_tokens/8) bytes]  (1 = literal, 0 = match)
-/// [fse_literals_len: u32] [fse_literals_data]
-/// [fse_offsets_len: u32]  [fse_offsets_data]
-/// [fse_lengths_len: u32]  [fse_lengths_data]
+/// [meta_len: u16 LE] [meta: meta_len bytes]
+/// [num_streams: u8]
+/// per stream: [orig_len: u32 LE] [fse_len: u32 LE] [fse_data]
 /// ```
 pub fn compress(input: &[u8], config: &SortLzConfig) -> PzResult<Vec<u8>> {
     if input.is_empty() {
@@ -508,148 +514,86 @@ pub fn compress_with_matches(
     }
 
     let tokens = parse_matches(input, &matches, config.lazy_parsing);
+    let encoder = LzSeqEncoder {
+        max_window: config.max_window,
+    };
+    let encoded = encoder.encode(input, &tokens)?;
 
-    // Split tokens into streams.
-    let num_tokens = tokens.len();
-    let flag_bytes = num_tokens.div_ceil(8);
-    let mut flags = vec![0u8; flag_bytes];
-    let mut literals = Vec::new();
-    let mut offsets_raw = Vec::new();
-    let mut lengths_raw = Vec::new();
-
-    for (i, token) in tokens.iter().enumerate() {
-        match token {
-            LzToken::Literal(b) => {
-                flags[i / 8] |= 1 << (7 - (i % 8));
-                literals.push(*b);
-            }
-            LzToken::Match { offset, length } => {
-                offsets_raw.extend_from_slice(&offset.to_le_bytes());
-                lengths_raw.extend_from_slice(&length.to_le_bytes());
-            }
-        }
-    }
-
-    // FSE-encode each stream.
-    let fse_literals = fse::encode(&literals);
-    let fse_offsets = fse::encode(&offsets_raw);
-    let fse_lengths = fse::encode(&lengths_raw);
-
-    // Assemble output.
+    // Assemble output: [meta_len:u16] [meta] [num_streams:u8]
+    // per stream: [orig_len:u32] [fse_len:u32] [fse_data]
     let mut output = Vec::new();
-    output.extend_from_slice(&(num_tokens as u32).to_le_bytes());
-    output.extend_from_slice(&(literals.len() as u32).to_le_bytes());
-    output.extend_from_slice(&(flag_bytes as u32).to_le_bytes());
-    output.extend_from_slice(&flags);
+    output.extend_from_slice(&(encoded.meta.len() as u16).to_le_bytes());
+    output.extend_from_slice(&encoded.meta);
+    output.push(encoded.streams.len() as u8);
 
-    output.extend_from_slice(&(fse_literals.len() as u32).to_le_bytes());
-    output.extend_from_slice(&fse_literals);
-
-    output.extend_from_slice(&(fse_offsets.len() as u32).to_le_bytes());
-    output.extend_from_slice(&fse_offsets);
-
-    output.extend_from_slice(&(fse_lengths.len() as u32).to_le_bytes());
-    output.extend_from_slice(&fse_lengths);
+    for stream in &encoded.streams {
+        let fse_data = fse::encode(stream);
+        output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+        output.extend_from_slice(&(fse_data.len() as u32).to_le_bytes());
+        output.extend_from_slice(&fse_data);
+    }
 
     Ok(output)
 }
 
 /// Decompress SortLZ data back to the original input.
+///
+/// Wire format (v2): [meta_len:u16] [meta] [num_streams:u8]
+/// per stream: [orig_len:u32] [fse_len:u32] [fse_data]
 pub fn decompress(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    if payload.len() < 12 {
+    if payload.len() < 3 {
         return Err(PzError::InvalidInput);
     }
 
-    let num_tokens = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-    let num_literals =
-        u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
-    let flag_bytes =
-        u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
-
-    let mut pos = 12;
-    if pos + flag_bytes > payload.len() {
+    let meta_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    let mut pos = 2;
+    if pos + meta_len > payload.len() {
         return Err(PzError::InvalidInput);
     }
-    let flags = &payload[pos..pos + flag_bytes];
-    pos += flag_bytes;
+    let meta = payload[pos..pos + meta_len].to_vec();
+    pos += meta_len;
 
-    // Decode FSE streams.
-    let literals = read_fse_stream(payload, &mut pos, num_literals)?;
+    if pos >= payload.len() {
+        return Err(PzError::InvalidInput);
+    }
+    let num_streams = payload[pos] as usize;
+    pos += 1;
 
-    // Count matches to know offset/length stream sizes.
-    let num_matches = num_tokens - num_literals;
-    let offsets_raw = read_fse_stream(payload, &mut pos, num_matches * 2)?;
-    let lengths_raw = read_fse_stream(payload, &mut pos, num_matches * 2)?;
-
-    // Reconstruct output.
-    let mut output = Vec::with_capacity(orig_len);
-    let mut lit_idx = 0;
-    let mut match_idx = 0;
-
-    for i in 0..num_tokens {
-        let is_literal = flags[i / 8] & (1 << (7 - (i % 8))) != 0;
-        if is_literal {
-            if lit_idx >= literals.len() {
-                return Err(PzError::InvalidInput);
-            }
-            output.push(literals[lit_idx]);
-            lit_idx += 1;
-        } else {
-            let off_pos = match_idx * 2;
-            if off_pos + 2 > offsets_raw.len() || off_pos + 2 > lengths_raw.len() {
-                return Err(PzError::InvalidInput);
-            }
-            let offset =
-                u16::from_le_bytes([offsets_raw[off_pos], offsets_raw[off_pos + 1]]) as usize;
-            let length =
-                u16::from_le_bytes([lengths_raw[off_pos], lengths_raw[off_pos + 1]]) as usize;
-
-            if offset == 0 || offset > output.len() {
-                return Err(PzError::InvalidInput);
-            }
-
-            for _ in 0..length {
-                let src = output.len() - offset;
-                let b = output[src];
-                output.push(b);
-            }
-
-            match_idx += 1;
+    let mut streams = Vec::with_capacity(num_streams);
+    for _ in 0..num_streams {
+        if pos + 8 > payload.len() {
+            return Err(PzError::InvalidInput);
         }
+        let stream_orig_len = u32::from_le_bytes([
+            payload[pos],
+            payload[pos + 1],
+            payload[pos + 2],
+            payload[pos + 3],
+        ]) as usize;
+        let fse_len = u32::from_le_bytes([
+            payload[pos + 4],
+            payload[pos + 5],
+            payload[pos + 6],
+            payload[pos + 7],
+        ]) as usize;
+        pos += 8;
+
+        if pos + fse_len > payload.len() {
+            return Err(PzError::InvalidInput);
+        }
+        let decoded = if stream_orig_len == 0 {
+            Vec::new()
+        } else {
+            fse::decode(&payload[pos..pos + fse_len], stream_orig_len)?
+        };
+        pos += fse_len;
+        streams.push(decoded);
     }
 
-    if output.len() != orig_len {
-        return Err(PzError::InvalidInput);
-    }
-
-    Ok(output)
-}
-
-/// Read an FSE-encoded stream from the payload.
-fn read_fse_stream(payload: &[u8], pos: &mut usize, orig_len: usize) -> PzResult<Vec<u8>> {
-    if *pos + 4 > payload.len() {
-        return Err(PzError::InvalidInput);
-    }
-    let fse_len = u32::from_le_bytes([
-        payload[*pos],
-        payload[*pos + 1],
-        payload[*pos + 2],
-        payload[*pos + 3],
-    ]) as usize;
-    *pos += 4;
-
-    if *pos + fse_len > payload.len() {
-        return Err(PzError::InvalidInput);
-    }
-
-    let decoded = if orig_len == 0 {
-        Vec::new()
-    } else {
-        fse::decode(&payload[*pos..*pos + fse_len], orig_len)?
+    let encoder = LzSeqEncoder {
+        max_window: DEFAULT_MAX_WINDOW,
     };
-    *pos += fse_len;
-
-    Ok(decoded)
+    encoder.decode(streams, &meta, orig_len)
 }
 
 /// Radix sort (hash, position) pairs by hash value.
@@ -873,32 +817,6 @@ mod tests {
         }
         let decoded = crate::lz77::decompress(&lz_bytes).unwrap();
         assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn test_pipeline_roundtrip_lzr_sortlz() {
-        use crate::pipeline::{self, CompressOptions, MatchFinder, ParseStrategy, Pipeline};
-        let input = test_data();
-
-        for strategy in [
-            ParseStrategy::Greedy,
-            ParseStrategy::Lazy,
-            ParseStrategy::Optimal,
-        ] {
-            let opts = CompressOptions {
-                match_finder: MatchFinder::SortLz,
-                parse_strategy: strategy,
-                threads: 1,
-                ..Default::default()
-            };
-            let compressed = pipeline::compress_with_options(&input, Pipeline::Lzr, &opts).unwrap();
-            let decoded = pipeline::decompress(&compressed).unwrap();
-            assert_eq!(
-                decoded, input,
-                "Lzr + SortLz + {:?} roundtrip failed",
-                strategy
-            );
-        }
     }
 
     #[test]

@@ -155,7 +155,6 @@ fn should_route_block_to_gpu_stage0(
     let is_gpu_stage0_pipeline = matches!(
         pipeline,
         Pipeline::Deflate
-            | Pipeline::Lzr
             | Pipeline::Lzf
             | Pipeline::Lzfi
             | Pipeline::LzssR
@@ -203,9 +202,6 @@ fn should_route_block_to_gpu_stage0(
 #[cfg(feature = "webgpu")]
 fn gpu_fused_span(pipeline: Pipeline) -> Option<(usize, usize)> {
     match pipeline {
-        // Both stages have GPU paths: LZ77 match-finding + rANS encode
-        // NOTE: GPU rANS is slower than CPU — fused path is gated by GPU_ENTROPY_THRESHOLD
-        Pipeline::Lzr => Some((0, 1)),
         // Both stages have GPU paths: LzSeq fused match+demux + rANS encode
         // NOTE: GPU rANS is slower than CPU — fused path is gated by GPU_ENTROPY_THRESHOLD
         Pipeline::LzSeqR => Some((0, 1)),
@@ -408,8 +404,7 @@ fn compress_parallel_unified(
 
             scope.spawn(move || {
                 let engine = opts.webgpu_engine.as_ref().unwrap();
-                let uses_lz77_demux =
-                    matches!(pipeline, Pipeline::Deflate | Pipeline::Lzr | Pipeline::Lzf);
+                let uses_lz77_demux = matches!(pipeline, Pipeline::Deflate | Pipeline::Lzf);
                 let uses_sortlz_match_finder =
                     opts.match_finder == super::MatchFinder::SortLz && uses_lz77_demux;
 
@@ -561,13 +556,17 @@ fn compress_parallel_unified(
                             let t0 = Instant::now();
                             let result = engine
                                 .sortlz_find_matches(blocks[block_idx], &sortlz_config)
-                                .map(|raw_matches| {
+                                .and_then(|raw_matches| {
                                     let lz_matches = crate::sortlz::matches_to_lz77_lazy(
                                         blocks[block_idx],
                                         &raw_matches,
                                     );
-                                    let demux = super::demux::demux_lz77_matches(lz_matches);
-                                    StageBlock {
+                                    let demux = super::demux::demux_lz77_matches(
+                                        blocks[block_idx],
+                                        lz_matches,
+                                        pipeline,
+                                    )?;
+                                    Ok(StageBlock {
                                         block_index: block_idx,
                                         original_len: blocks[block_idx].len(),
                                         data: Vec::new(),
@@ -577,7 +576,7 @@ fn compress_parallel_unified(
                                             demux_meta: demux.meta,
                                             ..StageMetadata::default()
                                         },
-                                    }
+                                    })
                                 });
                             if let Some(stats) = stats_ref.as_ref() {
                                 stats.add_stage_compute(t0.elapsed());
@@ -611,8 +610,12 @@ fn compress_parallel_unified(
                                 for (matches, block_idx) in
                                     all_matches.into_iter().zip(stage0_batch.iter().copied())
                                 {
-                                    let demux = super::demux::demux_lz77_matches(matches);
-                                    let sb = StageBlock {
+                                    let result = super::demux::demux_lz77_matches(
+                                        blocks[block_idx],
+                                        matches,
+                                        pipeline,
+                                    )
+                                    .map(|demux| StageBlock {
                                         block_index: block_idx,
                                         original_len: blocks[block_idx].len(),
                                         data: Vec::new(),
@@ -622,9 +625,9 @@ fn compress_parallel_unified(
                                             demux_meta: demux.meta,
                                             ..StageMetadata::default()
                                         },
-                                    };
+                                    });
                                     complete_gpu_stage(
-                                        Ok(sb),
+                                        result,
                                         0,
                                         block_idx,
                                         last_stage,

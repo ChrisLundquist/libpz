@@ -11,8 +11,7 @@
 //! |---------------|----------------------------------|-----------------|
 //! | `Deflate`     | LZ77 → Huffman                   | gzip            |
 //! | `Bw`          | BWT → MTF → RLE → FSE            | bzip2           |
-//! | `Lzr`         | LZ77 → rANS                      | fast ANS        |
-//! | `Lzf`         | LZ77 → FSE                       | zstd-like       |
+//! | `Lzf`         | LzSeq → FSE                      | zstd-like       |
 //! | `Lzfi`        | LZSS → interleaved FSE           | fast CPU decode |
 //! | `LzssR`       | LZSS → rANS                      | experimental    |
 //! | `LzSeqR`      | LzSeq → rANS                     | zstd-style      |
@@ -27,7 +26,7 @@
 //! Each compressed stream starts with a header:
 //! - Magic bytes: `PZ` (2 bytes)
 //! - Version: 2 (1 byte)
-//! - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 5=Lzfi, 6=LzssR, 8=LzSeqR, 9=LzSeqH, 10=SortLz (1 byte)
+//! - Pipeline ID: 0=Deflate, 1=Bw, 4=Lzf, 5=Lzfi, 6=LzssR, 8=LzSeqR, 9=LzSeqH, 10=SortLz (1 byte)
 //! - Original length: u32 little-endian (4 bytes)
 //! - num_blocks: u32 little-endian (4 bytes)
 //! - Block table: \[compressed_len: u32, original_len: u32\] \* num_blocks
@@ -167,7 +166,7 @@ pub struct CompressOptions {
     /// Maximum match length for LZ77 compression.
     ///
     /// `None` = use the pipeline's default: 258 for Deflate (RFC 1951
-    /// constraint), `u16::MAX` for other LZ77-based pipelines (Lzr, Lzf).
+    /// constraint), `u16::MAX` for other LZ-based pipelines (Lzf, LzSeqR, etc.).
     /// Larger limits allow longer matches on repetitive data without
     /// penalizing short-match performance (SIMD short-circuits).
     pub max_match_len: Option<u16>,
@@ -216,7 +215,7 @@ pub struct CompressOptions {
     /// Auto routes to GPU when block size >= GPU_ENTROPY_THRESHOLD and GPU available.
     pub stage1_backend: BackendAssignment,
     /// Match-finding algorithm: HashChain (default) or SortLz.
-    /// Applies to all LZ-based pipelines (Deflate, Lzr, Lzf, Lzfi, LzssR, LzSeqR, LzSeqH).
+    /// Applies to all LZ-based pipelines (Deflate, Lzf, Lzfi, LzssR, LzSeqR, LzSeqH).
     pub match_finder: MatchFinder,
 }
 
@@ -331,9 +330,8 @@ pub enum Pipeline {
     Bw = 1,
     /// Bijective BWT + MTF + RLE + FSE (parallelizable BWT variant)
     Bbw = 2,
-    /// LZ77 + rANS (fast entropy coding, SIMD/GPU friendly)
-    Lzr = 3,
-    /// LZ77 + FSE (finite state entropy, zstd-style)
+    // ID 3 was Lzr (LZ77 + rANS) — removed, identical to LzSeqR after wire encoder refactor.
+    /// LzSeq + FSE (finite state entropy, zstd-style)
     Lzf = 4,
     /// LZSS + interleaved FSE (N-way parallel FSE, fast CPU decode)
     Lzfi = 5,
@@ -359,7 +357,7 @@ impl TryFrom<u8> for Pipeline {
             0 => Ok(Self::Deflate),
             1 => Ok(Self::Bw),
             2 => Ok(Self::Bbw),
-            3 => Ok(Self::Lzr),
+            // 3 was Lzr — removed
             4 => Ok(Self::Lzf),
             5 => Ok(Self::Lzfi),
             6 => Ok(Self::LzssR),
@@ -695,7 +693,6 @@ pub fn select_pipeline_trial(
     let candidates = [
         Pipeline::Deflate,
         Pipeline::Bw,
-        Pipeline::Lzr,
         Pipeline::Lzfi,
         Pipeline::LzssR,
         Pipeline::LzSeqR,
@@ -770,7 +767,6 @@ fn adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> CompressOp
     let is_lz_pipeline = matches!(
         pipeline,
         Pipeline::Deflate
-            | Pipeline::Lzr
             | Pipeline::Lzf
             | Pipeline::Lzfi
             | Pipeline::LzssR
@@ -787,13 +783,20 @@ fn adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> CompressOp
         gpu
     };
 
+    let mut adjusted = options.clone();
+
     if is_lz_pipeline && is_gpu {
-        let mut adjusted = options.clone();
         adjusted.block_size = DEFAULT_GPU_BLOCK_SIZE;
-        adjusted
-    } else {
-        options.clone()
     }
+
+    // Non-Deflate LZ pipelines default to extended match length (u16::MAX)
+    // when the caller hasn't explicitly set one.
+    if adjusted.max_match_len.is_none() && is_lz_pipeline && !matches!(pipeline, Pipeline::Deflate)
+    {
+        adjusted.max_match_len = Some(lz77::DEFAULT_MAX_MATCH);
+    }
+
+    adjusted
 }
 
 /// Resolve thread count: 0 = auto (available_parallelism), otherwise use the given value.
@@ -862,18 +865,15 @@ fn decompress_framed(
 // GPU/CPU backend dispatch helpers
 // ---------------------------------------------------------------------------
 
-/// Demux helpers can use this for parse-mode-aware LZ77 match generation.
+/// Generate a universal token stream from input using configured match finder + parser.
 ///
-/// Backend/strategy selection logic:
-/// - `Auto` on GPU: hash-table kernel (best throughput at ≥256KB)
-/// - `Auto` on CPU: lazy matching (best compression ratio)
-/// - `Optimal` on GPU: GPU top-K match table → CPU backward DP
-/// - `Optimal` on CPU: CPU match table → CPU backward DP
-/// - GPU backend falls back to CPU when input < MIN_GPU_INPUT_SIZE
-pub(crate) fn lz77_matches_with_backend(
+/// This is the shared entry point for all LZ-based pipelines. Match finding
+/// and parsing produce `Vec<LzToken>`; the caller picks a `TokenEncoder` to
+/// wire-encode the tokens into streams for entropy coding.
+pub(crate) fn tokenize(
     input: &[u8],
     options: &CompressOptions,
-) -> PzResult<Vec<lz77::Match>> {
+) -> PzResult<Vec<crate::lz_token::LzToken>> {
     let max_match = options.max_match_len.unwrap_or(lz77::DEFLATE_MAX_MATCH);
 
     // GPU path: use GPU kernels when available and input is in range.
@@ -888,10 +888,12 @@ pub(crate) fn lz77_matches_with_backend(
                     if options.parse_strategy == ParseStrategy::Optimal {
                         let table = engine.find_topk_matches(input)?;
                         let bytes = crate::optimal::compress_optimal_with_table(input, &table)?;
-                        return Ok(lz77::deserialize_matches(&bytes));
+                        let matches = lz77::deserialize_matches(&bytes);
+                        return Ok(crate::lz_token::matches_to_tokens(&matches));
                     }
                     let bytes = engine.lz77_compress(input)?;
-                    return Ok(lz77::deserialize_matches(&bytes));
+                    let matches = lz77::deserialize_matches(&bytes);
+                    return Ok(crate::lz_token::matches_to_tokens(&matches));
                 }
             }
         }
@@ -899,47 +901,43 @@ pub(crate) fn lz77_matches_with_backend(
 
     // SortLZ match finder: radix sort + adjacent-pair verification
     if options.match_finder == MatchFinder::SortLz {
-        return sortlz_matches_with_strategy(input, options, max_match);
+        return sortlz_tokens_with_strategy(input, options, max_match);
     }
 
     // Hash-chain match finder (default)
     match options.parse_strategy {
         ParseStrategy::Auto => {
             let max_chain = lz77::select_chain_depth(input.len(), true);
-            lz77::compress_lazy_to_matches_with_limit_and_chain(input, max_match, max_chain)
+            lz77::compress_lazy_to_tokens_with_limit_and_chain(input, max_match, max_chain)
         }
-        ParseStrategy::Greedy => lz77::compress_greedy_to_matches_with_limit(input, max_match),
-        ParseStrategy::Lazy => lz77::compress_lazy_to_matches_with_limit(input, max_match),
-        ParseStrategy::Optimal => crate::optimal::optimal_matches_with_limit(input, max_match),
+        ParseStrategy::Greedy => lz77::compress_greedy_to_tokens_with_limit(input, max_match),
+        ParseStrategy::Lazy => lz77::compress_lazy_to_tokens_with_limit(input, max_match),
+        ParseStrategy::Optimal => {
+            let matches = crate::optimal::optimal_matches_with_limit(input, max_match)?;
+            Ok(crate::lz_token::matches_to_tokens(&matches))
+        }
     }
 }
 
-/// SortLZ match finding with parse strategy dispatch.
-///
-/// Uses GPU radix sort when a WebGPU engine is available and input is large
-/// enough. Falls back to CPU sort otherwise.
-fn sortlz_matches_with_strategy(
+/// SortLZ match finding + token generation with parse strategy dispatch.
+fn sortlz_tokens_with_strategy(
     input: &[u8],
     options: &CompressOptions,
     max_match: u16,
-) -> PzResult<Vec<lz77::Match>> {
+) -> PzResult<Vec<crate::lz_token::LzToken>> {
     use crate::sortlz::{self, SortLzConfig};
 
     let config = SortLzConfig::for_lz77(max_match);
 
-    // GPU path: use GPU radix sort for match finding when available.
-    // The GPU kernel does the sort + verify in parallel, then we convert
-    // to lz77::Match on CPU (parsing is inherently serial).
+    // GPU path for SortLZ match finding.
     #[cfg(feature = "webgpu")]
     if let Some(ref engine) = options.webgpu_engine {
         if input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
             && input.len() <= engine.max_dispatch_input_size()
         {
             let raw_matches = engine.sortlz_find_matches(input, &config)?;
-            return match options.parse_strategy {
-                ParseStrategy::Greedy => Ok(sortlz::matches_to_lz77_greedy(input, &raw_matches)),
-                _ => Ok(sortlz::matches_to_lz77_lazy(input, &raw_matches)),
-            };
+            let lazy = !matches!(options.parse_strategy, ParseStrategy::Greedy);
+            return Ok(sortlz::parse_matches(input, &raw_matches, lazy));
         }
     }
 
@@ -949,15 +947,16 @@ fn sortlz_matches_with_strategy(
             let table = sortlz::find_matches_topk(input, &config, crate::optimal::K);
             let freq = crate::frequency::get_frequency(input);
             let cost_model = crate::optimal::CostModel::from_frequencies(&freq);
-            Ok(crate::optimal::optimal_parse(input, &table, &cost_model))
+            let matches = crate::optimal::optimal_parse(input, &table, &cost_model);
+            Ok(crate::lz_token::matches_to_tokens(&matches))
         }
         ParseStrategy::Greedy => {
             let matches = sortlz::find_matches(input, &config);
-            Ok(sortlz::matches_to_lz77_greedy(input, &matches))
+            Ok(sortlz::parse_matches(input, &matches, false))
         }
         ParseStrategy::Auto | ParseStrategy::Lazy => {
             let matches = sortlz::find_matches(input, &config);
-            Ok(sortlz::matches_to_lz77_lazy(input, &matches))
+            Ok(sortlz::parse_matches(input, &matches, true))
         }
     }
 }

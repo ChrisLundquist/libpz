@@ -98,16 +98,6 @@ pub(crate) fn deserialize_matches(data: &[u8]) -> Vec<Match> {
     matches
 }
 
-/// A parsed LZ token: either a literal byte or a (length, offset) match.
-///
-/// Shared across LZ modules (sortlz) that need to classify positions
-/// as literals or matches during encoding.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum LzToken {
-    Literal(u8),
-    Match { offset: u16, length: u16 },
-}
-
 /// Decompress LZ77-compressed data.
 ///
 /// The input must be a sequence of serialized Match structs.
@@ -637,7 +627,7 @@ pub(crate) fn compress_greedy_to_matches_with_limit(
 
 /// Like `compress_lazy_to_matches` but with a caller-specified max match length.
 ///
-/// Non-Deflate pipelines (Lzr, Lzf) can pass `DEFAULT_MAX_MATCH` to find
+/// Non-Deflate pipelines (Lzf, LzSeqR, etc.) can pass `DEFAULT_MAX_MATCH` to find
 /// longer matches on repetitive data without being constrained by DEFLATE.
 pub(crate) fn compress_lazy_to_matches_with_limit(
     input: &[u8],
@@ -720,6 +710,38 @@ pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
 pub(crate) fn compress_lazy_with_limit(input: &[u8], max_match_len: u16) -> PzResult<Vec<u8>> {
     let matches = compress_lazy_to_matches_with_limit(input, max_match_len)?;
     Ok(serialize_matches(&matches))
+}
+
+// ---------------------------------------------------------------------------
+// Token-producing wrappers (for pluggable wire encoders)
+// ---------------------------------------------------------------------------
+
+/// Compress using greedy matching, returning a universal token stream.
+pub(crate) fn compress_greedy_to_tokens_with_limit(
+    input: &[u8],
+    max_match_len: u16,
+) -> PzResult<Vec<crate::lz_token::LzToken>> {
+    let matches = compress_greedy_to_matches_with_limit(input, max_match_len)?;
+    Ok(crate::lz_token::matches_to_tokens(&matches))
+}
+
+/// Compress using lazy matching, returning a universal token stream.
+pub(crate) fn compress_lazy_to_tokens_with_limit(
+    input: &[u8],
+    max_match_len: u16,
+) -> PzResult<Vec<crate::lz_token::LzToken>> {
+    let matches = compress_lazy_to_matches_with_limit(input, max_match_len)?;
+    Ok(crate::lz_token::matches_to_tokens(&matches))
+}
+
+/// Compress using lazy matching with tunable chain depth, returning tokens.
+pub(crate) fn compress_lazy_to_tokens_with_limit_and_chain(
+    input: &[u8],
+    max_match_len: u16,
+    max_chain: usize,
+) -> PzResult<Vec<crate::lz_token::LzToken>> {
+    let matches = compress_lazy_to_matches_with_limit_and_chain(input, max_match_len, max_chain)?;
+    Ok(crate::lz_token::matches_to_tokens(&matches))
 }
 
 /// Parse-mode-aware chain-depth heuristic.

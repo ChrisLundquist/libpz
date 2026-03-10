@@ -57,14 +57,14 @@ fn profile_bw_decode(data: &[u8], label: &str) {
     );
 }
 
-fn profile_lzr_decode(data: &[u8], label: &str) {
+fn profile_lzseqr_decode(data: &[u8], label: &str) {
     use pz::pipeline::{self, CompressOptions, Pipeline};
 
     let opts = CompressOptions {
         threads: 1,
         ..Default::default()
     };
-    let compressed = pipeline::compress_with_options(data, Pipeline::Lzr, &opts).unwrap();
+    let compressed = pipeline::compress_with_options(data, Pipeline::LzSeqR, &opts).unwrap();
 
     let iters = 10;
     let mut total_ns = 0u128;
@@ -120,7 +120,7 @@ fn main() {
         match std::fs::read(path) {
             Ok(data) => {
                 profile_bw_decode(&data, label);
-                profile_lzr_decode(&data, label);
+                profile_lzseqr_decode(&data, label);
                 profile_deflate_decode(&data, label);
                 println!();
             }

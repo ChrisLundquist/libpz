@@ -50,7 +50,7 @@ BUILD OPTIONS:
     --no-default-features   Disable default features (pure CPU build)
 
 PROFILE BINARY OPTIONS (forwarded to the profile example):
-    --pipeline P            Pipeline: deflate, bw, bbw, lzr, lzf, lzfi, lzssr (default: lzf)
+    --pipeline P            Pipeline: deflate, bw, bbw, lzf, lzfi, lzssr, lzseqr, lzseqh, sortlz (default: lzf)
     --stage S               Profile a single stage: lz77, huffman, bwt, mtf, rle, fse, rans
     --decompress            Profile decompression instead of compression
     --iterations N          Number of iterations (default: 200)

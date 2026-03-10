@@ -24,7 +24,9 @@ fn usage() {
     eprintln!("Usage: profile [OPTIONS]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --pipeline P    Pipeline: deflate, bw, bbw, lzr, lzf, lzfi, lzssr, lzseqr (default: lzf)");
+    eprintln!(
+        "  --pipeline P    Pipeline: deflate, bw, bbw, lzf, lzfi, lzssr, lzseqr (default: lzf)"
+    );
     eprintln!("  --stage S       Profile a single stage instead of full pipeline:");
     eprintln!("                    lz77, huffman, bwt, mtf, rle, fse, rans");
     eprintln!("  --decompress    Profile decompression instead of compression");
@@ -605,14 +607,13 @@ fn main() {
             "deflate" => Pipeline::Deflate,
             "bw" => Pipeline::Bw,
             "bbw" => Pipeline::Bbw,
-            "lzr" => Pipeline::Lzr,
             "lzf" => Pipeline::Lzf,
             "lzfi" => Pipeline::Lzfi,
             "lzssr" => Pipeline::LzssR,
             "lzseqr" => Pipeline::LzSeqR,
             other => {
                 eprintln!("unknown pipeline: {}", other);
-                eprintln!("valid pipelines: deflate, bw, bbw, lzr, lzf, lzfi, lzssr, lzseqr");
+                eprintln!("valid pipelines: deflate, bw, bbw, lzf, lzfi, lzssr, lzseqr");
                 std::process::exit(1);
             }
         };
