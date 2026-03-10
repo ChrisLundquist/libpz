@@ -751,7 +751,7 @@ mod tests {
     #[test]
     fn test_lz77_greedy_roundtrip() {
         let input = test_data();
-        let config = SortLzConfig::for_lz77(crate::lz77::DEFLATE_MAX_MATCH);
+        let config = SortLzConfig::for_lz77(crate::lz77::LZ77_MAX_MATCH);
         let matches = find_matches(&input, &config);
         let lz_matches = matches_to_lz77_greedy(&input, &matches);
 
@@ -767,7 +767,7 @@ mod tests {
     #[test]
     fn test_lz77_lazy_roundtrip() {
         let input = test_data();
-        let config = SortLzConfig::for_lz77(crate::lz77::DEFLATE_MAX_MATCH);
+        let config = SortLzConfig::for_lz77(crate::lz77::LZ77_MAX_MATCH);
         let matches = find_matches(&input, &config);
         let lz_matches = matches_to_lz77_lazy(&input, &matches);
 
@@ -782,7 +782,7 @@ mod tests {
     #[test]
     fn test_topk_roundtrip() {
         let input = test_data();
-        let config = SortLzConfig::for_lz77(crate::lz77::DEFLATE_MAX_MATCH);
+        let config = SortLzConfig::for_lz77(crate::lz77::LZ77_MAX_MATCH);
         let table = find_matches_topk(&input, &config, 4);
 
         // Verify table has valid candidates
@@ -839,22 +839,6 @@ mod tests {
                 strategy
             );
         }
-    }
-
-    #[test]
-    fn test_pipeline_roundtrip_deflate_sortlz() {
-        use crate::pipeline::{self, CompressOptions, MatchFinder, ParseStrategy, Pipeline};
-        let input = test_data();
-
-        let opts = CompressOptions {
-            match_finder: MatchFinder::SortLz,
-            parse_strategy: ParseStrategy::Lazy,
-            threads: 1,
-            ..Default::default()
-        };
-        let compressed = pipeline::compress_with_options(&input, Pipeline::Deflate, &opts).unwrap();
-        let decoded = pipeline::decompress(&compressed).unwrap();
-        assert_eq!(decoded, input);
     }
 
     #[test]

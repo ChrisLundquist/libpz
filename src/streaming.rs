@@ -646,7 +646,7 @@ mod tests {
     #[test]
     fn test_stream_round_trip_single_block() {
         let data = b"hello, world!".repeat(10);
-        for pipeline in [Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+        for pipeline in [Pipeline::Bw, Pipeline::Lzf] {
             let compressed = stream_compress(&data, pipeline, 1);
             let decompressed = stream_decompress(&compressed, 1);
             assert_eq!(decompressed, data, "round-trip failed for {:?}", pipeline);
@@ -657,7 +657,7 @@ mod tests {
     fn test_stream_round_trip_multi_block() {
         // 2KB input with 512-byte blocks = 4 blocks
         let data = b"The quick brown fox jumps over the lazy dog. ".repeat(50);
-        for pipeline in [Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+        for pipeline in [Pipeline::Bw, Pipeline::Lzf] {
             let compressed = stream_compress(&data, pipeline, 1);
             let decompressed = stream_decompress(&compressed, 1);
             assert_eq!(decompressed, data, "round-trip failed for {:?}", pipeline);
@@ -679,7 +679,7 @@ mod tests {
     fn test_framed_decompressed_by_in_memory() {
         // compress_stream -> pipeline::decompress (in-memory)
         let data = b"hello, world!".repeat(30);
-        let compressed = stream_compress(&data, Pipeline::Deflate, 1);
+        let compressed = stream_compress(&data, Pipeline::Lzf, 1);
         let decompressed = crate::pipeline::decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
     }
@@ -688,7 +688,7 @@ mod tests {
     fn test_table_mode_decompressed_by_stream() {
         // pipeline::compress (table-mode V2) -> decompress_stream
         let data = b"hello, world!".repeat(30);
-        let compressed = crate::pipeline::compress(&data, Pipeline::Deflate).unwrap();
+        let compressed = crate::pipeline::compress(&data, Pipeline::Lzf).unwrap();
         let decompressed = stream_decompress(&compressed, 1);
         assert_eq!(decompressed, data);
     }
@@ -723,7 +723,7 @@ mod tests {
     #[test]
     fn test_stream_single_byte() {
         let data = vec![0xAB];
-        for pipeline in [Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+        for pipeline in [Pipeline::Bw, Pipeline::Lzf] {
             let compressed = stream_compress(&data, pipeline, 1);
             let decompressed = stream_decompress(&compressed, 1);
             assert_eq!(decompressed, data, "single-byte failed for {:?}", pipeline);

@@ -34,7 +34,7 @@ Usage:
 Options:
   -n, --iters N          Number of iterations per operation (default: 3)
   -p, --pipelines LIST   Comma-separated list of pipelines to benchmark
-                         (default: deflate,lzf,lzseqr)
+                         (default: lzf,lzseqr)
   -t, --threads N        Pass thread count to pz (-t N; 0=auto, 1=single-threaded)
   --all                  Benchmark all available pipelines
   --pareto               Single-thread Pareto table: all pipelines + all competitors,
@@ -51,12 +51,12 @@ Use --silesia to also include the larger Silesia corpus (211 MB).
 Examples:
   ./scripts/bench.sh                              # all corpus, all pipelines
   ./scripts/bench.sh myfile.bin                   # specific file
-  ./scripts/bench.sh -p deflate,lzf               # subset of pipelines
+  ./scripts/bench.sh -p lzf,lzseqr                  # subset of pipelines
   ./scripts/bench.sh -t 1 -p lzseqr                # force single-threaded pz
   ./scripts/bench.sh -n 10                        # more iterations
   ./scripts/bench.sh --webgpu -p bw,bbw           # GPU-accelerated via WebGPU
   ./scripts/bench.sh --all                         # benchmark every pipeline
-  ./scripts/bench.sh -n 1 -p deflate,lzf file.txt # combine options
+  ./scripts/bench.sh -n 1 -p lzf,lzseqr file.txt   # combine options
   ./scripts/bench.sh -v                           # verbose output with full tables
 EOF
 }
@@ -101,7 +101,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --all)
-            PIPELINES=(deflate bw bbw lzf lzfi lzseqr lzseqh sortlz)
+            PIPELINES=(bw bbw lzf lzfi lzseqr lzseqh sortlz)
             shift
             ;;
         --silesia)
@@ -110,7 +110,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --pareto)
             PARETO=true
-            PIPELINES=(deflate bw bbw lzf lzfi lzseqr lzseqh sortlz)
+            PIPELINES=(bw bbw lzf lzfi lzseqr lzseqh sortlz)
             # Force single-thread for apples-to-apples comparison
             THREADS="1"
             shift
@@ -151,7 +151,7 @@ done
 
 # Default pipelines if none specified
 if [[ ${#PIPELINES[@]} -eq 0 ]]; then
-    PIPELINES=(deflate lzf lzseqr)
+    PIPELINES=(lzf lzseqr)
 fi
 
 # Collect input files from corpus if none given on command line
@@ -294,12 +294,12 @@ if [[ -n "$GPU_FLAG" ]]; then
     gpu_probe="$BENCH_TMPDIR/_gpu_probe"
     printf 'x%.0s' {1..256} > "$gpu_probe"
     # Warmup (shader compilation caching)
-    "$PZ" -k -f -p deflate $GPU_FLAG "$gpu_probe" >/dev/null 2>&1
+    "$PZ" -k -f -p lzf $GPU_FLAG "$gpu_probe" >/dev/null 2>&1
     rm -f "$gpu_probe.pz"
     # Average 3 GPU runs on tiny data
     gpu_total=0
     for (( gi=0; gi<3; gi++ )); do
-        gpu_ns=$(time_ns "$PZ" -k -f -p deflate $GPU_FLAG "$gpu_probe")
+        gpu_ns=$(time_ns "$PZ" -k -f -p lzf $GPU_FLAG "$gpu_probe")
         gpu_total=$(( gpu_total + gpu_ns ))
         rm -f "$gpu_probe.pz"
     done
@@ -307,7 +307,7 @@ if [[ -n "$GPU_FLAG" ]]; then
     # CPU-only baseline on same data
     cpu_total=0
     for (( gi=0; gi<3; gi++ )); do
-        cpu_ns=$(time_ns "$PZ" -k -f -p deflate "$gpu_probe")
+        cpu_ns=$(time_ns "$PZ" -k -f -p lzf "$gpu_probe")
         cpu_total=$(( cpu_total + cpu_ns ))
         rm -f "$gpu_probe.pz"
     done

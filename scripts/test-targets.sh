@@ -14,7 +14,7 @@ Usage:
   ./scripts/test-targets.sh <test_target> [test_target...]
 
 Examples:
-  ./scripts/test-targets.sh lz77::tests::test_lazy_quality_repeated_pattern pipeline::tests::test_optimal_deflate_round_trip
+  ./scripts/test-targets.sh lz77::tests::test_lazy_quality_repeated_pattern pipeline::tests::test_lzf_round_trip
   ./scripts/test-targets.sh --features webgpu -- webgpu::tests::test_smoke
 USAGE
 }

@@ -203,7 +203,7 @@ fn bench_gpu_match_finding(c: &mut Criterion) {
     }
     group.finish();
 
-    // --- Part 3: Cross-pipeline GPU sortlz (Deflate, LzSeqR, Lzf) at 256K ---
+    // --- Part 3: Cross-pipeline GPU sortlz (LzSeqR, Lzf) at 256K ---
     let mut group = c.benchmark_group("gpu_sortlz_pipelines");
     cap(&mut group);
 
@@ -211,11 +211,7 @@ fn bench_gpu_match_finding(c: &mut Criterion) {
     let data = get_test_data(size);
     group.throughput(Throughput::Bytes(size as u64));
 
-    for (name, pipeline) in [
-        ("deflate", Pipeline::Deflate),
-        ("lzseqr", Pipeline::LzSeqR),
-        ("lzf", Pipeline::Lzf),
-    ] {
+    for (name, pipeline) in [("lzseqr", Pipeline::LzSeqR), ("lzf", Pipeline::Lzf)] {
         // CPU hashchain baseline
         let opts = CompressOptions {
             parse_strategy: ParseStrategy::Lazy,

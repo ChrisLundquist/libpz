@@ -154,12 +154,7 @@ fn should_route_block_to_gpu_stage0(
     // Only LZ-based pipelines have GPU Stage 0 support
     let is_gpu_stage0_pipeline = matches!(
         pipeline,
-        Pipeline::Deflate
-            | Pipeline::Lzf
-            | Pipeline::Lzfi
-            | Pipeline::LzssR
-            | Pipeline::LzSeqR
-            | Pipeline::LzSeqH
+        Pipeline::Lzf | Pipeline::Lzfi | Pipeline::LzssR | Pipeline::LzSeqR | Pipeline::LzSeqH
     );
 
     if !is_gpu_stage0_pipeline {
@@ -404,7 +399,7 @@ fn compress_parallel_unified(
 
             scope.spawn(move || {
                 let engine = opts.webgpu_engine.as_ref().unwrap();
-                let uses_lz77_demux = matches!(pipeline, Pipeline::Deflate | Pipeline::Lzf);
+                let uses_lz77_demux = false; // No current pipeline uses the Lz77 demuxer
                 let uses_sortlz_match_finder =
                     opts.match_finder == super::MatchFinder::SortLz && uses_lz77_demux;
 
@@ -550,7 +545,7 @@ fn compress_parallel_unified(
                     if !stage0_batch.is_empty() && uses_sortlz_match_finder {
                         // SortLZ GPU match finding: per-block dispatch with LZ77 conversion
                         let sortlz_config = crate::sortlz::SortLzConfig::for_lz77(
-                            opts.max_match_len.unwrap_or(crate::lz77::DEFLATE_MAX_MATCH),
+                            opts.max_match_len.unwrap_or(crate::lz77::LZ77_MAX_MATCH),
                         );
                         for block_idx in stage0_batch {
                             let t0 = Instant::now();

@@ -62,7 +62,6 @@ FILES=(
 
 # Pipelines to benchmark.
 PIPELINES=(
-    deflate
     bw
     bbw
     lzf

@@ -53,6 +53,7 @@ pub(crate) trait StreamDemuxer {
 /// Concrete LZ demuxer variants (enum dispatch, no dyn/vtable overhead).
 pub(crate) enum LzDemuxer {
     /// LZ77: 3 streams (offsets, lengths, literals).
+    #[allow(dead_code)]
     Lz77,
     /// LZSS: 4 streams (flags, literals, offsets, lengths).
     Lzss,
@@ -64,7 +65,6 @@ pub(crate) enum LzDemuxer {
 /// Returns `None` for BWT-based pipelines (Bw, Bbw).
 pub(crate) fn demuxer_for_pipeline(pipeline: super::Pipeline) -> Option<LzDemuxer> {
     match pipeline {
-        super::Pipeline::Deflate => Some(LzDemuxer::Lz77),
         super::Pipeline::Lzf => Some(LzDemuxer::LzSeq),
         super::Pipeline::Lzfi | super::Pipeline::LzssR => Some(LzDemuxer::Lzss),
         super::Pipeline::LzSeqR | super::Pipeline::LzSeqH => Some(LzDemuxer::LzSeq),

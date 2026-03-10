@@ -5,7 +5,7 @@
 /// Usage:
 ///   cargo build --profile profiling --example profile
 ///   samply record ./target/profiling/examples/profile --pipeline lzf
-///   samply record ./target/profiling/examples/profile --pipeline deflate --decompress
+///   samply record ./target/profiling/examples/profile --pipeline lzseqr --decompress
 ///   samply record ./target/profiling/examples/profile --stage lz77
 ///   samply record ./target/profiling/examples/profile --stage fse --size 1048576
 use std::path::Path;
@@ -24,9 +24,7 @@ fn usage() {
     eprintln!("Usage: profile [OPTIONS]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!(
-        "  --pipeline P    Pipeline: deflate, bw, bbw, lzf, lzfi, lzssr, lzseqr (default: lzf)"
-    );
+    eprintln!("  --pipeline P    Pipeline: bw, bbw, lzf, lzfi, lzssr, lzseqr (default: lzf)");
     eprintln!("  --stage S       Profile a single stage instead of full pipeline:");
     eprintln!("                    lz77, huffman, bwt, mtf, rle, fse, rans");
     eprintln!("  --decompress    Profile decompression instead of compression");
@@ -604,7 +602,6 @@ fn main() {
         profile_stage(&data, stage_name, decompress, iterations, rans_profile_opts);
     } else {
         let pipe = match pipeline_name.as_str() {
-            "deflate" => Pipeline::Deflate,
             "bw" => Pipeline::Bw,
             "bbw" => Pipeline::Bbw,
             "lzf" => Pipeline::Lzf,
@@ -613,7 +610,7 @@ fn main() {
             "lzseqr" => Pipeline::LzSeqR,
             other => {
                 eprintln!("unknown pipeline: {}", other);
-                eprintln!("valid pipelines: deflate, bw, bbw, lzf, lzfi, lzssr, lzseqr");
+                eprintln!("valid pipelines: bw, bbw, lzf, lzfi, lzssr, lzseqr");
                 std::process::exit(1);
             }
         };

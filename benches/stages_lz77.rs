@@ -91,7 +91,7 @@ fn bench_lz77_webgpu_batched(c: &mut Criterion) {
 
         let eng = engine.clone();
         group.bench_with_input(
-            BenchmarkId::new("gpu_batched_deflate", size),
+            BenchmarkId::new("gpu_batched_lzf", size),
             &data,
             move |b, data| {
                 let opts = CompressOptions {
@@ -100,23 +100,19 @@ fn bench_lz77_webgpu_batched(c: &mut Criterion) {
                     threads: 4,
                     ..Default::default()
                 };
-                b.iter(|| {
-                    pz::pipeline::compress_with_options(data, Pipeline::Deflate, &opts).unwrap()
-                });
+                b.iter(|| pz::pipeline::compress_with_options(data, Pipeline::Lzf, &opts).unwrap());
             },
         );
 
         group.bench_with_input(
-            BenchmarkId::new("cpu_parallel_deflate", size),
+            BenchmarkId::new("cpu_parallel_lzf", size),
             &data,
             |b, data| {
                 let opts = CompressOptions {
                     threads: 4,
                     ..Default::default()
                 };
-                b.iter(|| {
-                    pz::pipeline::compress_with_options(data, Pipeline::Deflate, &opts).unwrap()
-                });
+                b.iter(|| pz::pipeline::compress_with_options(data, Pipeline::Lzf, &opts).unwrap());
             },
         );
     }

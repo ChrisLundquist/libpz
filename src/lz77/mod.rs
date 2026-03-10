@@ -30,8 +30,8 @@ pub(crate) const MAX_CHAIN: usize = 64;
 /// Reduced chain depth used by auto/speed-biased parsing on large inputs.
 const MAX_CHAIN_AUTO: usize = 48;
 
-/// Maximum match length for DEFLATE-compatible pipelines (RFC 1951).
-pub const DEFLATE_MAX_MATCH: u16 = 258;
+/// Standard LZ77 maximum match length (258 bytes, from RFC 1951).
+pub const LZ77_MAX_MATCH: u16 = 258;
 
 /// Default maximum match length for non-DEFLATE pipelines.
 /// Uses full u16 range since Match.length is u16.
@@ -259,7 +259,7 @@ pub(crate) struct HashChainFinder {
 impl HashChainFinder {
     /// Create a match finder with the DEFLATE-standard max match length (258).
     pub(crate) fn new() -> Self {
-        Self::with_max_match_len(DEFLATE_MAX_MATCH)
+        Self::with_max_match_len(LZ77_MAX_MATCH)
     }
 
     /// Create a match finder with a caller-specified max match length.
@@ -588,10 +588,10 @@ impl HashChainFinder {
 /// and is also faster than greedy hash-chain due to skipping matched
 /// positions during hash insertion.
 ///
-/// Uses `DEFLATE_MAX_MATCH` (258) as the maximum match length.
+/// Uses `LZ77_MAX_MATCH` (258) as the maximum match length.
 /// For configurable max match length, use `compress_lazy_to_matches_with_limit`.
 pub fn compress_lazy_to_matches(input: &[u8]) -> PzResult<Vec<Match>> {
-    compress_lazy_to_matches_with_limit(input, DEFLATE_MAX_MATCH)
+    compress_lazy_to_matches_with_limit(input, LZ77_MAX_MATCH)
 }
 
 /// Compress input using greedy matching: always take the longest match at
@@ -701,9 +701,9 @@ pub(crate) fn compress_lazy_to_matches_with_limit_and_chain(
 ///
 /// This is the standard entry point for LZ77 compression. Uses
 /// `compress_lazy_to_matches` internally and serializes the result.
-/// Uses `DEFLATE_MAX_MATCH` (258) as the maximum match length.
+/// Uses `LZ77_MAX_MATCH` (258) as the maximum match length.
 pub fn compress_lazy(input: &[u8]) -> PzResult<Vec<u8>> {
-    compress_lazy_with_limit(input, DEFLATE_MAX_MATCH)
+    compress_lazy_with_limit(input, LZ77_MAX_MATCH)
 }
 
 /// Like `compress_lazy` but with a caller-specified max match length.

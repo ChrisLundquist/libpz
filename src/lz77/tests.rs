@@ -373,9 +373,9 @@ fn test_round_trip_long_repeating_pattern() {
     );
 }
 
-/// Verify find_match respects the default DEFLATE_MAX_MATCH (258).
+/// Verify find_match respects the default LZ77_MAX_MATCH (258).
 ///
-/// The default HashChainFinder uses DEFLATE_MAX_MATCH, which is passed
+/// The default HashChainFinder uses LZ77_MAX_MATCH, which is passed
 /// as the limit to SIMD compare_bytes. This prevents matches from
 /// exceeding 258 for DEFLATE-compatible output.
 #[test]
@@ -386,7 +386,7 @@ fn test_find_match_length_bounded_deflate() {
     let m = finder.find_match(&input, 1);
     assert_eq!(
         m.length, 258,
-        "default find_match should cap at DEFLATE_MAX_MATCH"
+        "default find_match should cap at LZ77_MAX_MATCH"
     );
     assert_eq!(m.offset, 1, "should match with offset 1");
 }

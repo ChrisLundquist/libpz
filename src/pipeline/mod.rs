@@ -9,7 +9,6 @@
 //!
 //! | Pipeline      | Stages                           | Similar to      |
 //! |---------------|----------------------------------|-----------------|
-//! | `Deflate`     | LZ77 → Huffman                   | gzip            |
 //! | `Bw`          | BWT → MTF → RLE → FSE            | bzip2           |
 //! | `Lzf`         | LzSeq → FSE                      | zstd-like       |
 //! | `Lzfi`        | LZSS → interleaved FSE           | fast CPU decode |
@@ -26,7 +25,7 @@
 //! Each compressed stream starts with a header:
 //! - Magic bytes: `PZ` (2 bytes)
 //! - Version: 2 (1 byte)
-//! - Pipeline ID: 0=Deflate, 1=Bw, 4=Lzf, 5=Lzfi, 6=LzssR, 8=LzSeqR, 9=LzSeqH, 10=SortLz (1 byte)
+//! - Pipeline ID: 1=Bw, 4=Lzf, 5=Lzfi, 6=LzssR, 8=LzSeqR, 9=LzSeqH, 10=SortLz (1 byte)
 //! - Original length: u32 little-endian (4 bytes)
 //! - num_blocks: u32 little-endian (4 bytes)
 //! - Block table: \[compressed_len: u32, original_len: u32\] \* num_blocks
@@ -165,10 +164,9 @@ pub struct CompressOptions {
     pub parse_strategy: ParseStrategy,
     /// Maximum match length for LZ77 compression.
     ///
-    /// `None` = use the pipeline's default: 258 for Deflate (RFC 1951
-    /// constraint), `u16::MAX` for other LZ-based pipelines (Lzf, LzSeqR, etc.).
-    /// Larger limits allow longer matches on repetitive data without
-    /// penalizing short-match performance (SIMD short-circuits).
+    /// `None` = use the pipeline's default (`u16::MAX` for LZ-based
+    /// pipelines). Larger limits allow longer matches on repetitive data
+    /// without penalizing short-match performance (SIMD short-circuits).
     pub max_match_len: Option<u16>,
     /// WebGPU engine handle, required when `backend` is `Backend::WebGpu`.
     #[cfg(feature = "webgpu")]
@@ -215,7 +213,7 @@ pub struct CompressOptions {
     /// Auto routes to GPU when block size >= GPU_ENTROPY_THRESHOLD and GPU available.
     pub stage1_backend: BackendAssignment,
     /// Match-finding algorithm: HashChain (default) or SortLz.
-    /// Applies to all LZ-based pipelines (Deflate, Lzf, Lzfi, LzssR, LzSeqR, LzSeqH).
+    /// Applies to all LZ-based pipelines (Lzf, Lzfi, LzssR, LzSeqR, LzSeqH).
     pub match_finder: MatchFinder,
 }
 
@@ -292,13 +290,10 @@ impl Default for DecompressOptions {
 
 /// Resolve the effective max match length from options and pipeline type.
 ///
-/// Deflate is hard-capped at 258 (RFC 1951). Other LZ77-based pipelines
-/// default to `u16::MAX` for better compression on repetitive data.
-pub(crate) fn resolve_max_match_len(pipeline: Pipeline, options: &CompressOptions) -> u16 {
-    options.max_match_len.unwrap_or(match pipeline {
-        Pipeline::Deflate => lz77::DEFLATE_MAX_MATCH,
-        _ => lz77::DEFAULT_MAX_MATCH,
-    })
+/// All LZ77-based pipelines default to `u16::MAX` for best compression
+/// on repetitive data.
+pub(crate) fn resolve_max_match_len(_pipeline: Pipeline, options: &CompressOptions) -> u16 {
+    options.max_match_len.unwrap_or(lz77::DEFAULT_MAX_MATCH)
 }
 
 /// Magic bytes for the libpz container format.
@@ -324,8 +319,7 @@ pub(crate) const BLOCK_HEADER_SIZE: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Pipeline {
-    /// LZ77 + Huffman (gzip-like)
-    Deflate = 0,
+    // ID 0 was Deflate (LZ77 + Huffman, gzip-like) — removed as redundant with Lzf.
     /// BWT + MTF + RLE + FSE (bzip2-like)
     Bw = 1,
     /// Bijective BWT + MTF + RLE + FSE (parallelizable BWT variant)
@@ -354,7 +348,7 @@ impl TryFrom<u8> for Pipeline {
 
     fn try_from(v: u8) -> Result<Self, Self::Error> {
         match v {
-            0 => Ok(Self::Deflate),
+            // 0 was Deflate — removed
             1 => Ok(Self::Bw),
             2 => Ok(Self::Bbw),
             // 3 was Lzr — removed
@@ -568,14 +562,14 @@ pub fn select_pipeline(input: &[u8]) -> Pipeline {
     use crate::analysis::{self, DistributionShape};
 
     if input.is_empty() {
-        return Pipeline::Deflate;
+        return Pipeline::Lzf;
     }
 
     let profile = analysis::analyze(input);
 
     // Near-random data: use fastest pipeline, won't compress much
     if profile.byte_entropy > 7.5 && profile.match_density < 0.1 {
-        return Pipeline::Deflate;
+        return Pipeline::Lzf;
     }
 
     // High run ratio: BWT+RLE excels
@@ -599,7 +593,7 @@ pub fn select_pipeline(input: &[u8]) -> Pipeline {
             // High entropy: FSE handles better than Huffman
             return Pipeline::Lzfi;
         }
-        return Pipeline::Deflate;
+        return Pipeline::Lzf;
     }
 
     // Moderate match density with high entropy
@@ -607,8 +601,8 @@ pub fn select_pipeline(input: &[u8]) -> Pipeline {
         return Pipeline::Lzfi;
     }
 
-    // Default: Deflate (fast, decent compression)
-    Pipeline::Deflate
+    // Default: Lzf (LZ77 + FSE, fast and decent compression)
+    Pipeline::Lzf
 }
 
 /// Select the best match finder for the given input and options.
@@ -678,7 +672,7 @@ pub fn select_pipeline_trial(
     sample_size: usize,
 ) -> Pipeline {
     if input.is_empty() {
-        return Pipeline::Deflate;
+        return Pipeline::Lzf;
     }
 
     let sample_len = input.len().min(sample_size);
@@ -691,15 +685,15 @@ pub fn select_pipeline_trial(
     };
 
     let candidates = [
-        Pipeline::Deflate,
         Pipeline::Bw,
+        Pipeline::Lzf,
         Pipeline::Lzfi,
         Pipeline::LzssR,
         Pipeline::LzSeqR,
         Pipeline::LzSeqH,
         Pipeline::SortLz,
     ];
-    let mut best_pipeline = Pipeline::Deflate;
+    let mut best_pipeline = Pipeline::Lzf;
     let mut best_size = usize::MAX;
 
     // Also try SortLz match finder with LZ pipelines to find the best combo
@@ -766,12 +760,7 @@ fn adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> CompressOp
 
     let is_lz_pipeline = matches!(
         pipeline,
-        Pipeline::Deflate
-            | Pipeline::Lzf
-            | Pipeline::Lzfi
-            | Pipeline::LzssR
-            | Pipeline::LzSeqR
-            | Pipeline::LzSeqH
+        Pipeline::Lzf | Pipeline::Lzfi | Pipeline::LzssR | Pipeline::LzSeqR | Pipeline::LzSeqH
     );
     let is_gpu = {
         #[allow(unused_mut)]
@@ -789,10 +778,9 @@ fn adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> CompressOp
         adjusted.block_size = DEFAULT_GPU_BLOCK_SIZE;
     }
 
-    // Non-Deflate LZ pipelines default to extended match length (u16::MAX)
+    // LZ pipelines default to extended match length (u16::MAX)
     // when the caller hasn't explicitly set one.
-    if adjusted.max_match_len.is_none() && is_lz_pipeline && !matches!(pipeline, Pipeline::Deflate)
-    {
+    if adjusted.max_match_len.is_none() && is_lz_pipeline {
         adjusted.max_match_len = Some(lz77::DEFAULT_MAX_MATCH);
     }
 
@@ -874,7 +862,7 @@ pub(crate) fn tokenize(
     input: &[u8],
     options: &CompressOptions,
 ) -> PzResult<Vec<crate::lz_token::LzToken>> {
-    let max_match = options.max_match_len.unwrap_or(lz77::DEFLATE_MAX_MATCH);
+    let max_match = options.max_match_len.unwrap_or(lz77::LZ77_MAX_MATCH);
 
     // GPU path: use GPU kernels when available and input is in range.
     #[cfg(feature = "webgpu")]

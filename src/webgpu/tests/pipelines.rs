@@ -1,57 +1,5 @@
 use super::super::*;
 
-#[test]
-fn test_webgpu_deflate_pipeline_round_trip() {
-    let engine = match WebGpuEngine::new() {
-        Ok(e) => std::sync::Arc::new(e),
-        Err(PzError::Unsupported) => return,
-        Err(e) => panic!("unexpected error: {:?}", e),
-    };
-
-    let input = b"the quick brown fox jumps over the lazy dog. the quick brown fox.";
-    let options = crate::pipeline::CompressOptions {
-        backend: crate::pipeline::Backend::WebGpu,
-        webgpu_engine: Some(engine),
-        ..Default::default()
-    };
-
-    let compressed =
-        crate::pipeline::compress_with_options(input, crate::pipeline::Pipeline::Deflate, &options)
-            .unwrap();
-    let decompressed = crate::pipeline::decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
-#[test]
-fn test_webgpu_deflate_pipeline_larger() {
-    let engine = match WebGpuEngine::new() {
-        Ok(e) => std::sync::Arc::new(e),
-        Err(PzError::Unsupported) => return,
-        Err(e) => panic!("unexpected error: {:?}", e),
-    };
-
-    let pattern = b"The quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    for _ in 0..200 {
-        input.extend_from_slice(pattern);
-    }
-
-    let options = crate::pipeline::CompressOptions {
-        backend: crate::pipeline::Backend::WebGpu,
-        webgpu_engine: Some(engine),
-        ..Default::default()
-    };
-
-    let compressed = crate::pipeline::compress_with_options(
-        &input,
-        crate::pipeline::Pipeline::Deflate,
-        &options,
-    )
-    .unwrap();
-    let decompressed = crate::pipeline::decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
-
 // --- Modular GPU pipeline round-trip tests ---
 
 fn gpu_pipeline_round_trip(input: &[u8], pipeline: crate::pipeline::Pipeline) {
@@ -84,20 +32,8 @@ fn gpu_pipeline_round_trip(input: &[u8], pipeline: crate::pipeline::Pipeline) {
 }
 
 #[test]
-fn test_modular_gpu_deflate_round_trip() {
-    // GPU LZ77 → GPU Huffman (modular stage path)
-    let mut input = Vec::new();
-    for i in 0u8..=255 {
-        for _ in 0..40 {
-            input.push(i);
-        }
-    }
-    gpu_pipeline_round_trip(&input, crate::pipeline::Pipeline::Deflate);
-}
-
-#[test]
-fn test_gpu_lzseq_cpu_rans_round_trip() {
-    // GPU LzSeq → CPU rANS
+fn test_gpu_lz77_cpu_rans_round_trip() {
+    // GPU LZ77 → CPU rANS
     let pattern = b"Hello, World! This is a test pattern for GPU+CPU composition. ";
     let mut input = Vec::new();
     for _ in 0..100 {

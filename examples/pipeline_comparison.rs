@@ -17,7 +17,6 @@ fn test_pipeline_comparison(name: &str, data: Vec<u8>) {
     let pipelines = vec![
         ("Lzf (LzSeq+FSE)", Pipeline::Lzf),
         ("LzSeqR (LzSeq+rANS)", Pipeline::LzSeqR),
-        ("Deflate (LZ77+Huffman)", Pipeline::Deflate),
     ];
 
     println!(

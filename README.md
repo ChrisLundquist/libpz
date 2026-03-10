@@ -6,12 +6,11 @@ Lossless data compression library with GPU acceleration, written in Rust.
 
 | Pipeline | Stages | Similar to |
 |----------|--------|------------|
-| **Deflate** | LZ77 + Multi-stream Huffman | gzip |
 | **BW** | BWT + MTF + RLE + FSE | bzip2 |
 | **LZR** | LZ77 + Multi-stream rANS | — |
 | **LZF** | LZ77 + Multi-stream FSE | zstd-like |
 
-Deflate, Lzr, and Lzf use **multi-stream entropy coding**: LZ77 output is split into separate offset, length, and literal streams, each with its own entropy coder. This yields ~16-18% better compression than single-stream encoding with no speed penalty. LZR uses rANS (range ANS) — a multiply-shift entropy coder designed for SIMD and GPU parallelism via interleaved decode states. LZF uses FSE (Finite State Entropy) — a fast table-driven tANS coder similar to zstd.
+Lzr and Lzf use **multi-stream entropy coding**: LZ77 output is split into separate offset, length, and literal streams, each with its own entropy coder. This yields ~16-18% better compression than single-stream encoding with no speed penalty. LZR uses rANS (range ANS) — a multiply-shift entropy coder designed for SIMD and GPU parallelism via interleaved decode states. LZF uses FSE (Finite State Entropy) — a fast table-driven tANS coder similar to zstd.
 
 Optional WebGPU support for GPU-accelerated LZ77 match finding and BWT suffix array construction.
 
@@ -77,7 +76,7 @@ Uses [criterion](https://github.com/bheisler/criterion.rs) for statistical bench
 ```
 cargo bench                         # CPU benchmarks
 cargo bench --features webgpu       # includes GPU benchmarks
-cargo bench --bench throughput_deflate
+cargo bench --bench throughput_lzf
 cargo bench --bench stages_lz77
 ```
 

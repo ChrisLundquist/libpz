@@ -5,13 +5,13 @@ For day-to-day development instructions, see `CLAUDE.md`.
 
 ## Completed milestones (12/12)
 - **Algorithms:** LZ77 (brute, hashchain, lazy, parallel), LzSeq (code+extra-bits, repeat offsets, 128KB window), Huffman, BWT (SA-IS), MTF, RLE, FSE, rANS
-- **Pipelines:** Deflate (LZ77+Huffman), Bw (BWT+MTF+RLE+FSE), Lzr (LZ77+rANS), Lzf (LZ77+FSE), LzSeqR (LzSeq+rANS), LzSeqH (LzSeq+Huffman), SortLz (sort-LZ77+FSE) — Deflate, Lzr, and Lzf use multi-stream entropy coding for ~16-18% better compression; LzSeqR/LzSeqH use zstd-style code+extra-bits encoding with 6-stream demux; SortLz uses sort-based match finding (GPU-accelerated)
+- **Pipelines:** Bw (BWT+MTF+RLE+FSE), Lzf (LzSeq+FSE), LzSeqR (LzSeq+rANS), LzSeqH (LzSeq+Huffman), SortLz (sort-LZ77+FSE) — Lzf and LzSeqR/LzSeqH use multi-stream entropy coding for ~16-18% better compression; LzSeqR/LzSeqH use zstd-style code+extra-bits encoding with 6-stream demux; SortLz uses sort-based match finding (GPU-accelerated)
 - **Auto-selection:** Heuristic (`select_pipeline`) and trial-based (`select_pipeline_trial`) pipeline selection using data analysis (entropy, match density, run ratio, autocorrelation); LzSeqR included in trial candidates
 - **Data analysis:** `src/analysis.rs` — statistical profiling (Shannon entropy, autocorrelation, run ratio, match density, distribution shape) with sampling support
 - **Optimal parsing:** GPU top-K match table → CPU backward DP (4-6% better compression)
 - **Multi-threading:** Block-parallel and pipeline-parallel via V2 container format; within-block parallel LZ77 match finding (`compress_lazy_parallel`)
-- **SortLZ:** Sort-based match finder — standalone pipeline (ID 10) and pluggable `MatchFinder::SortLz` for Deflate/Lzr/Lzf/LzSeqR/LzSeqH; GPU radix sort batched (single submit); adaptive `select_match_finder()` heuristic; u64-optimized `extend_match`; 39.6% ratio (beats Deflate 43.4%)
-- **GPU kernels:** LZ77 hash-table (fast), LZ77 batch/per-position (legacy), LZ77 top-K, BWT radix sort + parallel rank assignment, SortLZ radix sort + match verification, Huffman encode (two-pass with Blelloch prefix sum), GPU Deflate chaining (LZ77→Huffman on device)
+- **SortLZ:** Sort-based match finder — standalone pipeline (ID 10) and pluggable `MatchFinder::SortLz` for Lzf/LzSeqR/LzSeqH; GPU radix sort batched (single submit); adaptive `select_match_finder()` heuristic; u64-optimized `extend_match`; 39.6% ratio
+- **GPU kernels:** LZ77 hash-table (fast), LZ77 batch/per-position (legacy), LZ77 top-K, BWT radix sort + parallel rank assignment, SortLZ radix sort + match verification, Huffman encode (two-pass with Blelloch prefix sum)
 - **Tooling:** CLI (`pz` with `-a`/`--auto` and `--trial` flags), C FFI, Criterion benchmarks, CI (3 OS)
 - **Fuzz testing (M5.3):** `cargo-fuzz` infrastructure with 12 targets covering all algorithms and pipelines (roundtrip + crash resistance)
 
@@ -23,9 +23,9 @@ For day-to-day development instructions, see `CLAUDE.md`.
 - **CPU:** Uses SA-IS (Suffix Array by Induced Sorting) — O(n) linear time via doubled-text-with-sentinel strategy.
 - **GPU:** Uses LSB-first 8-bit radix sort with prefix-doubling for suffix array construction. Replaced earlier bitonic sort (PR #21). Features adaptive key width (skip zero-digit radix passes) and event chain batching (one host sync per doubling step). Rank assignment runs on GPU via Blelloch prefix sum + scatter. Still slower than CPU SA-IS at all sizes but dramatically improved from bitonic sort (7-14x faster). The GPU uses circular comparison `(sa[i]+k) % n` vs CPU SA-IS's doubled-text approach — both produce valid BWTs that round-trip correctly.
 
-## Multi-stream Deflate
+## Multi-stream entropy coding
 
-The Deflate, Lzr, and Lzf pipelines use **multi-stream entropy coding** to improve
+The Lzf and LzSeqR pipelines use **multi-stream entropy coding** to improve
 compression ratio by separating LZ77 output into independent byte streams with
 tighter symbol distributions. Instead of feeding one mixed stream to the entropy
 coder, the encoder deinterleaves tokens into three streams:
@@ -36,7 +36,7 @@ coder, the encoder deinterleaves tokens into three streams:
 | **Lengths** | Match lengths (capped to u8) | Length distribution is highly skewed (short matches dominate) |
 | **Literals** | Literal bytes + low offset bytes + next bytes | Natural-language / binary byte distribution |
 
-Each stream gets its own Huffman tree (Deflate), FSE table (Lzf), or rANS context (Lzr),
+Each stream gets its own FSE table (Lzf) or rANS context (LzSeqR),
 yielding lower per-stream entropy than a single combined stream.
 
 ### Encoding format
@@ -65,14 +65,12 @@ Comparison on Canterbury + Large corpus (14 files, 13.3 MB total), averaged over
 
 | Pipeline | Before (bytes) | After (bytes) | Size delta | Throughput delta |
 |----------|---------------|--------------|------------|-----------------|
-| Deflate  | 6,319,168     | 5,301,184    | **-16.1%** | +1.6% faster    |
 | Lzf      | 6,199,044     | 5,107,601    | **-17.6%** | +2.8% faster    |
 
 **Decompression throughput:**
 
 | Pipeline | Throughput delta |
 |----------|-----------------|
-| Deflate  | **+8.4%** faster |
 | Lzf      | **+2.4%** faster |
 
 Multi-stream is a pure win: better compression **and** faster speed. The largest
@@ -132,16 +130,9 @@ Every symbol present in the input gets at least frequency 1. Excess is trimmed
 from the most-frequent symbol; deficit is added to it. The normalization code
 is shared conceptually with `src/fse.rs` (both operate on power-of-2 tables).
 
-### Pipeline: Lzr (LZ77 + rANS)
-
-`Pipeline::Lzr` (ID 3) reuses the existing multi-stream LZ77 architecture
-(offsets, lengths, literals) with rANS as the entropy coder instead of Huffman
-(Deflate) or FSE (Lzf). It participates in auto-selection via
-`select_pipeline_trial()`.
-
 ### Forward TODOs
 
-See `docs/exec-plans/tech-debt-tracker.md` for rANS SIMD decode and reciprocal multiplication work items. Benchmark integration (rANS/Lzr in `benches/throughput.rs` and `benches/stages.rs`) is also pending.
+See `docs/exec-plans/tech-debt-tracker.md` for rANS SIMD decode and reciprocal multiplication work items.
 
 ## SIMD acceleration
 `src/simd.rs` provides runtime-dispatched SIMD for CPU hot paths:
@@ -170,8 +161,7 @@ match verification. Zero atomics, fully deterministic — ideal for GPU executio
 | **`MatchFinder::SortLz`** | Pluggable match finder for other pipelines | Host pipeline's format |
 
 When used as a `MatchFinder`, SortLZ is transparent to the wire format — the
-output is 100% compatible with the host pipeline (Deflate, Lzr, Lzf, LzSeqR,
-LzSeqH). The consumer and decompressor see no difference.
+output is 100% compatible with the host pipeline (Lzf, LzSeqR, LzSeqH). The consumer and decompressor see no difference.
 
 ### Pipeline::SortLz wire format (per block)
 
@@ -221,19 +211,7 @@ Uses GPU radix sort (same kernels as BWT) + GPU match verification:
 | 256KB| 131 MB/s     | 31 MB/s   | 53 MB/s   | **1.7x faster** |
 | 4MB  | 142 MB/s     | 8 MB/s    | 89 MB/s   | **10.6x faster** |
 
-SortLZ compression ratio: **39.6%** (vs hashchain+Deflate 43.4%, BWT 32.7%).
-
-## GPU stage chaining
-The Deflate GPU path chains LZ77 → Huffman on the GPU with minimized transfers:
-1. GPU: LZ77 hash-table kernel → download match array → CPU dedupe + serialize
-2. GPU: upload LZ77 bytes once → `ByteHistogram` kernel → download only 256×u32 (1KB)
-3. CPU: build Huffman tree from histogram, produce code LUT
-4. GPU: Huffman encode (reusing LZ77 buffer) with Blelloch prefix sum
-5. GPU: download final encoded bitstream
-
-The `ByteHistogram` kernel eliminates the need to scan LZ77 data on CPU for frequency counting — only 1KB of histogram data is transferred instead of the full LZ77 stream.
-
-This is activated automatically when a GPU backend is selected and input ≥ `MIN_GPU_INPUT_SIZE`.
+SortLZ compression ratio: **39.6%** (vs BWT 32.7%).
 
 ## Parallel LZ77
 `compress_lazy_parallel(input, num_threads)` pre-computes matches in parallel (each thread builds its own hash chain), then serializes sequentially with lazy evaluation. Thresholds:
@@ -261,14 +239,6 @@ This is activated automatically when a GPU backend is selected and input ≥ `MI
 | 256KB | 1.85ms (135 MiB/s) | 999µs (250 MiB/s) | **543µs (460 MiB/s)** | **GPU 3.4x faster** |
 
 GPU Huffman with Blelloch prefix sum crosses over ~128KB. At 256KB the GPU scan path is 3.4x faster than CPU.
-
-### Deflate chained (GPU LZ77 → GPU Huffman)
-
-| Size | CPU 1-thread | GPU chained | Speedup |
-|------|-------------|-------------|---------|
-| 64KB | 1.63ms (38 MiB/s) | 3.01ms (21 MiB/s) | CPU 1.8x faster |
-| 256KB | 6.06ms (41 MiB/s) | 4.93ms (51 MiB/s) | **GPU 1.2x faster** |
-| 1MB | 23.5ms (43 MiB/s) | 18.3ms (55 MiB/s) | **GPU 1.3x faster** |
 
 ### BWT GPU (radix sort)
 

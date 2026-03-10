@@ -11,7 +11,6 @@ fuzz_target!(|data: &[u8]| {
     let input = if data.len() > 64 * 1024 { &data[..64 * 1024] } else { data };
 
     let pipelines = [
-        Pipeline::Deflate,
         Pipeline::Bw,
         Pipeline::Bbw,
         Pipeline::Lzf,

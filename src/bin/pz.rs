@@ -1,6 +1,6 @@
 /// pz – CLI compression tool for libpz.
 ///
-/// Works similar to gzip / zstd:
+/// Works similar to zstd:
 ///   pz file.txt          → compress to file.txt.pz (removes original)
 ///   pz -d file.txt.pz    → decompress to file.txt (removes original)
 ///   pz -d file.txt.gz    → decompress gzip file to file.txt
@@ -32,7 +32,7 @@ fn usage() {
     eprintln!("  -k, --keep         Keep original file");
     eprintln!("  -f, --force        Overwrite existing output files");
     eprintln!("  -l, --list         List info about compressed file");
-    eprintln!("  -p, --pipeline P   Compression pipeline (default: deflate)");
+    eprintln!("  -p, --pipeline P   Compression pipeline (default: lzf)");
     eprintln!("  --list-pipelines   List all available pipelines and exit");
     eprintln!("  -a, --auto         Auto-select best pipeline based on data analysis");
     eprintln!("  --trial            Auto-select by trial compression (slower, more accurate)");
@@ -70,14 +70,17 @@ fn list_pipelines() {
     println!("  NAME        ID  DESCRIPTION");
     println!("  ----        --  -----------");
     let pipelines: &[(&str, &str, &str)] = &[
-        ("deflate", "0", "LZ77 + Huffman (gzip-like, default)"),
         ("bw", "1", "BWT + MTF + RLE + FSE (bzip2-like, best ratio)"),
         (
             "bbw",
             "2",
             "Bijective BWT + MTF + RLE + FSE (parallelizable BWT)",
         ),
-        ("lzf", "4", "LzSeq + FSE (zstd-style entropy coding)"),
+        (
+            "lzf",
+            "4",
+            "LzSeq + FSE (zstd-style entropy coding, default)",
+        ),
         ("lzfi", "5", "LZSS + interleaved FSE (fast CPU decode)"),
         ("lzssr", "6", "LZSS + rANS (experimental)"),
         ("lzseqr", "8", "LzSeq + rANS (zstd-style code+extra-bits)"),
@@ -134,7 +137,7 @@ fn parse_args() -> Opts {
         rans_interleaved_min_bytes: 64 * 1024,
         rans_interleaved_states: pz::rans::DEFAULT_INTERLEAVE,
         rans_shared_stream: false,
-        pipeline: Pipeline::Deflate,
+        pipeline: Pipeline::Lzf,
         files: Vec::new(),
     };
 
@@ -236,7 +239,6 @@ fn parse_args() -> Opts {
                     process::exit(1);
                 }
                 opts.pipeline = match args[i].as_str() {
-                    "deflate" | "0" => Pipeline::Deflate,
                     "bw" | "1" => Pipeline::Bw,
                     "bbw" | "2" => Pipeline::Bbw,
                     "lzf" | "4" => Pipeline::Lzf,
@@ -430,7 +432,7 @@ fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
             }
             let version = data[2];
             let pipe = match data[3] {
-                0 => "deflate",
+                0 => "deflate (removed)",
                 1 => "bw",
                 2 => "bbw",
                 4 => "lzf",

@@ -307,8 +307,6 @@ fn main() {
     #[allow(unused_mut)]
     let mut pz_configs: Vec<(Pipeline, ParseStrategy, usize, Backend)> = vec![
         // Single-threaded CPU variants
-        (Pipeline::Deflate, ParseStrategy::Lazy, 1, Backend::Cpu),
-        (Pipeline::Deflate, ParseStrategy::Optimal, 1, Backend::Cpu),
         (Pipeline::Lzf, ParseStrategy::Lazy, 1, Backend::Cpu),
         (Pipeline::Lzf, ParseStrategy::Optimal, 1, Backend::Cpu),
         (Pipeline::Bw, ParseStrategy::Auto, 1, Backend::Cpu),
@@ -316,7 +314,6 @@ fn main() {
         // Experimental: LZSS pipeline
         (Pipeline::LzssR, ParseStrategy::Auto, 1, Backend::Cpu),
         // Multi-threaded CPU
-        (Pipeline::Deflate, ParseStrategy::Lazy, 0, Backend::Cpu),
         (Pipeline::Lzf, ParseStrategy::Lazy, 0, Backend::Cpu),
         (Pipeline::Bw, ParseStrategy::Auto, 0, Backend::Cpu),
         (Pipeline::Bbw, ParseStrategy::Auto, 0, Backend::Cpu),
@@ -327,7 +324,6 @@ fn main() {
     #[cfg(feature = "webgpu")]
     if has_webgpu {
         pz_configs.extend([
-            (Pipeline::Deflate, ParseStrategy::Auto, 1, Backend::WebGpu),
             (Pipeline::Lzf, ParseStrategy::Auto, 1, Backend::WebGpu),
             (Pipeline::Bw, ParseStrategy::Auto, 1, Backend::WebGpu),
         ]);

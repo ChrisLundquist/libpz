@@ -19,15 +19,15 @@ Each algorithm (`bwt`, `huffman`, `lz77`, `fse`, `rans`, etc.) is:
 - Usable standalone or in pipelines
 - Not tied to a specific compression format
 
-Pipelines (`deflate`, `bw`, `lzr`, `lzf`) combine algorithms via the demuxer pattern:
+Pipelines (`bw`, `lzf`, `lzseqr`) combine algorithms via the demuxer pattern:
 ```rust
 // Pipeline = sequence of stages
-LZ77 → demux into streams → Huffman encode → merge streams
+LZ77 → demux into streams → FSE/rANS encode → merge streams
 ```
 
 **Why:** Flexibility. New pipelines reuse existing algorithms. New algorithms enhance all pipelines.
 
-**Example:** The same LZ77 implementation works in Deflate (LZ77+Huffman), Lzf (LZ77+FSE), and Lzr (LZ77+rANS) pipelines.
+**Example:** The same LZ77 implementation works in Lzf (LZ77+FSE) and Lzr (LZ77+rANS) pipelines.
 
 ### 2. GPU-Friendly Design Patterns
 
@@ -210,7 +210,7 @@ Below these thresholds, kernel launch overhead dominates.
 
 ### Multi-Stream Entropy Coding
 
-LZ-based pipelines (Deflate, Lzf, Lzr) use multi-stream encoding (3 independent streams per block). See `ARCHITECTURE.md` for benchmark results (16-18% better compression, 2-8% faster decompression) and `design-docs/pipeline-architecture.md` for the stream layout.
+LZ-based pipelines (Lzf, Lzr) use multi-stream encoding (3 independent streams per block). See `ARCHITECTURE.md` for benchmark results (16-18% better compression, 2-8% faster decompression) and `design-docs/pipeline-architecture.md` for the stream layout.
 
 ### Memory Management
 
