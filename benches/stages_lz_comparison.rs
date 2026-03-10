@@ -18,13 +18,9 @@ fn bench_lz_comparison(c: &mut Criterion) {
     group.bench_with_input(BenchmarkId::new("lzss_compress", size), &data, |b, data| {
         b.iter(|| pz::lzss::encode(data).unwrap());
     });
-    group.bench_with_input(BenchmarkId::new("lz78_compress", size), &data, |b, data| {
-        b.iter(|| pz::lz78::encode(data).unwrap());
-    });
 
     let lz77_c = pz::lz77::compress_lazy(&data).unwrap();
     let lzss_c = pz::lzss::encode(&data).unwrap();
-    let lz78_c = pz::lz78::encode(&data).unwrap();
 
     group.bench_with_input(
         BenchmarkId::new("lz77_decompress", size),
@@ -38,13 +34,6 @@ fn bench_lz_comparison(c: &mut Criterion) {
         &lzss_c,
         |b, c| {
             b.iter(|| pz::lzss::decode(c).unwrap());
-        },
-    );
-    group.bench_with_input(
-        BenchmarkId::new("lz78_decompress", size),
-        &lz78_c,
-        |b, c| {
-            b.iter(|| pz::lz78::decode(c).unwrap());
         },
     );
 

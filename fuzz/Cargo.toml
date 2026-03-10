@@ -57,11 +57,6 @@ path = "fuzz_targets/fuzz_lz77.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_lz78"
-path = "fuzz_targets/fuzz_lz78.rs"
-doc = false
-
-[[bin]]
 name = "fuzz_lzss"
 path = "fuzz_targets/fuzz_lzss.rs"
 doc = false

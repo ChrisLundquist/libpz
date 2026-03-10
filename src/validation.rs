@@ -13,7 +13,6 @@ mod tests {
     use crate::frequency;
     use crate::huffman::HuffmanTree;
     use crate::lz77;
-    use crate::lz78;
     use crate::lzss;
     use crate::mtf;
     use crate::pipeline::{self, Pipeline};
@@ -132,14 +131,6 @@ mod tests {
                     let decompressed = lzss::decode(&compressed).unwrap();
                     assert_eq!(decompressed, input, "lzss round-trip failed");
                 }
-
-                #[test]
-                fn lz78() {
-                    let input = $data;
-                    let compressed = lz78::encode(&input).unwrap();
-                    let decompressed = lz78::decode(&compressed).unwrap();
-                    assert_eq!(decompressed, input, "lz78 round-trip failed");
-                }
             }
         };
     }
@@ -247,19 +238,6 @@ mod tests {
         }
 
         #[test]
-        fn lz78_then_fse() {
-            use crate::fse;
-            let input = data_repeating_text();
-            let lz78_data = lz78::encode(&input).unwrap();
-            let fse_data = fse::encode(&lz78_data);
-            // Inverse
-            let inv_fse = fse::decode(&fse_data, lz78_data.len()).unwrap();
-            assert_eq!(inv_fse, lz78_data);
-            let inv_lz78 = lz78::decode(&inv_fse).unwrap();
-            assert_eq!(inv_lz78, input);
-        }
-
-        #[test]
         fn mtf_then_rle_then_huffman() {
             // MTF + RLE + Huffman (without BWT)
             let input = data_runs();
@@ -305,7 +283,6 @@ mod tests {
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -322,7 +299,6 @@ mod tests {
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -339,7 +315,6 @@ mod tests {
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -356,7 +331,6 @@ mod tests {
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -373,7 +347,6 @@ mod tests {
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -390,7 +363,6 @@ mod tests {
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -407,7 +379,6 @@ mod tests {
                 Pipeline::Lzf,
                 Pipeline::Lzfi,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 assert_pipeline_round_trip(&input, p);
             }
@@ -543,22 +514,10 @@ mod tests {
                 lz77_size
             );
         }
-
-        #[test]
-        fn lz78_dictionary_grows() {
-            let input = data_repeating_text();
-            let compressed = lz78::encode(&input).unwrap();
-            assert!(
-                compressed.len() < input.len(),
-                "LZ78 should compress repetitive text: {} >= {}",
-                compressed.len(),
-                input.len()
-            );
-        }
     }
 
     // ---------------------------------------------------------------
-    // Compression ratio comparison (LZ77 vs LZSS vs LZ78)
+    // Compression ratio comparison (LZ77 vs LZSS)
     // ---------------------------------------------------------------
 
     mod lz_comparison {
@@ -568,33 +527,27 @@ mod tests {
         fn ratio_report(name: &str, input: &[u8]) {
             let lz77_raw = lz77::compress_lazy(input).unwrap();
             let lzss_raw = lzss::encode(input).unwrap();
-            let lz78_raw = lz78::encode(input).unwrap();
 
             let lz77_fse = fse::encode(&lz77_raw);
             let lzss_fse = fse::encode(&lzss_raw);
-            let lz78_fse = fse::encode(&lz78_raw);
 
             eprintln!(
-                "  {:20} {:>6}B | LZ77 {:>6} ({:5.1}%) | LZSS {:>6} ({:5.1}%) | LZ78 {:>6} ({:5.1}%)",
+                "  {:20} {:>6}B | LZ77 {:>6} ({:5.1}%) | LZSS {:>6} ({:5.1}%)",
                 name,
                 input.len(),
                 lz77_raw.len(),
                 100.0 * lz77_raw.len() as f64 / input.len() as f64,
                 lzss_raw.len(),
                 100.0 * lzss_raw.len() as f64 / input.len() as f64,
-                lz78_raw.len(),
-                100.0 * lz78_raw.len() as f64 / input.len() as f64,
             );
             eprintln!(
-                "  {:20} {:>6}  | +FSE {:>6} ({:5.1}%) | +FSE {:>6} ({:5.1}%) | +FSE {:>6} ({:5.1}%)",
+                "  {:20} {:>6}  | +FSE {:>6} ({:5.1}%) | +FSE {:>6} ({:5.1}%)",
                 "",
                 "",
                 lz77_fse.len(),
                 100.0 * lz77_fse.len() as f64 / input.len() as f64,
                 lzss_fse.len(),
                 100.0 * lzss_fse.len() as f64 / input.len() as f64,
-                lz78_fse.len(),
-                100.0 * lz78_fse.len() as f64 / input.len() as f64,
             );
         }
 
@@ -649,7 +602,6 @@ mod tests {
                 Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 let compressed = pipeline::compress(&input, pipe).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
@@ -756,7 +708,6 @@ mod tests {
                 Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 let compressed = pipeline::compress(input, pipe).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
@@ -784,7 +735,6 @@ mod tests {
                 Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 let compressed = pipeline::compress(input, pipe).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
@@ -815,7 +765,6 @@ mod tests {
                 Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
@@ -834,7 +783,6 @@ mod tests {
                 Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
@@ -853,7 +801,6 @@ mod tests {
                 Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
@@ -880,7 +827,6 @@ mod tests {
                 Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
@@ -898,7 +844,6 @@ mod tests {
                 Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
@@ -917,7 +862,6 @@ mod tests {
                 Pipeline::Lzr,
                 Pipeline::Lzf,
                 Pipeline::LzssR,
-                Pipeline::Lz78R,
             ] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();

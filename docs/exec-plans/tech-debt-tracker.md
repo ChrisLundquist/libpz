@@ -29,7 +29,7 @@ Catalog of known issues, gaps, and technical debt in libpz. Items are prioritize
   - `fuzz_pipeline_roundtrip` — all 9 pipelines compress/decompress roundtrip
   - `fuzz_decompress` — arbitrary bytes to decompress (crash resistance)
   - `fuzz_bwt`, `fuzz_rans`, `fuzz_fse`, `fuzz_huffman` — entropy coding roundtrips
-  - `fuzz_lz77`, `fuzz_lz78`, `fuzz_lzss`, `fuzz_lzseq` — LZ family roundtrips
+  - `fuzz_lz77`, `fuzz_lzss`, `fuzz_lzseq` — LZ family roundtrips
   - `fuzz_rle`, `fuzz_mtf` — simple codec roundtrips
 - Each target tests encode→decode roundtrip AND arbitrary-bytes decode crash resistance
 - Requires: `rustup toolchain install nightly && cargo install cargo-fuzz`

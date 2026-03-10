@@ -50,7 +50,6 @@ fn test_all_pipelines_banana() {
         Pipeline::Lzr,
         Pipeline::Lzf,
         Pipeline::LzssR,
-        Pipeline::Lz78R,
         Pipeline::Lzfi,
     ] {
         let compressed = compress(input, pipeline).unwrap();
@@ -72,7 +71,6 @@ fn test_all_pipelines_medium_text() {
         Pipeline::Lzr,
         Pipeline::Lzf,
         Pipeline::LzssR,
-        Pipeline::Lz78R,
         Pipeline::Lzfi,
     ] {
         let compressed = compress(&input, pipeline).unwrap();

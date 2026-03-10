@@ -1,6 +1,6 @@
 //! Per-pipeline single-block compress and decompress implementations.
 //!
-//! LZ-based pipelines (Deflate, Lzr, Lzf, Lzfi, LzssR, Lz78R) use a unified path:
+//! LZ-based pipelines (Deflate, Lzr, Lzf, Lzfi, LzssR) use a unified path:
 //!   compress:   demux → entropy_encode
 //!   decompress: entropy_decode → demux
 //!
@@ -142,7 +142,7 @@ fn entropy_encode(
             let _ = (input_len, options);
             stage_huffman_encode(block)
         }
-        Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R | Pipeline::LzSeqR => {
+        Pipeline::Lzr | Pipeline::LzssR | Pipeline::LzSeqR => {
             let _ = (input_len, options);
             stage_rans_encode_with_options(block, options)
         }
@@ -180,7 +180,7 @@ fn entropy_decode(
 ) -> PzResult<StageBlock> {
     match pipeline {
         Pipeline::Deflate => stage_huffman_decode(block),
-        Pipeline::Lzr | Pipeline::LzssR | Pipeline::Lz78R | Pipeline::LzSeqR => {
+        Pipeline::Lzr | Pipeline::LzssR | Pipeline::LzSeqR => {
             #[cfg(feature = "webgpu")]
             {
                 if let Backend::WebGpu = options.backend {

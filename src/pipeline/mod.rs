@@ -15,7 +15,6 @@
 //! | `Lzf`         | LZ77 → FSE                       | zstd-like       |
 //! | `Lzfi`        | LZSS → interleaved FSE           | fast CPU decode |
 //! | `LzssR`       | LZSS → rANS                      | experimental    |
-//! | `Lz78R`       | LZ78 → rANS                      | experimental    |
 //! | `LzSeqR`      | LzSeq → rANS                     | zstd-style      |
 //! | `LzSeqH`      | LzSeq → Huffman                  | fast decode     |
 //! | `SortLz`      | SortLZ → FSE                     | GPU match find  |
@@ -28,7 +27,7 @@
 //! Each compressed stream starts with a header:
 //! - Magic bytes: `PZ` (2 bytes)
 //! - Version: 2 (1 byte)
-//! - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 5=Lzfi, 6=LzssR, 7=Lz78R, 8=LzSeqR, 9=LzSeqH, 10=SortLz (1 byte)
+//! - Pipeline ID: 0=Deflate, 1=Bw, 3=Lzr, 4=Lzf, 5=Lzfi, 6=LzssR, 8=LzSeqR, 9=LzSeqH, 10=SortLz (1 byte)
 //! - Original length: u32 little-endian (4 bytes)
 //! - num_blocks: u32 little-endian (4 bytes)
 //! - Block table: \[compressed_len: u32, original_len: u32\] \* num_blocks
@@ -340,8 +339,8 @@ pub enum Pipeline {
     Lzfi = 5,
     /// LZSS + rANS (flag-bit LZ + arithmetic ANS, experimental)
     LzssR = 6,
-    /// LZ78 + rANS (incremental trie + rANS, experimental)
-    Lz78R = 7,
+    // ID 7 was Lz78R (LZ78 + rANS) — removed as uncompetitive (8-13x worse ratio,
+    // 34% slower than Lzr). See lz78r_benchmark_report.md.
     /// LzSeq + rANS (code+extra-bits sequence encoding, zstd-style)
     LzSeqR = 8,
     /// LzSeq + Huffman (fast decode, simpler entropy coding)
@@ -364,7 +363,7 @@ impl TryFrom<u8> for Pipeline {
             4 => Ok(Self::Lzf),
             5 => Ok(Self::Lzfi),
             6 => Ok(Self::LzssR),
-            7 => Ok(Self::Lz78R),
+            // 7 was Lz78R — removed
             8 => Ok(Self::LzSeqR),
             9 => Ok(Self::LzSeqH),
             10 => Ok(Self::SortLz),
@@ -699,7 +698,6 @@ pub fn select_pipeline_trial(
         Pipeline::Lzr,
         Pipeline::Lzfi,
         Pipeline::LzssR,
-        Pipeline::Lz78R,
         Pipeline::LzSeqR,
         Pipeline::LzSeqH,
         Pipeline::SortLz,
@@ -712,14 +710,12 @@ pub fn select_pipeline_trial(
 
     for &pipeline in &candidates {
         // SortLz pipeline has its own match finder, only test default
-        let finders: &[MatchFinder] = if matches!(
-            pipeline,
-            Pipeline::Bw | Pipeline::Bbw | Pipeline::Lz78R | Pipeline::SortLz
-        ) {
-            &[MatchFinder::HashChain]
-        } else {
-            &match_finders
-        };
+        let finders: &[MatchFinder] =
+            if matches!(pipeline, Pipeline::Bw | Pipeline::Bbw | Pipeline::SortLz) {
+                &[MatchFinder::HashChain]
+            } else {
+                &match_finders
+            };
 
         for &finder in finders {
             let opts = CompressOptions {

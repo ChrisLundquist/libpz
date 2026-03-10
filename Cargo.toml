@@ -46,6 +46,10 @@ name = "throughput_lzfi"
 harness = false
 
 [[bench]]
+name = "throughput_lzseqr"
+harness = false
+
+[[bench]]
 name = "stages_bwt"
 harness = false
 
@@ -59,10 +63,6 @@ harness = false
 
 [[bench]]
 name = "stages_lzss"
-harness = false
-
-[[bench]]
-name = "stages_lz78"
 harness = false
 
 [[bench]]

@@ -34,17 +34,6 @@ fn bench_lz_plus_fse(c: &mut Criterion) {
         },
     );
 
-    group.bench_with_input(
-        BenchmarkId::new("lz78_fse_compress", size),
-        &data,
-        |b, data| {
-            b.iter(|| {
-                let lz = pz::lz78::encode(data).unwrap();
-                pz::fse::encode(&lz)
-            });
-        },
-    );
-
     group.finish();
 }
 
