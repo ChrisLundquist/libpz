@@ -84,12 +84,8 @@ fn encoder_for_demuxer(demuxer: &LzDemuxer) -> Box<dyn lz_token::TokenEncoder> {
 
 /// Demux pre-computed LZ77 matches into encoder streams for the GPU coordinator.
 ///
-/// Used by the GPU coordinator to demux matches returned from
-/// `find_matches_batched()` without re-running match-finding.
-/// Converts `Vec<Match>` → `Vec<LzToken>` → encoder.encode().
-///
-/// `input` is the original block data — needed by `Lz77Encoder` to look up
-/// trailing literal bytes when consecutive matches appear.
+/// Used by the batched LZ77 GPU path (`find_matches_batched`) which returns
+/// `Vec<lz77::Match>`. Converts Match → LzToken → encoder.encode().
 #[cfg(feature = "webgpu")]
 pub(crate) fn demux_lz77_matches(
     input: &[u8],
@@ -97,9 +93,22 @@ pub(crate) fn demux_lz77_matches(
     pipeline: super::Pipeline,
 ) -> PzResult<DemuxOutput> {
     let tokens = lz_token::matches_to_tokens(&matches);
+    demux_tokens(input, &tokens, pipeline)
+}
+
+/// Demux a universal token stream into encoder streams.
+///
+/// Used by GPU SortLZ coordinator and LzSeq SortLZ CPU path, which produce
+/// `Vec<LzToken>` directly via `sortlz::parse_matches()`.
+#[cfg(feature = "webgpu")]
+pub(crate) fn demux_tokens(
+    input: &[u8],
+    tokens: &[lz_token::LzToken],
+    pipeline: super::Pipeline,
+) -> PzResult<DemuxOutput> {
     let demuxer = demuxer_for_pipeline(pipeline).ok_or(PzError::InvalidInput)?;
     let encoder = encoder_for_demuxer(&demuxer);
-    Ok(encoder.encode(input, &tokens)?.into())
+    Ok(encoder.encode(input, tokens)?.into())
 }
 
 impl StreamDemuxer for LzDemuxer {
@@ -167,47 +176,27 @@ impl StreamDemuxer for LzDemuxer {
                 })
             }
             LzDemuxer::LzSeq => {
-                // SortLZ match finder path: use sort-based matches converted
-                // to LzSeq's 6-stream format via encode_match_sequence.
-                // Prefers GPU radix sort when available for large inputs.
-                if options.match_finder == super::MatchFinder::SortLz {
-                    let window = options
-                        .seq_window_size
-                        .unwrap_or_else(|| lzseq::SeqConfig::default().max_window);
-                    let config = crate::sortlz::SortLzConfig {
-                        max_window: window,
-                        ..crate::sortlz::SortLzConfig::default()
-                    };
+                // SortLz and Optimal strategies route through the shared
+                // tokenize() entry point, which handles GPU/CPU dispatch,
+                // SortLz match finding, and optimal parsing uniformly.
+                let use_tokenize = options.match_finder == super::MatchFinder::SortLz
+                    || options.parse_strategy == ParseStrategy::Optimal;
 
-                    // GPU path for SortLZ match finding
-                    #[cfg(feature = "webgpu")]
-                    let raw_matches = if let Some(ref engine) = options.webgpu_engine {
-                        if input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
-                            && input.len() <= engine.max_dispatch_input_size()
-                        {
-                            engine.sortlz_find_matches(input, &config)?
-                        } else {
-                            crate::sortlz::find_matches(input, &config)
-                        }
-                    } else {
-                        crate::sortlz::find_matches(input, &config)
-                    };
-                    #[cfg(not(feature = "webgpu"))]
-                    let raw_matches = crate::sortlz::find_matches(input, &config);
-
-                    let lz_matches = crate::sortlz::matches_to_lz77_lazy(input, &raw_matches);
-                    let enc = lzseq::encode_match_sequence(
-                        input,
-                        &lz_matches,
+                if use_tokenize {
+                    let tokens = super::tokenize(input, options)?;
+                    let defaults = lzseq::SeqConfig::default();
+                    let enc = lzseq::encode_from_tokens(
+                        &tokens,
                         &lzseq::SeqConfig {
-                            max_window: window,
-                            ..lzseq::SeqConfig::default()
+                            max_window: options.seq_window_size.unwrap_or(defaults.max_window),
+                            max_match_len: options.max_match_len.unwrap_or(defaults.max_match_len),
+                            ..defaults
                         },
                     )?;
                     return Ok(seq_encoded_to_demux(enc));
                 }
 
-                // GPU path: match finding + demux on-device
+                // GPU path: fused match finding + demux on-device
                 #[cfg(feature = "webgpu")]
                 if let Backend::WebGpu = options.backend {
                     if let Some(ref engine) = options.webgpu_engine {
@@ -220,17 +209,15 @@ impl StreamDemuxer for LzDemuxer {
                     }
                 }
 
-                // CPU path
+                // Default CPU path: encode_with_config (tuned lazy matching
+                // with repeat-offset awareness, adaptive chain depth, hash4).
                 let defaults = lzseq::SeqConfig::default();
                 let config = lzseq::SeqConfig {
                     max_window: options.seq_window_size.unwrap_or(defaults.max_window),
                     max_match_len: options.max_match_len.unwrap_or(defaults.max_match_len),
                     ..defaults
                 };
-                let enc = match options.parse_strategy {
-                    ParseStrategy::Optimal => lzseq::encode_optimal(input, &config)?,
-                    _ => lzseq::encode_with_config(input, &config)?,
-                };
+                let enc = lzseq::encode_with_config(input, &config)?;
                 Ok(seq_encoded_to_demux(enc))
             }
         }
