@@ -176,46 +176,27 @@ impl StreamDemuxer for LzDemuxer {
                 })
             }
             LzDemuxer::LzSeq => {
-                // SortLZ match finder path: sort-based matches → LzToken →
-                // LzSeq 6-stream format via encode_from_tokens.
-                // Prefers GPU radix sort when available for large inputs.
-                if options.match_finder == super::MatchFinder::SortLz {
-                    let window = options
-                        .seq_window_size
-                        .unwrap_or_else(|| lzseq::SeqConfig::default().max_window);
-                    let config = crate::sortlz::SortLzConfig {
-                        max_window: window,
-                        ..crate::sortlz::SortLzConfig::default()
-                    };
+                // SortLz and Optimal strategies route through the shared
+                // tokenize() entry point, which handles GPU/CPU dispatch,
+                // SortLz match finding, and optimal parsing uniformly.
+                let use_tokenize = options.match_finder == super::MatchFinder::SortLz
+                    || options.parse_strategy == ParseStrategy::Optimal;
 
-                    // GPU path for SortLZ match finding
-                    #[cfg(feature = "webgpu")]
-                    let raw_matches = if let Some(ref engine) = options.webgpu_engine {
-                        if input.len() >= crate::webgpu::MIN_GPU_INPUT_SIZE
-                            && input.len() <= engine.max_dispatch_input_size()
-                        {
-                            engine.sortlz_find_matches(input, &config)?
-                        } else {
-                            crate::sortlz::find_matches(input, &config)
-                        }
-                    } else {
-                        crate::sortlz::find_matches(input, &config)
-                    };
-                    #[cfg(not(feature = "webgpu"))]
-                    let raw_matches = crate::sortlz::find_matches(input, &config);
-
-                    let tokens = crate::sortlz::parse_matches(input, &raw_matches, true);
+                if use_tokenize {
+                    let tokens = super::tokenize(input, options)?;
+                    let defaults = lzseq::SeqConfig::default();
                     let enc = lzseq::encode_from_tokens(
                         &tokens,
                         &lzseq::SeqConfig {
-                            max_window: window,
-                            ..lzseq::SeqConfig::default()
+                            max_window: options.seq_window_size.unwrap_or(defaults.max_window),
+                            max_match_len: options.max_match_len.unwrap_or(defaults.max_match_len),
+                            ..defaults
                         },
                     )?;
                     return Ok(seq_encoded_to_demux(enc));
                 }
 
-                // GPU path: match finding + demux on-device
+                // GPU path: fused match finding + demux on-device
                 #[cfg(feature = "webgpu")]
                 if let Backend::WebGpu = options.backend {
                     if let Some(ref engine) = options.webgpu_engine {
@@ -228,17 +209,15 @@ impl StreamDemuxer for LzDemuxer {
                     }
                 }
 
-                // CPU path
+                // Default CPU path: encode_with_config (tuned lazy matching
+                // with repeat-offset awareness, adaptive chain depth, hash4).
                 let defaults = lzseq::SeqConfig::default();
                 let config = lzseq::SeqConfig {
                     max_window: options.seq_window_size.unwrap_or(defaults.max_window),
                     max_match_len: options.max_match_len.unwrap_or(defaults.max_match_len),
                     ..defaults
                 };
-                let enc = match options.parse_strategy {
-                    ParseStrategy::Optimal => lzseq::encode_optimal(input, &config)?,
-                    _ => lzseq::encode_with_config(input, &config)?,
-                };
+                let enc = lzseq::encode_with_config(input, &config)?;
                 Ok(seq_encoded_to_demux(enc))
             }
         }
