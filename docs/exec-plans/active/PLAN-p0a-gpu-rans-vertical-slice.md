@@ -1,5 +1,10 @@
 # P0-A Plan: GPU Chunked rANS Vertical Slice (Highest-Leverage Track)
 
+> **Status: CLOSED (2026-03-09)** — Slice 4 performance gate failed. GPU rANS
+> is 0.54–0.77x CPU after 29+ optimization iterations. The serial state
+> dependency in rANS is structural under SIMT; no further work planned.
+> See `docs/design-docs/gpu-strategy.md` for the post-mortem.
+
 ## Decision
 
 Selected track: **P0-A GPU chunked rANS kernels**.

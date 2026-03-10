@@ -1,5 +1,9 @@
 # Task: Implement GPU Huffman decode with sync points
 
+> **Status: PARKED (2026-03-09)** — Valid approach (nvCOMP/GDeflate proven),
+> zero implementation progress. This is the most promising path to competitive
+> GPU entropy but is low priority until LzSeq encoding efficiency work lands.
+
 ## Context
 
 The WebGPU backend has GPU Huffman **encode** (fully parallel via prefix sum) but no

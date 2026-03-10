@@ -47,7 +47,6 @@ pub(crate) fn compress_block(
             Pipeline::Bw => compress_block_bw(input, opts),
             Pipeline::Bbw => compress_block_bbw(input, opts),
             Pipeline::SortLz => compress_block_sortlz(input, opts),
-            Pipeline::Parlz => compress_block_parlz(input, opts),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -66,7 +65,6 @@ pub(crate) fn decompress_block(
             Pipeline::Bw => decompress_block_bw(payload, orig_len),
             Pipeline::Bbw => decompress_block_bbw(payload, orig_len),
             Pipeline::SortLz => decompress_block_sortlz(payload, orig_len),
-            Pipeline::Parlz => decompress_block_parlz(payload, orig_len),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -357,27 +355,4 @@ fn compress_block_sortlz(input: &[u8], options: &CompressOptions) -> PzResult<Ve
 /// Decompress a single SortLZ block (no container header).
 fn decompress_block_sortlz(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     crate::sortlz::decompress(payload, orig_len)
-}
-
-// ---------------------------------------------------------------------------
-// ParlZ pipeline: parallel-parse LZ + FSE
-// ---------------------------------------------------------------------------
-
-/// Compress a single block using the ParlZ pipeline (no container header).
-fn compress_block_parlz(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    #[cfg(feature = "webgpu")]
-    {
-        if let Backend::WebGpu = options.backend {
-            if let Some(ref engine) = options.webgpu_engine {
-                return engine.parlz_compress(input);
-            }
-        }
-    }
-    let _ = options;
-    crate::parlz::compress(input)
-}
-
-/// Decompress a single ParlZ block (no container header).
-fn decompress_block_parlz(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    crate::parlz::decompress(payload, orig_len)
 }

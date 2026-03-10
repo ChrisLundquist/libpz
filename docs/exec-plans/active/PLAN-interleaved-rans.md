@@ -1,8 +1,9 @@
 # Interleaved rANS Execution Plan (CPU-First, GPU-Ready)
 
-**Created:** 2026-02-15  
-**Status:** Planned  
-**Priority:** P1  
+**Created:** 2026-02-15
+**Status:** PARKED (2026-03-09) — Phase A merged (PR #91). Phase D cancelled
+(GPU rANS dead end). Phases B–C valid but have no active owner.
+**Priority:** P1
 **Owner:** Engineering team
 
 ## Problem

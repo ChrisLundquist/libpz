@@ -100,7 +100,7 @@ pub(crate) fn deserialize_matches(data: &[u8]) -> Vec<Match> {
 
 /// A parsed LZ token: either a literal byte or a (length, offset) match.
 ///
-/// Shared across LZ modules (sortlz, parlz) that need to classify positions
+/// Shared across LZ modules (sortlz) that need to classify positions
 /// as literals or matches during encoding.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum LzToken {
@@ -587,37 +587,6 @@ impl HashChainFinder {
         found.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         found.truncate(k);
         found
-    }
-
-    /// Find the best match at every position in `input`.
-    ///
-    /// Returns a vector where `result[i]` is `Some((offset, length))` if a match
-    /// was found at position `i`, or `None` otherwise. Unlike serial greedy parsing,
-    /// this evaluates every position independently (useful for parallel-parse LZ).
-    ///
-    /// Uses `find_match_wide` (no length reduction for next-byte) since the caller
-    /// handles literal/match classification separately.
-    ///
-    /// Builds hash chains incrementally (each position is inserted before the next
-    /// position is queried), so earlier positions can serve as match sources for
-    /// later ones.
-    #[allow(clippy::needless_range_loop)]
-    pub(crate) fn find_all(&mut self, input: &[u8]) -> Vec<Option<(u16, u16)>> {
-        let n = input.len();
-        let mut best: Vec<Option<(u16, u16)>> = vec![None; n];
-
-        for pos in 0..n {
-            // Insert this position into hash chains.
-            self.insert(input, pos);
-
-            // Find the best match looking back at already-inserted positions.
-            let m = self.find_match_wide(input, pos);
-            if m.length >= MIN_MATCH && m.offset > 0 {
-                best[pos] = Some((m.offset as u16, m.length));
-            }
-        }
-
-        best
     }
 }
 

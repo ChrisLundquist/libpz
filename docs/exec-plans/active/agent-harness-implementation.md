@@ -1,7 +1,8 @@
 # Agent Harness Implementation Plan
 
 **Created:** 2026-02-14
-**Status:** Active
+**Status:** PARKED (2026-03-09) — Phase 1 (docs structure) complete and in use.
+Phases 2–8 (linters, CI validation, doc-gardening) deferred with no active owner.
 **Context:** Based on analysis of OpenAI's agent_harness.md article on building software with AI agents
 
 ## Executive Summary

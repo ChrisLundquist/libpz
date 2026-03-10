@@ -53,22 +53,8 @@ fn bench_lz77_webgpu(c: &mut Criterion) {
             },
         );
 
-        let eng2 = engine.clone();
-        group.bench_with_input(
-            BenchmarkId::new("compress_webgpu_greedy", size),
-            &data,
-            move |b, data| {
-                b.iter(|| {
-                    let matches = eng2.find_matches_greedy(data).unwrap();
-                    let mut out =
-                        Vec::with_capacity(matches.len() * pz::lz77::Match::SERIALIZED_SIZE);
-                    for m in &matches {
-                        out.extend_from_slice(&m.to_bytes());
-                    }
-                    out
-                });
-            },
-        );
+        // GPU hash-table greedy benchmark removed (dead end — atomic ordering
+        // breaks match quality). Only coop/lazy kernels remain.
 
         group.bench_with_input(
             BenchmarkId::new("compress_cpu_lazy", size),
