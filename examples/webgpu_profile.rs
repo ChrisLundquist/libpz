@@ -144,8 +144,8 @@ fn run() {
         cpu_huff.as_secs_f64() * 1000.0
     );
 
-    // Phase 5: Full pipeline end-to-end (deflate)
-    eprintln!("\n--- Full pipeline compress (4MB, deflate) ---");
+    // Phase 5: Full pipeline end-to-end (lzf)
+    eprintln!("\n--- Full pipeline compress (4MB, lzf) ---");
     let opts_gpu = CompressOptions {
         backend: Backend::WebGpu,
         webgpu_engine: Some(engine.clone()),
@@ -154,19 +154,19 @@ fn run() {
     let opts_cpu = CompressOptions::default();
 
     // Warmup
-    let _ = pipeline::compress_with_options(&large_data, Pipeline::Deflate, &opts_gpu).unwrap();
+    let _ = pipeline::compress_with_options(&large_data, Pipeline::Lzf, &opts_gpu).unwrap();
 
     let iters = 3;
     let t0 = Instant::now();
     for _ in 0..iters {
         let _ = std::hint::black_box(
-            pipeline::compress_with_options(&large_data, Pipeline::Deflate, &opts_gpu).unwrap(),
+            pipeline::compress_with_options(&large_data, Pipeline::Lzf, &opts_gpu).unwrap(),
         );
     }
     let gpu_full = t0.elapsed() / iters;
     let gpu_full_mbps = large_data.len() as f64 / gpu_full.as_secs_f64() / (1024.0 * 1024.0);
     eprintln!(
-        "GPU deflate: {:.0} ms ({:.1} MB/s)",
+        "GPU lzf:     {:.0} ms ({:.1} MB/s)",
         gpu_full.as_secs_f64() * 1000.0,
         gpu_full_mbps
     );
@@ -174,13 +174,13 @@ fn run() {
     let t0 = Instant::now();
     for _ in 0..iters {
         let _ = std::hint::black_box(
-            pipeline::compress_with_options(&large_data, Pipeline::Deflate, &opts_cpu).unwrap(),
+            pipeline::compress_with_options(&large_data, Pipeline::Lzf, &opts_cpu).unwrap(),
         );
     }
     let cpu_full = t0.elapsed() / iters;
     let cpu_full_mbps = large_data.len() as f64 / cpu_full.as_secs_f64() / (1024.0 * 1024.0);
     eprintln!(
-        "CPU deflate: {:.0} ms ({:.1} MB/s)",
+        "CPU lzf:     {:.0} ms ({:.1} MB/s)",
         cpu_full.as_secs_f64() * 1000.0,
         cpu_full_mbps
     );
@@ -290,11 +290,11 @@ fn run() {
 
     // Compression ratio comparison
     eprintln!("\n--- Compression ratios (4MB) ---");
-    let compressed_deflate =
-        pipeline::compress_with_options(&large_data, Pipeline::Deflate, &opts_cpu).unwrap();
+    let compressed_lzf =
+        pipeline::compress_with_options(&large_data, Pipeline::Lzf, &opts_cpu).unwrap();
     eprintln!(
-        "deflate: {:.2}%",
-        compressed_deflate.len() as f64 / large_data.len() as f64 * 100.0
+        "lzf:     {:.2}%",
+        compressed_lzf.len() as f64 / large_data.len() as f64 * 100.0
     );
     eprintln!(
         "lzfi:    {:.2}%",
@@ -318,7 +318,7 @@ fn run() {
     );
 
     // Phase 7: Single-threaded CPU comparison
-    eprintln!("\n--- Single-threaded CPU deflate (4MB) ---");
+    eprintln!("\n--- Single-threaded CPU lzf (4MB) ---");
     let opts_cpu_1t = CompressOptions {
         threads: 1,
         ..Default::default()
@@ -327,7 +327,7 @@ fn run() {
     let t0 = Instant::now();
     for _ in 0..iters {
         let _ = std::hint::black_box(
-            pipeline::compress_with_options(&large_data, Pipeline::Deflate, &opts_cpu_1t).unwrap(),
+            pipeline::compress_with_options(&large_data, Pipeline::Lzf, &opts_cpu_1t).unwrap(),
         );
     }
     let cpu_1t = t0.elapsed() / iters;
@@ -460,17 +460,17 @@ fn run() {
     );
     eprintln!("\n-- Full pipelines (4MB) --");
     eprintln!(
-        "GPU deflate:  {:.0} ms ({:.1} MB/s)",
+        "GPU lzf:      {:.0} ms ({:.1} MB/s)",
         gpu_full.as_secs_f64() * 1000.0,
         gpu_full_mbps
     );
     eprintln!(
-        "CPU deflate:  {:.0} ms ({:.1} MB/s)",
+        "CPU lzf:      {:.0} ms ({:.1} MB/s)",
         cpu_full.as_secs_f64() * 1000.0,
         cpu_full_mbps
     );
     eprintln!(
-        "CPU 1T defl:  {:.0} ms ({:.1} MB/s)",
+        "CPU 1T lzf:   {:.0} ms ({:.1} MB/s)",
         cpu_1t.as_secs_f64() * 1000.0,
         cpu_1t_mbps
     );

@@ -883,8 +883,6 @@ pub(crate) fn run_compress_stage(
     options: &CompressOptions,
 ) -> PzResult<StageBlock> {
     match (pipeline, stage_idx) {
-        (Pipeline::Deflate, 0) => stage_demux_compress(block, &LzDemuxer::Lz77, options),
-        (Pipeline::Deflate, 1) => stage_huffman_encode(block),
         (Pipeline::Bw, 0) => stage_bwt_encode(block, options),
         (Pipeline::Bw, 1) => stage_mtf_encode(block),
         (Pipeline::Bw, 2) => stage_rle_encode(block),

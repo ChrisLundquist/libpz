@@ -8,7 +8,7 @@
 #
 # Usage:
 #   ./scripts/profile.sh                              # lzf compress, 256KB
-#   ./scripts/profile.sh --pipeline deflate            # profile deflate compress
+#   ./scripts/profile.sh --pipeline lzseqr               # profile lzseqr compress
 #   ./scripts/profile.sh --stage lz77                  # profile lz77 encode only
 #   ./scripts/profile.sh --stage fse --decompress      # profile fse decode
 #   ./scripts/profile.sh --pipeline lzf --size 1048576 # 1MB input
@@ -50,7 +50,7 @@ BUILD OPTIONS:
     --no-default-features   Disable default features (pure CPU build)
 
 PROFILE BINARY OPTIONS (forwarded to the profile example):
-    --pipeline P            Pipeline: deflate, bw, bbw, lzf, lzfi, lzssr, lzseqr, lzseqh, sortlz (default: lzf)
+    --pipeline P            Pipeline: bw, bbw, lzf, lzfi, lzssr, lzseqr, lzseqh, sortlz (default: lzf)
     --stage S               Profile a single stage: lz77, huffman, bwt, mtf, rle, fse, rans
     --decompress            Profile decompression instead of compression
     --iterations N          Number of iterations (default: 200)
@@ -60,8 +60,8 @@ EXAMPLES:
     # Profile lz77 → profiling/a1b2c3d/lz77_encode_256KB.json.gz
     ./scripts/profile.sh --stage lz77
 
-    # Profile pipeline → profiling/a1b2c3d/deflate_decompress_256KB.json.gz
-    ./scripts/profile.sh --pipeline deflate --decompress
+    # Profile pipeline → profiling/a1b2c3d/lzseqr_decompress_256KB.json.gz
+    ./scripts/profile.sh --pipeline lzseqr --decompress
 
     # Open browser to inspect results interactively
     ./scripts/profile.sh --web --pipeline lzf

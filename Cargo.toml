@@ -22,10 +22,6 @@ path = "src/bin/pz.rs"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
-name = "throughput_deflate"
-harness = false
-
-[[bench]]
 name = "throughput_bw"
 harness = false
 
@@ -99,10 +95,6 @@ harness = false
 
 [[bench]]
 name = "stages_auto_select"
-harness = false
-
-[[bench]]
-name = "stages_deflate_webgpu_chained"
 harness = false
 
 [[bench]]

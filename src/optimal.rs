@@ -286,9 +286,9 @@ impl RepeatOffsetState {
 /// Build a match table from input using the hash-chain finder.
 ///
 /// For each position, finds up to `k` match candidates using the
-/// existing hash-chain infrastructure. Uses `DEFLATE_MAX_MATCH` (258).
+/// existing hash-chain infrastructure. Uses `LZ77_MAX_MATCH` (258).
 pub fn build_match_table_cpu(input: &[u8], k: usize) -> MatchTable {
-    build_match_table_cpu_with_limit(input, k, crate::lz77::DEFLATE_MAX_MATCH)
+    build_match_table_cpu_with_limit(input, k, crate::lz77::LZ77_MAX_MATCH)
 }
 
 /// Like `build_match_table_cpu` but with a caller-specified max match length.
@@ -537,9 +537,9 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
 ///
 /// Produces the same serialized `Match` format as `lz77::compress_lazy`,
 /// but selects matches via backward DP to minimize total encoding cost.
-/// Decompressible with `lz77::decompress()`. Uses `DEFLATE_MAX_MATCH` (258).
+/// Decompressible with `lz77::decompress()`. Uses `LZ77_MAX_MATCH` (258).
 pub fn compress_optimal(input: &[u8]) -> PzResult<Vec<u8>> {
-    compress_optimal_with_limit(input, crate::lz77::DEFLATE_MAX_MATCH)
+    compress_optimal_with_limit(input, crate::lz77::LZ77_MAX_MATCH)
 }
 
 /// Like `compress_optimal` but with a caller-specified max match length.

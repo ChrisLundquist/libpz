@@ -46,7 +46,7 @@ Output:
 
 Example:
   ./scripts/analyze-ratio.sh samples/cantrbry/alice29.txt
-  ./scripts/analyze-ratio.sh -p deflate samples/cantrbry/enwik8
+  ./scripts/analyze-ratio.sh -p lzf samples/cantrbry/enwik8
 EOF
 }
 
@@ -159,7 +159,7 @@ gap_pct=$(awk "BEGIN { printf \"%.2f%%\", (($PZ_SIZE - $GZ_SIZE) / $ORIG_SIZE) *
 
 # Pipeline category: LZ-based or BWT-based (affects interpretation of gap)
 case "$PIPELINE" in
-    deflate|lzf|lzfi|lzseqr|lzseqh|lzssr|sortlz)
+    lzf|lzfi|lzseqr|lzseqh|lzssr|sortlz)
         PIPELINE_CLASS="LZ-based" ;;
     bw|bbw)
         PIPELINE_CLASS="BWT-based" ;;

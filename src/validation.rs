@@ -276,7 +276,6 @@ mod tests {
         fn all_pipelines_zeros() {
             let input = data_all_zeros(500);
             for &p in &[
-                Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
                 Pipeline::Lzf,
@@ -291,7 +290,6 @@ mod tests {
         fn all_pipelines_uniform() {
             let input = data_uniform();
             for &p in &[
-                Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
                 Pipeline::Lzf,
@@ -306,7 +304,6 @@ mod tests {
         fn all_pipelines_skewed() {
             let input = data_skewed(2000);
             for &p in &[
-                Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
                 Pipeline::Lzf,
@@ -321,7 +318,6 @@ mod tests {
         fn all_pipelines_text() {
             let input = data_repeating_text();
             for &p in &[
-                Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
                 Pipeline::Lzf,
@@ -336,7 +332,6 @@ mod tests {
         fn all_pipelines_sawtooth() {
             let input = data_sawtooth(2048);
             for &p in &[
-                Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
                 Pipeline::Lzf,
@@ -351,7 +346,6 @@ mod tests {
         fn all_pipelines_runs() {
             let input = data_runs();
             for &p in &[
-                Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
                 Pipeline::Lzf,
@@ -366,7 +360,6 @@ mod tests {
         fn all_pipelines_single_byte() {
             let input = vec![42u8];
             for &p in &[
-                Pipeline::Deflate,
                 Pipeline::Bw,
                 Pipeline::Bbw,
                 Pipeline::Lzf,
@@ -588,13 +581,7 @@ mod tests {
                 return;
             }
 
-            for &pipe in &[
-                Pipeline::Deflate,
-                Pipeline::Bw,
-                Pipeline::Bbw,
-                Pipeline::Lzf,
-                Pipeline::LzssR,
-            ] {
+            for &pipe in &[Pipeline::Bw, Pipeline::Bbw, Pipeline::Lzf, Pipeline::LzssR] {
                 let compressed = pipeline::compress(&input, pipe).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(
@@ -693,13 +680,7 @@ mod tests {
             }
             let full = fs::read(&path).unwrap();
             let input = &full[..full.len().min(65536)];
-            for &pipe in &[
-                Pipeline::Deflate,
-                Pipeline::Bw,
-                Pipeline::Bbw,
-                Pipeline::Lzf,
-                Pipeline::LzssR,
-            ] {
+            for &pipe in &[Pipeline::Bw, Pipeline::Bbw, Pipeline::Lzf, Pipeline::LzssR] {
                 let compressed = pipeline::compress(input, pipe).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(
@@ -719,13 +700,7 @@ mod tests {
             }
             let full = fs::read(&path).unwrap();
             let input = &full[..full.len().min(65536)];
-            for &pipe in &[
-                Pipeline::Deflate,
-                Pipeline::Bw,
-                Pipeline::Bbw,
-                Pipeline::Lzf,
-                Pipeline::LzssR,
-            ] {
+            for &pipe in &[Pipeline::Bw, Pipeline::Bbw, Pipeline::Lzf, Pipeline::LzssR] {
                 let compressed = pipeline::compress(input, pipe).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(
@@ -748,13 +723,7 @@ mod tests {
         fn pipeline_two_bytes() {
             // Smallest non-trivial input
             let input = vec![0u8, 1];
-            for &p in &[
-                Pipeline::Deflate,
-                Pipeline::Bw,
-                Pipeline::Bbw,
-                Pipeline::Lzf,
-                Pipeline::LzssR,
-            ] {
+            for &p in &[Pipeline::Bw, Pipeline::Bbw, Pipeline::Lzf, Pipeline::LzssR] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -765,13 +734,7 @@ mod tests {
         fn alternating_bytes() {
             // Worst case for RLE (no runs), but structured for LZ77
             let input: Vec<u8> = (0..1000).map(|i| if i % 2 == 0 { 0 } else { 1 }).collect();
-            for &p in &[
-                Pipeline::Deflate,
-                Pipeline::Bw,
-                Pipeline::Bbw,
-                Pipeline::Lzf,
-                Pipeline::LzssR,
-            ] {
+            for &p in &[Pipeline::Bw, Pipeline::Bbw, Pipeline::Lzf, Pipeline::LzssR] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -782,13 +745,7 @@ mod tests {
         fn all_256_byte_values() {
             // Every byte value appears exactly once
             let input: Vec<u8> = (0..=255).collect();
-            for &p in &[
-                Pipeline::Deflate,
-                Pipeline::Bw,
-                Pipeline::Bbw,
-                Pipeline::Lzf,
-                Pipeline::LzssR,
-            ] {
+            for &p in &[Pipeline::Bw, Pipeline::Bbw, Pipeline::Lzf, Pipeline::LzssR] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -807,13 +764,7 @@ mod tests {
             assert_eq!(decoded, input);
 
             // Full pipeline test
-            for &p in &[
-                Pipeline::Deflate,
-                Pipeline::Bw,
-                Pipeline::Bbw,
-                Pipeline::Lzf,
-                Pipeline::LzssR,
-            ] {
+            for &p in &[Pipeline::Bw, Pipeline::Bbw, Pipeline::Lzf, Pipeline::LzssR] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -823,13 +774,7 @@ mod tests {
         #[test]
         fn descending_bytes() {
             let input: Vec<u8> = (0..=255).rev().collect();
-            for &p in &[
-                Pipeline::Deflate,
-                Pipeline::Bw,
-                Pipeline::Bbw,
-                Pipeline::Lzf,
-                Pipeline::LzssR,
-            ] {
+            for &p in &[Pipeline::Bw, Pipeline::Bbw, Pipeline::Lzf, Pipeline::LzssR] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -840,13 +785,7 @@ mod tests {
         fn repeated_short_pattern() {
             // "ab" repeated 500 times - good for LZ77
             let input: Vec<u8> = b"ab".iter().copied().cycle().take(1000).collect();
-            for &p in &[
-                Pipeline::Deflate,
-                Pipeline::Bw,
-                Pipeline::Bbw,
-                Pipeline::Lzf,
-                Pipeline::LzssR,
-            ] {
+            for &p in &[Pipeline::Bw, Pipeline::Bbw, Pipeline::Lzf, Pipeline::LzssR] {
                 let compressed = pipeline::compress(&input, p).unwrap();
                 let decompressed = pipeline::decompress(&compressed).unwrap();
                 assert_eq!(decompressed, input, "pipeline {:?}", p);
@@ -884,27 +823,6 @@ mod tests {
         }
         input.truncate(target_size);
         input
-    }
-
-    #[test]
-    #[cfg(feature = "webgpu")]
-    fn webgpu_compress_cpu_decompress_deflate() {
-        use crate::pipeline::{Backend, CompressOptions};
-        let engine = match crate::webgpu::WebGpuEngine::new() {
-            Ok(e) => std::sync::Arc::new(e),
-            Err(crate::PzError::Unsupported) => return,
-            Err(e) => panic!("unexpected error: {:?}", e),
-        };
-        let input = gpu_test_input();
-        let options = CompressOptions {
-            backend: Backend::WebGpu,
-            webgpu_engine: Some(engine),
-            ..Default::default()
-        };
-        let compressed =
-            pipeline::compress_with_options(&input, Pipeline::Deflate, &options).unwrap();
-        let decompressed = pipeline::decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input, "WebGPU Deflate GPU→CPU round-trip");
     }
 
     #[test]
@@ -972,31 +890,6 @@ mod tests {
 
     #[test]
     #[cfg(feature = "webgpu")]
-    fn webgpu_streaming_round_trip_deflate() {
-        use crate::pipeline::{Backend, CompressOptions};
-        let engine = match crate::webgpu::WebGpuEngine::new() {
-            Ok(e) => std::sync::Arc::new(e),
-            Err(crate::PzError::Unsupported) => return,
-            Err(e) => panic!("unexpected error: {:?}", e),
-        };
-        let input = gpu_streaming_test_input();
-        let options = CompressOptions {
-            backend: Backend::WebGpu,
-            webgpu_engine: Some(engine),
-            threads: 2,
-            ..Default::default()
-        };
-        let compressed =
-            pipeline::compress_with_options(&input, Pipeline::Deflate, &options).unwrap();
-        let decompressed = pipeline::decompress(&compressed).unwrap();
-        assert_eq!(
-            decompressed, input,
-            "WebGPU streaming Deflate round-trip (multi-block)"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "webgpu")]
     fn webgpu_streaming_round_trip_lzf() {
         use crate::pipeline::{Backend, CompressOptions};
         let engine = match crate::webgpu::WebGpuEngine::new() {
@@ -1039,12 +932,11 @@ mod tests {
         };
         // This should go through the streaming path (5 blocks > 1)
         // or batched path, both exercising multi-block GPU code
-        let compressed =
-            pipeline::compress_with_options(&input, Pipeline::Deflate, &options).unwrap();
+        let compressed = pipeline::compress_with_options(&input, Pipeline::Lzf, &options).unwrap();
         let decompressed = pipeline::decompress(&compressed).unwrap();
         assert_eq!(
             decompressed, input,
-            "WebGPU streaming Deflate round-trip (small blocks)"
+            "WebGPU streaming Lzf round-trip (small blocks)"
         );
     }
 }

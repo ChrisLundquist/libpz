@@ -6,7 +6,7 @@
 /// ## Encoders
 ///
 /// - `Lz77Encoder`: DEFLATE-compatible (u16 offset, u16 length, u8 next).
-///   3 streams. Used by the Deflate pipeline for backward compat.
+///   3 streams. Legacy format (Deflate pipeline removed).
 /// - `LzSeqEncoder`: log2-coded offsets/lengths with repeat offsets.
 ///   6 streams. Best ratio. Used by LzSeqR, LzSeqH, Lzf, SortLz.
 /// - `LzssEncoder`: flag bits + raw u16 offsets/lengths.

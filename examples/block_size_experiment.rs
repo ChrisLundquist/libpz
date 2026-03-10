@@ -35,7 +35,7 @@ const BLOCK_SIZES: &[usize] = &[
 ];
 
 /// Pipelines to test (LZ77-based, GPU-eligible).
-const PIPELINES: &[Pipeline] = &[Pipeline::Deflate, Pipeline::Lzf];
+const PIPELINES: &[Pipeline] = &[Pipeline::Lzf];
 
 fn load_data(size: usize) -> Vec<u8> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));

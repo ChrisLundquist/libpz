@@ -762,9 +762,9 @@ pub fn encode_optimal(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncoded> 
     }
 
     // Build match table and run repeat-offset-aware optimal parse.
-    // Use DEFLATE_MAX_MATCH (258) for reasonable performance.
+    // Use LZ77_MAX_MATCH (258) for reasonable performance.
     // Searching for extremely long matches (u16::MAX) is prohibitively slow.
-    let max_match = crate::lz77::DEFLATE_MAX_MATCH;
+    let max_match = crate::lz77::LZ77_MAX_MATCH;
     let table = crate::optimal::build_match_table_cpu_with_config(
         input,
         crate::optimal::K,

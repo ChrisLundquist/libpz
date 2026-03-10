@@ -83,14 +83,14 @@ fn profile_lzseqr_decode(data: &[u8], label: &str) {
     );
 }
 
-fn profile_deflate_decode(data: &[u8], label: &str) {
+fn profile_lzf_decode(data: &[u8], label: &str) {
     use pz::pipeline::{self, CompressOptions, Pipeline};
 
     let opts = CompressOptions {
         threads: 1,
         ..Default::default()
     };
-    let compressed = pipeline::compress_with_options(data, Pipeline::Deflate, &opts).unwrap();
+    let compressed = pipeline::compress_with_options(data, Pipeline::Lzf, &opts).unwrap();
 
     let iters = 10;
     let mut total_ns = 0u128;
@@ -104,7 +104,7 @@ fn profile_deflate_decode(data: &[u8], label: &str) {
     let avg_ms = total_ns as f64 / iters as f64 / 1e6;
     let tp = mb / (avg_ms / 1000.0);
     println!(
-        "Deflate decode {} ({:.1} MB) — {:.1} ms ({:.1} MB/s)",
+        "Lzf decode {} ({:.1} MB) — {:.1} ms ({:.1} MB/s)",
         label, mb, avg_ms, tp
     );
 }
@@ -121,7 +121,7 @@ fn main() {
             Ok(data) => {
                 profile_bw_decode(&data, label);
                 profile_lzseqr_decode(&data, label);
-                profile_deflate_decode(&data, label);
+                profile_lzf_decode(&data, label);
                 println!();
             }
             Err(e) => println!("{}: {}", label, e),

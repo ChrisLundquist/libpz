@@ -36,11 +36,7 @@ fn main() {
 
     let iters = 20;
 
-    for &(name, pipeline) in &[
-        ("LzSeqR", Pipeline::LzSeqR),
-        ("LzSeqH", Pipeline::LzSeqH),
-        ("Deflate", Pipeline::Deflate),
-    ] {
+    for &(name, pipeline) in &[("LzSeqR", Pipeline::LzSeqR), ("LzSeqH", Pipeline::LzSeqH)] {
         let options = CompressOptions::default();
         let compressed = pipeline::compress_with_options(&data, pipeline, &options).unwrap();
         let ratio = compressed.len() as f64 / data.len() as f64 * 100.0;

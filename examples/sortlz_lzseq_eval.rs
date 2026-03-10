@@ -1,6 +1,6 @@
 // Evaluate SortLZ+LzSeq hybrid pipeline vs alternatives.
 // Compares: LzSeqR (hashchain), LzSeqR (sortlz), LzSeqH (hashchain), LzSeqH (sortlz),
-//           SortLz (native), Deflate, Bw
+//           SortLz (native), Bw
 use std::time::Instant;
 
 use pz::pipeline::{self, CompressOptions, MatchFinder, Pipeline};
@@ -57,7 +57,6 @@ fn main() {
     ];
 
     let configs: Vec<(Pipeline, MatchFinder, &str)> = vec![
-        (Pipeline::Deflate, MatchFinder::HashChain, "deflate"),
         (Pipeline::Bw, MatchFinder::HashChain, "bw"),
         (Pipeline::LzSeqR, MatchFinder::HashChain, "lzseqr-hc"),
         (Pipeline::LzSeqR, MatchFinder::SortLz, "lzseqr-slz"),

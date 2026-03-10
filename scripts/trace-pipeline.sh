@@ -23,8 +23,8 @@ USAGE:
     ./scripts/trace-pipeline.sh [OPTIONS]
 
 OPTIONS:
-    -p, --pipeline NAME     Pipeline to trace (default: deflate)
-                            Options: deflate, lzf, lzfi, lzssr, bw, bbw, lzseqr, lzseqh, sortlz
+    -p, --pipeline NAME     Pipeline to trace (default: lzf)
+                            Options: lzf, lzfi, lzssr, bw, bbw, lzseqr, lzseqh, sortlz
     --format FORMAT         Output format: text (default) or mermaid
     -h, --help              Show this help
 
@@ -33,7 +33,7 @@ OUTPUT FORMATS:
     mermaid                 Mermaid flowchart syntax (paste into mermaid.live)
 
 EXAMPLES:
-    ./scripts/trace-pipeline.sh                        # deflate pipeline (text)
+    ./scripts/trace-pipeline.sh                        # lzf pipeline (text)
     ./scripts/trace-pipeline.sh -p bw                  # BWT pipeline
     ./scripts/trace-pipeline.sh -p lzfi --format mermaid  # FSE interleaved (mermaid)
 
@@ -44,7 +44,7 @@ UNDERSTANDING THE OUTPUT:
 EOF
 }
 
-PIPELINE="deflate"
+PIPELINE="lzf"
 FORMAT="text"
 
 while [[ $# -gt 0 ]]; do
@@ -79,10 +79,10 @@ done
 
 # Validate pipeline
 case "$PIPELINE" in
-    deflate|lzf|lzfi|lzssr|bw|bbw|lzseqr|lzseqh|sortlz) ;;
+    lzf|lzfi|lzssr|bw|bbw|lzseqr|lzseqh|sortlz) ;;
     *)
         echo "ERROR: unknown pipeline '$PIPELINE'" >&2
-        echo "Valid pipelines: deflate, lzf, lzfi, lzssr, bw, bbw, lzseqr, lzseqh, sortlz" >&2
+        echo "Valid pipelines: lzf, lzfi, lzssr, bw, bbw, lzseqr, lzseqh, sortlz" >&2
         exit 1
         ;;
 esac
@@ -104,11 +104,6 @@ esac
 # - compress_block_bw()/compress_block_bbw() in src/pipeline/blocks.rs:200-263
 
 case "$PIPELINE" in
-    deflate)
-        DEMUXER="Lz77"
-        STREAM_COUNT=3
-        ENTROPY="Huffman"
-        ;;
     lzf)
         DEMUXER="LzSeq"
         STREAM_COUNT=6
@@ -165,7 +160,7 @@ if [[ "$FORMAT" == "mermaid" ]]; then
     emit_mermaid "    Start([\"Input: raw bytes\"]) --> CompressBlock"
 fi
 
-# Trace LZ-based pipelines (Deflate, Lzf, Lzfi, LzssR, LzSeqR, LzSeqH)
+# Trace LZ-based pipelines (Lzf, Lzfi, LzssR, LzSeqR, LzSeqH)
 trace_lz_pipeline() {
     local pipeline=$1
     local demuxer=$2
@@ -391,7 +386,7 @@ trace_bwt_pipeline() {
 
 # Main trace dispatch
 case "$PIPELINE" in
-    deflate|lzf|lzfi|lzssr|lzseqr|lzseqh|sortlz)
+    lzf|lzfi|lzssr|lzseqr|lzseqh|sortlz)
         trace_lz_pipeline "$PIPELINE" "$DEMUXER" "$STREAM_COUNT" "$ENTROPY"
         ;;
     bw|bbw)

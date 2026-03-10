@@ -1,6 +1,6 @@
 //! Per-pipeline single-block compress and decompress implementations.
 //!
-//! LZ-based pipelines (Deflate, Lzf, Lzfi, LzssR) use a unified path:
+//! LZ-based pipelines (Lzf, Lzfi, LzssR) use a unified path:
 //!   compress:   demux → entropy_encode
 //!   decompress: entropy_decode → demux
 //!
@@ -28,7 +28,7 @@ pub(crate) fn compress_block(
     pipeline: Pipeline,
     options: &CompressOptions,
 ) -> PzResult<Vec<u8>> {
-    // Resolve max match length for this pipeline (Deflate=258, others=u16::MAX).
+    // Resolve max match length for this pipeline.
     // Clone options only when we need to override the default.
     let resolved;
     let opts = if options.max_match_len.is_none() && demuxer_for_pipeline(pipeline).is_some() {
@@ -124,8 +124,6 @@ fn decompress_block_lz(
 // ---------------------------------------------------------------------------
 
 /// Dispatch to the correct entropy encoder for a pipeline.
-///
-/// For Huffman (Deflate), GPU variants are used when a GPU backend is active.
 fn entropy_encode(
     block: StageBlock,
     pipeline: Pipeline,
@@ -133,15 +131,6 @@ fn entropy_encode(
     options: &CompressOptions,
 ) -> PzResult<StageBlock> {
     match pipeline {
-        Pipeline::Deflate => {
-            // Note: WebGPU Huffman is intentionally NOT used here.
-            // Profiling shows CPU Huffman (~0.5ms/256KB) is faster than the
-            // WebGPU path (~2ms) due to CPU↔GPU round-trips for bit-length
-            // computation and prefix-sum. The GPU LZ77 path provides the
-            // parallelism win; entropy encoding is faster on the CPU.
-            let _ = (input_len, options);
-            stage_huffman_encode(block)
-        }
         Pipeline::LzssR | Pipeline::LzSeqR => {
             let _ = (input_len, options);
             stage_rans_encode_with_options(block, options)
@@ -179,7 +168,6 @@ fn entropy_decode(
     options: &DecompressOptions,
 ) -> PzResult<StageBlock> {
     match pipeline {
-        Pipeline::Deflate => stage_huffman_decode(block),
         Pipeline::LzssR | Pipeline::LzSeqR => {
             #[cfg(feature = "webgpu")]
             {

@@ -34,7 +34,7 @@ fn test_too_short_input() {
 
 #[test]
 fn test_zero_original_length() {
-    let result = decompress(&[b'P', b'Z', VERSION, 0, 0, 0, 0, 0]);
+    let result = decompress(&[b'P', b'Z', VERSION, 1, 0, 0, 0, 0]);
     assert_eq!(result.unwrap(), Vec::<u8>::new());
 }
 
@@ -44,7 +44,6 @@ fn test_zero_original_length() {
 fn test_all_pipelines_banana() {
     let input = b"banana banana banana banana banana";
     for &pipeline in &[
-        Pipeline::Deflate,
         Pipeline::Bw,
         Pipeline::Bbw,
         Pipeline::LzSeqR,
@@ -65,7 +64,6 @@ fn test_all_pipelines_medium_text() {
         input.extend(b"abcdefghij klmnopqrstuvwxyz 0123456789 ");
     }
     for &pipeline in &[
-        Pipeline::Deflate,
         Pipeline::Bw,
         Pipeline::Bbw,
         Pipeline::LzSeqR,
@@ -106,7 +104,6 @@ fn test_multiblock_round_trip_all_pipelines() {
     }
 
     for &pipeline in &[
-        Pipeline::Deflate,
         Pipeline::Bw,
         Pipeline::Lzf,
         Pipeline::Lzfi,
@@ -129,7 +126,7 @@ fn test_multiblock_various_block_sizes() {
     }
 
     for block_size in [256, 512, 1024, 2048] {
-        for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+        for &pipeline in &[Pipeline::Bw, Pipeline::Lzf] {
             let compressed = compress_mt(&input, pipeline, 4, block_size).unwrap();
             let decompressed = decompress(&compressed).unwrap();
             assert_eq!(
@@ -143,7 +140,7 @@ fn test_multiblock_various_block_sizes() {
 
 #[test]
 fn test_multiblock_empty_input() {
-    let compressed = compress_mt(&[], Pipeline::Deflate, 4, 512).unwrap();
+    let compressed = compress_mt(&[], Pipeline::Lzf, 4, 512).unwrap();
     assert!(compressed.is_empty());
 }
 
@@ -182,7 +179,7 @@ fn test_multiblock_large_input() {
     for _ in 0..2500 {
         input.extend_from_slice(pattern);
     }
-    for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::Lzf] {
+    for &pipeline in &[Pipeline::Bw, Pipeline::Lzf] {
         let compressed = compress_mt(&input, pipeline, 4, 16384).unwrap();
         assert_eq!(compressed[2], VERSION);
         let decompressed = decompress(&compressed).unwrap();
@@ -191,23 +188,6 @@ fn test_multiblock_large_input() {
 }
 
 // --- Optimal parsing pipeline tests ---
-
-#[test]
-fn test_optimal_deflate_round_trip() {
-    let pattern = b"The quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    for _ in 0..100 {
-        input.extend_from_slice(pattern);
-    }
-    let opts = CompressOptions {
-        parse_strategy: ParseStrategy::Optimal,
-        threads: 1,
-        ..Default::default()
-    };
-    let compressed = compress_with_options(&input, Pipeline::Deflate, &opts).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-}
 
 #[test]
 fn test_optimal_lza_round_trip() {
@@ -239,7 +219,7 @@ fn test_optimal_multiblock_round_trip() {
         block_size: 4096,
         ..Default::default()
     };
-    let compressed = compress_with_options(&input, Pipeline::Deflate, &opts).unwrap();
+    let compressed = compress_with_options(&input, Pipeline::Lzf, &opts).unwrap();
     let decompressed = decompress(&compressed).unwrap();
     assert_eq!(decompressed, input);
 }
@@ -248,7 +228,7 @@ fn test_optimal_multiblock_round_trip() {
 
 #[test]
 fn test_select_pipeline_empty() {
-    assert_eq!(select_pipeline(&[]), Pipeline::Deflate);
+    assert_eq!(select_pipeline(&[]), Pipeline::Lzf);
 }
 
 #[test]
@@ -261,7 +241,7 @@ fn test_select_pipeline_constant_data() {
 
 #[test]
 fn test_select_pipeline_text() {
-    // Repetitive text → good match density, moderate entropy → Deflate or Lzf
+    // Repetitive text → good match density, moderate entropy → Lzf
     let pattern = b"The quick brown fox jumps over the lazy dog. ";
     let mut input = Vec::new();
     for _ in 0..200 {
@@ -269,15 +249,15 @@ fn test_select_pipeline_text() {
     }
     let pipeline = select_pipeline(&input);
     assert!(
-        pipeline == Pipeline::Deflate || pipeline == Pipeline::Lzf,
-        "expected Deflate or Lzf, got {:?}",
+        pipeline == Pipeline::Lzf,
+        "expected Lzf, got {:?}",
         pipeline
     );
 }
 
 #[test]
 fn test_select_pipeline_random() {
-    // Pseudo-random → high entropy, low match density → Deflate (fastest)
+    // Pseudo-random → high entropy, low match density → Lzf (fastest)
     let mut input = vec![0u8; 10000];
     let mut state: u32 = 12345;
     for byte in &mut input {
@@ -285,7 +265,7 @@ fn test_select_pipeline_random() {
         *byte = (state >> 16) as u8;
     }
     let pipeline = select_pipeline(&input);
-    assert_eq!(pipeline, Pipeline::Deflate);
+    assert_eq!(pipeline, Pipeline::Lzf);
 }
 
 #[test]
@@ -322,43 +302,6 @@ fn test_select_pipeline_auto_vs_explicit_round_trip() {
 // --- Multi-stream tests ---
 
 #[test]
-fn test_multistream_deflate_round_trip_medium() {
-    // 10KB of repetitive text
-    let pattern = b"The quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    for _ in 0..222 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress(&input, Pipeline::Deflate).unwrap();
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(decompressed, input);
-    assert!(
-        compressed.len() < input.len(),
-        "compressed {} >= input {}",
-        compressed.len(),
-        input.len()
-    );
-}
-
-#[test]
-fn test_multistream_deflate_compression_ratio() {
-    // Multi-stream should compress well on structured/repetitive data
-    // because offset/length/literal distributions are each tighter
-    let pattern = b"The quick brown fox jumps over the lazy dog. ";
-    let mut input = Vec::new();
-    for _ in 0..500 {
-        input.extend_from_slice(pattern);
-    }
-    let compressed = compress(&input, Pipeline::Deflate).unwrap();
-    assert!(
-        compressed.len() < input.len() / 2,
-        "expected significant compression: compressed {} vs input {}",
-        compressed.len(),
-        input.len()
-    );
-}
-
-#[test]
 fn test_multistream_lzf_round_trip_medium() {
     let pattern = b"abcdefghij abcdefghij ";
     let mut input = Vec::new();
@@ -384,7 +327,7 @@ fn test_multistream_all_pipelines_round_trip() {
     for _ in 0..100 {
         input.extend_from_slice(pattern);
     }
-    for &pipeline in &[Pipeline::Deflate, Pipeline::Bw, Pipeline::LzSeqR] {
+    for &pipeline in &[Pipeline::Bw, Pipeline::LzSeqR] {
         let compressed = compress(&input, pipeline).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, input, "round-trip failed for {:?}", pipeline);
@@ -608,27 +551,35 @@ fn test_lzfi_multistream_deinterleave_reinterleave() {
 /// Verify LzSeqR pipeline benefits from extended match lengths on repetitive data.
 #[test]
 fn test_lzseqr_extended_match_length() {
+    use crate::lz77;
+
     let input = vec![0xAAu8; 100_000];
 
-    // Deflate should use 258-byte max matches
-    let deflate_compressed = compress(&input, Pipeline::Deflate).unwrap();
+    // LzSeqR with constrained (258-byte) max matches as baseline
+    let opts_limited = CompressOptions {
+        max_match_len: Some(lz77::LZ77_MAX_MATCH),
+        threads: 1,
+        ..Default::default()
+    };
+    let limited_compressed =
+        compress_with_options(&input, Pipeline::LzSeqR, &opts_limited).unwrap();
 
     // LzSeqR should use extended matches (u16::MAX) and compress better
-    let lzr_compressed = compress(&input, Pipeline::LzSeqR).unwrap();
+    let extended_compressed = compress(&input, Pipeline::LzSeqR).unwrap();
 
     // Both must decompress correctly
-    let deflate_decompressed = decompress(&deflate_compressed).unwrap();
-    let lzr_decompressed = decompress(&lzr_compressed).unwrap();
-    assert_eq!(deflate_decompressed, input);
-    assert_eq!(lzr_decompressed, input);
+    let limited_decompressed = decompress(&limited_compressed).unwrap();
+    let extended_decompressed = decompress(&extended_compressed).unwrap();
+    assert_eq!(limited_decompressed, input);
+    assert_eq!(extended_decompressed, input);
 
     // LzSeqR with extended matches should produce smaller output on highly
     // repetitive data (fewer matches needed = fewer tokens = better ratio)
     assert!(
-        lzr_compressed.len() < deflate_compressed.len(),
-        "LzSeqR ({} bytes) should compress better than Deflate ({} bytes) on repetitive data",
-        lzr_compressed.len(),
-        deflate_compressed.len()
+        extended_compressed.len() < limited_compressed.len(),
+        "LzSeqR extended ({} bytes) should compress better than LzSeqR limited ({} bytes) on repetitive data",
+        extended_compressed.len(),
+        limited_compressed.len()
     );
 }
 
@@ -713,21 +664,29 @@ fn test_lzseqr_recoil_wide_interleave_round_trip() {
 /// Verify Lzf pipeline benefits from extended match lengths on repetitive data.
 #[test]
 fn test_lzf_extended_match_length() {
+    use crate::lz77;
+
     let input = vec![0xBBu8; 100_000];
 
-    let deflate_compressed = compress(&input, Pipeline::Deflate).unwrap();
+    // Lzf with constrained (258-byte) max matches as baseline
+    let opts_limited = CompressOptions {
+        max_match_len: Some(lz77::LZ77_MAX_MATCH),
+        threads: 1,
+        ..Default::default()
+    };
+    let limited_compressed = compress_with_options(&input, Pipeline::Lzf, &opts_limited).unwrap();
     let lzf_compressed = compress(&input, Pipeline::Lzf).unwrap();
 
     // Both must decompress correctly
-    assert_eq!(decompress(&deflate_compressed).unwrap(), input);
+    assert_eq!(decompress(&limited_compressed).unwrap(), input);
     assert_eq!(decompress(&lzf_compressed).unwrap(), input);
 
     // Lzf with extended matches should produce smaller output
     assert!(
-        lzf_compressed.len() < deflate_compressed.len(),
-        "Lzf ({} bytes) should compress better than Deflate ({} bytes) on repetitive data",
+        lzf_compressed.len() < limited_compressed.len(),
+        "Lzf extended ({} bytes) should compress better than Lzf limited ({} bytes) on repetitive data",
         lzf_compressed.len(),
-        deflate_compressed.len()
+        limited_compressed.len()
     );
 }
 
@@ -738,9 +697,9 @@ fn test_explicit_max_match_len_option() {
 
     let input = vec![0xCCu8; 100_000];
 
-    // Force LzSeqR to use Deflate-style 258 limit
+    // Force LzSeqR to use 258-byte match limit
     let opts_limited = CompressOptions {
-        max_match_len: Some(lz77::DEFLATE_MAX_MATCH),
+        max_match_len: Some(lz77::LZ77_MAX_MATCH),
         threads: 1,
         ..Default::default()
     };
@@ -816,20 +775,6 @@ mod gpu_batched_tests {
             threads: 2,
             ..CompressOptions::default()
         })
-    }
-
-    #[test]
-    fn test_gpu_batched_deflate_round_trip() {
-        let opts = match make_webgpu_options() {
-            Some(o) => o,
-            None => return,
-        };
-
-        let pattern = b"the quick brown fox jumps over the lazy dog. ";
-        let input: Vec<u8> = pattern.iter().cycle().take(256 * 1024).copied().collect();
-        let compressed = compress_with_options(&input, Pipeline::Deflate, &opts).unwrap();
-        let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(decompressed, input);
     }
 
     #[test]
@@ -943,7 +888,7 @@ mod gpu_batched_tests {
             input.extend_from_slice(&block);
         }
 
-        for pipeline in [Pipeline::Deflate, Pipeline::LzSeqR, Pipeline::Lzf] {
+        for pipeline in [Pipeline::LzSeqR, Pipeline::Lzf] {
             let compressed = compress_with_options(&input, pipeline, &opts).unwrap();
             let decompressed = decompress(&compressed).unwrap();
             assert_eq!(
