@@ -25,59 +25,32 @@ For day-to-day development instructions, see `CLAUDE.md`.
 
 ## Multi-stream entropy coding
 
-The Lzf and LzSeqR pipelines use **multi-stream entropy coding** to improve
-compression ratio by separating LZ77 output into independent byte streams with
-tighter symbol distributions. Instead of feeding one mixed stream to the entropy
-coder, the encoder deinterleaves tokens into three streams:
+All LZ-based pipelines use **multi-stream entropy coding**: the match finder
+produces a universal `LzToken` stream (literals + matches), and a pluggable
+`TokenEncoder` splits it into independent byte streams with tighter symbol
+distributions. Each stream gets its own entropy coder, yielding lower
+per-stream entropy than a single combined stream.
 
-| Stream | Contents | Why it helps |
-|--------|----------|-------------|
-| **Offsets** | High bytes of match offsets (offset >> 8) | Offsets cluster in a narrow range; dedicated Huffman/RC table exploits this |
-| **Lengths** | Match lengths (capped to u8) | Length distribution is highly skewed (short matches dominate) |
-| **Literals** | Literal bytes + low offset bytes + next bytes | Natural-language / binary byte distribution |
+### Wire encoders (`src/lz_token.rs`)
 
-Each stream gets its own FSE table (Lzf) or rANS context (LzSeqR),
-yielding lower per-stream entropy than a single combined stream.
+| Encoder | Streams | Used by | Contents |
+|---------|---------|---------|----------|
+| `LzSeqEncoder` | 6 | Lzf, LzSeqR, LzSeqH, SortLz | flags, literals, offset_codes, offset_extra, length_codes, length_extra |
+| `LzssEncoder` | 4 | Lzfi, LzssR | flags (1-bit per token), literals, offsets (u16 LE), lengths (u16 LE) |
 
-### Encoding format
+`LzSeqEncoder` uses log2-coded offsets and lengths with repeat offset tracking,
+achieving the best ratio (~32% on Canterbury+large). `LzssEncoder` uses raw u16
+values with flag bits, trading ratio for simplicity.
 
-Multi-stream data is stored with a `0x02` stream-format flag in the container
-header, followed by three length-prefixed compressed sub-streams:
+### Architecture
 
 ```
-[stream_format: u8 = 0x02]
-[offsets_len: u32 LE] [offsets compressed data...]
-[lengths_len: u32 LE] [lengths compressed data...]
-[literals_len: u32 LE] [literals compressed data...]
+Input → tokenize() → Vec<LzToken> → TokenEncoder::encode() → EncodedStreams → entropy coding
 ```
 
-The decoder reads the flag, decompresses each sub-stream independently, then
-reinterleaves them back into the original LZ77 token sequence. Single-stream
-format (`0x01`) is used as fallback for small inputs (< 256 bytes) or when
-multi-stream produces larger output.
-
-### Benchmark results
-
-Comparison on Canterbury + Large corpus (14 files, 13.3 MB total), averaged over
-3 iterations. "Before" = single-stream, "After" = multi-stream:
-
-**Compression (size and throughput):**
-
-| Pipeline | Before (bytes) | After (bytes) | Size delta | Throughput delta |
-|----------|---------------|--------------|------------|-----------------|
-| Lzf      | 6,199,044     | 5,107,601    | **-17.6%** | +2.8% faster    |
-
-**Decompression throughput:**
-
-| Pipeline | Throughput delta |
-|----------|-----------------|
-| Lzf      | **+2.4%** faster |
-
-Multi-stream is a pure win: better compression **and** faster speed. The largest
-gains are on big files (E.coli: -21% size, +11% decode throughput; bible.txt:
--14% size, +16% decode throughput). Small files (< 4 KB) may see slight
-expansion due to the overhead of three separate stream headers — the encoder
-automatically falls back to single-stream when multi-stream would be larger.
+Match finding and parsing (`tokenize()` in `src/pipeline/mod.rs`) are decoupled
+from wire encoding. The `tokenize()` entry point handles GPU/CPU dispatch,
+SortLz vs HashChain match finding, and parse strategy (greedy/lazy/optimal).
 
 ## rANS entropy coder
 
@@ -163,21 +136,20 @@ match verification. Zero atomics, fully deterministic — ideal for GPU executio
 When used as a `MatchFinder`, SortLZ is transparent to the wire format — the
 output is 100% compatible with the host pipeline (Lzf, LzSeqR, LzSeqH). The consumer and decompressor see no difference.
 
-### Pipeline::SortLz wire format (per block)
+### Pipeline::SortLz wire format v2 (per block)
 
 ```
-[num_tokens: u32 LE]       total token count (literals + matches)
-[num_literals: u32 LE]     literal count
-[flags_len: u32 LE]        ceil(num_tokens / 8)
-[flags: flags_len bytes]   bitfield (1 = literal, 0 = match, MSB-first)
-[fse_lit_len: u32 LE]      [fse_literals: ...]   FSE-encoded literal bytes
-[fse_off_len: u32 LE]      [fse_offsets: ...]    FSE-encoded u16 LE offsets
-[fse_len_len: u32 LE]      [fse_lengths: ...]    FSE-encoded u16 LE lengths
+[meta_len: u16 LE]         LzSeq metadata length
+[meta: meta_len bytes]     num_tokens + num_matches (u32 each)
+[num_streams: u8]          number of streams (6 for LzSeq)
+per stream:
+  [orig_len: u32 LE]       uncompressed stream length
+  [fse_len: u32 LE]        FSE-compressed length
+  [fse_data: fse_len bytes]
 ```
 
-This is NOT wire-compatible with any other pipeline. It uses FSE entropy coding
-on three raw byte streams (literals, offsets as u16 LE, lengths as u16 LE),
-with a bitfield flag stream to interleave them during decompression.
+SortLz uses `LzSeqEncoder` for wire encoding + FSE for entropy. The 6 streams
+are: flags, literals, offset_codes, offset_extra, length_codes, length_extra.
 
 ### Algorithm
 
@@ -279,6 +251,25 @@ GPU path.
 
 See `docs/design-docs/gpu-strategy.md` for full analysis and `CLAUDE.md` "Known
 dead ends" for the complete list of GPU optimization attempts that failed.
+
+## Active architecture: what GPU does / doesn't do
+
+### GPU-accelerated paths (shipping)
+- **LZ77 match finding** — GPU hash-table kernel for Lzf/LzSeq pipelines (2x faster at 256KB+)
+- **SortLZ match finding** — GPU radix sort + match verification (10.6x faster at 4MB)
+- **BWT suffix array** — GPU radix sort with prefix-doubling
+- **Interleaved FSE** — GPU-accelerated encode/decode for Lzfi pipeline
+- **rANS Recoil decode** — GPU-accelerated parallel rANS decode using split-point metadata
+
+### CPU-only paths (by design)
+- **All entropy coding in the streaming CLI** — `streaming::compress_stream` uses CPU rANS/FSE
+- **rANS/FSE/Huffman encode/decode** — serial state machines, GPU is 0.54-0.77x CPU speed
+- **LZ77 lazy evaluation** — sequential dependency (next match depends on current)
+- **LzSeq `encode_with_config`** — repeat offset tracking, adaptive chain depth, hash4 prefix
+
+### Threshold gates
+- `GPU_ENTROPY_THRESHOLD` (256KB) > `DEFAULT_GPU_BLOCK_SIZE` (128KB) — prevents entropy routing to GPU
+- `MIN_GPU_INPUT_SIZE` — minimum block size for GPU dispatch (avoids setup overhead)
 
 ## Remaining GPU bottlenecks
 
