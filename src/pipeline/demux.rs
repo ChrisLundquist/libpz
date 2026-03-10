@@ -2,7 +2,6 @@
 //! for entropy coding, and re-merges them on decompression.
 
 use crate::lz77;
-use crate::lz78;
 use crate::lzseq;
 use crate::lzss;
 use crate::{PzError, PzResult};
@@ -21,7 +20,7 @@ pub(crate) struct DemuxOutput {
     pub meta: Vec<u8>,
 }
 
-/// Describes how a pre-entropy stage (LZ77, LZSS, LZ78, etc.) splits its
+/// Describes how a pre-entropy stage (LZ77, LZSS, LzSeq, etc.) splits its
 /// output into independent byte streams for entropy coding, and merges
 /// them back on decompression.
 pub(crate) trait StreamDemuxer {
@@ -46,8 +45,6 @@ pub(crate) enum LzDemuxer {
     Lz77,
     /// LZSS: 4 streams (flags, literals, offsets, lengths).
     Lzss,
-    /// LZ78: 1 stream (flat blob, no splitting).
-    Lz78,
     /// LzSeq: 6 streams (flags, literals, offset_codes, offset_extra, length_codes, length_extra).
     LzSeq,
 }
@@ -60,7 +57,6 @@ pub(crate) fn demuxer_for_pipeline(pipeline: super::Pipeline) -> Option<LzDemuxe
             Some(LzDemuxer::Lz77)
         }
         super::Pipeline::Lzfi | super::Pipeline::LzssR => Some(LzDemuxer::Lzss),
-        super::Pipeline::Lz78R => Some(LzDemuxer::Lz78),
         super::Pipeline::LzSeqR | super::Pipeline::LzSeqH => Some(LzDemuxer::LzSeq),
         super::Pipeline::Bw | super::Pipeline::Bbw => None,
         super::Pipeline::SortLz => None,
@@ -95,7 +91,6 @@ impl StreamDemuxer for LzDemuxer {
         match self {
             LzDemuxer::Lz77 => 3,
             LzDemuxer::Lzss => 4,
-            LzDemuxer::Lz78 => 1,
             LzDemuxer::LzSeq => 6,
         }
     }
@@ -168,15 +163,6 @@ impl StreamDemuxer for LzDemuxer {
                     streams: vec![flags_stream, literals, offsets, lengths],
                     pre_entropy_len: encoded.len(),
                     meta: num_tokens.to_le_bytes().to_vec(),
-                })
-            }
-            LzDemuxer::Lz78 => {
-                let encoded = lz78::encode(input)?;
-                let pre_entropy_len = encoded.len();
-                Ok(DemuxOutput {
-                    streams: vec![encoded],
-                    pre_entropy_len,
-                    meta: Vec::new(),
                 })
             }
             LzDemuxer::LzSeq => {
@@ -350,16 +336,6 @@ impl StreamDemuxer for LzDemuxer {
                 lzss_blob.extend_from_slice(&token_data);
 
                 let decoded = lzss::decode(&lzss_blob)?;
-                if decoded.len() != original_len {
-                    return Err(PzError::InvalidInput);
-                }
-                Ok(decoded)
-            }
-            LzDemuxer::Lz78 => {
-                if streams.len() != 1 {
-                    return Err(PzError::InvalidInput);
-                }
-                let decoded = lz78::decode(&streams[0])?;
                 if decoded.len() != original_len {
                     return Err(PzError::InvalidInput);
                 }

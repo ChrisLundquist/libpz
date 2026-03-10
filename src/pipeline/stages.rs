@@ -911,8 +911,6 @@ pub(crate) fn run_compress_stage(
         }
         (Pipeline::LzssR, 0) => stage_demux_compress(block, &LzDemuxer::Lzss, options),
         (Pipeline::LzssR, 1) => stage_rans_encode_with_options(block, options),
-        (Pipeline::Lz78R, 0) => stage_demux_compress(block, &LzDemuxer::Lz78, options),
-        (Pipeline::Lz78R, 1) => stage_rans_encode_with_options(block, options),
         (Pipeline::LzSeqR, 0) => stage_demux_compress(block, &LzDemuxer::LzSeq, options),
         (Pipeline::LzSeqR, 1) => {
             #[cfg(feature = "webgpu")]

@@ -313,16 +313,14 @@ fn main() {
         (Pipeline::Lzf, ParseStrategy::Optimal, 1, Backend::Cpu),
         (Pipeline::Bw, ParseStrategy::Auto, 1, Backend::Cpu),
         (Pipeline::Bbw, ParseStrategy::Auto, 1, Backend::Cpu),
-        // Experimental: LZSS and LZ78 pipelines
+        // Experimental: LZSS pipeline
         (Pipeline::LzssR, ParseStrategy::Auto, 1, Backend::Cpu),
-        (Pipeline::Lz78R, ParseStrategy::Auto, 1, Backend::Cpu),
         // Multi-threaded CPU
         (Pipeline::Deflate, ParseStrategy::Lazy, 0, Backend::Cpu),
         (Pipeline::Lzf, ParseStrategy::Lazy, 0, Backend::Cpu),
         (Pipeline::Bw, ParseStrategy::Auto, 0, Backend::Cpu),
         (Pipeline::Bbw, ParseStrategy::Auto, 0, Backend::Cpu),
         (Pipeline::LzssR, ParseStrategy::Auto, 0, Backend::Cpu),
-        (Pipeline::Lz78R, ParseStrategy::Auto, 0, Backend::Cpu),
     ];
 
     // WebGPU GPU variants (if available)

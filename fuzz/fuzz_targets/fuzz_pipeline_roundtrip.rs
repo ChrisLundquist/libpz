@@ -18,7 +18,6 @@ fuzz_target!(|data: &[u8]| {
         Pipeline::Lzf,
         Pipeline::Lzfi,
         Pipeline::LzssR,
-        Pipeline::Lz78R,
         Pipeline::LzSeqR,
     ];
 
