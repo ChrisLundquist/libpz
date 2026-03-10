@@ -1,6 +1,6 @@
 # Active Execution Plans
 
-**Last Updated:** 2026-03-09
+**Last Updated:** 2026-03-10
 
 ## Active Plans
 
@@ -10,27 +10,23 @@
 ### [PLAN-unified-scheduler-perf-validation.md](PLAN-unified-scheduler-perf-validation.md)
 **Status:** In Progress (Phases 0-1 landed; local baseline captured; Phase 2 optimization started) | **Priority:** P0
 
-## Parked Plans
+## Investigation TODOs
 
-### [PLAN-interleaved-rans.md](PLAN-interleaved-rans.md)
-**Status:** PARKED — Phase A merged (PR #91); Phase D cancelled (GPU rANS dead end); Phases B–C need new owner | **Priority:** P1
+### [TODO-gpu-rans-6stream-bug.md](TODO-gpu-rans-6stream-bug.md)
+**Status:** Open — GPU rANS interleaved decode fails with 6-stream LzSeqR; works with 4-stream LzssR | **Priority:** P1
 
-### [PLAN-unified-scheduler-north-star.md](PLAN-unified-scheduler-north-star.md)
-**Status:** PARKED — Phases 3–4 done and in production; Phases 2+5 blocked indefinitely (GPU entropy not competitive) | **Priority:** P1
+### [TODO-benchmark-lzfi-vs-lzssr.md](TODO-benchmark-lzfi-vs-lzssr.md)
+**Status:** Open — Benchmark whether LzssR is worth keeping vs Lzfi consolidation | **Priority:** P2
 
 ### [TODO-huffman-sync-decode.md](TODO-huffman-sync-decode.md)
 **Status:** PARKED — valid approach, zero implementation progress, awaiting LzSeq encoding work | **Priority:** P2
 
-### [agent-harness-implementation.md](agent-harness-implementation.md)
-**Status:** PARKED — Phase 1 complete; Phases 2–8 deferred | **Priority:** P1
-
-## Closed Plans
-
-### [PLAN-p0a-gpu-rans-vertical-slice.md](PLAN-p0a-gpu-rans-vertical-slice.md)
-**Status:** CLOSED — Slice 4 perf gate failed; GPU rANS 0.54–0.77x CPU after 29+ iterations; structural dead end | **Priority:** was P0
-
 ## Completed Plans (in ../completed/)
 
+- `PLAN-p0a-gpu-rans-vertical-slice.md` — GPU chunked rANS vertical slice (CLOSED: structural dead end)
+- `PLAN-unified-scheduler-north-star.md` — Unified scheduler north star (PARKED: GPU entropy blocked)
+- `PLAN-interleaved-rans.md` — Interleaved rANS (PARKED: Phase A merged, Phase D cancelled)
+- `agent-harness-implementation.md` — Agent harness (PARKED: Phase 1 complete, rest deferred)
 - `PLAN-gpu-backpressure-impl.md` — GPU ring buffer batching
 - `lz77_merge.md` — Cooperative-stitch kernel consolidation
 - `upgrade-wgpu-to-27.md` — wgpu 24→27 upgrade
