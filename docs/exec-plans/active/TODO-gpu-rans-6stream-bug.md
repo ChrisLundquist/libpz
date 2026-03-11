@@ -1,38 +1,57 @@
-# TODO: GPU rANS interleaved decode fails with 6-stream LzSeqR
+# RESOLVED: GPU rANS encode routing bug for LzSeqR
+
+**Status:** Fixed (2026-03-10)
 
 ## Problem
 
-GPU rANS interleaved decode works correctly for 4-stream pipelines (LzssR)
-but fails for 6-stream pipelines (LzSeqR). CPU rANS interleaved decode
-works correctly for both 4 and 6 streams.
+LzSeqR (6-stream) round-trip failed with `InvalidInput` when compressed with
+multi-threaded GPU backend. The bug was mischaracterized as "GPU rANS
+interleaved decode fails with 6-stream LzSeqR" — the actual root cause was
+on the encode side.
+
+## Root Cause
+
+**Routing inconsistency between single-block and parallel compress paths:**
+
+- `entropy_encode` (blocks.rs:134) — used by single-block/single-thread paths:
+  LzSeqR always uses `stage_rans_encode_with_options` (CPU rANS)
+
+- `run_compress_stage` (stages.rs:911) — used by the parallel scheduler:
+  LzSeqR routed to `stage_rans_encode_webgpu` when WebGpu backend was active
+
+`stage_rans_encode_webgpu` uses `rans_encode_chunked_payload_gpu_batched`
+which produces a **chunked payload format** incompatible with the standard
+`rans::decode_interleaved` decoder. The data would encode successfully but
+no decoder (CPU or GPU) could decode it.
+
+LzssR didn't have this bug because `run_compress_stage` for LzssR (line 909)
+always used `stage_rans_encode_with_options`.
 
 ## Evidence
 
-- `test_gpu_rans_interleaved_decode_round_trip` originally used `Pipeline::Lzr`
-  (3 streams). After Lzr removal, switching to `Pipeline::LzSeqR` (6 streams)
-  caused the test to fail with `InvalidInput`.
-- Switching to `Pipeline::LzssR` (4 streams) passes.
-- CPU rANS interleaved encode/decode with LzSeqR works fine.
-- The rANS encode/decode code in `src/pipeline/stages.rs` is stream-count
-  agnostic — each stream is encoded/decoded independently.
+Diagnostic results (192KB input, 64KB block size):
+```
+size=65536:  OK   (1 block, single-block fast path)
+size=131072: FAIL (2 blocks, parallel path → stage_rans_encode_webgpu)
+192KB threads=1: OK (sequential path → stage_rans_encode_with_options)
+192KB threads=2: FAIL (parallel path → stage_rans_encode_webgpu)
+```
 
-## Workaround
+## Fix
 
-Test uses `Pipeline::LzssR` (4-stream) instead of `Pipeline::LzSeqR` (6-stream).
-See `src/pipeline/tests.rs:test_gpu_rans_interleaved_decode_round_trip`.
+Changed `run_compress_stage` for `(Pipeline::LzSeqR, 1)` to always use
+`stage_rans_encode_with_options`, matching the `entropy_encode` path.
 
-## Investigation directions
+## Remaining TODO
 
-- LzSeq's `offset_extra` and `length_extra` streams can be very small or empty.
-  GPU buffer sizing or dispatch dimensions may misbehave with near-zero streams.
-- Check if the GPU rANS decode path (`stage_rans_decode_webgpu`) has alignment
-  assumptions that break with 6 streams.
-- Compare the per-stream byte sizes between LzssR (4 streams, all non-trivial)
-  and LzSeqR (6 streams, some potentially empty) to find the divergence point.
-- Test with synthetic 6-stream data where all streams are non-trivially sized.
+The GPU rANS encode path (`stage_rans_encode_webgpu`) produces a chunked
+payload wire format that the standard rANS decoder doesn't understand.
+If GPU rANS encode is ever re-enabled for LzSeqR, the chunked decode path
+must be wired into `stage_rans_decode_webgpu`. However, since GPU rANS
+entropy is known to be slower than CPU (0.54-0.77x), this is low priority.
 
 ## Files
 
-- `src/pipeline/stages.rs` — `stage_rans_decode_webgpu`, `stage_rans_encode_with_options`
-- `src/pipeline/tests.rs` — `test_gpu_rans_interleaved_decode_round_trip`
-- `src/webgpu/rans.rs` — GPU rANS implementation
+- `src/pipeline/stages.rs:911` — fix: removed GPU routing for LzSeqR stage 1
+- `src/pipeline/blocks.rs:134` — reference: entropy_encode always uses CPU
+- `src/pipeline/tests.rs` — new test: `test_gpu_rans_interleaved_decode_lzseqr_6stream`
