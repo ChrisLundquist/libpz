@@ -943,6 +943,7 @@ fn test_lzseq_r_optimal_round_trip_short() {
 }
 
 #[test]
+#[ignore] // Takes >60s in debug builds — run with `cargo test -- --ignored`
 fn test_lzseq_r_optimal_round_trip_large() {
     // Larger data to exercise optimal parsing
     let pattern = b"compression and decompression with optimal parsing ";
@@ -979,6 +980,7 @@ fn test_lzseq_r_quality_level_quality_uses_larger_window() {
 }
 
 #[test]
+#[ignore] // Takes >60s in debug builds — run with `cargo test -- --ignored`
 fn test_lzseq_r_optimal_better_than_lazy_on_structured_data() {
     // Verify both parsing strategies round-trip correctly on structured data.
     // NOTE: We don't assert optimal < lazy because they make different tradeoffs:
