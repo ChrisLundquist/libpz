@@ -15,22 +15,49 @@ streams) and differ only in entropy coder (interleaved FSE vs rANS).
 | Pipeline ID | 5 | 6 |
 | GPU entropy | Yes (interleaved FSE) | Yes (rANS Recoil) |
 
-## Known data
+## Criterion benchmark data (2026-03-10)
 
-- FSE decode is ~2.2x faster than rANS decode (596 vs 266 MB/s, Criterion)
-- FSE encode is comparable to rANS encode (~357 vs 359 MB/s)
-- Lzfi auto-selected when: match_density > 0.4 + byte_entropy > 6.0,
-  or match_density > 0.2 + byte_entropy > 5.0
-- LzssR is only exercised via trial compression or explicit user selection
+### Entropy throughput (CPU-only, Canterbury 64KB)
 
-## Action items
+| Coder | Encode | Decode |
+|-------|--------|--------|
+| FSE | 238-302 MB/s | 412-533 MB/s |
+| rANS (basic) | 326-446 MB/s | 262-316 MB/s |
+| rANS (chunked) | 279-486 MB/s | 453 MB/s – 1.06 GB/s |
 
-1. Run `./scripts/bench.sh` comparing Lzfi vs LzssR on Canterbury+Silesia corpus
-2. Run Criterion benchmarks: `cargo bench -- lzfi lzssr` for per-stage timing
-3. If LzssR shows no ratio or throughput advantage over Lzfi, consider removing
-   it to reduce pipeline surface area (similar to Lzr removal)
-4. If rANS interleaved or Recoil decode gives LzssR better GPU decode throughput,
-   document the use case and keep it
+FSE decode is ~2x faster than rANS basic decode. rANS chunked decode is
+competitive but requires the chunked wire format.
+
+### Full pipeline throughput (Canterbury corpus, 25 MB)
+
+| Pipeline | Compress | Decompress |
+|----------|----------|------------|
+| Lzfi | **543 MB/s** | **1.23 GB/s** |
+| LzSeqR | 333 MB/s | 1.22 GB/s |
+| Lzf | 295 MB/s | 1.02 GB/s |
+
+Lzfi dominates compress speed (63% faster than LzSeqR). Decompress is
+effectively tied across all LZ pipelines.
+
+### Recommendation
+
+LzssR has no measurable advantage over Lzfi:
+- Same demuxer (LZSS, 4 streams)
+- rANS decode is slower than FSE decode (262 vs 533 MB/s)
+- rANS encode is faster but Lzfi pipeline throughput is still higher
+- LzssR is never auto-selected
+- GPU Recoil decode is interesting but GPU entropy is known to be slower
+  than CPU (0.54-0.77x), so the GPU rANS advantage doesn't materialize
+
+**Action:** LzssR is a candidate for removal, similar to the Lzr removal.
+Keep only if a concrete use case for GPU Recoil decode emerges.
+
+## Remaining action items
+
+1. ~~Run Criterion benchmarks~~ Done (see above)
+2. Run `./scripts/bench.sh` for compression ratio comparison on Canterbury+Silesia
+3. Decide: remove LzssR or document its niche use case
+4. If removing: retire Pipeline ID 6, update wire-formats.md, add to retired IDs
 
 ## Files
 

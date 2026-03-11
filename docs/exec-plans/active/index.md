@@ -13,10 +13,10 @@
 ## Investigation TODOs
 
 ### [TODO-gpu-rans-6stream-bug.md](TODO-gpu-rans-6stream-bug.md)
-**Status:** Open — GPU rANS interleaved decode fails with 6-stream LzSeqR; works with 4-stream LzssR | **Priority:** P1
+**Status:** RESOLVED — Was routing bug: parallel path sent LzSeqR entropy to GPU chunked encoder incompatible with standard decoder. Fixed by routing to CPU rANS.
 
 ### [TODO-benchmark-lzfi-vs-lzssr.md](TODO-benchmark-lzfi-vs-lzssr.md)
-**Status:** Open — Benchmark whether LzssR is worth keeping vs Lzfi consolidation | **Priority:** P2
+**Status:** In Progress — Criterion benchmarks done; Lzfi dominates (543 vs 333 MB/s compress). LzssR removal candidate. | **Priority:** P2
 
 ### [TODO-huffman-sync-decode.md](TODO-huffman-sync-decode.md)
 **Status:** PARKED — valid approach, zero implementation progress, awaiting LzSeq encoding work | **Priority:** P2

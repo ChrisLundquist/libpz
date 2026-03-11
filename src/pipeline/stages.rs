@@ -478,91 +478,6 @@ pub(crate) fn stage_rans_decode_webgpu(
     Ok(block)
 }
 
-/// batched GPU dispatch with ring-buffered submit/readback overlap.
-///
-/// Per-stream framing: [orig_len: u32] [compressed_len: u32 | flags] [rans_data]
-///
-/// Streams below `rans_interleaved_min_bytes` fall back to CPU basic rANS.
-/// The output wire format is identical to [`stage_rans_encode_with_options()`],
-/// so the same decoder works for both CPU and GPU encoded data.
-#[cfg(feature = "webgpu")]
-pub(crate) fn stage_rans_encode_webgpu(
-    mut block: StageBlock,
-    engine: &crate::webgpu::WebGpuEngine,
-    options: &CompressOptions,
-) -> PzResult<StageBlock> {
-    let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
-    let pre_entropy_len = block
-        .metadata
-        .pre_entropy_len
-        .ok_or(PzError::InvalidInput)?;
-    let meta = &block.metadata.demux_meta;
-
-    // Phase 1: batch-encode all GPU-eligible streams in one call.
-    // The batched API uses a ring buffer internally to overlap GPU
-    // compute with readback across streams.
-    let min_bytes = options.rans_interleaved_min_bytes;
-    let mut gpu_inputs: Vec<&[u8]> = Vec::new();
-    let mut gpu_indices: Vec<usize> = Vec::new();
-    for (i, stream) in streams.iter().enumerate() {
-        if stream.len() >= min_bytes {
-            gpu_inputs.push(stream);
-            gpu_indices.push(i);
-        }
-    }
-
-    let batch_results = if !gpu_inputs.is_empty() {
-        engine.rans_encode_chunked_payload_gpu_batched(
-            &gpu_inputs,
-            options.rans_interleaved_states,
-            rans::DEFAULT_SCALE_BITS,
-            256,
-        )?
-    } else {
-        Vec::new()
-    };
-
-    // Index batch results by original stream position.
-    let mut gpu_results: Vec<Option<Vec<u8>>> = vec![None; streams.len()];
-    for ((data, _used_chunked), &stream_idx) in batch_results.into_iter().zip(&gpu_indices) {
-        gpu_results[stream_idx] = Some(data);
-    }
-
-    // Phase 2: assemble the multi-stream container.
-    let mut output = Vec::new();
-    output.push(streams.len() as u8);
-    output.extend_from_slice(&(pre_entropy_len as u32).to_le_bytes());
-    output.extend_from_slice(&(meta.len() as u16).to_le_bytes());
-    output.extend_from_slice(meta);
-
-    for (i, stream) in streams.iter().enumerate() {
-        // GPU path: always interleaved (engine uses encode_interleaved_n
-        // even when chunked encoding is not possible).
-        // CPU path: basic rANS for small streams.
-        let (rans_data, is_interleaved) = if let Some(data) = gpu_results[i].take() {
-            (data, true)
-        } else {
-            (rans::encode(stream), false)
-        };
-
-        if rans_data.len() >= (1usize << 31) {
-            return Err(PzError::InvalidInput);
-        }
-
-        let flagged_len = if is_interleaved {
-            (rans_data.len() as u32) | RANS_INTERLEAVED_FLAG
-        } else {
-            rans_data.len() as u32
-        };
-        output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
-        output.extend_from_slice(&flagged_len.to_le_bytes());
-        output.extend_from_slice(&rans_data);
-    }
-
-    block.data = output;
-    Ok(block)
-}
-
 // ---------------------------------------------------------------------------
 // Entropy stage functions — FSE (multi-stream, LZ-based pipelines)
 // ---------------------------------------------------------------------------
@@ -908,17 +823,11 @@ pub(crate) fn run_compress_stage(
         (Pipeline::LzssR, 0) => stage_demux_compress(block, &LzDemuxer::Lzss, options),
         (Pipeline::LzssR, 1) => stage_rans_encode_with_options(block, options),
         (Pipeline::LzSeqR, 0) => stage_demux_compress(block, &LzDemuxer::LzSeq, options),
-        (Pipeline::LzSeqR, 1) => {
-            #[cfg(feature = "webgpu")]
-            {
-                if let super::Backend::WebGpu = options.backend {
-                    if let Some(ref engine) = options.webgpu_engine {
-                        return stage_rans_encode_webgpu(block, engine, options);
-                    }
-                }
-            }
-            stage_rans_encode_with_options(block, options)
-        }
+        // GPU rANS encode (stage_rans_encode_webgpu) uses chunked-payload format
+        // which is incompatible with the standard decode_interleaved decoder.
+        // Use CPU rANS encode to match the entropy_encode path in blocks.rs.
+        // TODO: fix GPU rANS encode wire format compatibility, then re-enable.
+        (Pipeline::LzSeqR, 1) => stage_rans_encode_with_options(block, options),
         (Pipeline::LzSeqH, 0) => stage_demux_compress(block, &LzDemuxer::LzSeq, options),
         (Pipeline::LzSeqH, 1) => stage_huffman_encode(block),
         (Pipeline::SortLz, 0) => stage_sortlz_compress(block),
