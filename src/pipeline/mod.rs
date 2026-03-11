@@ -41,7 +41,11 @@ use crate::bwt;
 use crate::lz77;
 use crate::{PzError, PzResult};
 
+#[cfg(feature = "webgpu")]
+pub(crate) use blocks::compress_block_from_demux;
 pub(crate) use blocks::{compress_block, decompress_block};
+#[cfg(feature = "webgpu")]
+pub(crate) use demux::demux_lz77_matches;
 use parallel::{compress_parallel, decompress_parallel};
 pub use telemetry::UnifiedSchedulerStats;
 
@@ -362,6 +366,19 @@ impl TryFrom<u8> for Pipeline {
             // 11 was Parlz — removed
             _ => Err(PzError::Unsupported),
         }
+    }
+}
+
+impl Pipeline {
+    /// Whether this pipeline uses LZ-demux (match-finding + stream demux).
+    ///
+    /// Only these pipelines benefit from the GPU coordinator's batched
+    /// LZ77 match-finding path. BWT and SortLz pipelines do not.
+    pub(crate) fn uses_lz_demux(self) -> bool {
+        matches!(
+            self,
+            Self::Lzf | Self::Lzfi | Self::LzssR | Self::LzSeqR | Self::LzSeqH
+        )
     }
 }
 

@@ -52,6 +52,35 @@ pub(crate) fn compress_block(
     }
 }
 
+/// Compress a single block from pre-computed demux output (entropy-encode only).
+///
+/// Used by the GPU streaming coordinator: GPU match-finding produces matches,
+/// CPU `demux_lz77_matches` converts to streams + meta, and this function
+/// runs only the entropy stage. Skips match-finding entirely.
+#[cfg(feature = "webgpu")]
+pub(crate) fn compress_block_from_demux(
+    pipeline: Pipeline,
+    original_len: usize,
+    streams: Vec<Vec<u8>>,
+    pre_entropy_len: usize,
+    demux_meta: Vec<u8>,
+    options: &CompressOptions,
+) -> PzResult<Vec<u8>> {
+    let block = StageBlock {
+        block_index: 0,
+        original_len,
+        data: Vec::new(),
+        streams: Some(streams),
+        metadata: StageMetadata {
+            pre_entropy_len: Some(pre_entropy_len),
+            demux_meta,
+            ..StageMetadata::default()
+        },
+    };
+    let block = entropy_encode(block, pipeline, original_len, options)?;
+    Ok(block.data)
+}
+
 /// Decompress a single block using the appropriate pipeline (no container header).
 pub(crate) fn decompress_block(
     payload: &[u8],
