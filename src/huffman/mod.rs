@@ -442,9 +442,22 @@ impl HuffmanTree {
                 }
             }
 
-            // Slow path: tree walk for codes > DECODE_TABLE_BITS,
-            // when accumulator is nearly empty, or no decode table
-            return self.decode_tree_walk(input, total_bits, bits_consumed, output);
+            // Slow path for codes > DECODE_TABLE_BITS or no decode table.
+            // Use lookup-based search (safe after canonicalize), with tree walk
+            // as final fallback for non-canonical trees.
+            match self.decode_long_code_from_accumulator(accumulator, bits_avail) {
+                Some((sym, len)) => {
+                    output.push(sym);
+                    accumulator <<= len as u32;
+                    bits_avail -= len as u32;
+                    bits_consumed += len as usize;
+                    continue;
+                }
+                None => {
+                    // Fall back to tree walk for non-canonical trees.
+                    return self.decode_tree_walk(input, total_bits, bits_consumed, output);
+                }
+            }
         }
 
         Ok(output)
@@ -498,16 +511,33 @@ impl HuffmanTree {
                 }
             }
 
-            // Slow path: tree walk for remaining symbols or no decode table
-            let remaining = self.decode_tree_walk(input, total_bits, bits_consumed, Vec::new())?;
-            for &sym in &remaining {
-                if out_pos >= output.len() {
-                    return Err(PzError::BufferTooSmall);
+            // Slow path for codes > DECODE_TABLE_BITS or no decode table.
+            match self.decode_long_code_from_accumulator(accumulator, bits_avail) {
+                Some((sym, len)) => {
+                    if out_pos >= output.len() {
+                        return Err(PzError::BufferTooSmall);
+                    }
+                    output[out_pos] = sym;
+                    out_pos += 1;
+                    accumulator <<= len as u32;
+                    bits_avail -= len as u32;
+                    bits_consumed += len as usize;
+                    continue;
                 }
-                output[out_pos] = sym;
-                out_pos += 1;
+                None => {
+                    // Fall back to tree walk for non-canonical trees.
+                    let remaining =
+                        self.decode_tree_walk(input, total_bits, bits_consumed, Vec::new())?;
+                    for &s in &remaining {
+                        if out_pos >= output.len() {
+                            return Err(PzError::BufferTooSmall);
+                        }
+                        output[out_pos] = s;
+                        out_pos += 1;
+                    }
+                    return Ok(out_pos);
+                }
             }
-            return Ok(out_pos);
         }
 
         Ok(out_pos)
@@ -733,13 +763,27 @@ impl HuffmanTree {
 
                 let (sym, len) = self.decode_table[peek];
                 if len == 0 {
-                    // Shouldn't happen with valid data; fall back to tree walk.
-                    return self.decode_segment_tree_walk(
-                        encoded,
-                        bit_pos,
-                        num_symbols - out_pos,
-                        &mut output[out_pos..],
-                    );
+                    // Code is longer than DECODE_TABLE_BITS (12).
+                    // Fall back to lookup-table search for codes 13-15 bits.
+                    // This avoids tree walk, which is broken after canonicalize()
+                    // (tree topology doesn't match canonical codewords).
+                    match self.decode_long_code(encoded, bit_pos) {
+                        Some((long_sym, long_len)) => {
+                            output[out_pos] = long_sym;
+                            out_pos += 1;
+                            bit_pos += long_len as usize;
+                        }
+                        None => {
+                            #[cfg(test)]
+                            eprintln!(
+                                "decode_long_code failed: bit_pos={bit_pos}, out_pos={out_pos}/{num_symbols}, \
+                                 encoded_len={}, peek_idx={peek:#05x}",
+                                encoded.len(),
+                            );
+                            return Err(PzError::InvalidInput);
+                        }
+                    }
+                    continue;
                 }
 
                 output[out_pos] = sym;
@@ -749,11 +793,17 @@ impl HuffmanTree {
             return Ok(());
         }
 
-        // No decode table — fall back to tree walk.
-        self.decode_segment_tree_walk(encoded, bit_pos, num_symbols, output)
+        // No decode table — fall back to lookup-table search.
+        self.decode_segment_lookup(encoded, bit_pos, num_symbols, output)
     }
 
     /// Tree-walk fallback for segment decode.
+    ///
+    /// WARNING: This method walks the tree node topology, which is NOT updated
+    /// by `canonicalize()`. Only use with non-canonical trees (i.e. trees that
+    /// haven't had `canonicalize()` called). For canonical trees, use the LUT
+    /// fast path + `decode_long_code()` fallback instead.
+    #[allow(dead_code)]
     fn decode_segment_tree_walk(
         &self,
         encoded: &[u8],
@@ -790,6 +840,98 @@ impl HuffmanTree {
                     } else {
                         node_idx = child_idx;
                     }
+                }
+                None => return Err(PzError::InvalidInput),
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode a single symbol with code length > DECODE_TABLE_BITS using
+    /// brute-force lookup table search.
+    ///
+    /// This handles the rare case of codes 13-15 bits that don't fit in the
+    /// 12-bit LUT. After `canonicalize()`, the tree topology is stale, so we
+    /// cannot use tree walk — instead we read up to MAX_CODE_BITS bits and
+    /// match against the codeword lookup table.
+    ///
+    /// Returns `Some((symbol, code_bits))` on match, `None` on invalid data.
+    fn decode_long_code(&self, encoded: &[u8], bit_pos: usize) -> Option<(u8, u8)> {
+        // Read up to MAX_CODE_BITS (15) bits from the bitstream.
+        let byte_idx = bit_pos / 8;
+        let bit_in_byte = bit_pos % 8;
+
+        // Load enough bytes: we need up to 15 + 7 = 22 bits from byte_idx,
+        // so 3 bytes is sufficient (24 bits).
+        let b0 = encoded.get(byte_idx).copied().unwrap_or(0) as u32;
+        let b1 = encoded.get(byte_idx + 1).copied().unwrap_or(0) as u32;
+        let b2 = encoded.get(byte_idx + 2).copied().unwrap_or(0) as u32;
+        let window = (b0 << 16) | (b1 << 8) | b2;
+
+        // Try codes from shortest to longest (greedy prefix property).
+        // When called from the LUT fast path, only codes > DECODE_TABLE_BITS
+        // will match. When called without a LUT, all codes may match.
+        for code_bits in 1..=MAX_CODE_BITS as u8 {
+            let shift = 24 - code_bits as usize - bit_in_byte;
+            let mask = (1u32 << code_bits) - 1;
+            let bits = (window >> shift) & mask;
+
+            for sym in 0..256u16 {
+                let (cw, cb) = self.lookup[sym as usize];
+                if cb == code_bits && cw == bits {
+                    return Some((sym as u8, code_bits));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Decode a single symbol from a 64-bit MSB-first accumulator.
+    ///
+    /// Same as `decode_long_code` but works with the accumulator used by
+    /// `decode()` and `decode_to_buf()` instead of a byte slice.
+    ///
+    /// Returns `Some((symbol, code_bits))` on match, `None` on invalid data.
+    fn decode_long_code_from_accumulator(
+        &self,
+        accumulator: u64,
+        bits_avail: u32,
+    ) -> Option<(u8, u8)> {
+        for code_bits in 1..=MAX_CODE_BITS as u8 {
+            if (code_bits as u32) > bits_avail {
+                break;
+            }
+            // Extract the top code_bits bits from the accumulator.
+            let bits = (accumulator >> (64 - code_bits as u32)) as u32;
+
+            for sym in 0..256u16 {
+                let (cw, cb) = self.lookup[sym as usize];
+                if cb == code_bits && cw == bits {
+                    return Some((sym as u8, code_bits));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Decode a segment using only the lookup table (no tree walk).
+    ///
+    /// Uses the 12-bit LUT for short codes and brute-force lookup search
+    /// for codes > 12 bits. Safe to use with canonical trees.
+    fn decode_segment_lookup(
+        &self,
+        encoded: &[u8],
+        mut bit_pos: usize,
+        num_symbols: usize,
+        output: &mut [u8],
+    ) -> PzResult<()> {
+        for out in output.iter_mut().take(num_symbols) {
+            match self.decode_long_code(encoded, bit_pos) {
+                Some((sym, len)) => {
+                    *out = sym;
+                    bit_pos += len as usize;
                 }
                 None => return Err(PzError::InvalidInput),
             }
@@ -881,27 +1023,32 @@ impl HuffmanTree {
     /// standard canonical Huffman algorithm. This is required for the
     /// GpuLz codec where the decoder rebuilds the tree from lengths.
     pub fn canonicalize(&mut self) {
-        let lengths = self.code_lengths();
+        let mut lengths = self.code_lengths();
+
+        // Limit code lengths to MAX_CODE_BITS (15), same as DEFLATE.
+        // If any codes exceed this, redistribute using the standard
+        // overflow fixup algorithm.
+        Self::limit_code_lengths(&mut lengths, MAX_CODE_BITS as u8);
 
         // Count codes per length.
-        let mut bl_count = [0u32; 16];
+        let mut bl_count = [0u32; MAX_CODE_BITS + 1];
         for &len in &lengths {
-            if len > 0 && (len as usize) < bl_count.len() {
+            if len > 0 {
                 bl_count[len as usize] += 1;
             }
         }
 
         // Compute first code for each length (RFC 1951 algorithm).
-        let mut next_code = [0u32; 16];
+        let mut next_code = [0u32; MAX_CODE_BITS + 1];
         let mut code = 0u32;
-        for bits in 1..16 {
+        for bits in 1..=MAX_CODE_BITS {
             code = (code + bl_count[bits - 1]) << 1;
             next_code[bits] = code;
         }
 
         // Assign canonical codes to symbols in order.
         for (sym, &len) in lengths.iter().enumerate() {
-            if len > 0 && (len as usize) < next_code.len() {
+            if len > 0 {
                 self.lookup[sym] = (next_code[len as usize], len);
                 next_code[len as usize] += 1;
                 // Update the node too.
@@ -914,6 +1061,83 @@ impl HuffmanTree {
 
         // Rebuild decode table with new codes.
         self.decode_table = Self::build_decode_table(&self.lookup);
+    }
+
+    /// Limit all code lengths to `max_bits`, redistributing overflow
+    /// using the DEFLATE-style fixup algorithm.
+    ///
+    /// When a Huffman tree has codes longer than `max_bits` (e.g. 16+ bits
+    /// for a degenerate frequency distribution), this shortens them to
+    /// `max_bits` and compensates by lengthening shorter codes to maintain
+    /// a valid prefix-free code (Kraft inequality).
+    fn limit_code_lengths(lengths: &mut [u8; 256], max_bits: u8) {
+        // Count codes per length (up to 32 to handle deep trees).
+        let mut bl_count = [0u32; 33];
+        for &l in lengths.iter() {
+            if l > 0 {
+                bl_count[l as usize] += 1;
+            }
+        }
+
+        // Calculate overflow: each code at length L > max_bits that we cap
+        // to max_bits increases the Kraft sum by (1 - 2^(max_bits - L)).
+        // Since L > max_bits, 2^(max_bits - L) < 1, so overflow ≈ 1 per symbol.
+        // We track overflow in units of 2^(-max_bits).
+        let mut overflow = 0u32;
+        for bits in (max_bits as usize + 1)..33 {
+            // Each symbol here, when capped to max_bits, adds
+            // (2^0 - 2^(max_bits - bits)) ≈ 1 to the Kraft sum at max_bits scale.
+            // Since bits > max_bits, 2^(max_bits - bits) < 1 → rounds to 0.
+            overflow += bl_count[bits];
+            bl_count[max_bits as usize] += bl_count[bits];
+            bl_count[bits] = 0;
+        }
+
+        if overflow == 0 {
+            return; // No codes exceeded max_bits.
+        }
+
+        // Fix overflow by promoting codes from (max_bits-1) downward.
+        // Moving one code from length L to L+1 frees 2^(max_bits - L - 1)
+        // Kraft slots at the max_bits level.
+        let mut bits = max_bits as usize - 1;
+        while overflow > 0 && bits >= 1 {
+            while bl_count[bits] > 0 && overflow > 0 {
+                // Move one code from `bits` to `bits + 1`.
+                bl_count[bits] -= 1;
+                bl_count[bits + 1] += 1;
+
+                // How many overflow symbols does this fix?
+                // Moving from L to L+1 frees 2^(max - L - 1) slots.
+                let freed = 1u32 << (max_bits as usize - bits - 1);
+                overflow = overflow.saturating_sub(freed);
+            }
+            bits -= 1;
+        }
+
+        // Reconstruct lengths array from bl_count.
+        // Assign lengths to symbols preserving original ordering:
+        // symbols originally with shorter codes keep shorter codes.
+        // Build a mapping: for each target length, assign to symbols
+        // sorted by their original length (ascending).
+        let mut sym_by_len: Vec<(u8, usize)> = lengths
+            .iter()
+            .enumerate()
+            .filter(|(_, &l)| l > 0)
+            .map(|(sym, &l)| (l, sym))
+            .collect();
+        sym_by_len.sort();
+
+        // Assign new lengths from bl_count, shortest first.
+        let mut idx = 0;
+        for new_len in 1..=max_bits {
+            for _ in 0..bl_count[new_len as usize] {
+                if idx < sym_by_len.len() {
+                    lengths[sym_by_len[idx].1] = new_len;
+                    idx += 1;
+                }
+            }
+        }
     }
 }
 

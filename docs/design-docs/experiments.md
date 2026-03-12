@@ -2,9 +2,34 @@
 
 Documentation of optimization attempts, successful iterations, and abandoned approaches.
 
-**Last updated:** 2026-02-22
+**Last updated:** 2026-03-12
 
 ## Successful Experiments
+
+### 0. GpuLz Sync-Point Parallel Huffman Codec
+
+**Period:** March 2026
+**Commits:** `220b055`, `c05b534`
+**Full writeup:** [`gpulz-experiment-findings.md`](gpulz-experiment-findings.md)
+
+**What was tried:**
+- Designed LZ codec with sync-point Huffman encoding for GPU-parallel decode
+- WGSL kernel: one thread per segment, 12-bit LUT decode, MSB-first bitstream
+- Batched multi-stream dispatch for 6 LzSeq streams
+- Multi-block batched GPU decompress with parallel CPU LzSeq
+
+**Key results:**
+- GPU Huffman kernel: 751 MiB/s (4.6x over CPU monolithic) — kernel is fast
+- But wgpu buffer overhead dominates at scale: 960 buffer allocs = ~10ms overhead
+- CPU parallel (thread-per-block): **1.7 GiB/s** at 32x128KB — clear winner
+- Sync-point overhead: only +1.3% at interval=1024
+
+**Conclusions:**
+- Sync-point parallel Huffman is validated — excellent for CPU-parallel decompress
+- GPU decode viable only with merged buffers (5 instead of 5xN) or native d3d12
+- CPU-parallel is the target architecture for pipeline integration
+
+
 
 ### 1. Cooperative-Stitch Kernel Strategy
 
