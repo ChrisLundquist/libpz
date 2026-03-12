@@ -54,9 +54,6 @@ pub(super) struct LocalSchedulerStats {
     stage_compute_ns: AtomicU64,
     queue_wait_ns: AtomicU64,
     queue_admin_ns: AtomicU64,
-    gpu_handoff_ns: AtomicU64,
-    gpu_try_send_full_count: AtomicU64,
-    gpu_try_send_disconnected_count: AtomicU64,
 }
 
 impl LocalSchedulerStats {
@@ -73,23 +70,6 @@ impl LocalSchedulerStats {
     pub(super) fn add_queue_admin(&self, d: Duration) {
         self.queue_admin_ns
             .fetch_add(duration_to_ns(d), Ordering::Relaxed);
-    }
-
-    #[cfg(feature = "webgpu")]
-    pub(super) fn add_gpu_handoff(&self, d: Duration) {
-        self.gpu_handoff_ns
-            .fetch_add(duration_to_ns(d), Ordering::Relaxed);
-    }
-
-    #[cfg(feature = "webgpu")]
-    pub(super) fn inc_gpu_try_send_full(&self) {
-        self.gpu_try_send_full_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[cfg(feature = "webgpu")]
-    pub(super) fn inc_gpu_try_send_disconnected(&self) {
-        self.gpu_try_send_disconnected_count
-            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -136,18 +116,9 @@ impl Drop for SchedulerRunRecorder {
         guard.queue_admin_ns = guard
             .queue_admin_ns
             .saturating_add(local.queue_admin_ns.load(Ordering::Relaxed));
-        guard.gpu_handoff_ns = guard
-            .gpu_handoff_ns
-            .saturating_add(local.gpu_handoff_ns.load(Ordering::Relaxed));
-        guard.gpu_try_send_full_count = guard
-            .gpu_try_send_full_count
-            .saturating_add(local.gpu_try_send_full_count.load(Ordering::Relaxed));
-        guard.gpu_try_send_disconnected_count =
-            guard.gpu_try_send_disconnected_count.saturating_add(
-                local
-                    .gpu_try_send_disconnected_count
-                    .load(Ordering::Relaxed),
-            );
+        // GPU telemetry fields (gpu_handoff_ns, gpu_try_send_*) are retained
+        // in UnifiedSchedulerStats for API stability but always 0: the parallel
+        // scheduler is CPU-only; GPU work uses the streaming path.
     }
 }
 

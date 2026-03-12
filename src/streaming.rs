@@ -231,8 +231,9 @@ fn compress_stream_parallel<R: Read + Send, W: Write>(
     };
 
     // Adaptive backpressure: workers check this before try_send to GPU.
-    // Score ramps up on Full (+2), down on Ok (-1). When score >= limit,
-    // workers skip GPU entirely. Same mechanism as parallel.rs.
+    // Score ramps up on Full (+2), down on Ok (-1) per worker send, and
+    // the coordinator decrements by batch_len after completing work.
+    // When score >= limit, workers skip GPU entirely.
     #[cfg(feature = "webgpu")]
     let gpu_pressure = if has_gpu {
         Some(Arc::new(std::sync::atomic::AtomicUsize::new(0)))
@@ -253,6 +254,7 @@ fn compress_stream_parallel<R: Read + Send, W: Write>(
             let gpu_output_tx = output_tx.clone();
             let opts = options.clone();
             let pl = pipeline;
+            let coordinator_pressure = gpu_pressure.clone();
             Some(scope.spawn(move || -> StreamResult<()> {
                 let engine = opts.webgpu_engine.as_ref().unwrap();
 
@@ -265,6 +267,8 @@ fn compress_stream_parallel<R: Read + Send, W: Write>(
                         batch_indices.push(idx);
                         batch_blocks.push(data);
                     }
+
+                    let batch_len = batch_blocks.len();
 
                     // Run GPU match-finding on the batch.
                     let block_refs: Vec<&[u8]> =
@@ -309,6 +313,17 @@ fn compress_stream_parallel<R: Read + Send, W: Write>(
                                 }
                             }
                         }
+                    }
+
+                    // Signal capacity: decrement pressure so workers resume
+                    // sending to GPU. Without this, pressure is a one-way ratchet
+                    // that permanently locks out GPU after initial Full events.
+                    if let Some(ref p) = coordinator_pressure {
+                        let _ = p.fetch_update(
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                            |v| Some(v.saturating_sub(batch_len)),
+                        );
                     }
                 }
                 Ok(())

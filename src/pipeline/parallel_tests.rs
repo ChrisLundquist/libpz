@@ -60,67 +60,8 @@ fn test_stage1_routing_respects_size_threshold() {
     assert_eq!(decompressed, input, "round-trip should match");
 }
 
-#[cfg(feature = "webgpu")]
-#[test]
-fn test_stage1_auto_backpressure_biases_to_cpu() {
-    use super::super::BackendAssignment;
-    use super::super::GPU_ENTROPY_THRESHOLD;
-
-    let block_len = GPU_ENTROPY_THRESHOLD * 2;
-    let limit = 8usize;
-
-    assert!(
-        should_route_block_to_gpu_entropy_with_backpressure(
-            block_len,
-            BackendAssignment::Auto,
-            true,
-            0,
-            limit,
-        ),
-        "auto should route to GPU when pressure is low"
-    );
-    assert!(
-        !should_route_block_to_gpu_entropy_with_backpressure(
-            block_len,
-            BackendAssignment::Auto,
-            true,
-            limit,
-            limit,
-        ),
-        "auto should bias to CPU when pressure reaches limit"
-    );
-}
-
-#[cfg(feature = "webgpu")]
-#[test]
-fn test_stage1_backpressure_does_not_override_explicit_backend() {
-    use super::super::BackendAssignment;
-    use super::super::GPU_ENTROPY_THRESHOLD;
-
-    let block_len = GPU_ENTROPY_THRESHOLD * 2;
-    let high_pressure = 1_000usize;
-
-    assert!(
-        should_route_block_to_gpu_entropy_with_backpressure(
-            block_len,
-            BackendAssignment::Gpu,
-            true,
-            high_pressure,
-            1,
-        ),
-        "explicit GPU assignment should remain GPU regardless of pressure"
-    );
-    assert!(
-        !should_route_block_to_gpu_entropy_with_backpressure(
-            block_len,
-            BackendAssignment::Cpu,
-            true,
-            0,
-            1,
-        ),
-        "explicit CPU assignment should remain CPU regardless of pressure"
-    );
-}
+// GPU backpressure unit tests removed — parallel path is now CPU-only.
+// GPU routing with backpressure is handled by the streaming path.
 
 // --- Task 3 tests: Round-trip correctness and threshold boundary ---
 

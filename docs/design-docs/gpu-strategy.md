@@ -72,29 +72,37 @@ The GPU rANS performance gate (Slice 4 in PLAN-p0a) remains FAIL. Recommendation
 
 GPU Huffman encode (`huffman_encode.wgsl`) and FSE encode/decode (`fse_encode.wgsl`, `fse_decode.wgsl`) exist in production. These have the same serial-per-stream limitation as rANS but are used for specific pipelines (Deflate uses Huffman, Lzf uses FSE). Their per-stream performance has not been systematically compared to CPU in the same way as rANS.
 
-## Current architecture: unified scheduler
+## Current architecture: dual-path GPU support
 
-All GPU work routes through `compress_parallel_unified()` in `src/pipeline/parallel.rs` (PR #101). The architecture:
+GPU-accelerated compression uses the **streaming path** (`compress_stream` in `streaming.rs`), not the parallel scheduler. The parallel scheduler (`compress_parallel` in `parallel.rs`) is CPU-only by design — its GPU coordinator was removed after proving it bottlenecked at 28 MiB/s due to serializing entropy encoding on a single thread.
+
+When `compress_with_options` is called with `Backend::WebGpu`, it routes through `compress_stream` internally (producing framed-format output, which `decompress` handles natively).
+
+### Streaming GPU coordinator
+
+For LZ-demux pipelines (Lzf, LzSeqR, etc.), `compress_stream_parallel` spawns a GPU coordinator thread:
 
 ```
-CPU workers: pick up tasks from shared VecDeque<UnifiedTask>
-  ├─ Stage(stage_idx, block_idx)     → run on CPU
-  ├─ StageGpu(stage_idx, block_idx)  → send to GPU coordinator via bounded channel
-  └─ FusedGpu(start, end, block_idx) → send to GPU coordinator
+Workers: read blocks → if GPU available and pressure < limit,
+                        try_send to GPU coordinator via bounded channel
+                      → else, compress on CPU
 
 GPU coordinator thread:
-  ├─ Batch-collects Stage 0 requests → find_matches_batched() (ring-buffered)
-  ├─ Processes Stage N requests → run_compress_stage() individually
-  └─ Processes Fused requests → runs stages start..=end sequentially
+  1. Block on gpu_rx.recv() for first request
+  2. Drain additional requests via gpu_rx.try_recv()
+  3. Batch blocks → engine.find_matches_batched()
+  4. Demux matches → compress_block_from_demux() (CPU entropy)
+  5. Send results to output_tx for ordered writing
+  6. Decrement backpressure by batch_len (enables worker → GPU flow)
 ```
 
-**Deadlock prevention**: Workers use `try_send()` on the bounded channel. If the channel is full, the block falls back to CPU processing.
+**Adaptive backpressure**: An `AtomicUsize` pressure score gates worker → GPU routing. Workers increment on `try_send` Full (+2), decrement on Ok (-1). The coordinator decrements by `batch_len` after completing each batch, preventing the one-way ratchet that would permanently lock out GPU.
 
-**GPU failure recovery**: If any GPU operation fails, the block is re-enqueued as `Stage(0, block_idx)` for CPU retry.
+**GPU failure recovery**: If `find_matches_batched` fails, all blocks in the batch fall back to CPU via `compress_block`.
 
-### The FusedGpu path problem
+### GPU entropy is not used
 
-`gpu_fused_span()` currently returns `Some((0, 1))` for Lzr and LzSeqR, routing both stages to GPU. But since GPU entropy is 0.77x CPU encode, this actually makes those pipelines *slower* than the decomposed path (GPU LZ77 + CPU entropy). The fused path is architectural preparation for the case where GPU entropy becomes competitive — it is not a performance win today.
+GPU entropy (rANS/FSE) is 0.54-0.77x CPU throughput due to serial state dependencies. All entropy encoding runs on CPU — the GPU is only used for LZ77 match-finding.
 
 ## What would need to change for GPU to win
 

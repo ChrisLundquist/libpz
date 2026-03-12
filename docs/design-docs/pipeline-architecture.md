@@ -189,35 +189,30 @@ Synchronization: Join all threads before writing container
 
 **When used:** Default for >256KB inputs with multiple CPU cores
 
-### 2. Unified GPU Coordinator
+### 2. GPU Coordinator (Streaming Path)
 
-**File:** `src/pipeline/parallel.rs` - `compress_parallel_unified()`
+**File:** `src/streaming.rs` - `compress_stream_parallel()`
 
-A single GPU coordinator thread handles all GPU work. CPU workers send GPU requests via a bounded `SyncSender`; the coordinator batch-collects and dispatches:
+The parallel scheduler (`compress_parallel` in `parallel.rs`) is **CPU-only**. GPU-accelerated compression uses the streaming path, which spawns a dedicated GPU coordinator thread for LZ-demux pipelines:
 
 ```
-CPU workers: split input → enqueue StageGpu(0, block_idx)
-                          or FusedGpu(0, 1, block_idx)
+Workers: read blocks → try_send to GPU coordinator (bounded channel)
+                     → CPU fallback on Full or when pressure >= limit
 
 GPU coordinator:
-  1. Block on rx.recv() for first request
-  2. Drain up to ring_depth more Stage0 requests via try_recv()
-  3. Batch Stage0 blocks → find_matches_batched() (ring-buffered overlap)
-  4. Demux results → push Stage(1, block_idx) to unified queue
-  5. Process StageN requests via run_compress_stage()
-  6. Process Fused requests: run stages start..=end sequentially on GPU
+  1. Block on gpu_rx.recv() for first request
+  2. Drain additional requests via gpu_rx.try_recv()
+  3. Batch blocks → engine.find_matches_batched()
+  4. Demux matches → compress_block_from_demux() (CPU entropy)
+  5. Send compressed results to output_tx for ordered writing
+  6. Decrement backpressure by batch_len
 ```
 
-**Task variants:** `UnifiedTask` enum routes work:
-- `Stage(stage_idx, block_idx)` — CPU worker picks up
-- `StageGpu(stage_idx, block_idx)` — GPU coordinator handles
-- `FusedGpu(start, end, block_idx)` — GPU runs multiple stages without queue round-trips
+**Adaptive backpressure:** AtomicUsize pressure score ramps up on Full (+2), down on Ok (-1) per worker, and coordinator decrements by batch_len on completion. Prevents one-way ratchet lockout.
 
-**Deadlock prevention:** Workers use `try_send()` with CPU fallback when the bounded GPU channel is full
+**GPU-to-CPU fallback:** If `find_matches_batched` fails, all batch blocks fall back to CPU via `compress_block`.
 
-**GPU-to-CPU fallback:** If GPU operations fail, blocks are re-enqueued as `Stage(0, block_idx)` for CPU retry
-
-**When used:** GPU available AND input ≥ 256KB
+**When used:** `compress_stream` with `Backend::WebGpu` + LZ-demux pipeline. Also used internally by `compress_with_options` when `Backend::WebGpu` is requested (routes through `compress_stream` with in-memory I/O).
 
 ## Auto-Selection Strategy
 

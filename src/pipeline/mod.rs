@@ -417,11 +417,16 @@ pub fn compress(input: &[u8], pipeline: Pipeline) -> PzResult<Vec<u8>> {
 /// When `threads` is 1 or the input fits in a single block, a single block
 /// is compressed without thread overhead.
 ///
-/// The output always uses the multi-block container format (V2) with a
-/// block table, even for single-block streams.
+/// Output format depends on the path taken:
+/// - **CPU parallel**: table-mode V2 container (block table + block data)
+/// - **GPU parallel**: framed V2 container (self-framing blocks, routed
+///   through the streaming path's GPU coordinator)
+///
+/// Both formats are readable by [`decompress`] and [`decompress_with_options`].
 ///
 /// When `options.backend` is `Backend::WebGpu` and an engine is provided,
-/// GPU-amenable stages (e.g., LZ77 match finding) run on the GPU.
+/// GPU-amenable stages (e.g., LZ77 match finding) run on the GPU via the
+/// streaming path's coordinator thread with adaptive backpressure.
 /// Other stages and decompression always use the CPU.
 pub fn compress_with_options(
     input: &[u8],
@@ -483,7 +488,26 @@ pub fn compress_with_options(
         return Ok(output);
     }
 
-    // Multi-block parallel: unified scheduler dispatches all stages from a shared work queue.
+    // Multi-block parallel with GPU: route through the streaming path which
+    // has the GPU coordinator thread with adaptive backpressure. The parallel
+    // scheduler is CPU-only by design (see CLAUDE.md). Output uses framed
+    // format, which decompress()/decompress_with_options() handle natively.
+    #[cfg(feature = "webgpu")]
+    if matches!(options.backend, Backend::WebGpu) && options.webgpu_engine.is_some() {
+        let reader = std::io::Cursor::new(input);
+        let mut buf = Vec::new();
+        crate::streaming::compress_stream(reader, &mut buf, pipeline, options).map_err(
+            |e| match e {
+                crate::streaming::StreamError::Pz(pe) => pe,
+                // Unreachable: in-memory Cursor I/O cannot produce IO errors.
+                crate::streaming::StreamError::Io(_) => PzError::InvalidInput,
+            },
+        )?;
+        return Ok(buf);
+    }
+
+    // Multi-block parallel (CPU-only): unified scheduler dispatches all stages
+    // from a shared work queue.
     compress_parallel(input, pipeline, options, num_threads)
 }
 
