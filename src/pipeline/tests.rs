@@ -50,6 +50,7 @@ fn test_all_pipelines_banana() {
         Pipeline::Lzf,
         Pipeline::LzssR,
         Pipeline::Lzfi,
+        Pipeline::LzSeq2R,
     ] {
         let compressed = compress(input, pipeline).unwrap();
         let decompressed = decompress(&compressed).unwrap();
@@ -70,6 +71,7 @@ fn test_all_pipelines_medium_text() {
         Pipeline::Lzf,
         Pipeline::LzssR,
         Pipeline::Lzfi,
+        Pipeline::LzSeq2R,
     ] {
         let compressed = compress(&input, pipeline).unwrap();
         let decompressed = decompress(&compressed).unwrap();
@@ -109,6 +111,7 @@ fn test_multiblock_round_trip_all_pipelines() {
         Pipeline::Lzfi,
         Pipeline::LzSeqR,
         Pipeline::LzSeqH,
+        Pipeline::LzSeq2R,
     ] {
         let compressed = compress_mt(&input, pipeline, 4, 512).unwrap();
         assert_eq!(compressed[2], VERSION, "expected V2 for {:?}", pipeline);

@@ -463,4 +463,69 @@ mod shared_stream_tests {
         assert_eq!(decoded_interleaved, input);
         assert_eq!(decoded_shared, decoded_interleaved);
     }
+
+    // --- Sparse frequency tables ---
+
+    #[test]
+    fn test_sparse_freq_roundtrip() {
+        let mut freq = FrequencyTable::new();
+        freq.count(b"aaabbc");
+        let norm = normalize_frequencies(&freq, 12).unwrap();
+
+        let mut buf = Vec::new();
+        serialize_freq_table_sparse(&norm, &mut buf);
+        // 3 symbols: 1 + 3 + 6 = 10 bytes (vs 512 for dense)
+        assert_eq!(buf.len(), 10);
+
+        let (norm2, consumed) = deserialize_freq_table_sparse(&buf, 12).unwrap();
+        assert_eq!(consumed, 10);
+        assert_eq!(norm, norm2);
+    }
+
+    #[test]
+    fn test_sparse_freq_all_symbols() {
+        // All 256 symbols present
+        let input: Vec<u8> = (0..=255).collect();
+        let mut freq = FrequencyTable::new();
+        freq.count(&input);
+        let norm = normalize_frequencies(&freq, 12).unwrap();
+
+        let mut buf = Vec::new();
+        serialize_freq_table_sparse(&norm, &mut buf);
+        // 256 symbols: 1 + 256 + 512 = 769 bytes (vs 512 for dense, slightly larger)
+        // But this is the rare case; most streams have far fewer symbols.
+        let (norm2, _) = deserialize_freq_table_sparse(&buf, 12).unwrap();
+        assert_eq!(norm, norm2);
+    }
+
+    #[test]
+    fn test_sparse_encode_decode_roundtrip() {
+        let input = b"hello world! this is a test of sparse rANS encoding.";
+        let encoded = encode_sparse(input, DEFAULT_SCALE_BITS);
+        let decoded = decode_sparse(&encoded, input.len()).unwrap();
+        assert_eq!(decoded, input.as_slice());
+    }
+
+    #[test]
+    fn test_sparse_smaller_than_dense() {
+        // With few distinct symbols, sparse should be smaller
+        let input: Vec<u8> = vec![0u8; 500]
+            .into_iter()
+            .chain(vec![1u8; 300])
+            .chain(vec![2u8; 200])
+            .collect();
+        let dense = encode_with_scale(&input, DEFAULT_SCALE_BITS);
+        let sparse = encode_sparse(&input, DEFAULT_SCALE_BITS);
+        assert!(
+            sparse.len() < dense.len(),
+            "sparse {} should be < dense {}",
+            sparse.len(),
+            dense.len()
+        );
+        // Verify both decode correctly
+        let dec_dense = decode(&dense, input.len()).unwrap();
+        let dec_sparse = decode_sparse(&sparse, input.len()).unwrap();
+        assert_eq!(dec_dense, input);
+        assert_eq!(dec_sparse, input);
+    }
 }

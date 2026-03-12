@@ -500,6 +500,22 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
         }
     }
 
+    // Forward refinement: re-evaluate each position with actual repeat state.
+    // The backward DP used greedy repeat estimates; the refinement corrects this.
+    const MAX_REFINEMENT_PASSES: usize = 3;
+    for _ in 0..MAX_REFINEMENT_PASSES {
+        if !refine_parse_with_repeats(
+            input,
+            table,
+            cost_model,
+            &cost,
+            &mut choice_len,
+            &mut choice_offset,
+        ) {
+            break;
+        }
+    }
+
     // Forward trace: recover the optimal match sequence
     let mut matches = Vec::new();
     let mut pos = 0;
@@ -527,6 +543,85 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
     }
 
     matches
+}
+
+/// Forward refinement pass: re-evaluate each parse position using actual repeat
+/// offset state instead of the greedy approximation used during backward DP.
+///
+/// Walks the current parse forward, tracking the real `RepeatOffsetState`. At each
+/// position, re-evaluates all K match candidates plus the literal option using the
+/// actual repeat state and the backward DP cost-to-end array. If a different choice
+/// is cheaper, switches it.
+///
+/// Returns `true` if any choice was changed (caller should iterate until stable).
+fn refine_parse_with_repeats(
+    input: &[u8],
+    table: &MatchTable,
+    cost_model: &CostModel,
+    cost: &[u32],
+    choice_len: &mut [u16],
+    choice_offset: &mut [u16],
+) -> bool {
+    let n = input.len();
+    let mut changed = false;
+    let mut repeat_state = RepeatOffsetState::new();
+    let mut pos = 0;
+
+    while pos < n {
+        let old_len = choice_len[pos];
+        let old_offset = choice_offset[pos];
+
+        // Option 1: literal
+        let lit_cost = cost_model
+            .literal_token(input[pos])
+            .saturating_add(cost[pos + 1]);
+        let mut best_cost = lit_cost;
+        let mut best_len = 0u16;
+        let mut best_offset = 0u16;
+
+        // Option 2: each match candidate with actual repeat state
+        for cand in table.at(pos) {
+            if cand.length < MIN_MATCH as u32 {
+                break;
+            }
+            let match_end = pos + cand.length as usize;
+            if match_end >= n {
+                continue;
+            }
+            let next_pos = match_end + 1;
+            let is_repeat = repeat_state.is_repeat(cand.offset);
+            let mcost = cost_model
+                .match_cost_with_repeat_flag(
+                    cand.offset,
+                    cand.length as u16,
+                    input[match_end],
+                    is_repeat,
+                )
+                .saturating_add(cost[next_pos]);
+
+            if mcost < best_cost {
+                best_cost = mcost;
+                best_len = cand.length as u16;
+                best_offset = cand.offset as u16;
+            }
+        }
+
+        if best_len != old_len || best_offset != old_offset {
+            choice_len[pos] = best_len;
+            choice_offset[pos] = best_offset;
+            changed = true;
+        }
+
+        // Advance and update repeat state
+        if best_len > 0 {
+            repeat_state.update(best_offset as u32);
+            pos += best_len as usize + 1;
+        } else {
+            pos += 1;
+        }
+    }
+
+    changed
 }
 
 // ---------------------------------------------------------------------------

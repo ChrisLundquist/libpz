@@ -184,6 +184,10 @@ fn entropy_encode(
             let _ = (input_len, options);
             stage_fse_interleaved_encode(block)
         }
+        Pipeline::LzSeq2R => {
+            let _ = (input_len, options);
+            stage_rans_encode_sparse(block, options)
+        }
         _ => Err(PzError::Unsupported),
     }
 }
@@ -222,6 +226,10 @@ fn entropy_decode(
             }
             let _ = options;
             stage_fse_interleaved_decode(block)
+        }
+        Pipeline::LzSeq2R => {
+            let _ = options;
+            stage_rans_decode_sparse(block)
         }
         _ => Err(PzError::Unsupported),
     }
