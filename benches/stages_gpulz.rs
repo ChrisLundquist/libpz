@@ -415,6 +415,229 @@ fn bench_gpulz_decompress_gpu(c: &mut Criterion) {
     group.finish();
 }
 
+/// Report per-phase GPU decompress timing breakdown (not a throughput benchmark).
+#[cfg(feature = "webgpu")]
+fn bench_gpulz_gpu_timing(c: &mut Criterion) {
+    use pz::webgpu::WebGpuEngine;
+
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => {
+            eprintln!("no WebGPU device, skipping GPU timing breakdown");
+            return;
+        }
+    };
+
+    let mut group = c.benchmark_group("gpulz_gpu_timing");
+    cap(&mut group);
+
+    for &size in &[65536usize, 131072, 4_194_304] {
+        let data = get_test_data(size);
+        let compressed = pz::gpulz::compress_block(&data).unwrap();
+
+        // Warmup + collect timings.
+        let mut timings = Vec::new();
+        for _ in 0..20 {
+            let (_, t) = pz::gpulz::decompress_block_gpu_timed(&engine, &compressed, size).unwrap();
+            timings.push(t);
+        }
+
+        // Report median timings.
+        let n = timings.len();
+        let mut parse: Vec<u64> = timings.iter().map(|t| t.parse_us).collect();
+        let mut gpu: Vec<u64> = timings.iter().map(|t| t.gpu_huffman_us).collect();
+        let mut gpu_buf: Vec<u64> = timings.iter().map(|t| t.gpu_buffers_us).collect();
+        let mut gpu_sub: Vec<u64> = timings.iter().map(|t| t.gpu_submit_us).collect();
+        let mut gpu_rb: Vec<u64> = timings.iter().map(|t| t.gpu_readback_us).collect();
+        let mut lzseq: Vec<u64> = timings.iter().map(|t| t.lzseq_us).collect();
+        let mut total: Vec<u64> = timings.iter().map(|t| t.total_us).collect();
+        parse.sort();
+        gpu.sort();
+        gpu_buf.sort();
+        gpu_sub.sort();
+        gpu_rb.sort();
+        lzseq.sort();
+        total.sort();
+
+        let med = n / 2;
+        eprintln!(
+            "  [{size}B] median: parse={parse}µs  gpu={gpu}µs [buf={buf}µs sub={sub}µs rb={rb}µs]  \
+             lzseq={lzseq}µs  total={total}µs  gpu%={gpu_pct:.0}%  lzseq%={lzseq_pct:.0}%",
+            parse = parse[med],
+            gpu = gpu[med],
+            buf = gpu_buf[med],
+            sub = gpu_sub[med],
+            rb = gpu_rb[med],
+            lzseq = lzseq[med],
+            total = total[med],
+            gpu_pct = gpu[med] as f64 / total[med] as f64 * 100.0,
+            lzseq_pct = lzseq[med] as f64 / total[med] as f64 * 100.0,
+        );
+
+        // Dummy bench so criterion doesn't complain about empty group.
+        let comp = compressed.clone();
+        let eng = engine.clone();
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::new("gpu_timed", size), &data, move |b, _| {
+            b.iter(|| pz::gpulz::decompress_block_gpu(&eng, &comp, size).unwrap());
+        });
+    }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Experiment 5: Multi-block batched GPU decompress
+// ---------------------------------------------------------------------------
+
+/// Multi-block batched GPU decompress with parallel CPU LzSeq.
+///
+/// Simulates the target pipeline architecture: N pipeline blocks' Huffman
+/// decodes batched into a single GPU submission, then LzSeq reconstructed
+/// in parallel on CPU threads.
+#[cfg(feature = "webgpu")]
+fn bench_gpulz_multiblock_gpu(c: &mut Criterion) {
+    use pz::webgpu::WebGpuEngine;
+
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(_) => {
+            eprintln!("no WebGPU device, skipping multi-block GPU benchmarks");
+            return;
+        }
+    };
+
+    let mut group = c.benchmark_group("gpulz_multiblock_gpu");
+    cap(&mut group);
+
+    // Test with fixed block size (128KB) and varying block count.
+    // Use Canterbury corpus block 0 (realistic ~46% ratio), replicated N times.
+    let block_size = 131072usize; // 128KB
+    let block_data = get_test_data(block_size);
+    let reference_compressed = pz::gpulz::compress_block(&block_data).unwrap();
+    let _reference_ratio = reference_compressed.len() as f64 / block_data.len() as f64 * 100.0;
+    pz::gpulz::decompress_block(&reference_compressed, block_size)
+        .expect("reference block round-trip must work");
+
+    for &num_blocks in &[1usize, 4, 8, 16, 32] {
+        let total_size = block_size * num_blocks;
+        let test_data = block_data.repeat(num_blocks);
+
+        // Replicate the same compressed block N times.
+        let compressed_blocks: Vec<Vec<u8>> = (0..num_blocks)
+            .map(|_| reference_compressed.clone())
+            .collect();
+
+        // Report compressed size.
+        let total_compressed: usize = compressed_blocks.iter().map(|b| b.len()).sum();
+        let ratio = total_compressed as f64 / total_size as f64 * 100.0;
+        eprintln!(
+            "  [{}×128KB = {}KB] gpulz ratio: {ratio:.1}%  ({num_blocks} blocks)",
+            num_blocks,
+            total_size / 1024,
+        );
+
+        // CPU single-threaded decompress baseline (serial over all blocks).
+        {
+            let blocks_c = compressed_blocks.clone();
+            group.throughput(Throughput::Bytes(total_size as u64));
+            group.bench_with_input(
+                BenchmarkId::new("cpu_serial", num_blocks),
+                &test_data,
+                move |b, _| {
+                    b.iter(|| {
+                        for bc in &blocks_c {
+                            pz::gpulz::decompress_block(bc, block_size).unwrap();
+                        }
+                    });
+                },
+            );
+        }
+
+        // CPU multi-threaded decompress baseline (parallel over blocks).
+        if num_blocks > 1 {
+            let blocks_c = compressed_blocks.clone();
+            group.throughput(Throughput::Bytes(total_size as u64));
+            group.bench_with_input(
+                BenchmarkId::new("cpu_parallel", num_blocks),
+                &test_data,
+                move |b, _| {
+                    b.iter(|| {
+                        std::thread::scope(|scope| {
+                            let handles: Vec<_> = blocks_c
+                                .iter()
+                                .map(|bc| {
+                                    scope.spawn(|| {
+                                        pz::gpulz::decompress_block(bc, block_size).unwrap()
+                                    })
+                                })
+                                .collect();
+                            handles
+                                .into_iter()
+                                .map(|h| h.join().unwrap())
+                                .collect::<Vec<_>>()
+                        })
+                    });
+                },
+            );
+        }
+
+        // GPU batched Huffman + parallel CPU LzSeq.
+        {
+            let blocks_c = compressed_blocks.clone();
+            let eng = engine.clone();
+            group.throughput(Throughput::Bytes(total_size as u64));
+            group.bench_with_input(
+                BenchmarkId::new("gpu_parallel", num_blocks),
+                &test_data,
+                move |b, _| {
+                    b.iter(|| {
+                        let block_refs: Vec<(&[u8], usize)> = blocks_c
+                            .iter()
+                            .map(|bc| (bc.as_slice(), block_size))
+                            .collect();
+                        pz::gpulz::decompress_blocks_gpu(&eng, &block_refs).unwrap()
+                    });
+                },
+            );
+        }
+
+        // Report timing breakdown for this configuration.
+        {
+            let block_refs: Vec<(&[u8], usize)> = compressed_blocks
+                .iter()
+                .map(|bc| (bc.as_slice(), block_size))
+                .collect();
+            // Warmup.
+            for _ in 0..5 {
+                let _ = pz::gpulz::decompress_blocks_gpu(&engine, &block_refs).unwrap();
+            }
+            let mut timings = Vec::new();
+            for _ in 0..10 {
+                let (_, t) = pz::gpulz::decompress_blocks_gpu(&engine, &block_refs).unwrap();
+                timings.push(t);
+            }
+            let n = timings.len();
+            let mut total: Vec<u64> = timings.iter().map(|t| t.total_us).collect();
+            let mut gpu: Vec<u64> = timings.iter().map(|t| t.gpu_huffman_us).collect();
+            let mut lzseq: Vec<u64> = timings.iter().map(|t| t.lzseq_us).collect();
+            total.sort();
+            gpu.sort();
+            lzseq.sort();
+            let med = n / 2;
+            let throughput = total_size as f64 / total[med] as f64; // bytes/µs = MB/s
+            eprintln!(
+                "    → {num_blocks}×128KB: gpu={gpu}µs  lzseq={lzseq}µs  total={total}µs  = {tp:.0} MiB/s  ({streams} GPU streams)",
+                gpu = gpu[med],
+                lzseq = lzseq[med],
+                total = total[med],
+                tp = throughput / 1.048576,
+                streams = timings[0].num_gpu_streams,
+            );
+        }
+    }
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -476,6 +699,8 @@ criterion_group!(
     bench_gpulz_block,
     bench_huffman_decode_gpu,
     bench_gpulz_decompress_gpu,
+    bench_gpulz_gpu_timing,
+    bench_gpulz_multiblock_gpu,
 );
 
 #[cfg(not(feature = "webgpu"))]

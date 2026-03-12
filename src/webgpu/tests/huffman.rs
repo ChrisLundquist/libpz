@@ -362,3 +362,45 @@ fn test_gpulz_decompress_gpu_roundtrip() {
     assert_eq!(gpu_decoded, input, "GPU decompress mismatch");
     assert_eq!(gpu_decoded, cpu_decoded, "GPU differs from CPU");
 }
+
+#[test]
+fn test_gpulz_multiblock_gpu_roundtrip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Create 4 blocks of different content.
+    let block_size = 4096;
+    let mut blocks_data: Vec<Vec<u8>> = Vec::new();
+    for i in 0..4u8 {
+        let mut data = Vec::new();
+        for _ in 0..100 {
+            data.extend_from_slice(
+                &format!("block {i}: the quick brown fox jumps over the lazy dog. ").into_bytes(),
+            );
+        }
+        data.truncate(block_size);
+        blocks_data.push(data);
+    }
+
+    // Compress each block.
+    let compressed: Vec<Vec<u8>> = blocks_data
+        .iter()
+        .map(|d| crate::gpulz::compress_block(d).unwrap())
+        .collect();
+
+    // Multi-block GPU decompress.
+    let block_refs: Vec<(&[u8], usize)> = compressed
+        .iter()
+        .map(|c| (c.as_slice(), block_size))
+        .collect();
+    let (gpu_results, _timings) =
+        crate::gpulz::decompress_blocks_gpu(&engine, &block_refs).unwrap();
+
+    // Verify each block.
+    for (i, (gpu_out, orig)) in gpu_results.iter().zip(blocks_data.iter()).enumerate() {
+        assert_eq!(gpu_out, orig, "block {i} GPU decompress mismatch");
+    }
+}

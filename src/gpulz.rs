@@ -241,6 +241,26 @@ pub fn decompress_block(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     )
 }
 
+/// Timing breakdown for GPU decompress (returned by `decompress_block_gpu_timed`).
+#[cfg(feature = "webgpu")]
+#[derive(Debug, Clone)]
+pub struct GpuDecompressTimings {
+    /// Parse wire format + build decode LUTs (µs).
+    pub parse_us: u64,
+    /// GPU Huffman decode: buffer creation + dispatch + readback (µs).
+    pub gpu_huffman_us: u64,
+    /// GPU buffer creation (µs) — subset of gpu_huffman_us.
+    pub gpu_buffers_us: u64,
+    /// GPU command record + submit (µs) — subset of gpu_huffman_us.
+    pub gpu_submit_us: u64,
+    /// GPU poll + readback (µs) — subset of gpu_huffman_us.
+    pub gpu_readback_us: u64,
+    /// CPU LzSeq reconstruct (µs).
+    pub lzseq_us: u64,
+    /// Total wall time (µs).
+    pub total_us: u64,
+}
+
 /// Decompress a GpuLz block using GPU-accelerated Huffman decode.
 ///
 /// Parses the same wire format as [`decompress_block()`], but uses the GPU
@@ -252,7 +272,20 @@ pub fn decompress_block_gpu(
     payload: &[u8],
     orig_len: usize,
 ) -> PzResult<Vec<u8>> {
+    decompress_block_gpu_timed(engine, payload, orig_len).map(|(data, _)| data)
+}
+
+/// Same as [`decompress_block_gpu`] but also returns timing breakdown.
+#[cfg(feature = "webgpu")]
+pub fn decompress_block_gpu_timed(
+    engine: &crate::webgpu::WebGpuEngine,
+    payload: &[u8],
+    orig_len: usize,
+) -> PzResult<(Vec<u8>, GpuDecompressTimings)> {
     use crate::webgpu::HuffmanDecodeStream;
+    use std::time::Instant;
+
+    let t_start = Instant::now();
 
     if payload.len() < 3 {
         return Err(PzError::InvalidInput);
@@ -371,6 +404,9 @@ pub fn decompress_block_gpu(
         }));
     }
 
+    let t_parse = Instant::now();
+    let parse_us = t_parse.duration_since(t_start).as_micros() as u64;
+
     // Build batched decode descriptors referencing payload slices.
     let decode_streams: Vec<HuffmanDecodeStream> = stream_infos
         .into_iter()
@@ -391,7 +427,9 @@ pub fn decompress_block_gpu(
         .collect();
 
     // Single batched GPU dispatch for all 6 streams.
-    let streams = engine.huffman_decode_gpu_batched(&decode_streams)?;
+    let (streams, gpu_timings) = engine.huffman_decode_gpu_batched_timed(&decode_streams)?;
+    let t_gpu = Instant::now();
+    let gpu_huffman_us = t_gpu.duration_since(t_parse).as_micros() as u64;
 
     if streams.len() != 6 {
         return Err(PzError::InvalidInput);
@@ -404,7 +442,7 @@ pub fn decompress_block_gpu(
     let num_tokens = u32::from_le_bytes(meta[..4].try_into().unwrap());
     let num_matches = u32::from_le_bytes(meta[4..8].try_into().unwrap());
 
-    crate::lzseq::decode(
+    let result = crate::lzseq::decode(
         &streams[0],
         &streams[1],
         &streams[2],
@@ -414,7 +452,23 @@ pub fn decompress_block_gpu(
         num_tokens,
         num_matches,
         orig_len,
-    )
+    )?;
+    let t_lzseq = Instant::now();
+    let lzseq_us = t_lzseq.duration_since(t_gpu).as_micros() as u64;
+    let total_us = t_lzseq.duration_since(t_start).as_micros() as u64;
+
+    Ok((
+        result,
+        GpuDecompressTimings {
+            parse_us,
+            gpu_huffman_us,
+            gpu_buffers_us: gpu_timings.buffer_create_us,
+            gpu_submit_us: gpu_timings.submit_us,
+            gpu_readback_us: gpu_timings.readback_us,
+            lzseq_us,
+            total_us,
+        },
+    ))
 }
 
 /// Rebuild a HuffmanTree from code lengths for decoding.
@@ -490,6 +544,289 @@ fn rebuild_tree_from_code_lengths(code_lengths: &[u8; 256]) -> PzResult<HuffmanT
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Multi-block GPU decompress with parallel LzSeq
+// ---------------------------------------------------------------------------
+
+/// Parsed block ready for GPU Huffman decode + CPU LzSeq.
+#[cfg(feature = "webgpu")]
+struct ParsedBlock {
+    num_tokens: u32,
+    num_matches: u32,
+    orig_len: usize,
+    /// Per-stream: (orig_len, huff_data_range, sync_points, decode_lut).
+    streams: Vec<ParsedStream>,
+}
+
+#[cfg(feature = "webgpu")]
+struct ParsedStream {
+    orig_len: usize,
+    huff_start: usize,
+    huff_end: usize,
+    sync_points: Vec<SyncPoint>,
+    decode_lut: Box<[u32; 4096]>,
+}
+
+/// Parse a compressed block without decoding — extract all Huffman stream
+/// metadata for batched GPU dispatch.
+#[cfg(feature = "webgpu")]
+fn parse_block(payload: &[u8], orig_len: usize) -> PzResult<ParsedBlock> {
+    if payload.len() < 3 {
+        return Err(PzError::InvalidInput);
+    }
+
+    let mut pos = 0;
+    let meta_len = u16::from_le_bytes([payload[pos], payload[pos + 1]]) as usize;
+    pos += 2;
+    if pos + meta_len >= payload.len() {
+        return Err(PzError::InvalidInput);
+    }
+    let meta = &payload[pos..pos + meta_len];
+    pos += meta_len;
+
+    let num_streams = payload[pos] as usize;
+    pos += 1;
+    if num_streams != 6 {
+        return Err(PzError::InvalidInput);
+    }
+
+    if meta.len() < 8 {
+        return Err(PzError::InvalidInput);
+    }
+    let num_tokens = u32::from_le_bytes(meta[..4].try_into().unwrap());
+    let num_matches = u32::from_le_bytes(meta[4..8].try_into().unwrap());
+
+    let mut streams = Vec::with_capacity(6);
+
+    for _ in 0..num_streams {
+        if pos + 8 + 256 + 2 > payload.len() {
+            return Err(PzError::InvalidInput);
+        }
+
+        let stream_orig_len = u32::from_le_bytes([
+            payload[pos],
+            payload[pos + 1],
+            payload[pos + 2],
+            payload[pos + 3],
+        ]) as usize;
+        pos += 4;
+
+        let total_bits = u32::from_le_bytes([
+            payload[pos],
+            payload[pos + 1],
+            payload[pos + 2],
+            payload[pos + 3],
+        ]) as usize;
+        pos += 4;
+
+        let code_lengths: [u8; 256] = payload[pos..pos + 256]
+            .try_into()
+            .map_err(|_| PzError::InvalidInput)?;
+        pos += 256;
+
+        let num_sync_points = u16::from_le_bytes([payload[pos], payload[pos + 1]]) as usize;
+        pos += 2;
+
+        let sync_bytes = num_sync_points * 8;
+        if pos + sync_bytes > payload.len() {
+            return Err(PzError::InvalidInput);
+        }
+        let mut sync_points = Vec::with_capacity(num_sync_points);
+        for _ in 0..num_sync_points {
+            let bit_offset = u32::from_le_bytes([
+                payload[pos],
+                payload[pos + 1],
+                payload[pos + 2],
+                payload[pos + 3],
+            ]);
+            pos += 4;
+            let symbol_index = u32::from_le_bytes([
+                payload[pos],
+                payload[pos + 1],
+                payload[pos + 2],
+                payload[pos + 3],
+            ]);
+            pos += 4;
+            sync_points.push(SyncPoint {
+                bit_offset,
+                symbol_index,
+            });
+        }
+
+        if stream_orig_len == 0 {
+            streams.push(ParsedStream {
+                orig_len: 0,
+                huff_start: pos,
+                huff_end: pos,
+                sync_points: Vec::new(),
+                decode_lut: Box::new([0u32; 4096]),
+            });
+            continue;
+        }
+
+        let huffman_bytes = total_bits.div_ceil(8);
+        if pos + huffman_bytes > payload.len() {
+            return Err(PzError::InvalidInput);
+        }
+        let huff_start = pos;
+        pos += huffman_bytes;
+
+        let tree = rebuild_tree_from_code_lengths(&code_lengths)?;
+        let lut = tree.build_gpu_decode_lut();
+        let lut_box: Box<[u32; 4096]> = lut
+            .into_boxed_slice()
+            .try_into()
+            .map_err(|_| PzError::InvalidInput)?;
+
+        streams.push(ParsedStream {
+            orig_len: stream_orig_len,
+            huff_start,
+            huff_end: pos,
+            sync_points,
+            decode_lut: lut_box,
+        });
+    }
+
+    Ok(ParsedBlock {
+        num_tokens,
+        num_matches,
+        orig_len,
+        streams,
+    })
+}
+
+/// Timing breakdown for multi-block GPU decompress.
+#[cfg(feature = "webgpu")]
+#[derive(Debug, Clone)]
+pub struct MultiBlockTimings {
+    /// Parse all blocks (µs).
+    pub parse_us: u64,
+    /// GPU Huffman decode for all blocks combined (µs).
+    pub gpu_huffman_us: u64,
+    /// Parallel CPU LzSeq for all blocks (µs, wall time).
+    pub lzseq_us: u64,
+    /// Total wall time (µs).
+    pub total_us: u64,
+    /// Number of blocks.
+    pub num_blocks: usize,
+    /// Number of GPU streams dispatched.
+    pub num_gpu_streams: usize,
+}
+
+/// Decompress multiple GpuLz blocks with batched GPU Huffman + parallel CPU LzSeq.
+///
+/// All Huffman decodes for all blocks are batched into a single GPU submission.
+/// Then LzSeq reconstruct for each block runs in parallel on separate threads.
+#[cfg(feature = "webgpu")]
+pub fn decompress_blocks_gpu(
+    engine: &crate::webgpu::WebGpuEngine,
+    blocks: &[(&[u8], usize)], // (payload, orig_len) per block
+) -> PzResult<(Vec<Vec<u8>>, MultiBlockTimings)> {
+    use crate::webgpu::HuffmanDecodeStream;
+    use std::time::Instant;
+
+    let t_start = Instant::now();
+
+    // Phase 1: Parse all blocks and extract Huffman stream descriptors.
+    let mut parsed: Vec<ParsedBlock> = Vec::with_capacity(blocks.len());
+    for &(payload, orig_len) in blocks {
+        parsed.push(parse_block(payload, orig_len)?);
+    }
+
+    let t_parse = Instant::now();
+    let parse_us = t_parse.duration_since(t_start).as_micros() as u64;
+
+    // Phase 2: Build one big batch of all Huffman decode streams across all blocks.
+    // Track which decoded streams belong to which block.
+    let mut all_decode_streams = Vec::new();
+    let mut block_ranges: Vec<(usize, usize)> = Vec::with_capacity(blocks.len());
+
+    for (parsed_block, &(payload, _)) in parsed.iter().zip(blocks.iter()) {
+        let start = all_decode_streams.len();
+        for ps in &parsed_block.streams {
+            if ps.orig_len == 0 {
+                all_decode_streams.push(HuffmanDecodeStream {
+                    huffman_data: &[],
+                    decode_lut: Box::new([0u32; 4096]),
+                    sync_points: Vec::new(),
+                    output_len: 0,
+                });
+            } else {
+                all_decode_streams.push(HuffmanDecodeStream {
+                    huffman_data: &payload[ps.huff_start..ps.huff_end],
+                    decode_lut: ps.decode_lut.clone(),
+                    sync_points: ps.sync_points.clone(),
+                    output_len: ps.orig_len,
+                });
+            }
+        }
+        let end = all_decode_streams.len();
+        block_ranges.push((start, end));
+    }
+
+    let num_gpu_streams = all_decode_streams.len();
+
+    // Single GPU submission for all streams across all blocks.
+    let all_decoded = engine.huffman_decode_gpu_batched(&all_decode_streams)?;
+
+    let t_gpu = Instant::now();
+    let gpu_huffman_us = t_gpu.duration_since(t_parse).as_micros() as u64;
+
+    // Phase 3: Parallel CPU LzSeq reconstruct — one thread per block.
+    let results: Vec<PzResult<Vec<u8>>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(blocks.len());
+
+        for (bi, pb) in parsed.iter().enumerate() {
+            let (start, end) = block_ranges[bi];
+            let block_streams = &all_decoded[start..end];
+            let num_tokens = pb.num_tokens;
+            let num_matches = pb.num_matches;
+            let orig_len = pb.orig_len;
+
+            handles.push(scope.spawn(move || {
+                if block_streams.len() != 6 {
+                    return Err(PzError::InvalidInput);
+                }
+                crate::lzseq::decode(
+                    &block_streams[0],
+                    &block_streams[1],
+                    &block_streams[2],
+                    &block_streams[3],
+                    &block_streams[4],
+                    &block_streams[5],
+                    num_tokens,
+                    num_matches,
+                    orig_len,
+                )
+            }));
+        }
+
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let t_lzseq = Instant::now();
+    let lzseq_us = t_lzseq.duration_since(t_gpu).as_micros() as u64;
+    let total_us = t_lzseq.duration_since(t_start).as_micros() as u64;
+
+    // Collect results, propagating first error.
+    let mut output = Vec::with_capacity(blocks.len());
+    for r in results {
+        output.push(r?);
+    }
+
+    Ok((
+        output,
+        MultiBlockTimings {
+            parse_us,
+            gpu_huffman_us,
+            lzseq_us,
+            total_us,
+            num_blocks: blocks.len(),
+            num_gpu_streams,
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,10 +872,90 @@ mod tests {
     }
 
     #[test]
+    fn test_roundtrip_high_entropy() {
+        // Simulate data with high entropy (like binary/compressed sections of a tar).
+        // Use a pseudo-random sequence with enough structure for LZ to find some matches.
+        let mut input = Vec::with_capacity(131072);
+        let mut state = 12345u64;
+        for _ in 0..131072 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let byte = (state >> 33) as u8;
+            input.push(byte);
+        }
+        // Inject some repeated patterns so LZ finds matches.
+        let pattern: Vec<u8> = input[..256].to_vec();
+        for i in (0..input.len()).step_by(4096) {
+            let end = (i + 256).min(input.len());
+            let copy_len = end - i;
+            input[i..end].copy_from_slice(&pattern[..copy_len]);
+        }
+        let compressed = compress_block(&input).unwrap();
+        let decompressed = decompress_block(&compressed, input.len()).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_roundtrip_all_256_bytes() {
+        // Every possible byte value in a 128KB block.
+        let mut input = Vec::with_capacity(131072);
+        for _ in 0..512 {
+            for b in 0..=255u8 {
+                input.push(b);
+            }
+        }
+        let compressed = compress_block(&input).unwrap();
+        let decompressed = decompress_block(&compressed, input.len()).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
     fn test_all_same_byte() {
         let input = vec![0x42u8; 1000];
         let compressed = compress_block(&input).unwrap();
         let decompressed = decompress_block(&compressed, input.len()).unwrap();
         assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_roundtrip_128k() {
+        // Use a realistic 128KB block size with varied data.
+        let mut input = Vec::new();
+        let patterns: &[&[u8]] = &[
+            b"The quick brown fox jumps over the lazy dog. ",
+            b"Pack my box with five dozen liquor jugs. ",
+            b"How vexingly quick daft zebras jump! ",
+        ];
+        let mut pi = 0;
+        while input.len() < 131072 {
+            input.extend_from_slice(patterns[pi % patterns.len()]);
+            pi += 1;
+        }
+        input.truncate(131072);
+        let compressed = compress_block(&input).unwrap();
+        let decompressed = decompress_block(&compressed, input.len()).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_roundtrip_multi_block_sliced() {
+        // Simulate slicing a larger dataset into 128KB blocks.
+        let mut big_data = Vec::new();
+        // Mix in some binary-ish data too.
+        for i in 0u32..200_000 {
+            big_data.push((i % 256) as u8);
+            if i % 37 == 0 {
+                big_data.extend_from_slice(b"pattern ");
+            }
+        }
+        let block_size = 131072;
+        let num_blocks = big_data.len() / block_size;
+        for i in 0..num_blocks {
+            let block = &big_data[i * block_size..(i + 1) * block_size];
+            let compressed = compress_block(block).unwrap();
+            let decompressed = decompress_block(&compressed, block_size).unwrap();
+            assert_eq!(decompressed, block, "block {i} round-trip failed");
+        }
     }
 }

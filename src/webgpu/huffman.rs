@@ -1059,8 +1059,29 @@ impl WebGpuEngine {
         &self,
         streams: &[HuffmanDecodeStream],
     ) -> PzResult<Vec<Vec<u8>>> {
+        self.huffman_decode_gpu_batched_timed(streams)
+            .map(|(data, _)| data)
+    }
+
+    /// Same as [`huffman_decode_gpu_batched`] but returns per-phase timing.
+    #[allow(clippy::type_complexity)]
+    pub fn huffman_decode_gpu_batched_timed(
+        &self,
+        streams: &[HuffmanDecodeStream],
+    ) -> PzResult<(Vec<Vec<u8>>, GpuBatchedTimings)> {
+        use std::time::Instant;
+        let t0 = Instant::now();
+
         if streams.is_empty() {
-            return Ok(Vec::new());
+            return Ok((
+                Vec::new(),
+                GpuBatchedTimings {
+                    buffer_create_us: 0,
+                    submit_us: 0,
+                    readback_us: 0,
+                    total_us: 0,
+                },
+            ));
         }
 
         let pipeline = self.pipeline_huffman_decode();
@@ -1172,6 +1193,9 @@ impl WebGpuEngine {
             }));
         }
 
+        let t_buffers = Instant::now();
+        let buffer_create_us = t_buffers.duration_since(t0).as_micros() as u64;
+
         // Record all dispatches into a single command encoder.
         let mut encoder = self
             .device
@@ -1214,6 +1238,9 @@ impl WebGpuEngine {
         self.profiler_resolve(&mut encoder);
         self.queue.submit(Some(encoder.finish()));
 
+        let t_submit = Instant::now();
+        let submit_us = t_submit.duration_since(t_buffers).as_micros() as u64;
+
         // Map all staging buffers and read back.
         let mut results = Vec::with_capacity(streams.len());
         for (i, staging) in staging_bufs.iter().enumerate() {
@@ -1234,8 +1261,33 @@ impl WebGpuEngine {
             }
         }
 
-        Ok(results)
+        let t_readback = Instant::now();
+        let readback_us = t_readback.duration_since(t_submit).as_micros() as u64;
+        let total_us = t_readback.duration_since(t0).as_micros() as u64;
+
+        Ok((
+            results,
+            GpuBatchedTimings {
+                buffer_create_us,
+                submit_us,
+                readback_us,
+                total_us,
+            },
+        ))
     }
+}
+
+/// Per-phase timing for batched GPU Huffman decode.
+#[derive(Debug, Clone)]
+pub struct GpuBatchedTimings {
+    /// Buffer creation + bind group setup (µs).
+    pub buffer_create_us: u64,
+    /// Command record + submit (µs).
+    pub submit_us: u64,
+    /// Poll + readback (µs).
+    pub readback_us: u64,
+    /// Total wall time (µs).
+    pub total_us: u64,
 }
 
 /// Descriptor for one Huffman stream to decode on the GPU.
