@@ -8,11 +8,11 @@ use throughput_common::{run_throughput_benches, ThroughputBenchSpec};
 const SPEC: ThroughputBenchSpec = ThroughputBenchSpec {
     id: "lzfi",
     pipeline: Pipeline::Lzfi,
-    parallel: false,
-    large: false,
-    decompress_large: false,
-    webgpu: false,
-    webgpu_large: false,
+    parallel: true,
+    large: true,
+    decompress_large: true,
+    webgpu: true,
+    webgpu_large: true,
 };
 
 fn bench(c: &mut Criterion) {
