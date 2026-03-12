@@ -924,6 +924,330 @@ impl WebGpuEngine {
 
         Ok((output_bytes, total_bits))
     }
+
+    /// Decode a Huffman-encoded bitstream on the GPU using sync-point parallel decode.
+    ///
+    /// Each sync-point segment is decoded by an independent GPU thread using a
+    /// 12-bit lookup table. This is the GPU equivalent of [`HuffmanTree::decode_tiled()`].
+    ///
+    /// # Arguments
+    /// * `huffman_data` — MSB-first packed bitstream bytes (as produced by `encode_with_sync_points`)
+    /// * `total_bits` — number of valid bits in the bitstream
+    /// * `decode_lut` — 4096-entry decode table: `(symbol << 8) | code_bits`
+    /// * `sync_points` — sync-point array including sentinel at the end
+    /// * `output_len` — expected number of decoded symbols (bytes)
+    pub fn huffman_decode_gpu(
+        &self,
+        huffman_data: &[u8],
+        _total_bits: usize,
+        decode_lut: &[u32; 4096],
+        sync_points: &[crate::huffman::SyncPoint],
+        output_len: usize,
+    ) -> PzResult<Vec<u8>> {
+        if output_len == 0 || sync_points.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        let num_segments = sync_points.len() - 1; // last entry is sentinel
+
+        // Upload bitstream as big-endian u32 words.
+        // The CPU encode produces MSB-first byte order; WGSL reads u32 words,
+        // so we must convert bytes to big-endian u32 to preserve bit layout.
+        // Pad by at least 4 bytes so peek_12_msb can safely read word_idx + 1.
+        let padded_len = huffman_data.len().div_ceil(4) + 1; // +1 word padding
+        let mut bitstream_words = vec![0u32; padded_len];
+        for (i, chunk) in huffman_data.chunks(4).enumerate() {
+            let mut bytes = [0u8; 4];
+            bytes[..chunk.len()].copy_from_slice(chunk);
+            bitstream_words[i] = u32::from_be_bytes(bytes);
+        }
+
+        let bitstream_buf = self.create_buffer_init(
+            "huff_dec_bitstream",
+            bytemuck::cast_slice(&bitstream_words),
+            wgpu::BufferUsages::STORAGE,
+        );
+
+        // Upload decode LUT (4096 × u32 = 16KB).
+        let lut_buf = self.create_buffer_init(
+            "huff_dec_lut",
+            bytemuck::cast_slice(decode_lut),
+            wgpu::BufferUsages::STORAGE,
+        );
+
+        // Upload sync points as flat u32 pairs: [bit_offset, symbol_index, ...].
+        let sp_flat: Vec<u32> = sync_points
+            .iter()
+            .flat_map(|sp| [sp.bit_offset, sp.symbol_index])
+            .collect();
+        let sp_buf = self.create_buffer_init(
+            "huff_dec_sync_points",
+            bytemuck::cast_slice(&sp_flat),
+            wgpu::BufferUsages::STORAGE,
+        );
+
+        // Output buffer: zero-initialized, padded to u32 alignment.
+        let output_words = output_len.div_ceil(4);
+        let output_buf = self.create_buffer_init(
+            "huff_dec_output",
+            &vec![0u8; output_words * 4],
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
+        // Params: num_segments, output_len, 0, dispatch_width
+        let workgroups = (num_segments as u32).div_ceil(64);
+        let params = [
+            num_segments as u32,
+            output_len as u32,
+            0u32,
+            self.dispatch_width(workgroups, 64),
+        ];
+        let params_buf = self.create_buffer_init(
+            "huff_dec_params",
+            bytemuck::cast_slice(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+
+        // Create bind group.
+        let bg_layout = self.pipeline_huffman_decode().get_bind_group_layout(0);
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("huff_dec_bg"),
+            layout: &bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: bitstream_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: lut_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: sp_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Dispatch.
+        self.dispatch(
+            self.pipeline_huffman_decode(),
+            &bg,
+            workgroups,
+            "huffman_sync_decode",
+        )?;
+
+        // Read back output and truncate to output_len.
+        let raw = self.read_buffer(&output_buf, (output_words * 4) as u64);
+        Ok(raw[..output_len].to_vec())
+    }
+
+    /// Decode multiple Huffman-encoded streams in a single GPU submission.
+    ///
+    /// This batches all stream decodes into one command encoder → one submit → one
+    /// readback, amortizing per-dispatch overhead (~0.8ms) that dominates at small sizes.
+    /// Used by [`crate::gpulz::decompress_block_gpu`] to decode all 6 LzSeq streams.
+    pub fn huffman_decode_gpu_batched(
+        &self,
+        streams: &[HuffmanDecodeStream],
+    ) -> PzResult<Vec<Vec<u8>>> {
+        if streams.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let pipeline = self.pipeline_huffman_decode();
+        let bg_layout = pipeline.get_bind_group_layout(0);
+
+        // Build all buffers and bind groups upfront.
+        struct StreamGpu {
+            bg: wgpu::BindGroup,
+            workgroups: u32,
+            output_buf: wgpu::Buffer,
+            output_words: usize,
+            output_len: usize,
+        }
+
+        let mut stream_gpus = Vec::with_capacity(streams.len());
+
+        for (i, s) in streams.iter().enumerate() {
+            if s.output_len == 0 || s.sync_points.len() < 2 {
+                stream_gpus.push(None);
+                continue;
+            }
+
+            let num_segments = s.sync_points.len() - 1;
+
+            // Bitstream → big-endian u32 words.
+            let padded_len = s.huffman_data.len().div_ceil(4) + 1;
+            let mut bitstream_words = vec![0u32; padded_len];
+            for (j, chunk) in s.huffman_data.chunks(4).enumerate() {
+                let mut bytes = [0u8; 4];
+                bytes[..chunk.len()].copy_from_slice(chunk);
+                bitstream_words[j] = u32::from_be_bytes(bytes);
+            }
+            let bitstream_buf = self.create_buffer_init(
+                &format!("huff_dec_bs_{i}"),
+                bytemuck::cast_slice(&bitstream_words),
+                wgpu::BufferUsages::STORAGE,
+            );
+
+            let lut_buf = self.create_buffer_init(
+                &format!("huff_dec_lut_{i}"),
+                bytemuck::cast_slice(s.decode_lut.as_ref()),
+                wgpu::BufferUsages::STORAGE,
+            );
+
+            let sp_flat: Vec<u32> = s
+                .sync_points
+                .iter()
+                .flat_map(|sp| [sp.bit_offset, sp.symbol_index])
+                .collect();
+            let sp_buf = self.create_buffer_init(
+                &format!("huff_dec_sp_{i}"),
+                bytemuck::cast_slice(&sp_flat),
+                wgpu::BufferUsages::STORAGE,
+            );
+
+            let output_words = s.output_len.div_ceil(4);
+            let output_buf = self.create_buffer_init(
+                &format!("huff_dec_out_{i}"),
+                &vec![0u8; output_words * 4],
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            );
+
+            let workgroups = (num_segments as u32).div_ceil(64);
+            let params = [
+                num_segments as u32,
+                s.output_len as u32,
+                0u32,
+                self.dispatch_width(workgroups, 64),
+            ];
+            let params_buf = self.create_buffer_init(
+                &format!("huff_dec_params_{i}"),
+                bytemuck::cast_slice(&params),
+                wgpu::BufferUsages::UNIFORM,
+            );
+
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("huff_dec_bg_{i}")),
+                layout: &bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: bitstream_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: lut_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: sp_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: output_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            stream_gpus.push(Some(StreamGpu {
+                bg,
+                workgroups,
+                output_buf,
+                output_words,
+                output_len: s.output_len,
+            }));
+        }
+
+        // Record all dispatches into a single command encoder.
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("huff_dec_batched"),
+            });
+
+        for sg in stream_gpus.iter().flatten() {
+            self.record_dispatch(
+                &mut encoder,
+                pipeline,
+                &sg.bg,
+                sg.workgroups,
+                "huffman_sync_decode",
+            )?;
+        }
+
+        // Copy all outputs to staging buffers in the same encoder.
+        let mut staging_bufs = Vec::with_capacity(streams.len());
+        for sg in &stream_gpus {
+            if let Some(sg) = sg {
+                let staging = self.create_buffer(
+                    "staging",
+                    (sg.output_words * 4) as u64,
+                    wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                );
+                encoder.copy_buffer_to_buffer(
+                    &sg.output_buf,
+                    0,
+                    &staging,
+                    0,
+                    (sg.output_words * 4) as u64,
+                );
+                staging_bufs.push(Some(staging));
+            } else {
+                staging_bufs.push(None);
+            }
+        }
+
+        self.profiler_resolve(&mut encoder);
+        self.queue.submit(Some(encoder.finish()));
+
+        // Map all staging buffers and read back.
+        let mut results = Vec::with_capacity(streams.len());
+        for (i, staging) in staging_bufs.iter().enumerate() {
+            if let Some(staging) = staging {
+                let slice = staging.slice(..);
+                let (tx, rx) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |r| {
+                    tx.send(r).unwrap();
+                });
+                self.poll_wait();
+                rx.recv().unwrap().map_err(|_| PzError::Unsupported)?;
+                let data = slice.get_mapped_range().to_vec();
+                staging.unmap();
+                let output_len = stream_gpus[i].as_ref().unwrap().output_len;
+                results.push(data[..output_len].to_vec());
+            } else {
+                results.push(Vec::new());
+            }
+        }
+
+        Ok(results)
+    }
+}
+
+/// Descriptor for one Huffman stream to decode on the GPU.
+pub struct HuffmanDecodeStream<'a> {
+    /// MSB-first packed bitstream bytes.
+    pub huffman_data: &'a [u8],
+    /// 4096-entry decode LUT: `(symbol << 8) | code_bits`.
+    pub decode_lut: Box<[u32; 4096]>,
+    /// Sync-point array including sentinel.
+    pub sync_points: Vec<crate::huffman::SyncPoint>,
+    /// Expected number of decoded symbols.
+    pub output_len: usize,
 }
 
 #[cfg(test)]

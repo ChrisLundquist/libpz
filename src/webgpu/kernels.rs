@@ -40,5 +40,9 @@ pub(super) const LZSEQ_DEMUX_KERNEL_SOURCE: &str = include_str!("../../kernels/l
 /// Embedded WGSL kernel source: GPU SortLZ operations (Experiment B).
 pub(super) const SORTLZ_OPS_KERNEL_SOURCE: &str = include_str!("../../kernels/sortlz_ops.wgsl");
 
+/// Embedded WGSL kernel source: GPU Huffman sync-point parallel decode.
+pub(super) const HUFFMAN_DECODE_KERNEL_SOURCE: &str =
+    include_str!("../../kernels/huffman_decode.wgsl");
+
 /// Number of candidates per position in the top-K kernel (must match K in lz77_topk.wgsl).
 pub(super) const TOPK_K: usize = 4;

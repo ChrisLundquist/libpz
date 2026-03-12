@@ -113,6 +113,10 @@ harness = false
 name = "gpu_parallel_vs_streaming"
 harness = false
 
+[[bench]]
+name = "stages_gpulz"
+harness = false
+
 [profile.profiling]
 inherits = "release"
 debug = true

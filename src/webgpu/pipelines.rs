@@ -92,6 +92,11 @@ pub(super) struct LzSeqPipelines {
     pub(super) demux: wgpu::ComputePipeline,
 }
 
+/// Huffman sync-point decode pipeline (1 pipeline from huffman_decode.wgsl).
+pub(super) struct HuffmanDecodePipelines {
+    pub(super) decode: wgpu::ComputePipeline,
+}
+
 /// SortLZ radix sort + match verification pipelines (Experiment B).
 pub(super) struct SortLzPipelines {
     pub(super) compute_keys: wgpu::ComputePipeline,
@@ -620,6 +625,27 @@ impl WebGpuEngine {
 
     pub(super) fn pipeline_sortlz_verify_matches(&self) -> &wgpu::ComputePipeline {
         &self.sortlz_pipelines().verify_matches
+    }
+
+    pub(super) fn pipeline_huffman_decode(&self) -> &wgpu::ComputePipeline {
+        &self
+            .huffman_decode
+            .get_or_init(|| {
+                let t0 = std::time::Instant::now();
+                let group = HuffmanDecodePipelines {
+                    decode: self.make_pipeline(
+                        "huffman_decode",
+                        HUFFMAN_DECODE_KERNEL_SOURCE,
+                        "huffman_sync_decode",
+                    ),
+                };
+                if self.profiling {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[pz-gpu] compile huffman_decode.wgsl: {ms:.3} ms");
+                }
+                group
+            })
+            .decode
     }
 
     pub(super) fn sortlz_pipelines(&self) -> &SortLzPipelines {

@@ -227,3 +227,138 @@ fn test_huffman_encode_fully_on_device_larger() {
     let decoded = tree.decode(&gpu_encoded, gpu_bits).unwrap();
     assert_eq!(decoded, input);
 }
+
+// --- GPU Huffman sync-point decode tests ---
+
+#[test]
+fn test_huffman_decode_gpu_roundtrip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::new();
+    for _ in 0..100 {
+        input.extend_from_slice(pattern);
+    }
+
+    let mut tree = crate::huffman::HuffmanTree::from_data(&input).unwrap();
+    tree.canonicalize();
+
+    let result = tree.encode_with_sync_points(&input, 1024).unwrap();
+    let lut = tree.build_gpu_decode_lut();
+    let lut_array: &[u32; 4096] = lut.as_slice().try_into().unwrap();
+
+    let decoded = engine
+        .huffman_decode_gpu(
+            &result.data,
+            result.total_bits,
+            lut_array,
+            &result.sync_points,
+            input.len(),
+        )
+        .unwrap();
+
+    assert_eq!(decoded, input, "GPU Huffman decode round-trip mismatch");
+}
+
+#[test]
+fn test_huffman_decode_gpu_vs_cpu() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let pattern = b"abcdefghijklmnopqrstuvwxyz0123456789 ";
+    let mut input = Vec::new();
+    for _ in 0..200 {
+        input.extend_from_slice(pattern);
+    }
+
+    let mut tree = crate::huffman::HuffmanTree::from_data(&input).unwrap();
+    tree.canonicalize();
+
+    let result = tree.encode_with_sync_points(&input, 512).unwrap();
+    let lut = tree.build_gpu_decode_lut();
+    let lut_array: &[u32; 4096] = lut.as_slice().try_into().unwrap();
+
+    // CPU tiled decode.
+    let cpu_decoded = tree
+        .decode_tiled(&result.data, result.total_bits, &result.sync_points)
+        .unwrap();
+
+    // GPU decode.
+    let gpu_decoded = engine
+        .huffman_decode_gpu(
+            &result.data,
+            result.total_bits,
+            lut_array,
+            &result.sync_points,
+            input.len(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        gpu_decoded, cpu_decoded,
+        "GPU decode differs from CPU tiled decode"
+    );
+    assert_eq!(gpu_decoded, input, "GPU decode differs from original input");
+}
+
+#[test]
+fn test_huffman_decode_gpu_single_symbol() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let input = vec![42u8; 4096];
+    let mut tree = crate::huffman::HuffmanTree::from_data(&input).unwrap();
+    tree.canonicalize();
+
+    let result = tree.encode_with_sync_points(&input, 1024).unwrap();
+    let lut = tree.build_gpu_decode_lut();
+    let lut_array: &[u32; 4096] = lut.as_slice().try_into().unwrap();
+
+    let decoded = engine
+        .huffman_decode_gpu(
+            &result.data,
+            result.total_bits,
+            lut_array,
+            &result.sync_points,
+            input.len(),
+        )
+        .unwrap();
+
+    assert_eq!(decoded, input, "single-symbol GPU decode mismatch");
+}
+
+#[test]
+fn test_gpulz_decompress_gpu_roundtrip() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    let mut input = Vec::new();
+    for _ in 0..200 {
+        input.extend_from_slice(b"the quick brown fox jumps over the lazy dog. ");
+    }
+
+    let compressed = crate::gpulz::compress_block(&input).unwrap();
+
+    // CPU decompress.
+    let cpu_decoded = crate::gpulz::decompress_block(&compressed, input.len()).unwrap();
+    assert_eq!(cpu_decoded, input, "CPU decompress mismatch");
+
+    // GPU decompress.
+    let gpu_decoded =
+        crate::gpulz::decompress_block_gpu(&engine, &compressed, input.len()).unwrap();
+    assert_eq!(gpu_decoded, input, "GPU decompress mismatch");
+    assert_eq!(gpu_decoded, cpu_decoded, "GPU differs from CPU");
+}

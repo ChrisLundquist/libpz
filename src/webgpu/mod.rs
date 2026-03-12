@@ -49,6 +49,7 @@ mod sortlz;
 
 use buffers::*;
 pub use buffers::{DeviceBuf, GpuMatchBuf};
+pub use huffman::HuffmanDecodeStream;
 use kernels::*;
 use pipelines::*;
 
@@ -139,6 +140,7 @@ pub struct WebGpuEngine {
     rans_decode: OnceLock<RansDecodePipelines>,
     rans_encode: OnceLock<RansEncodePipelines>,
     lzseq_demux: OnceLock<LzSeqPipelines>,
+    huffman_decode: OnceLock<HuffmanDecodePipelines>,
     sortlz: OnceLock<SortLzPipelines>,
     /// Device name for diagnostics.
     device_name: String,
@@ -294,6 +296,7 @@ impl WebGpuEngine {
             rans_decode: OnceLock::new(),
             rans_encode: OnceLock::new(),
             lzseq_demux: OnceLock::new(),
+            huffman_decode: OnceLock::new(),
             sortlz: OnceLock::new(),
             device_name,
             max_work_group_size,

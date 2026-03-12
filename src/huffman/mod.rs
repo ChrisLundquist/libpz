@@ -20,6 +20,31 @@ use crate::frequency::FrequencyTable;
 use crate::pqueue::MinHeap;
 use crate::{PzError, PzResult};
 
+/// A sync point recorded during Huffman encoding for GPU-parallel decode.
+///
+/// Placed every N symbols, these allow independent decode of segments
+/// between adjacent sync points — each GPU thread starts from a known
+/// bit offset and decodes a known number of symbols.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncPoint {
+    /// Bit offset in the encoded bitstream where this segment starts.
+    pub bit_offset: u32,
+    /// Index of the first symbol in this segment (in the decoded output).
+    pub symbol_index: u32,
+}
+
+/// Result of Huffman encoding with sync-point metadata.
+pub struct SyncEncodeResult {
+    /// The encoded bitstream bytes.
+    pub data: Vec<u8>,
+    /// Total number of valid bits in the bitstream.
+    pub total_bits: usize,
+    /// Sync points including a sentinel at the end.
+    /// The sentinel has `bit_offset = total_bits` and `symbol_index = input_len`.
+    /// Number of decode segments = `sync_points.len() - 1`.
+    pub sync_points: Vec<SyncPoint>,
+}
+
 /// A node in the Huffman tree.
 #[derive(Debug, Clone)]
 pub struct HuffmanNode {
@@ -207,6 +232,23 @@ impl HuffmanTree {
         }
     }
 
+    /// Construct a HuffmanTree from pre-built parts (for decode from wire format).
+    pub fn from_parts(
+        nodes: Vec<HuffmanNode>,
+        root: Option<usize>,
+        lookup: [(u32, u8); 256],
+        leaf_count: u32,
+        decode_table: Vec<(u8, u8)>,
+    ) -> Self {
+        HuffmanTree {
+            nodes,
+            root,
+            lookup,
+            leaf_count,
+            decode_table,
+        }
+    }
+
     /// Build a flat decode lookup table for fast O(1) symbol resolution.
     ///
     /// For each symbol with code_bits <= DECODE_TABLE_BITS, fills
@@ -230,6 +272,11 @@ impl HuffmanTree {
         }
 
         table
+    }
+
+    /// Build decode table from a lookup array (public for cross-module use).
+    pub fn build_decode_table_from_lookup(lookup: &[(u32, u8); 256]) -> Vec<(u8, u8)> {
+        Self::build_decode_table(lookup)
     }
 
     /// Return the code lookup table for use with GPU encoding.
@@ -532,6 +579,341 @@ impl HuffmanTree {
             *freq = node.weight;
         }
         freqs
+    }
+
+    /// Encode with sync-point metadata for GPU-parallel decode.
+    ///
+    /// Identical output bitstream to [`encode`], but also records a
+    /// [`SyncPoint`] every `interval` symbols. A sentinel sync point
+    /// is appended at the end with `(total_bits, input_len)`.
+    ///
+    /// The sync points enable independent segment decode: each GPU
+    /// thread reads from `sync_points[i].bit_offset` and decodes
+    /// `sync_points[i+1].symbol_index - sync_points[i].symbol_index`
+    /// symbols.
+    pub fn encode_with_sync_points(
+        &self,
+        input: &[u8],
+        interval: u32,
+    ) -> PzResult<SyncEncodeResult> {
+        if input.is_empty() {
+            return Ok(SyncEncodeResult {
+                data: Vec::new(),
+                total_bits: 0,
+                sync_points: vec![SyncPoint {
+                    bit_offset: 0,
+                    symbol_index: 0,
+                }],
+            });
+        }
+
+        // Pre-calculate total bits for output allocation.
+        let mut total_bits: usize = 0;
+        for &byte in input {
+            let (_, bits) = self.lookup[byte as usize];
+            if bits == 0 {
+                return Err(PzError::InvalidInput);
+            }
+            total_bits += bits as usize;
+        }
+
+        let output_len = total_bits.div_ceil(8);
+        let mut output = vec![0u8; output_len];
+
+        // Estimate sync point count.
+        let est_sync = (input.len() as u32 / interval) + 2;
+        let mut sync_points = Vec::with_capacity(est_sync as usize);
+
+        // First sync point at position 0.
+        sync_points.push(SyncPoint {
+            bit_offset: 0,
+            symbol_index: 0,
+        });
+
+        let mut byte_pos: usize = 0;
+        let mut accumulator: u64 = 0;
+        let mut bits_in_acc: u32 = 0;
+        let mut bits_written: usize = 0;
+
+        for (sym_idx, &byte) in input.iter().enumerate() {
+            // Record sync point at interval boundaries (skip 0, already recorded).
+            if sym_idx > 0 && (sym_idx as u32).is_multiple_of(interval) {
+                sync_points.push(SyncPoint {
+                    bit_offset: bits_written as u32,
+                    symbol_index: sym_idx as u32,
+                });
+            }
+
+            let (codeword, code_bits) = self.lookup[byte as usize];
+            let shift = 64 - bits_in_acc - code_bits as u32;
+            accumulator |= (codeword as u64) << shift;
+            bits_in_acc += code_bits as u32;
+            bits_written += code_bits as usize;
+
+            while bits_in_acc >= 8 {
+                output[byte_pos] = (accumulator >> 56) as u8;
+                accumulator <<= 8;
+                bits_in_acc -= 8;
+                byte_pos += 1;
+            }
+        }
+
+        // Flush remaining partial byte.
+        if bits_in_acc > 0 {
+            output[byte_pos] = (accumulator >> 56) as u8;
+        }
+
+        // Sentinel sync point.
+        sync_points.push(SyncPoint {
+            bit_offset: total_bits as u32,
+            symbol_index: input.len() as u32,
+        });
+
+        Ok(SyncEncodeResult {
+            data: output,
+            total_bits,
+            sync_points,
+        })
+    }
+
+    /// Decode a single segment of a sync-point-encoded Huffman bitstream.
+    ///
+    /// Decodes symbols starting at `start_bit` in the encoded data,
+    /// writing exactly `num_symbols` decoded bytes to `output`.
+    /// This is what each GPU thread would execute independently.
+    ///
+    /// Requires a decode table (call [`from_frequency_table`] not
+    /// [`from_frequency_table_encode_only`]).
+    pub fn decode_segment(
+        &self,
+        encoded: &[u8],
+        start_bit: usize,
+        num_symbols: usize,
+        output: &mut [u8],
+    ) -> PzResult<()> {
+        if num_symbols == 0 {
+            return Ok(());
+        }
+        if output.len() < num_symbols {
+            return Err(PzError::BufferTooSmall);
+        }
+
+        let mut bit_pos = start_bit;
+        let mut out_pos = 0;
+
+        // Use the fast decode table if available.
+        if !self.decode_table.is_empty() {
+            while out_pos < num_symbols {
+                // Refill a 24-bit peek window from the MSB-first bitstream.
+                let byte_idx = bit_pos / 8;
+                let bit_in_byte = bit_pos % 8;
+
+                // Load enough bytes for a 12-bit peek + offset within byte.
+                // We need at most ceil((12 + bit_in_byte) / 8) = 3 bytes.
+                let b0 = if byte_idx < encoded.len() {
+                    encoded[byte_idx] as u32
+                } else {
+                    0
+                };
+                let b1 = if byte_idx + 1 < encoded.len() {
+                    encoded[byte_idx + 1] as u32
+                } else {
+                    0
+                };
+                let b2 = if byte_idx + 2 < encoded.len() {
+                    encoded[byte_idx + 2] as u32
+                } else {
+                    0
+                };
+                let window = (b0 << 16) | (b1 << 8) | b2;
+
+                // Extract 12 bits starting at bit_in_byte from the MSB side.
+                let shift = 24 - DECODE_TABLE_BITS as usize - bit_in_byte;
+                let peek = ((window >> shift) & ((1 << DECODE_TABLE_BITS) - 1)) as usize;
+
+                let (sym, len) = self.decode_table[peek];
+                if len == 0 {
+                    // Shouldn't happen with valid data; fall back to tree walk.
+                    return self.decode_segment_tree_walk(
+                        encoded,
+                        bit_pos,
+                        num_symbols - out_pos,
+                        &mut output[out_pos..],
+                    );
+                }
+
+                output[out_pos] = sym;
+                out_pos += 1;
+                bit_pos += len as usize;
+            }
+            return Ok(());
+        }
+
+        // No decode table — fall back to tree walk.
+        self.decode_segment_tree_walk(encoded, bit_pos, num_symbols, output)
+    }
+
+    /// Tree-walk fallback for segment decode.
+    fn decode_segment_tree_walk(
+        &self,
+        encoded: &[u8],
+        mut bit_pos: usize,
+        num_symbols: usize,
+        output: &mut [u8],
+    ) -> PzResult<()> {
+        let root_idx = self.root.ok_or(PzError::InvalidInput)?;
+        let mut out_pos = 0;
+        let mut node_idx = root_idx;
+
+        while out_pos < num_symbols {
+            let byte_idx = bit_pos / 8;
+            if byte_idx >= encoded.len() {
+                return Err(PzError::InvalidInput);
+            }
+            let bit_offset = 7 - (bit_pos % 8);
+            let bit = (encoded[byte_idx] >> bit_offset) & 1;
+            bit_pos += 1;
+
+            let next = if bit == 0 {
+                self.nodes[node_idx].left
+            } else {
+                self.nodes[node_idx].right
+            };
+
+            match next {
+                Some(child_idx) => {
+                    let child = &self.nodes[child_idx];
+                    if child.left.is_none() && child.right.is_none() {
+                        output[out_pos] = child.value;
+                        out_pos += 1;
+                        node_idx = root_idx;
+                    } else {
+                        node_idx = child_idx;
+                    }
+                }
+                None => return Err(PzError::InvalidInput),
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode a sync-point-encoded bitstream using per-segment independent decode.
+    ///
+    /// This simulates GPU-parallel decode on the CPU: each segment between
+    /// adjacent sync points is decoded independently, as if by a separate
+    /// GPU thread.
+    pub fn decode_tiled(
+        &self,
+        encoded: &[u8],
+        _total_bits: usize,
+        sync_points: &[SyncPoint],
+    ) -> PzResult<Vec<u8>> {
+        if sync_points.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        let total_symbols = sync_points.last().unwrap().symbol_index as usize;
+        let mut output = vec![0u8; total_symbols];
+        let num_segments = sync_points.len() - 1;
+
+        for seg in 0..num_segments {
+            let start_bit = sync_points[seg].bit_offset as usize;
+            let start_sym = sync_points[seg].symbol_index as usize;
+            let end_sym = sync_points[seg + 1].symbol_index as usize;
+            let num_symbols = end_sym - start_sym;
+
+            self.decode_segment(
+                encoded,
+                start_bit,
+                num_symbols,
+                &mut output[start_sym..start_sym + num_symbols],
+            )?;
+        }
+
+        Ok(output)
+    }
+
+    /// Build a GPU-friendly 12-bit decode lookup table.
+    ///
+    /// Returns a `Vec<u32>` with 4096 entries. Each entry packs:
+    /// - bits [15:8]: symbol (u8)
+    /// - bits [7:0]:  code length (u8)
+    ///
+    /// This is the format the `huffman_sync_decode.wgsl` kernel expects.
+    /// Entry value 0 means "code longer than 12 bits" (extremely rare).
+    pub fn build_gpu_decode_lut(&self) -> Vec<u32> {
+        let mut lut = vec![0u32; DECODE_TABLE_SIZE];
+
+        for sym in 0..256u16 {
+            let (codeword, code_bits) = self.lookup[sym as usize];
+            if code_bits == 0 || code_bits > DECODE_TABLE_BITS {
+                continue;
+            }
+            let num_entries = 1usize << (DECODE_TABLE_BITS - code_bits);
+            let base = (codeword as usize) << (DECODE_TABLE_BITS - code_bits);
+            let packed = ((sym as u32) << 8) | (code_bits as u32);
+            for i in 0..num_entries {
+                lut[base + i] = packed;
+            }
+        }
+
+        lut
+    }
+
+    /// Export code lengths for all 256 byte symbols (for wire format).
+    ///
+    /// Returns a 256-byte array where `code_lengths[i]` is the Huffman
+    /// code length for byte value `i`. Symbols not present in the tree
+    /// have length 0.
+    pub fn code_lengths(&self) -> [u8; 256] {
+        let mut lengths = [0u8; 256];
+        for (i, &(_, bits)) in self.lookup.iter().enumerate() {
+            lengths[i] = bits;
+        }
+        lengths
+    }
+
+    /// Reassign codewords to canonical Huffman codes based on the current
+    /// code lengths.
+    ///
+    /// After canonicalization, the tree can be exactly reconstructed from
+    /// just the code lengths (256 bytes in the wire format) using the
+    /// standard canonical Huffman algorithm. This is required for the
+    /// GpuLz codec where the decoder rebuilds the tree from lengths.
+    pub fn canonicalize(&mut self) {
+        let lengths = self.code_lengths();
+
+        // Count codes per length.
+        let mut bl_count = [0u32; 16];
+        for &len in &lengths {
+            if len > 0 && (len as usize) < bl_count.len() {
+                bl_count[len as usize] += 1;
+            }
+        }
+
+        // Compute first code for each length (RFC 1951 algorithm).
+        let mut next_code = [0u32; 16];
+        let mut code = 0u32;
+        for bits in 1..16 {
+            code = (code + bl_count[bits - 1]) << 1;
+            next_code[bits] = code;
+        }
+
+        // Assign canonical codes to symbols in order.
+        for (sym, &len) in lengths.iter().enumerate() {
+            if len > 0 && (len as usize) < next_code.len() {
+                self.lookup[sym] = (next_code[len as usize], len);
+                next_code[len as usize] += 1;
+                // Update the node too.
+                if sym < self.nodes.len() {
+                    self.nodes[sym].codeword = self.lookup[sym].0;
+                    self.nodes[sym].code_bits = len;
+                }
+            }
+        }
+
+        // Rebuild decode table with new codes.
+        self.decode_table = Self::build_decode_table(&self.lookup);
     }
 }
 

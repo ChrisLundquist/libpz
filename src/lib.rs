@@ -4,6 +4,7 @@ pub mod crc32;
 pub mod deflate;
 pub mod frequency;
 pub mod fse;
+pub mod gpulz;
 pub mod gzip;
 pub mod huffman;
 pub mod lz77;
