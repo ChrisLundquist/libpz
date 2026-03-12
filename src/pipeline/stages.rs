@@ -512,7 +512,23 @@ pub(crate) fn stage_rans_encode_sparse(
                 output.extend_from_slice(&0u32.to_le_bytes());
                 output.extend_from_slice(&flagged_len.to_le_bytes());
             } else {
-                let data = rans::encode_sparse(stream, rans::DEFAULT_SCALE_BITS);
+                // Auto-select scale_bits based on symbol diversity:
+                // few symbols → lower precision is fine, many → higher helps.
+                let distinct = {
+                    let mut seen = [false; 256];
+                    for &b in stream.iter() {
+                        seen[b as usize] = true;
+                    }
+                    seen.iter().filter(|&&s| s).count()
+                };
+                let sb = if distinct <= 8 {
+                    10
+                } else if distinct >= 64 {
+                    13
+                } else {
+                    rans::DEFAULT_SCALE_BITS
+                };
+                let data = rans::encode_sparse(stream, sb);
                 let flagged_len = (data.len() as u32) | RANS_SPARSE_FLAG;
                 output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
                 output.extend_from_slice(&flagged_len.to_le_bytes());

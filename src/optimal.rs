@@ -135,16 +135,17 @@ impl CostModel {
             }
         }
 
-        // Estimate overhead costs:
-        // In a typical LZ77 output, ~50% of tokens are literals (offset=0, length=0).
-        // The 0x00 byte thus appears very frequently, making it cheap to encode.
-        // Estimate: 0x00 costs ~1 bit after entropy coding, so 4 zero bytes ≈ 4 bits.
-        let literal_overhead = 4 * COST_SCALE;
+        // LzSeq-aware overhead estimates:
+        //
+        // Flag stream: typically ~55-65% literals, ~35-45% matches.
+        // flag(0) entropy ≈ -log2(0.6) ≈ 0.74 bits ≈ 1 bit
+        // flag(1) entropy ≈ -log2(0.4) ≈ 1.32 bits ≈ 1 bit
+        let literal_overhead = COST_SCALE;
 
-        // Match offset/length fields contain varied byte values.
-        // Typical entropy: ~4-5 bits/byte for offset, ~3-4 bits/byte for length.
-        // Conservative estimate: 4 bytes × 4 bits/byte = 16 bits overhead.
-        let match_overhead = 16 * COST_SCALE;
+        // Generic match overhead (fallback when offset is unavailable):
+        // flag(1) + offset_code(~3) + length_code(~3) + flag(0) for trailing literal
+        // ≈ 8 bits. Detailed match_cost() is used when offset is known.
+        let match_overhead = 8 * COST_SCALE;
 
         Self {
             literal_cost,
@@ -170,6 +171,7 @@ impl CostModel {
     #[inline]
     pub fn match_token(&self, next_byte: u8) -> u32 {
         self.match_overhead
+            .saturating_add(self.literal_overhead)
             .saturating_add(self.literal_cost[next_byte as usize])
     }
 
@@ -203,6 +205,7 @@ impl CostModel {
         code_cost
             .saturating_sub(code_discount)
             .saturating_add(extra_cost)
+            .saturating_add(self.literal_overhead)
             .saturating_add(self.literal_cost[next_byte as usize])
     }
 
@@ -222,14 +225,16 @@ impl CostModel {
     ) -> u32 {
         if is_repeat {
             // Repeat offset: encode with code 0-2, 0 extra bits.
-            // Cost = ~2 bits for offset code + length cost + next_byte cost.
+            // flag(1) ≈ 1 bit, repeat code ≈ 2 bits, length_code ≈ 3 bits,
+            // flag(0) trailing ≈ 1 bit
             let (_lc, leb, _) = crate::lzseq::encode_length(length);
-            let length_code_cost = 4 * COST_SCALE; // ~4 bits for length code
+            let length_code_cost = 3 * COST_SCALE;
             let length_extra_cost = leb as u32 * COST_SCALE;
-            let repeat_offset_cost = 2 * COST_SCALE; // ~2 bits for repeat code (0-2)
+            let repeat_offset_cost = 2 * COST_SCALE;
             repeat_offset_cost
                 .saturating_add(length_code_cost)
                 .saturating_add(length_extra_cost)
+                .saturating_add(self.literal_overhead)
                 .saturating_add(self.literal_cost[next_byte as usize])
         } else {
             self.match_cost(offset, length, next_byte)
