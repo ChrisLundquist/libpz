@@ -84,7 +84,7 @@ pz compresses 2.5–7x faster than gzip with ~2pp ratio gap. Decompress is faste
 
 - `src/lib.rs` — crate root, `PzError`/`PzResult` types
 - `src/lz_token.rs` — universal `LzToken` type, `TokenEncoder` trait, three encoder implementations
-- `src/{algorithm}.rs` — one file per composable algorithm (bwt, crc32, fse, huffman, lz77, lzseq, lzss, mtf, rans, rle)
+- `src/{algorithm}.rs` — one file per composable algorithm (bwt, crc32, fse, huffman, lz77, lzseq, lzss, lz_token, mtf, rans, rle, sortlz, recoil)
 - `src/analysis.rs` — data profiling (entropy, match density, run ratio, autocorrelation)
 - `src/optimal.rs` — optimal parsing (GPU top-K + backward DP)
 - `src/simd.rs` — SIMD decode paths for rANS
@@ -102,8 +102,8 @@ pz compresses 2.5–7x faster than gzip with ~2pp ratio gap. Decompress is faste
 Before optimizing GPU code paths, read this first — multiple agents have spent full sessions rediscovering these:
 
 - **GPU entropy (rANS/FSE) is slower than CPU** — 0.77x on encode, 0.54x on decode. This has been proven across 500+ optimization iterations. The serial state dependency in rANS limits GPU to ~300 threads; saturation needs ~8K-16K. Do not attempt to batch, parallelize, or "pipeline" GPU entropy encoding.
-- **`gpu_fused_span()` returning `Some((0,1))` is counterproductive** — it routes entropy to GPU (slower). It exists as architectural prep for if GPU entropy ever becomes competitive. The `GPU_ENTROPY_THRESHOLD` (256KB > default GPU block size 128KB) intentionally prevents this path from activating.
-- **The CLI uses `streaming::compress_stream`, not `pipeline::compress_with_options`** — the parallel scheduler's GPU coordinator is not invoked by the CLI. The streaming path deliberately uses CPU rANS for entropy.
+- **The parallel scheduler (`compress_with_options`) is CPU-only** — the GPU coordinator was removed because it serialized entropy encoding on one thread, bottlenecking at 28 MiB/s. GPU-accelerated compression uses the streaming path (`compress_stream`) which has a dedicated GPU coordinator with adaptive backpressure. Do not re-add a GPU coordinator to the parallel path.
+- **The CLI uses `streaming::compress_stream`, not `pipeline::compress_with_options`** — the streaming path handles GPU match-finding via a coordinator thread with adaptive backpressure that decrements on batch completion. Workers use CPU for entropy.
 - **The real GPU win (ring-buffered LZ77 batching) is already shipped** — delivers +7-17% throughput. See `docs/design-docs/gpu-strategy.md`.
 - **GPU device init time skews throughput benchmarks** — first-call GPU init adds significant overhead that `bench.sh` captures but Criterion amortizes across iterations. When comparing GPU vs CPU throughput, use Criterion (`cargo bench`) for apples-to-apples; `bench.sh` reflects real-world cold-start cost. Don't chase "GPU is slower" regressions that are really just init time.
 - **Compression ratio is limited by wire encoding overhead, not match quality** — the LZ match-finder finds good matches. The legacy Lz77Encoder (5-byte per match) was the worst offender; LzSeqEncoder (log2-coded, 6 streams) is much better but still ~2pp behind gzip on Silesia (34.4% vs 32.2%). Further ratio gains require encoding format work, not matcher tuning.

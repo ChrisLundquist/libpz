@@ -180,7 +180,7 @@ To understand how a pipeline works, trace a single block from `compress_block()`
 - Account for staging buffers and padding/alignment
 - Use `scripts/gpu-meminfo.sh` to analyze actual allocations
 
-**GPU scheduling:** All GPU work is routed through a single unified scheduler (`compress_parallel_unified` in `pipeline/parallel.rs`). A dedicated GPU coordinator thread batch-collects requests from CPU workers. The `UnifiedTask` enum has three variants: `Stage` (CPU), `StageGpu` (single GPU stage), and `FusedGpu` (multi-stage GPU execution). Workers use `try_send()` on a bounded channel with CPU fallback to avoid deadlock.
+**GPU scheduling:** GPU-accelerated compression uses the **streaming path** (`compress_stream` in `streaming.rs`), which spawns a dedicated GPU coordinator thread that batch-collects LZ77 match-finding requests from CPU workers via a bounded channel with adaptive backpressure. The **parallel scheduler** (`compress_parallel` in `pipeline/parallel.rs`) is CPU-only by design — it achieves higher throughput by avoiding GPU dispatch overhead. When `compress_with_options` is called with `Backend::WebGpu`, it routes through `compress_stream` internally.
 
 ### Feature Flags and Build Configurations
 
