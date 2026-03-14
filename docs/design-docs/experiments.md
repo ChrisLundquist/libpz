@@ -2,7 +2,7 @@
 
 Documentation of optimization attempts, successful iterations, and abandoned approaches.
 
-**Last updated:** 2026-03-12
+**Last updated:** 2026-03-13
 
 ## Successful Experiments
 
@@ -26,7 +26,9 @@ Documentation of optimization attempts, successful iterations, and abandoned app
 
 **Conclusions:**
 - Sync-point parallel Huffman is validated — excellent for CPU-parallel decompress
-- GPU decode viable only with merged buffers (5 instead of 5xN) or native d3d12
+- Fully merged output buffers are a dead end (D3D12 UAV barrier serialization)
+- Hybrid buffers (merge read-only, separate output) improved throughput 228→249 MiB/s (+9%)
+- CPU-parallel (1.7 GiB/s) still 6.8x faster than best GPU path (249 MiB/s)
 - CPU-parallel is the target architecture for pipeline integration
 
 
@@ -303,6 +305,43 @@ reducing submission count. Single mega-dispatch serializes compute→readback, l
 - **Not all transforms help compression ratio** (even orthogonal transforms)
 - Evaluation before implementation critical (commit `d3ddeda` is a good example)
 - Domain-specific nature of compression — transforms work for images, not arbitrary data
+
+### 5. Fully Merged GPU Buffers (D3D12 UAV Barrier Serialization)
+
+**Period:** March 2026
+**Commit:** attempted in hybrid buffer work (`8390b97`)
+
+**What was tried:**
+- Pack all N streams' data into 5 large buffers (one per binding type:
+  bitstream, LUT, sync_points, output, params)
+- Use `BufferBinding` with offsets so each dispatch gets a sub-range view
+- Goal: reduce 960 buffer allocations to 5 at 32 blocks (192 streams)
+
+**Why it failed:**
+- D3D12 UAV barriers serialize dispatches that share a `read_write` storage buffer
+- Even though dispatches write to non-overlapping sub-ranges, wgpu-hal inserts
+  barriers between every dispatch that touches the same buffer
+- `poll_wait()` time scaled linearly with stream count: 1.7ms (6 streams) →
+  5ms (24 streams) → 46ms (192 streams) — confirming sequential execution
+
+**Metrics:**
+- Buffer creation: 4,068us (improved from 5,375us) — 25% faster
+- Readback: 46,227us (regression from 3,643us) — **12.7x slower**
+- Total: 66 MiB/s (regression from 216 MiB/s) — 3.3x slower overall
+
+**What worked instead (hybrid approach):**
+- Merge only the 4 read-only buffers (bitstream, LUT, sync_points, params)
+- Keep separate per-stream output + staging buffers
+- Read-only buffers don't trigger UAV barriers → dispatches run in parallel
+- Result: 249 MiB/s peak (+9% over fully batched)
+
+**Lessons:**
+1. **Never merge `read_write` storage buffers across dispatches in wgpu/D3D12** —
+   UAV barriers will serialize them regardless of access pattern
+2. **Read-only buffer merging is safe** — `var<storage, read>` bindings don't
+   trigger barriers
+3. **Sub-phase timing is essential for GPU debugging** — without breaking readback
+   into poll/recv/copy/unmap, we'd have chased the wrong bottleneck
 
 ---
 

@@ -1,7 +1,8 @@
 # GpuLz Experiment Findings
 
 **Period:** March 2026
-**Commits:** `220b055` (kernel + codec), `c05b534` (multi-block + timing)
+**Commits:** `220b055` (kernel + codec), `c05b534` (multi-block + timing),
+`dea0c04` (Huffman decode fix), `8390b97` (hybrid buffers)
 **Hardware:** AMD Ryzen 9 9950X3D (16C/32T) + AMD Radeon RX 9070 XT (16GB RDNA4, ~40 TFLOPS)
 
 ## Summary
@@ -160,6 +161,84 @@ host overhead is 20x larger.
 GPU Huffman time grows ~linearly with stream count (buffer alloc dominated).
 Parallel LzSeq scales well (saturates ~16 cores around 16-32 blocks).
 
+### Experiment 6: Fully Merged Buffers (Failed)
+
+**Hypothesis:** Pack all N streams' data into 5 large buffers (one per binding type)
+using `BufferBinding` with offsets. Reduce 960 buffer allocations to 5.
+
+**Results at 32 x 128KB (192 GPU streams):**
+
+| Phase | Batched (5N bufs) | Fully Merged (5 bufs) |
+|-------|------------------|-----------------------|
+| Buffer creation | 5,375us | **4,068us** |
+| Submit | 3,291us | 2,150us |
+| **Readback** | **3,643us** | **46,227us** |
+| **Total GPU** | **14,212us** | **52,445us** |
+| Throughput | 216 MiB/s | **66 MiB/s** |
+
+**Root cause: D3D12 UAV barrier serialization.** When all 192 dispatches write to
+sub-ranges of the same `read_write` storage buffer, the D3D12 backend (via wgpu-hal)
+inserts Unordered Access View barriers between every dispatch, forcing sequential
+execution. With separate output buffers, dispatches run in parallel.
+
+**Evidence:** Sub-phase timing showed `poll_wait()` was the entire bottleneck.
+Poll time scaled linearly with stream count (1.7ms at 6 streams, 5ms at 24 streams,
+~46ms at 192 streams), confirming serialized dispatch execution. Buffer map, copy,
+and split were all negligible (<0.1ms combined).
+
+**Conclusion:** Fully merged buffers are a dead end. The buffer creation savings
+(6ms) are dwarfed by the dispatch serialization penalty (44ms). Do not merge
+`read_write` storage buffers across dispatches in wgpu/D3D12.
+
+### Experiment 7: Hybrid Buffers (Success)
+
+**Hypothesis:** Merge the 4 read-only buffers (bitstream, LUT, sync_points, params)
+via `BufferBinding` with sub-range offsets, but keep separate per-stream output +
+staging buffers to avoid UAV barrier serialization.
+
+Buffer count: `2N + 4` (vs `6N` batched, vs `6` fully merged).
+
+**Results (same-session comparison):**
+
+| Config | Batched buf/sub/rb | Hybrid buf/sub/rb | Batched MiB/s | Hybrid MiB/s |
+|--------|-------------------|-------------------|---------------|--------------|
+| 1x128KB | 156/1166/525 | 117/1041/492 | 40 | **44** |
+| 4x128KB | 583/1293/746 | 451/1635/738 | 121 | 113 |
+| 8x128KB | 1203/1558/1148 | 773/1249/951 | 178 | **210** |
+| 16x128KB | 2275/2025/1707 | 1684/1952/1562 | 228 | **249** |
+| 32x128KB | 5375/3291/3643 | 4710/3530/3240 | 216 | **221** |
+
+**Key findings:**
+- Buffer creation reduced 30-36% across all block counts (4 bulk uploads vs 4N small ones)
+- Readback unchanged (same per-stream staging approach)
+- Submit slightly higher at some counts (sub-range binding overhead)
+- **Peak throughput: 249 MiB/s** (hybrid, 16 blocks) vs 228 MiB/s (batched) — **+9%**
+- Sweet spot is 16 blocks; at 32 blocks per-stream output buffer allocation still dominates
+
+**Conclusion:** Hybrid is a clean win. Read-only buffer merging is safe; output buffer
+merging is not. The remaining bottleneck is per-stream output + staging buffer allocation
+(~4.7ms at 32 blocks = 384 allocations). Next steps would be buffer pooling or native
+D3D12 placed resources.
+
+### Experiment 8: Huffman Decode Correctness (Canterbury Corpus)
+
+Fixed two bugs in canonical Huffman decode that caused silent data corruption:
+
+**Bug 1: Tree-walk fallback used pre-canonical topology.** `canonicalize()` reassigns
+codewords but doesn't rebuild the tree node structure. Codes <= 12 bits use the 4096-entry
+LUT (correct). Codes 13-15 bits fell back to tree walk, which followed the pre-canonical
+tree — producing wrong symbols. Fixed with `decode_long_code()`: brute-force lookup search
+over the canonical code table.
+
+**Bug 2: Codes > 15 bits silently dropped.** `canonicalize()` only tracked `bl_count[0..16]`.
+Degenerate frequency distributions can produce codes > 15 bits (Canterbury block 15 had
+16-bit codes). These were silently ignored, producing a corrupt code table. Fixed with
+`limit_code_lengths()`: DEFLATE-style depth limiting that caps codes at MAX_CODE_BITS(15)
+and redistributes via Kraft inequality.
+
+**Result:** 20/21 Canterbury blocks now round-trip correctly. Block 16 has a pre-existing
+LzSeq encoder panic (match length < MIN_MATCH) — separate bug, not Huffman-related.
+
 ---
 
 ## Architecture Analysis
@@ -178,43 +257,46 @@ Plus per-stream: 1 bind group, 1 staging buffer for readback.
 Per-stream host cost: ~50-100us (buffer creation + upload + bind group).
 At 192 streams: ~10-19ms of pure host overhead.
 
-### Potential Fix: Merged Buffers
+### Merged Buffer Strategy (Tried — Partial Success)
 
-Instead of 5 x N buffers, pack all streams into 5 large buffers:
-- 1 bitstream buffer (all bitstreams concatenated)
-- 1 LUT buffer (all LUTs concatenated, or shared if identical across streams)
-- 1 sync-point buffer (all sync points concatenated)
-- 1 output buffer (all outputs concatenated)
-- 1 params buffer (per-stream offsets + metadata packed)
+**Fully merged (5 buffers total):** Dead end. D3D12 UAV barriers serialize dispatches
+that share a `read_write` storage buffer, even for non-overlapping sub-ranges. 20x
+readback regression. See Experiment 6.
 
-Single dispatch, single readback. Reduces 960 buffer creates to 5.
+**Hybrid (4 merged read-only + N separate output):** Clean win. Reduces buffer
+allocations from 6N to 2N+4. Buffer creation 30-36% faster. Peak throughput +9%.
+See Experiment 7.
 
-Expected improvement: 10ms -> ~0.5ms for buffer management.
-Projected 32-block throughput: ~1.0-1.5 GiB/s (competitive with CPU parallel).
+**Remaining bottleneck:** Per-stream output + staging buffer allocation (~4.7ms
+at 192 streams). Options:
+- **Buffer pooling**: pre-allocate output/staging buffers, reuse across calls
+- **Native D3D12**: placed resources in pre-allocated heaps (~1us vs ~25us per buffer)
 
-### Alternative: Native d3d12
+### Native D3D12 (Not Yet Tried)
 
 The wgpu abstraction adds overhead at several layers:
 - **Buffer creation** goes through HAL + validation, even in release mode
 - **Memory allocation** is per-buffer (no suballocation from heaps)
 - **Synchronization** uses `poll_wait()` (busy-spin) instead of fence-based
+- **UAV barriers** are inserted conservatively (can't mark non-overlapping sub-ranges)
 
-With native d3d12:
-- **Placed resources** in pre-allocated heaps: ~1us per buffer (vs ~50us in wgpu)
+With native D3D12:
+- **Placed resources** in pre-allocated heaps: ~1us per buffer (vs ~25us in wgpu)
 - **Ring buffer** for upload staging: zero per-frame allocation
 - **Fence-based sync**: lower CPU overhead than polling
 - **Root signatures** with descriptor tables: faster binding than wgpu bind groups
+- **Explicit UAV barriers**: could allow merged output buffer if non-overlapping
 
 Expected improvement: 5-10x reduction in host overhead.
 
 **Trade-offs:**
 - Windows-only (no Linux/Mac/WebGPU portability)
 - Significant implementation effort (~2-4 weeks)
-- Must maintain two backends (wgpu for portability, d3d12 for performance)
+- Must maintain two backends (wgpu for portability, D3D12 for performance)
 
-**Recommendation:** Try merged buffers in wgpu first. If that gets within 2x of CPU
-parallel, the GPU path may be viable. If not, d3d12 is the fallback for Windows
-perf-critical deployments.
+**Status:** Hybrid wgpu buffers got us to 249 MiB/s (vs 228 MiB/s batched), still
+6.8x behind CPU-parallel 1.7 GiB/s. D3D12 could close the gap further but the
+cost/benefit ratio is questionable unless GPU decompress is a hard requirement.
 
 ### Why Not GPU LzSeq Decode?
 
@@ -241,40 +323,47 @@ memory bandwidth.
 |------|-------------|
 | `kernels/huffman_decode.wgsl` | GPU sync-point Huffman decode kernel |
 | `src/gpulz.rs` | GpuLz codec (compress, decompress, multi-block GPU) |
-| `src/webgpu/huffman.rs` | GPU dispatch (single + batched + timed) |
+| `src/webgpu/huffman.rs` | GPU dispatch (batched + merged + hybrid + timed) |
 | `src/webgpu/pipelines.rs` | `HuffmanDecodePipelines` registration |
 | `src/webgpu/tests/huffman.rs` | GPU decode + GpuLz round-trip tests |
 | `benches/stages_gpulz.rs` | Experiments 1-5 criterion benchmarks |
 
 ## Known Issues
 
-1. **Canterbury corpus block 1 round-trip failure:** `decompress_block()` fails on
-   bytes 131072..262144 of the decompressed Canterbury tar. Root cause not yet
-   investigated — likely an edge case in `decode_tiled()` or
-   `rebuild_tree_from_code_lengths()` with certain data patterns (binary tar
-   metadata + mixed content).
+1. **Canterbury corpus block 16 LzSeq encoder panic:** `encode_length()` panics with
+   "attempt to subtract with overflow" when match length < MIN_MATCH(3). Pre-existing
+   bug in the LZ77→LzSeq pipeline, not Huffman-related. 20/21 blocks pass.
 
 2. **Compression ratio gap:** GpuLz is 2-6pp worse than existing pipelines. The
    sync-point overhead is only 1.3% — the gap comes from canonical Huffman (vs
    rANS/FSE) and the 6-stream LzSeq framing overhead.
+
+3. **No kernel fusion:** GPU Huffman results are read back to host, then CPU does
+   LzSeq reconstruct. Fusing into a single GPU pipeline would avoid the PCIe
+   roundtrip but LzSeq decode is serial per-block — poor GPU fit.
 
 ---
 
 ## Conclusions
 
 1. **Sync-point parallel Huffman is validated.** The codec design works correctly
-   and enables excellent parallel decode.
+   and enables excellent parallel decode. Canonical Huffman bugs fixed (Exp 8).
 
 2. **CPU-parallel decompress (1.7 GiB/s) is the clear winner** for the pipeline.
    Thread-per-block with tiled Huffman decode, no GPU needed.
 
-3. **GPU kernel is fast but host overhead kills it.** The actual compute is ~200us
-   for 4MB; the wgpu buffer management is ~10ms at 32 blocks. Merged buffers
-   or native d3d12 could fix this, but CPU parallel may already be fast enough.
+3. **GPU kernel is fast but wgpu host overhead kills it.** The actual compute is
+   ~200us for 4MB; the wgpu buffer management is ~4.7ms at 32 blocks (hybrid).
+   Hybrid merged buffers improved throughput by 9% (228→249 MiB/s) but the GPU
+   path is still 6.8x behind CPU-parallel.
 
-4. **GPU decompress is only viable if buffer overhead is eliminated.** Either
-   merged buffers in wgpu (5 buffers regardless of stream count) or native
-   d3d12 with placed resources + ring buffers.
+4. **Fully merged output buffers are a dead end.** D3D12 UAV barriers serialize
+   dispatches that share a `read_write` storage buffer, even for non-overlapping
+   sub-ranges. Only read-only buffers can be safely merged (Exp 6-7).
 
-5. **The codec should be integrated with CPU-parallel decompress** into the
+5. **Remaining GPU overhead is per-stream output+staging buffer allocation.**
+   Next steps would be buffer pooling (reuse across calls) or native D3D12
+   (placed resources in pre-allocated heaps).
+
+6. **The codec should be integrated with CPU-parallel decompress** into the
    streaming pipeline as the primary decompression path.
