@@ -703,6 +703,12 @@ pub struct MultiBlockTimings {
     pub parse_us: u64,
     /// GPU Huffman decode for all blocks combined (µs).
     pub gpu_huffman_us: u64,
+    /// GPU sub-phase: buffer creation + bind groups (µs).
+    pub gpu_buf_us: u64,
+    /// GPU sub-phase: command record + submit (µs).
+    pub gpu_submit_us: u64,
+    /// GPU sub-phase: readback (µs).
+    pub gpu_readback_us: u64,
     /// Parallel CPU LzSeq for all blocks (µs, wall time).
     pub lzseq_us: u64,
     /// Total wall time (µs).
@@ -767,7 +773,11 @@ pub fn decompress_blocks_gpu(
     let num_gpu_streams = all_decode_streams.len();
 
     // Single GPU submission for all streams across all blocks.
-    let all_decoded = engine.huffman_decode_gpu_batched(&all_decode_streams)?;
+    // Hybrid: merge read-only buffers (bitstream, LUT, sync_points, params)
+    // but keep separate per-stream output buffers to avoid D3D12 UAV barrier
+    // serialization. This gives us both fast buffer creation (4 bulk uploads)
+    // and parallel GPU dispatch (no shared read_write buffer).
+    let (all_decoded, gpu_timings) = engine.huffman_decode_gpu_hybrid_timed(&all_decode_streams)?;
 
     let t_gpu = Instant::now();
     let gpu_huffman_us = t_gpu.duration_since(t_parse).as_micros() as u64;
@@ -819,6 +829,9 @@ pub fn decompress_blocks_gpu(
         MultiBlockTimings {
             parse_us,
             gpu_huffman_us,
+            gpu_buf_us: gpu_timings.buffer_create_us,
+            gpu_submit_us: gpu_timings.submit_us,
+            gpu_readback_us: gpu_timings.readback_us,
             lzseq_us,
             total_us,
             num_blocks: blocks.len(),

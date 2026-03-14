@@ -1275,6 +1275,733 @@ impl WebGpuEngine {
             },
         ))
     }
+
+    /// Decode multiple Huffman streams using **merged buffers** — 5 buffers
+    /// regardless of stream count, plus 1 staging buffer for readback.
+    ///
+    /// This eliminates the O(N) buffer allocation overhead that dominates
+    /// GPU decompress at scale (e.g. 960 buffers → 6 for 192 streams).
+    ///
+    /// The approach: pack all streams' data into 5 large buffers (one per
+    /// binding type), then create lightweight per-stream bind groups using
+    /// `BufferBinding` with offsets. The kernel is unchanged.
+    #[allow(clippy::type_complexity)]
+    pub fn huffman_decode_gpu_merged_timed(
+        &self,
+        streams: &[HuffmanDecodeStream],
+    ) -> PzResult<(Vec<Vec<u8>>, GpuBatchedTimings)> {
+        use std::time::Instant;
+        let t0 = Instant::now();
+
+        if streams.is_empty() {
+            return Ok((
+                Vec::new(),
+                GpuBatchedTimings {
+                    buffer_create_us: 0,
+                    submit_us: 0,
+                    readback_us: 0,
+                    total_us: 0,
+                },
+            ));
+        }
+
+        // Buffer offset alignment — safe default for both storage and uniform.
+        // wgpu typically requires 256 for min_storage_buffer_offset_alignment
+        // and 256 for min_uniform_buffer_offset_alignment.
+        const ALIGN: usize = 256;
+
+        fn align_up(n: usize, align: usize) -> usize {
+            (n + align - 1) & !(align - 1)
+        }
+
+        let pipeline = self.pipeline_huffman_decode();
+        let bg_layout = pipeline.get_bind_group_layout(0);
+
+        // --- Phase 1: Compute offsets and total sizes for each merged buffer ---
+
+        struct StreamLayout {
+            bs_offset: usize,
+            bs_size: usize,
+            lut_offset: usize,
+            lut_size: usize,
+            sp_offset: usize,
+            sp_size: usize,
+            out_offset: usize,
+            out_size: usize,
+            params_offset: usize,
+            params_size: usize,
+            output_len: usize,
+            workgroups: u32,
+            active: bool,
+        }
+
+        let mut layouts = Vec::with_capacity(streams.len());
+        let mut total_bs = 0usize;
+        let mut total_lut = 0usize;
+        let mut total_sp = 0usize;
+        let mut total_out = 0usize;
+        let mut total_params = 0usize;
+
+        for s in streams {
+            if s.output_len == 0 || s.sync_points.len() < 2 {
+                layouts.push(StreamLayout {
+                    bs_offset: 0,
+                    bs_size: 0,
+                    lut_offset: 0,
+                    lut_size: 0,
+                    sp_offset: 0,
+                    sp_size: 0,
+                    out_offset: 0,
+                    out_size: 0,
+                    params_offset: 0,
+                    params_size: 0,
+                    output_len: 0,
+                    workgroups: 0,
+                    active: false,
+                });
+                continue;
+            }
+
+            let num_segments = s.sync_points.len() - 1;
+
+            // Bitstream: padded to u32 + 1 safety word, then align.
+            let bs_words = s.huffman_data.len().div_ceil(4) + 1;
+            let bs_size = bs_words * 4;
+            let bs_offset = total_bs;
+            total_bs += align_up(bs_size, ALIGN);
+
+            // LUT: always 4096 × u32 = 16384 bytes.
+            let lut_size = 4096 * 4;
+            let lut_offset = total_lut;
+            total_lut += align_up(lut_size, ALIGN);
+
+            // Sync points: 2 × num_sync_points × u32.
+            let sp_size = s.sync_points.len() * 2 * 4;
+            let sp_offset = total_sp;
+            total_sp += align_up(sp_size, ALIGN);
+
+            // Output: u32-aligned.
+            let out_words = s.output_len.div_ceil(4);
+            let out_size = out_words * 4;
+            let out_offset = total_out;
+            total_out += align_up(out_size, ALIGN);
+
+            // Params: 4 × u32 = 16 bytes.
+            let params_size = 16;
+            let params_offset = total_params;
+            total_params += align_up(params_size, ALIGN);
+
+            let workgroups = (num_segments as u32).div_ceil(64);
+
+            layouts.push(StreamLayout {
+                bs_offset,
+                bs_size,
+                lut_offset,
+                lut_size,
+                sp_offset,
+                sp_size,
+                out_offset,
+                out_size,
+                params_offset,
+                params_size,
+                output_len: s.output_len,
+                workgroups,
+                active: true,
+            });
+        }
+
+        // Ensure non-zero sizes (wgpu rejects 0-size buffers).
+        if total_bs == 0 {
+            total_bs = ALIGN;
+        }
+        if total_lut == 0 {
+            total_lut = ALIGN;
+        }
+        if total_sp == 0 {
+            total_sp = ALIGN;
+        }
+        if total_out == 0 {
+            total_out = ALIGN;
+        }
+        if total_params == 0 {
+            total_params = ALIGN;
+        }
+
+        // --- Phase 2: Pack data into CPU-side buffers ---
+
+        let mut bs_data = vec![0u8; total_bs];
+        let mut lut_data = vec![0u8; total_lut];
+        let mut sp_data = vec![0u8; total_sp];
+        // Output is zero-initialized (no data to pack).
+        let mut params_data = vec![0u8; total_params];
+
+        for (s, layout) in streams.iter().zip(layouts.iter()) {
+            if !layout.active {
+                continue;
+            }
+
+            // Bitstream: convert to big-endian u32 words.
+            let bs_words = s.huffman_data.len().div_ceil(4) + 1;
+            let mut words = vec![0u32; bs_words];
+            for (j, chunk) in s.huffman_data.chunks(4).enumerate() {
+                let mut bytes = [0u8; 4];
+                bytes[..chunk.len()].copy_from_slice(chunk);
+                words[j] = u32::from_be_bytes(bytes);
+            }
+            let word_bytes = bytemuck::cast_slice::<u32, u8>(&words);
+            bs_data[layout.bs_offset..layout.bs_offset + word_bytes.len()]
+                .copy_from_slice(word_bytes);
+
+            // LUT.
+            let lut_bytes = bytemuck::cast_slice::<u32, u8>(s.decode_lut.as_ref());
+            lut_data[layout.lut_offset..layout.lut_offset + lut_bytes.len()]
+                .copy_from_slice(lut_bytes);
+
+            // Sync points.
+            let sp_flat: Vec<u32> = s
+                .sync_points
+                .iter()
+                .flat_map(|sp| [sp.bit_offset, sp.symbol_index])
+                .collect();
+            let sp_bytes = bytemuck::cast_slice::<u32, u8>(&sp_flat);
+            sp_data[layout.sp_offset..layout.sp_offset + sp_bytes.len()].copy_from_slice(sp_bytes);
+
+            // Params.
+            let num_segments = s.sync_points.len() - 1;
+            let params = [
+                num_segments as u32,
+                s.output_len as u32,
+                0u32,
+                self.dispatch_width(layout.workgroups, 64),
+            ];
+            let param_bytes = bytemuck::cast_slice::<u32, u8>(&params);
+            params_data[layout.params_offset..layout.params_offset + param_bytes.len()]
+                .copy_from_slice(param_bytes);
+        }
+
+        // --- Phase 3: Create 5 merged GPU buffers + 1 staging buffer ---
+
+        let bs_buf =
+            self.create_buffer_init("merged_bitstream", &bs_data, wgpu::BufferUsages::STORAGE);
+        let lut_buf = self.create_buffer_init("merged_lut", &lut_data, wgpu::BufferUsages::STORAGE);
+        let sp_buf =
+            self.create_buffer_init("merged_sync_points", &sp_data, wgpu::BufferUsages::STORAGE);
+        let out_buf = self.create_buffer_init(
+            "merged_output",
+            &vec![0u8; total_out],
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let params_buf =
+            self.create_buffer_init("merged_params", &params_data, wgpu::BufferUsages::UNIFORM);
+
+        // Per-stream bind groups using buffer sub-ranges.
+        let mut bind_groups: Vec<Option<(wgpu::BindGroup, u32)>> =
+            Vec::with_capacity(streams.len());
+        for layout in &layouts {
+            if !layout.active {
+                bind_groups.push(None);
+                continue;
+            }
+
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("merged_bg"),
+                layout: &bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &bs_buf,
+                            offset: layout.bs_offset as u64,
+                            size: std::num::NonZeroU64::new(layout.bs_size as u64),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &lut_buf,
+                            offset: layout.lut_offset as u64,
+                            size: std::num::NonZeroU64::new(layout.lut_size as u64),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &sp_buf,
+                            offset: layout.sp_offset as u64,
+                            size: std::num::NonZeroU64::new(layout.sp_size as u64),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &out_buf,
+                            offset: layout.out_offset as u64,
+                            size: std::num::NonZeroU64::new(layout.out_size as u64),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &params_buf,
+                            offset: layout.params_offset as u64,
+                            size: std::num::NonZeroU64::new(layout.params_size as u64),
+                        }),
+                    },
+                ],
+            });
+
+            bind_groups.push(Some((bg, layout.workgroups)));
+        }
+
+        let t_buffers = Instant::now();
+        let buffer_create_us = t_buffers.duration_since(t0).as_micros() as u64;
+
+        // --- Phase 4: Record all dispatches ---
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("merged_huff_dec"),
+            });
+
+        for bg_opt in bind_groups.iter().flatten() {
+            let (bg, workgroups) = bg_opt;
+            self.record_dispatch(
+                &mut encoder,
+                pipeline,
+                bg,
+                *workgroups,
+                "huffman_sync_decode",
+            )?;
+        }
+
+        // Copy merged output to one staging buffer.
+        let staging = self.create_buffer(
+            "merged_staging",
+            total_out as u64,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, total_out as u64);
+
+        self.profiler_resolve(&mut encoder);
+        self.queue.submit(Some(encoder.finish()));
+
+        let t_submit = Instant::now();
+        let submit_us = t_submit.duration_since(t_buffers).as_micros() as u64;
+
+        // --- Phase 5: Read back and split ---
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).unwrap();
+        });
+        self.poll_wait();
+        rx.recv().unwrap().map_err(|_| PzError::Unsupported)?;
+        let raw = slice.get_mapped_range().to_vec();
+        staging.unmap();
+
+        let mut results = Vec::with_capacity(streams.len());
+        for layout in &layouts {
+            if !layout.active {
+                results.push(Vec::new());
+            } else {
+                let start = layout.out_offset;
+                let end = start + layout.output_len;
+                results.push(raw[start..end].to_vec());
+            }
+        }
+
+        let t_readback = Instant::now();
+        let readback_us = t_readback.duration_since(t_submit).as_micros() as u64;
+        let total_us = t_readback.duration_since(t0).as_micros() as u64;
+
+        Ok((
+            results,
+            GpuBatchedTimings {
+                buffer_create_us,
+                submit_us,
+                readback_us,
+                total_us,
+            },
+        ))
+    }
+
+    /// Same as [`huffman_decode_gpu_merged_timed`] but discards timing.
+    pub fn huffman_decode_gpu_merged(
+        &self,
+        streams: &[HuffmanDecodeStream],
+    ) -> PzResult<Vec<Vec<u8>>> {
+        self.huffman_decode_gpu_merged_timed(streams)
+            .map(|(data, _)| data)
+    }
+
+    /// Decode multiple Huffman streams using **hybrid** buffer strategy:
+    /// merge the 4 read-only buffers (bitstream, LUT, sync_points, params)
+    /// but keep separate per-stream output + staging buffers.
+    ///
+    /// This avoids the UAV barrier serialization that killed the fully-merged
+    /// approach (D3D12 inserts barriers between dispatches that share a
+    /// `read_write` storage buffer, even for non-overlapping sub-ranges).
+    ///
+    /// Buffer count: 4 merged + N output + N staging = 2N + 4
+    /// (vs 5N + N = 6N for fully batched, or 5 + 1 = 6 for fully merged).
+    #[allow(clippy::type_complexity)]
+    pub fn huffman_decode_gpu_hybrid_timed(
+        &self,
+        streams: &[HuffmanDecodeStream],
+    ) -> PzResult<(Vec<Vec<u8>>, GpuBatchedTimings)> {
+        use std::time::Instant;
+        let t0 = Instant::now();
+
+        if streams.is_empty() {
+            return Ok((
+                Vec::new(),
+                GpuBatchedTimings {
+                    buffer_create_us: 0,
+                    submit_us: 0,
+                    readback_us: 0,
+                    total_us: 0,
+                },
+            ));
+        }
+
+        // min_storage_buffer_offset_alignment is typically 256 on all backends.
+        const ALIGN: usize = 256;
+
+        fn align_up(n: usize, align: usize) -> usize {
+            (n + align - 1) & !(align - 1)
+        }
+
+        let pipeline = self.pipeline_huffman_decode();
+        let bg_layout = pipeline.get_bind_group_layout(0);
+
+        // --- Phase 1: Compute offsets for merged read-only buffers ---
+
+        struct StreamLayout {
+            bs_offset: usize,
+            bs_size: usize,
+            lut_offset: usize,
+            lut_size: usize,
+            sp_offset: usize,
+            sp_size: usize,
+            params_offset: usize,
+            params_size: usize,
+            output_words: usize,
+            output_len: usize,
+            workgroups: u32,
+            active: bool,
+        }
+
+        let mut layouts = Vec::with_capacity(streams.len());
+        let mut total_bs = 0usize;
+        let mut total_lut = 0usize;
+        let mut total_sp = 0usize;
+        let mut total_params = 0usize;
+
+        for s in streams {
+            if s.output_len == 0 || s.sync_points.len() < 2 {
+                layouts.push(StreamLayout {
+                    bs_offset: 0,
+                    bs_size: 0,
+                    lut_offset: 0,
+                    lut_size: 0,
+                    sp_offset: 0,
+                    sp_size: 0,
+                    params_offset: 0,
+                    params_size: 0,
+                    output_words: 0,
+                    output_len: 0,
+                    workgroups: 0,
+                    active: false,
+                });
+                continue;
+            }
+
+            let num_segments = s.sync_points.len() - 1;
+
+            // Bitstream: padded to u32 + 1 safety word, then align.
+            let bs_words = s.huffman_data.len().div_ceil(4) + 1;
+            let bs_size = bs_words * 4;
+            let bs_offset = total_bs;
+            total_bs += align_up(bs_size, ALIGN);
+
+            // LUT: always 4096 × u32 = 16384 bytes.
+            let lut_size = 4096 * 4;
+            let lut_offset = total_lut;
+            total_lut += align_up(lut_size, ALIGN);
+
+            // Sync points: 2 × num_sync_points × u32.
+            let sp_size = s.sync_points.len() * 2 * 4;
+            let sp_offset = total_sp;
+            total_sp += align_up(sp_size, ALIGN);
+
+            // Params: 4 × u32 = 16 bytes.
+            let params_size = 16;
+            let params_offset = total_params;
+            total_params += align_up(params_size, ALIGN);
+
+            let output_words = s.output_len.div_ceil(4);
+            let workgroups = (num_segments as u32).div_ceil(64);
+
+            layouts.push(StreamLayout {
+                bs_offset,
+                bs_size,
+                lut_offset,
+                lut_size,
+                sp_offset,
+                sp_size,
+                params_offset,
+                params_size,
+                output_words,
+                output_len: s.output_len,
+                workgroups,
+                active: true,
+            });
+        }
+
+        // Ensure non-zero sizes (wgpu rejects 0-size buffers).
+        if total_bs == 0 {
+            total_bs = ALIGN;
+        }
+        if total_lut == 0 {
+            total_lut = ALIGN;
+        }
+        if total_sp == 0 {
+            total_sp = ALIGN;
+        }
+        if total_params == 0 {
+            total_params = ALIGN;
+        }
+
+        // --- Phase 2: Pack read-only data into CPU-side buffers ---
+
+        let mut bs_data = vec![0u8; total_bs];
+        let mut lut_data = vec![0u8; total_lut];
+        let mut sp_data = vec![0u8; total_sp];
+        let mut params_data = vec![0u8; total_params];
+
+        for (s, layout) in streams.iter().zip(layouts.iter()) {
+            if !layout.active {
+                continue;
+            }
+
+            // Bitstream: convert to big-endian u32 words.
+            let bs_words = s.huffman_data.len().div_ceil(4) + 1;
+            let mut words = vec![0u32; bs_words];
+            for (j, chunk) in s.huffman_data.chunks(4).enumerate() {
+                let mut bytes = [0u8; 4];
+                bytes[..chunk.len()].copy_from_slice(chunk);
+                words[j] = u32::from_be_bytes(bytes);
+            }
+            let word_bytes = bytemuck::cast_slice::<u32, u8>(&words);
+            bs_data[layout.bs_offset..layout.bs_offset + word_bytes.len()]
+                .copy_from_slice(word_bytes);
+
+            // LUT.
+            let lut_bytes = bytemuck::cast_slice::<u32, u8>(s.decode_lut.as_ref());
+            lut_data[layout.lut_offset..layout.lut_offset + lut_bytes.len()]
+                .copy_from_slice(lut_bytes);
+
+            // Sync points.
+            let sp_flat: Vec<u32> = s
+                .sync_points
+                .iter()
+                .flat_map(|sp| [sp.bit_offset, sp.symbol_index])
+                .collect();
+            let sp_bytes = bytemuck::cast_slice::<u32, u8>(&sp_flat);
+            sp_data[layout.sp_offset..layout.sp_offset + sp_bytes.len()].copy_from_slice(sp_bytes);
+
+            // Params.
+            let num_segments = s.sync_points.len() - 1;
+            let params = [
+                num_segments as u32,
+                s.output_len as u32,
+                0u32,
+                self.dispatch_width(layout.workgroups, 64),
+            ];
+            let param_bytes = bytemuck::cast_slice::<u32, u8>(&params);
+            params_data[layout.params_offset..layout.params_offset + param_bytes.len()]
+                .copy_from_slice(param_bytes);
+        }
+
+        // --- Phase 3: Create merged read-only buffers + per-stream output ---
+
+        let bs_buf =
+            self.create_buffer_init("hybrid_bitstream", &bs_data, wgpu::BufferUsages::STORAGE);
+        let lut_buf = self.create_buffer_init("hybrid_lut", &lut_data, wgpu::BufferUsages::STORAGE);
+        let sp_buf =
+            self.create_buffer_init("hybrid_sync_points", &sp_data, wgpu::BufferUsages::STORAGE);
+        let params_buf =
+            self.create_buffer_init("hybrid_params", &params_data, wgpu::BufferUsages::UNIFORM);
+
+        // Per-stream output buffers (separate to avoid UAV barrier serialization).
+        struct StreamOut {
+            output_buf: wgpu::Buffer,
+            bg: wgpu::BindGroup,
+            workgroups: u32,
+            output_words: usize,
+            output_len: usize,
+        }
+
+        let mut stream_outs: Vec<Option<StreamOut>> = Vec::with_capacity(streams.len());
+        for layout in &layouts {
+            if !layout.active {
+                stream_outs.push(None);
+                continue;
+            }
+
+            let output_buf = self.create_buffer_init(
+                "hybrid_out",
+                &vec![0u8; layout.output_words * 4],
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            );
+
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("hybrid_bg"),
+                layout: &bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &bs_buf,
+                            offset: layout.bs_offset as u64,
+                            size: std::num::NonZeroU64::new(layout.bs_size as u64),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &lut_buf,
+                            offset: layout.lut_offset as u64,
+                            size: std::num::NonZeroU64::new(layout.lut_size as u64),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &sp_buf,
+                            offset: layout.sp_offset as u64,
+                            size: std::num::NonZeroU64::new(layout.sp_size as u64),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: output_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &params_buf,
+                            offset: layout.params_offset as u64,
+                            size: std::num::NonZeroU64::new(layout.params_size as u64),
+                        }),
+                    },
+                ],
+            });
+
+            stream_outs.push(Some(StreamOut {
+                output_buf,
+                bg,
+                workgroups: layout.workgroups,
+                output_words: layout.output_words,
+                output_len: layout.output_len,
+            }));
+        }
+
+        let t_buffers = Instant::now();
+        let buffer_create_us = t_buffers.duration_since(t0).as_micros() as u64;
+
+        // --- Phase 4: Record all dispatches + staging copies ---
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("hybrid_huff_dec"),
+            });
+
+        for so in stream_outs.iter().flatten() {
+            self.record_dispatch(
+                &mut encoder,
+                pipeline,
+                &so.bg,
+                so.workgroups,
+                "huffman_sync_decode",
+            )?;
+        }
+
+        // Per-stream staging buffers + copy commands.
+        let mut staging_bufs: Vec<Option<wgpu::Buffer>> = Vec::with_capacity(streams.len());
+        for so in &stream_outs {
+            if let Some(so) = so {
+                let staging = self.create_buffer(
+                    "hybrid_staging",
+                    (so.output_words * 4) as u64,
+                    wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                );
+                encoder.copy_buffer_to_buffer(
+                    &so.output_buf,
+                    0,
+                    &staging,
+                    0,
+                    (so.output_words * 4) as u64,
+                );
+                staging_bufs.push(Some(staging));
+            } else {
+                staging_bufs.push(None);
+            }
+        }
+
+        self.profiler_resolve(&mut encoder);
+        self.queue.submit(Some(encoder.finish()));
+
+        let t_submit = Instant::now();
+        let submit_us = t_submit.duration_since(t_buffers).as_micros() as u64;
+
+        // --- Phase 5: Map staging buffers and read back ---
+
+        let mut results = Vec::with_capacity(streams.len());
+        for (i, staging) in staging_bufs.iter().enumerate() {
+            if let Some(staging) = staging {
+                let slice = staging.slice(..);
+                let (tx, rx) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |r| {
+                    tx.send(r).unwrap();
+                });
+                self.poll_wait();
+                rx.recv().unwrap().map_err(|_| PzError::Unsupported)?;
+                let data = slice.get_mapped_range().to_vec();
+                staging.unmap();
+                let output_len = stream_outs[i].as_ref().unwrap().output_len;
+                results.push(data[..output_len].to_vec());
+            } else {
+                results.push(Vec::new());
+            }
+        }
+
+        let t_readback = Instant::now();
+        let readback_us = t_readback.duration_since(t_submit).as_micros() as u64;
+        let total_us = t_readback.duration_since(t0).as_micros() as u64;
+
+        Ok((
+            results,
+            GpuBatchedTimings {
+                buffer_create_us,
+                submit_us,
+                readback_us,
+                total_us,
+            },
+        ))
+    }
+
+    /// Same as [`huffman_decode_gpu_hybrid_timed`] but discards timing.
+    pub fn huffman_decode_gpu_hybrid(
+        &self,
+        streams: &[HuffmanDecodeStream],
+    ) -> PzResult<Vec<Vec<u8>>> {
+        self.huffman_decode_gpu_hybrid_timed(streams)
+            .map(|(data, _)| data)
+    }
 }
 
 /// Per-phase timing for batched GPU Huffman decode.

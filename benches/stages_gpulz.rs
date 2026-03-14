@@ -619,15 +619,24 @@ fn bench_gpulz_multiblock_gpu(c: &mut Criterion) {
             let n = timings.len();
             let mut total: Vec<u64> = timings.iter().map(|t| t.total_us).collect();
             let mut gpu: Vec<u64> = timings.iter().map(|t| t.gpu_huffman_us).collect();
+            let mut gpu_buf: Vec<u64> = timings.iter().map(|t| t.gpu_buf_us).collect();
+            let mut gpu_sub: Vec<u64> = timings.iter().map(|t| t.gpu_submit_us).collect();
+            let mut gpu_rb: Vec<u64> = timings.iter().map(|t| t.gpu_readback_us).collect();
             let mut lzseq: Vec<u64> = timings.iter().map(|t| t.lzseq_us).collect();
             total.sort();
             gpu.sort();
+            gpu_buf.sort();
+            gpu_sub.sort();
+            gpu_rb.sort();
             lzseq.sort();
             let med = n / 2;
             let throughput = total_size as f64 / total[med] as f64; // bytes/µs = MB/s
             eprintln!(
-                "    → {num_blocks}×128KB: gpu={gpu}µs  lzseq={lzseq}µs  total={total}µs  = {tp:.0} MiB/s  ({streams} GPU streams)",
+                "    → {num_blocks}×128KB: gpu={gpu}µs [buf={buf}µs sub={sub}µs rb={rb}µs]  lzseq={lzseq}µs  total={total}µs  = {tp:.0} MiB/s  ({streams} GPU streams)",
                 gpu = gpu[med],
+                buf = gpu_buf[med],
+                sub = gpu_sub[med],
+                rb = gpu_rb[med],
                 lzseq = lzseq[med],
                 total = total[med],
                 tp = throughput / 1.048576,

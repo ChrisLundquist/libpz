@@ -404,3 +404,105 @@ fn test_gpulz_multiblock_gpu_roundtrip() {
         assert_eq!(gpu_out, orig, "block {i} GPU decompress mismatch");
     }
 }
+
+#[test]
+fn test_merged_decode_matches_batched() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Create multiple distinct streams.
+    let patterns: &[&[u8]] = &[
+        b"The quick brown fox jumps over the lazy dog. ",
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ",
+        b"aaabbbcccdddeeefffggghhhiiijjjkkklll ",
+    ];
+
+    let mut all_streams = Vec::new();
+    for pattern in patterns {
+        let data: Vec<u8> = pattern.iter().copied().cycle().take(4096).collect();
+        let mut tree = crate::huffman::HuffmanTree::from_data(&data).unwrap();
+        tree.canonicalize();
+        let result = tree.encode_with_sync_points(&data, 1024).unwrap();
+        let lut = tree.build_gpu_decode_lut();
+        let lut_box: Box<[u32; 4096]> = lut.into_boxed_slice().try_into().unwrap();
+        all_streams.push(HuffmanDecodeStream {
+            huffman_data: Box::leak(result.data.into_boxed_slice()),
+            decode_lut: lut_box,
+            sync_points: result.sync_points,
+            output_len: data.len(),
+        });
+    }
+
+    // Decode with both approaches.
+    let batched_results = engine.huffman_decode_gpu_batched(&all_streams).unwrap();
+    let merged_results = engine.huffman_decode_gpu_merged(&all_streams).unwrap();
+
+    assert_eq!(batched_results.len(), merged_results.len());
+    for (i, (batched, merged)) in batched_results
+        .iter()
+        .zip(merged_results.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            batched,
+            merged,
+            "stream {i}: merged decode doesn't match batched decode (len {} vs {})",
+            batched.len(),
+            merged.len(),
+        );
+    }
+}
+
+#[test]
+fn test_hybrid_decode_matches_batched() {
+    let engine = match WebGpuEngine::new() {
+        Ok(e) => e,
+        Err(PzError::Unsupported) => return,
+        Err(e) => panic!("unexpected error: {:?}", e),
+    };
+
+    // Create multiple distinct streams (same as merged test).
+    let patterns: &[&[u8]] = &[
+        b"The quick brown fox jumps over the lazy dog. ",
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ",
+        b"aaabbbcccdddeeefffggghhhiiijjjkkklll ",
+    ];
+
+    let mut all_streams = Vec::new();
+    for pattern in patterns {
+        let data: Vec<u8> = pattern.iter().copied().cycle().take(4096).collect();
+        let mut tree = crate::huffman::HuffmanTree::from_data(&data).unwrap();
+        tree.canonicalize();
+        let result = tree.encode_with_sync_points(&data, 1024).unwrap();
+        let lut = tree.build_gpu_decode_lut();
+        let lut_box: Box<[u32; 4096]> = lut.into_boxed_slice().try_into().unwrap();
+        all_streams.push(HuffmanDecodeStream {
+            huffman_data: Box::leak(result.data.into_boxed_slice()),
+            decode_lut: lut_box,
+            sync_points: result.sync_points,
+            output_len: data.len(),
+        });
+    }
+
+    // Decode with both approaches.
+    let batched_results = engine.huffman_decode_gpu_batched(&all_streams).unwrap();
+    let hybrid_results = engine.huffman_decode_gpu_hybrid(&all_streams).unwrap();
+
+    assert_eq!(batched_results.len(), hybrid_results.len());
+    for (i, (batched, hybrid)) in batched_results
+        .iter()
+        .zip(hybrid_results.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            batched,
+            hybrid,
+            "stream {i}: hybrid decode doesn't match batched decode (len {} vs {})",
+            batched.len(),
+            hybrid.len(),
+        );
+    }
+}
