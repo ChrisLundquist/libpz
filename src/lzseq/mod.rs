@@ -68,9 +68,9 @@ impl Default for SeqConfig {
     fn default() -> Self {
         SeqConfig {
             max_window: 128 * 1024,
-            hash_prefix_len: 3,
+            hash_prefix_len: 4,
             max_chain: crate::lz77::MAX_CHAIN,
-            adaptive_chain: false,
+            adaptive_chain: true,
             max_match_len: crate::lz77::DEFAULT_MAX_MATCH,
         }
     }
@@ -137,7 +137,7 @@ pub struct SeqEncoded {
 /// Code 1: value 2 (0 extra bits)
 /// Code N (N>=2): base = 1 + 2^(N-1), extra_bits = N-1
 #[inline]
-fn encode_value(value: u32) -> (u8, u8, u32) {
+pub(crate) fn encode_value(value: u32) -> (u8, u8, u32) {
     debug_assert!(value >= 1);
     match value {
         1 => (0, 0, 0),
@@ -154,7 +154,7 @@ fn encode_value(value: u32) -> (u8, u8, u32) {
 
 /// Decode from (code, extra_value) back to 1-based value.
 #[inline]
-fn decode_value(code: u8, extra_value: u32) -> u32 {
+pub(crate) fn decode_value(code: u8, extra_value: u32) -> u32 {
     match code {
         0 => 1,
         1 => 2,
@@ -167,7 +167,7 @@ fn decode_value(code: u8, extra_value: u32) -> u32 {
 
 /// Number of extra bits for a given code.
 #[inline]
-fn extra_bits_for_code(code: u8) -> u8 {
+pub(crate) fn extra_bits_for_code(code: u8) -> u8 {
     if code < 2 {
         0
     } else {
@@ -210,19 +210,19 @@ pub(crate) fn decode_length(code: u8, extra_value: u32) -> u16 {
 // ---------------------------------------------------------------------------
 
 /// Number of reserved repeat offset codes (0, 1, 2).
-const NUM_REPEAT_CODES: u8 = 3;
+pub(crate) const NUM_REPEAT_CODES: u8 = 3;
 
 /// Tracks the 3 most recently used offsets for repeat-offset encoding.
 ///
 /// Encoder and decoder maintain identical state. Matches that reuse a
 /// recent offset encode with code 0-2 (0 extra bits), saving the full
 /// offset encoding cost.
-struct RepeatOffsets {
-    recent: [u32; 3],
+pub(crate) struct RepeatOffsets {
+    pub(crate) recent: [u32; 3],
 }
 
 impl RepeatOffsets {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         // Initialize with common small offsets. Encoder and decoder must match.
         RepeatOffsets { recent: [1, 1, 1] }
     }
@@ -232,7 +232,7 @@ impl RepeatOffsets {
     /// Codes 0-2: repeat offset (0 extra bits).
     /// Code 3+: literal offset (shifted from base table).
     #[inline]
-    fn encode_offset(&mut self, offset: u32) -> (u8, u8, u32) {
+    pub(crate) fn encode_offset(&mut self, offset: u32) -> (u8, u8, u32) {
         // Check repeat offsets (cheapest encoding: 0 extra bits)
         for i in 0..3 {
             if offset == self.recent[i] {
@@ -248,7 +248,7 @@ impl RepeatOffsets {
 
     /// Decode an offset from code + extra_value, updating repeat state.
     #[inline]
-    fn decode_offset(&mut self, code: u8, extra_value: u32) -> u32 {
+    pub(crate) fn decode_offset(&mut self, code: u8, extra_value: u32) -> u32 {
         if code < NUM_REPEAT_CODES {
             let offset = self.recent[code as usize];
             self.promote(code as usize);
@@ -262,7 +262,7 @@ impl RepeatOffsets {
 
     /// Promote repeat index `i` to most-recent position.
     #[inline]
-    fn promote(&mut self, i: usize) {
+    pub(crate) fn promote(&mut self, i: usize) {
         match i {
             0 => {}                           // already most recent
             1 => self.recent.swap(0, 1),      // swap 1↔0
@@ -273,7 +273,7 @@ impl RepeatOffsets {
 
     /// Push a new (non-repeat) offset, evicting the oldest.
     #[inline]
-    fn push_new(&mut self, offset: u32) {
+    pub(crate) fn push_new(&mut self, offset: u32) {
         self.recent[2] = self.recent[1];
         self.recent[1] = self.recent[0];
         self.recent[0] = offset;
@@ -282,7 +282,7 @@ impl RepeatOffsets {
 
 /// Number of extra bits for a repeat-aware offset code.
 #[inline]
-fn extra_bits_for_offset_code(code: u8) -> u8 {
+pub(crate) fn extra_bits_for_offset_code(code: u8) -> u8 {
     if code < NUM_REPEAT_CODES {
         0
     } else {
@@ -312,14 +312,14 @@ fn check_repeat_match(input: &[u8], pos: usize, offset: u32, max_match: usize) -
 // BitWriter / BitReader for extra-bits streams (LSB-first, u64 container)
 // ---------------------------------------------------------------------------
 
-struct BitWriter {
+pub(crate) struct BitWriter {
     buffer: Vec<u8>,
     container: u64,
     bit_pos: u32,
 }
 
 impl BitWriter {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         BitWriter {
             buffer: Vec::new(),
             container: 0,
@@ -328,7 +328,7 @@ impl BitWriter {
     }
 
     #[inline]
-    fn write_bits(&mut self, value: u32, nb_bits: u8) {
+    pub(crate) fn write_bits(&mut self, value: u32, nb_bits: u8) {
         debug_assert!(nb_bits <= 32);
         if nb_bits == 0 {
             return;
@@ -342,7 +342,7 @@ impl BitWriter {
         }
     }
 
-    fn finish(mut self) -> Vec<u8> {
+    pub(crate) fn finish(mut self) -> Vec<u8> {
         if self.bit_pos > 0 {
             self.buffer.push(self.container as u8);
         }
@@ -350,7 +350,7 @@ impl BitWriter {
     }
 }
 
-struct BitReader<'a> {
+pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     byte_pos: usize,
     container: u64,
@@ -364,7 +364,7 @@ struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         let mut r = BitReader {
             data,
             byte_pos: 0,
@@ -379,7 +379,7 @@ impl<'a> BitReader<'a> {
     }
 
     #[inline]
-    fn read_bits(&mut self, nb_bits: u8) -> u32 {
+    pub(crate) fn read_bits(&mut self, nb_bits: u8) -> u32 {
         if nb_bits == 0 {
             return 0;
         }

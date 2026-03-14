@@ -135,16 +135,17 @@ impl CostModel {
             }
         }
 
-        // Estimate overhead costs:
-        // In a typical LZ77 output, ~50% of tokens are literals (offset=0, length=0).
-        // The 0x00 byte thus appears very frequently, making it cheap to encode.
-        // Estimate: 0x00 costs ~1 bit after entropy coding, so 4 zero bytes ≈ 4 bits.
-        let literal_overhead = 4 * COST_SCALE;
+        // LzSeq-aware overhead estimates:
+        //
+        // Flag stream: typically ~55-65% literals, ~35-45% matches.
+        // flag(0) entropy ≈ -log2(0.6) ≈ 0.74 bits ≈ 1 bit
+        // flag(1) entropy ≈ -log2(0.4) ≈ 1.32 bits ≈ 1 bit
+        let literal_overhead = COST_SCALE;
 
-        // Match offset/length fields contain varied byte values.
-        // Typical entropy: ~4-5 bits/byte for offset, ~3-4 bits/byte for length.
-        // Conservative estimate: 4 bytes × 4 bits/byte = 16 bits overhead.
-        let match_overhead = 16 * COST_SCALE;
+        // Generic match overhead (fallback when offset is unavailable):
+        // flag(1) + offset_code(~3) + length_code(~3) + flag(0) for trailing literal
+        // ≈ 8 bits. Detailed match_cost() is used when offset is known.
+        let match_overhead = 8 * COST_SCALE;
 
         Self {
             literal_cost,
@@ -170,6 +171,7 @@ impl CostModel {
     #[inline]
     pub fn match_token(&self, next_byte: u8) -> u32 {
         self.match_overhead
+            .saturating_add(self.literal_overhead)
             .saturating_add(self.literal_cost[next_byte as usize])
     }
 
@@ -203,6 +205,7 @@ impl CostModel {
         code_cost
             .saturating_sub(code_discount)
             .saturating_add(extra_cost)
+            .saturating_add(self.literal_overhead)
             .saturating_add(self.literal_cost[next_byte as usize])
     }
 
@@ -222,14 +225,16 @@ impl CostModel {
     ) -> u32 {
         if is_repeat {
             // Repeat offset: encode with code 0-2, 0 extra bits.
-            // Cost = ~2 bits for offset code + length cost + next_byte cost.
+            // flag(1) ≈ 1 bit, repeat code ≈ 2 bits, length_code ≈ 3 bits,
+            // flag(0) trailing ≈ 1 bit
             let (_lc, leb, _) = crate::lzseq::encode_length(length);
-            let length_code_cost = 4 * COST_SCALE; // ~4 bits for length code
+            let length_code_cost = 3 * COST_SCALE;
             let length_extra_cost = leb as u32 * COST_SCALE;
-            let repeat_offset_cost = 2 * COST_SCALE; // ~2 bits for repeat code (0-2)
+            let repeat_offset_cost = 2 * COST_SCALE;
             repeat_offset_cost
                 .saturating_add(length_code_cost)
                 .saturating_add(length_extra_cost)
+                .saturating_add(self.literal_overhead)
                 .saturating_add(self.literal_cost[next_byte as usize])
         } else {
             self.match_cost(offset, length, next_byte)
@@ -500,6 +505,22 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
         }
     }
 
+    // Forward refinement: re-evaluate each position with actual repeat state.
+    // The backward DP used greedy repeat estimates; the refinement corrects this.
+    const MAX_REFINEMENT_PASSES: usize = 3;
+    for _ in 0..MAX_REFINEMENT_PASSES {
+        if !refine_parse_with_repeats(
+            input,
+            table,
+            cost_model,
+            &cost,
+            &mut choice_len,
+            &mut choice_offset,
+        ) {
+            break;
+        }
+    }
+
     // Forward trace: recover the optimal match sequence
     let mut matches = Vec::new();
     let mut pos = 0;
@@ -527,6 +548,85 @@ pub fn optimal_parse(input: &[u8], table: &MatchTable, cost_model: &CostModel) -
     }
 
     matches
+}
+
+/// Forward refinement pass: re-evaluate each parse position using actual repeat
+/// offset state instead of the greedy approximation used during backward DP.
+///
+/// Walks the current parse forward, tracking the real `RepeatOffsetState`. At each
+/// position, re-evaluates all K match candidates plus the literal option using the
+/// actual repeat state and the backward DP cost-to-end array. If a different choice
+/// is cheaper, switches it.
+///
+/// Returns `true` if any choice was changed (caller should iterate until stable).
+fn refine_parse_with_repeats(
+    input: &[u8],
+    table: &MatchTable,
+    cost_model: &CostModel,
+    cost: &[u32],
+    choice_len: &mut [u16],
+    choice_offset: &mut [u16],
+) -> bool {
+    let n = input.len();
+    let mut changed = false;
+    let mut repeat_state = RepeatOffsetState::new();
+    let mut pos = 0;
+
+    while pos < n {
+        let old_len = choice_len[pos];
+        let old_offset = choice_offset[pos];
+
+        // Option 1: literal
+        let lit_cost = cost_model
+            .literal_token(input[pos])
+            .saturating_add(cost[pos + 1]);
+        let mut best_cost = lit_cost;
+        let mut best_len = 0u16;
+        let mut best_offset = 0u16;
+
+        // Option 2: each match candidate with actual repeat state
+        for cand in table.at(pos) {
+            if cand.length < MIN_MATCH as u32 {
+                break;
+            }
+            let match_end = pos + cand.length as usize;
+            if match_end >= n {
+                continue;
+            }
+            let next_pos = match_end + 1;
+            let is_repeat = repeat_state.is_repeat(cand.offset);
+            let mcost = cost_model
+                .match_cost_with_repeat_flag(
+                    cand.offset,
+                    cand.length as u16,
+                    input[match_end],
+                    is_repeat,
+                )
+                .saturating_add(cost[next_pos]);
+
+            if mcost < best_cost {
+                best_cost = mcost;
+                best_len = cand.length as u16;
+                best_offset = cand.offset as u16;
+            }
+        }
+
+        if best_len != old_len || best_offset != old_offset {
+            choice_len[pos] = best_len;
+            choice_offset[pos] = best_offset;
+            changed = true;
+        }
+
+        // Advance and update repeat state
+        if best_len > 0 {
+            repeat_state.update(best_offset as u32);
+            pos += best_len as usize + 1;
+        } else {
+            pos += 1;
+        }
+    }
+
+    changed
 }
 
 // ---------------------------------------------------------------------------

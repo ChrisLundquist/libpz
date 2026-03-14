@@ -479,6 +479,127 @@ pub(crate) fn stage_rans_decode_webgpu(
 }
 
 // ---------------------------------------------------------------------------
+// Entropy stage functions — rANS with sparse freq tables (LzSeq2)
+// ---------------------------------------------------------------------------
+
+/// Bit-28 flag on per-stream compressed_len signaling sparse freq tables.
+const RANS_SPARSE_FLAG: u32 = 1 << 28;
+/// Bit-27 flag signaling raw passthrough (no entropy coding).
+const RANS_RAW_FLAG: u32 = 1 << 27;
+
+/// rANS encoding stage with sparse frequency tables.
+///
+/// All streams are entropy-coded with sparse rANS. For streams with few
+/// distinct symbols (offset_codes, length_codes), sparse freq tables save
+/// ~400-500 bytes each compared to the standard 512-byte table.
+pub(crate) fn stage_rans_encode_sparse(
+    mut block: StageBlock,
+    _options: &CompressOptions,
+) -> PzResult<StageBlock> {
+    let streams = block.streams.take().ok_or(PzError::InvalidInput)?;
+    let pre_entropy_len = block
+        .metadata
+        .pre_entropy_len
+        .ok_or(PzError::InvalidInput)?;
+
+    block.data = encode_multistream_indexed(
+        &streams,
+        pre_entropy_len,
+        &block.metadata.demux_meta,
+        |_stream_idx, stream, output| {
+            if stream.is_empty() {
+                let flagged_len = RANS_RAW_FLAG;
+                output.extend_from_slice(&0u32.to_le_bytes());
+                output.extend_from_slice(&flagged_len.to_le_bytes());
+            } else {
+                // Auto-select scale_bits based on symbol diversity:
+                // few symbols → lower precision is fine, many → higher helps.
+                let distinct = {
+                    let mut seen = [false; 256];
+                    for &b in stream.iter() {
+                        seen[b as usize] = true;
+                    }
+                    seen.iter().filter(|&&s| s).count()
+                };
+                let sb = if distinct <= 8 {
+                    10
+                } else if distinct >= 64 {
+                    13
+                } else {
+                    rans::DEFAULT_SCALE_BITS
+                };
+                let data = rans::encode_sparse(stream, sb);
+                let flagged_len = (data.len() as u32) | RANS_SPARSE_FLAG;
+                output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+                output.extend_from_slice(&flagged_len.to_le_bytes());
+                output.extend_from_slice(&data);
+            }
+            Ok(())
+        },
+    )?;
+
+    Ok(block)
+}
+
+/// rANS decoding stage with sparse frequency tables.
+pub(crate) fn stage_rans_decode_sparse(mut block: StageBlock) -> PzResult<StageBlock> {
+    let (streams, pre_entropy_len, meta) = decode_multistream(&block.data, |data| {
+        if data.len() < 8 {
+            return Err(PzError::InvalidInput);
+        }
+        let orig_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let comp_field = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let is_raw = (comp_field & RANS_RAW_FLAG) != 0;
+        let comp_len = (comp_field
+            & !(RANS_SPARSE_FLAG
+                | RANS_RAW_FLAG
+                | RANS_INTERLEAVED_FLAG
+                | RANS_RECOIL_FLAG
+                | RANS_SHARED_STREAM_FLAG)) as usize;
+
+        if 8 + comp_len > data.len() {
+            return Err(PzError::InvalidInput);
+        }
+        let payload = &data[8..8 + comp_len];
+
+        let decoded = if is_raw {
+            // Raw passthrough: data is uncompressed
+            payload.to_vec()
+        } else {
+            // Sparse rANS decode
+            rans::decode_sparse(payload, orig_len)?
+        };
+        Ok((decoded, 8 + comp_len))
+    })?;
+
+    block.metadata.pre_entropy_len = Some(pre_entropy_len);
+    block.metadata.demux_meta = meta;
+    block.streams = Some(streams);
+    block.data.clear();
+    Ok(block)
+}
+
+/// Like `encode_multistream` but passes stream index to the encoder closure.
+fn encode_multistream_indexed(
+    streams: &[Vec<u8>],
+    pre_entropy_len: usize,
+    meta: &[u8],
+    mut encode_one: impl FnMut(usize, &[u8], &mut Vec<u8>) -> PzResult<()>,
+) -> PzResult<Vec<u8>> {
+    let mut output = Vec::new();
+    output.push(streams.len() as u8);
+    output.extend_from_slice(&(pre_entropy_len as u32).to_le_bytes());
+    output.extend_from_slice(&(meta.len() as u16).to_le_bytes());
+    output.extend_from_slice(meta);
+
+    for (idx, stream) in streams.iter().enumerate() {
+        encode_one(idx, stream, &mut output)?;
+    }
+
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
 // Entropy stage functions — FSE (multi-stream, LZ-based pipelines)
 // ---------------------------------------------------------------------------
 
@@ -830,6 +951,8 @@ pub(crate) fn run_compress_stage(
         (Pipeline::LzSeqR, 1) => stage_rans_encode_with_options(block, options),
         (Pipeline::LzSeqH, 0) => stage_demux_compress(block, &LzDemuxer::LzSeq, options),
         (Pipeline::LzSeqH, 1) => stage_huffman_encode(block),
+        (Pipeline::LzSeq2R, 0) => stage_demux_compress(block, &LzDemuxer::LzSeq, options),
+        (Pipeline::LzSeq2R, 1) => stage_rans_encode_sparse(block, options),
         (Pipeline::SortLz, 0) => stage_sortlz_compress(block),
         _ => Err(PzError::Unsupported),
     }

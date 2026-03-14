@@ -345,6 +345,8 @@ pub enum Pipeline {
     SortLz = 10,
     // ID 11 was Parlz (parallel-parse LZ experiment) — removed as confirmed
     // dead end (37.6% ratio gap vs serial greedy). See gpu-experiments-wave2-conclusions.md.
+    /// LzSeq2 + sparse rANS (literal-run sequences, combined extra bits)
+    LzSeq2R = 12,
 }
 
 impl TryFrom<u8> for Pipeline {
@@ -364,6 +366,7 @@ impl TryFrom<u8> for Pipeline {
             9 => Ok(Self::LzSeqH),
             10 => Ok(Self::SortLz),
             // 11 was Parlz — removed
+            12 => Ok(Self::LzSeq2R),
             _ => Err(PzError::Unsupported),
         }
     }
@@ -377,7 +380,7 @@ impl Pipeline {
     pub(crate) fn uses_lz_demux(self) -> bool {
         matches!(
             self,
-            Self::Lzf | Self::Lzfi | Self::LzssR | Self::LzSeqR | Self::LzSeqH
+            Self::Lzf | Self::Lzfi | Self::LzssR | Self::LzSeqR | Self::LzSeqH | Self::LzSeq2R
         )
     }
 }
@@ -732,6 +735,7 @@ pub fn select_pipeline_trial(
         Pipeline::LzssR,
         Pipeline::LzSeqR,
         Pipeline::LzSeqH,
+        Pipeline::LzSeq2R,
         Pipeline::SortLz,
     ];
     let mut best_pipeline = Pipeline::Lzf;

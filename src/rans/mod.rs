@@ -770,6 +770,85 @@ pub(crate) fn deserialize_freq_table(input: &[u8], scale_bits: u8) -> PzResult<N
     })
 }
 
+/// Serialize a sparse frequency table: only non-zero entries.
+///
+/// Format: [num_symbols: u8] [symbols: N × u8] [freqs: N × u16 LE]
+/// num_symbols=0 encodes 256 (all symbols present).
+/// Saves ~400-500 bytes per stream when few symbols are used.
+pub(crate) fn serialize_freq_table_sparse(norm: &NormalizedFreqs, output: &mut Vec<u8>) {
+    let mut symbols: Vec<u8> = Vec::new();
+    let mut freqs: Vec<u16> = Vec::new();
+    for (i, &f) in norm.freq.iter().enumerate() {
+        if f > 0 {
+            symbols.push(i as u8);
+            freqs.push(f);
+        }
+    }
+    let count = symbols.len();
+    // 0 encodes 256 (all symbols present)
+    output.push(if count == NUM_SYMBOLS { 0 } else { count as u8 });
+    output.extend_from_slice(&symbols);
+    for &f in &freqs {
+        output.extend_from_slice(&f.to_le_bytes());
+    }
+}
+
+/// Deserialize a sparse frequency table.
+///
+/// Format: [num_symbols: u8] [symbols: N × u8] [freqs: N × u16 LE]
+/// Returns (NormalizedFreqs, bytes_consumed).
+pub(crate) fn deserialize_freq_table_sparse(
+    input: &[u8],
+    scale_bits: u8,
+) -> PzResult<(NormalizedFreqs, usize)> {
+    if input.is_empty() {
+        return Err(PzError::InvalidInput);
+    }
+    let raw_count = input[0];
+    let count = if raw_count == 0 {
+        NUM_SYMBOLS
+    } else {
+        raw_count as usize
+    };
+
+    let needed = 1 + count + count * 2;
+    if input.len() < needed {
+        return Err(PzError::InvalidInput);
+    }
+
+    let mut freq = [0u16; NUM_SYMBOLS];
+    let symbols_start = 1;
+    let freqs_start = symbols_start + count;
+
+    for i in 0..count {
+        let sym = input[symbols_start + i] as usize;
+        let f_offset = freqs_start + i * 2;
+        freq[sym] = u16::from_le_bytes([input[f_offset], input[f_offset + 1]]);
+    }
+
+    let table_size = 1u32 << scale_bits;
+    let sum: u32 = freq.iter().map(|&f| f as u32).sum();
+    if sum != table_size {
+        return Err(PzError::InvalidInput);
+    }
+
+    let mut cum = [0u16; NUM_SYMBOLS];
+    let mut cumulative = 0u16;
+    for i in 0..NUM_SYMBOLS {
+        cum[i] = cumulative;
+        cumulative += freq[i];
+    }
+
+    Ok((
+        NormalizedFreqs {
+            freq,
+            cum,
+            scale_bits,
+        },
+        needed,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Public API — single-stream
 // ---------------------------------------------------------------------------
@@ -908,6 +987,106 @@ pub fn decode_to_buf(input: &[u8], original_len: usize, output: &mut [u8]) -> Pz
         original_len,
     )?;
     Ok(original_len)
+}
+
+// ---------------------------------------------------------------------------
+// Public API — single-stream with sparse freq tables
+// ---------------------------------------------------------------------------
+
+/// Encode data using rANS with sparse frequency table serialization.
+///
+/// Same as `encode_with_scale` but uses compact freq table format.
+/// Saves ~400-500 bytes per stream when few distinct symbols are used.
+pub(crate) fn encode_sparse(input: &[u8], scale_bits: u8) -> Vec<u8> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+
+    let scale_bits = scale_bits.clamp(MIN_SCALE_BITS, MAX_SCALE_BITS);
+
+    let mut freq = FrequencyTable::new();
+    freq.count(input);
+
+    let mut sb = scale_bits;
+    while (1u32 << sb) < freq.used {
+        sb += 1;
+        if sb > MAX_SCALE_BITS {
+            break;
+        }
+    }
+
+    let norm = normalize_frequencies(&freq, sb).expect("valid non-empty input");
+    let (words, final_state) = rans_encode_internal(input, &norm);
+
+    let mut output = Vec::with_capacity(64 + words.len() * 2);
+    output.push(sb);
+    serialize_freq_table_sparse(&norm, &mut output);
+    output.extend_from_slice(&final_state.to_le_bytes());
+    output.extend_from_slice(&(words.len() as u32).to_le_bytes());
+    serialize_u16_le_bulk(&words, &mut output);
+
+    output
+}
+
+/// Parse a single-stream header with sparse frequency table.
+fn parse_sparse_header(input: &[u8]) -> PzResult<SingleStreamHeader<'_>> {
+    if input.len() < 2 {
+        return Err(PzError::InvalidInput);
+    }
+
+    let scale_bits = input[0];
+    if !(MIN_SCALE_BITS..=MAX_SCALE_BITS).contains(&scale_bits) {
+        return Err(PzError::InvalidInput);
+    }
+
+    let (norm, freq_bytes) = deserialize_freq_table_sparse(&input[1..], scale_bits)?;
+    let after_freq = 1 + freq_bytes;
+
+    if input.len() < after_freq + 8 {
+        return Err(PzError::InvalidInput);
+    }
+
+    let initial_state = u32::from_le_bytes([
+        input[after_freq],
+        input[after_freq + 1],
+        input[after_freq + 2],
+        input[after_freq + 3],
+    ]);
+    let num_words = u32::from_le_bytes([
+        input[after_freq + 4],
+        input[after_freq + 5],
+        input[after_freq + 6],
+        input[after_freq + 7],
+    ]) as usize;
+
+    let words_start = after_freq + 8;
+    if input.len() < words_start + num_words * 2 {
+        return Err(PzError::InvalidInput);
+    }
+
+    let words = bytes_as_u16_le(&input[words_start..], num_words);
+
+    Ok(SingleStreamHeader {
+        norm,
+        initial_state,
+        words,
+    })
+}
+
+/// Decode rANS data with sparse frequency table header.
+pub(crate) fn decode_sparse(input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
+    if original_len == 0 {
+        return Ok(Vec::new());
+    }
+    let hdr = parse_sparse_header(input)?;
+    let lookup = build_symbol_lookup(&hdr.norm);
+    rans_decode_internal(
+        &hdr.words,
+        hdr.initial_state,
+        &hdr.norm,
+        &lookup,
+        original_len,
+    )
 }
 
 // ---------------------------------------------------------------------------
