@@ -258,58 +258,6 @@ impl TokenEncoder for LzSeqEncoder {
 }
 
 // ---------------------------------------------------------------------------
-// LzSeq2Encoder — literal-run sequences (5 streams)
-// ---------------------------------------------------------------------------
-
-/// Literal-run-length sequence encoder (zstd-style).
-/// Produces 5 streams: lit_run_codes, offset_codes, length_codes, literals, packed_extra.
-/// Streams 0-3 are entropy-coded; stream 4 (packed_extra) is raw.
-pub(crate) struct LzSeq2Encoder;
-
-impl TokenEncoder for LzSeq2Encoder {
-    fn encode(&self, _input: &[u8], tokens: &[LzToken]) -> PzResult<EncodedStreams> {
-        let enc = crate::lzseq::seq2::encode_from_tokens(tokens)?;
-        let pre_entropy_len = enc.lit_run_codes.len()
-            + enc.offset_codes.len()
-            + enc.length_codes.len()
-            + enc.literals.len()
-            + enc.packed_extra.len();
-        let meta = enc.num_sequences.to_le_bytes().to_vec();
-        Ok(EncodedStreams {
-            streams: vec![
-                enc.lit_run_codes,
-                enc.offset_codes,
-                enc.length_codes,
-                enc.literals,
-                enc.packed_extra,
-            ],
-            meta,
-            pre_entropy_len,
-        })
-    }
-
-    fn decode(&self, streams: Vec<Vec<u8>>, meta: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
-        if streams.len() != 5 {
-            return Err(PzError::InvalidInput);
-        }
-        if meta.len() < 4 {
-            return Err(PzError::InvalidInput);
-        }
-        let num_sequences = u32::from_le_bytes(meta[..4].try_into().unwrap());
-
-        crate::lzseq::seq2::decode(
-            &streams[0], // lit_run_codes
-            &streams[1], // offset_codes
-            &streams[2], // length_codes
-            &streams[3], // literals
-            &streams[4], // packed_extra
-            num_sequences,
-            original_len,
-        )
-    }
-}
-
-// ---------------------------------------------------------------------------
 // LzssEncoder — flags + raw u16 (4 streams)
 // ---------------------------------------------------------------------------
 
@@ -477,19 +425,6 @@ mod tests {
     }
 
     #[test]
-    fn lzseq2_encoder_roundtrip() {
-        let input = test_input();
-        let tokens = make_tokens(&input);
-        let encoder = LzSeq2Encoder;
-        let encoded = encoder.encode(&input, &tokens).unwrap();
-        assert_eq!(encoded.streams.len(), 5);
-        let decoded = encoder
-            .decode(encoded.streams, &encoded.meta, input.len())
-            .unwrap();
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
     fn lzss_encoder_roundtrip() {
         let input = test_input();
         let tokens = make_tokens(&input);
@@ -511,7 +446,6 @@ mod tests {
         for encoder in [
             &Lz77Encoder as &dyn TokenEncoder,
             &LzSeqEncoder::default(),
-            &LzSeq2Encoder,
             &LzssEncoder,
         ] {
             let encoded = encoder.encode(&input, &tokens).unwrap();

@@ -33,8 +33,6 @@
 ///   Code 1: length 4       (0 extra bits)
 ///   Code 2: length 5-6     (1 extra bit)
 ///   Code 3: length 7-10    (2 extra bits)
-pub(crate) mod seq2;
-
 use crate::lz77::{HashChainFinder, MIN_MATCH};
 use crate::{PzError, PzResult};
 
@@ -70,9 +68,9 @@ impl Default for SeqConfig {
     fn default() -> Self {
         SeqConfig {
             max_window: 128 * 1024,
-            hash_prefix_len: 3,
+            hash_prefix_len: 4,
             max_chain: crate::lz77::MAX_CHAIN,
-            adaptive_chain: false,
+            adaptive_chain: true,
             max_match_len: crate::lz77::DEFAULT_MAX_MATCH,
         }
     }

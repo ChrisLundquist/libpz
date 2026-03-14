@@ -59,9 +59,6 @@ pub(crate) enum LzDemuxer {
     Lzss,
     /// LzSeq: 6 streams (flags, literals, offset_codes, offset_extra, length_codes, length_extra).
     LzSeq,
-    /// LzSeq2: 5 streams (lit_run_codes, offset_codes, length_codes, literals, packed_extra).
-    #[allow(dead_code)]
-    LzSeq2,
 }
 
 /// Map a pipeline to its demuxer, if it uses one.
@@ -83,7 +80,6 @@ fn encoder_for_demuxer(demuxer: &LzDemuxer) -> Box<dyn lz_token::TokenEncoder> {
         LzDemuxer::Lz77 => Box::new(lz_token::Lz77Encoder),
         LzDemuxer::Lzss => Box::new(lz_token::LzssEncoder),
         LzDemuxer::LzSeq => Box::new(lz_token::LzSeqEncoder::default()),
-        LzDemuxer::LzSeq2 => Box::new(lz_token::LzSeq2Encoder),
     }
 }
 
@@ -122,7 +118,6 @@ impl StreamDemuxer for LzDemuxer {
             LzDemuxer::Lz77 => 3,
             LzDemuxer::Lzss => 4,
             LzDemuxer::LzSeq => 6,
-            LzDemuxer::LzSeq2 => 5,
         }
     }
 
@@ -225,12 +220,6 @@ impl StreamDemuxer for LzDemuxer {
                 };
                 let enc = lzseq::encode_with_config(input, &config)?;
                 Ok(seq_encoded_to_demux(enc))
-            }
-            LzDemuxer::LzSeq2 => {
-                // LzSeq2 always routes through the shared tokenize() path.
-                let tokens = super::tokenize(input, options)?;
-                let encoder = encoder_for_demuxer(self);
-                Ok(encoder.encode(input, &tokens)?.into())
             }
         }
     }
@@ -363,10 +352,6 @@ impl StreamDemuxer for LzDemuxer {
                     original_len,
                 )?;
                 Ok(decoded)
-            }
-            LzDemuxer::LzSeq2 => {
-                let encoder = encoder_for_demuxer(self);
-                encoder.decode(streams, meta, original_len)
             }
         }
     }
