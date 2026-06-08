@@ -42,6 +42,22 @@ const LAZY_SKIP_THRESHOLD: u16 = 32;
 /// Maximum hash insertion count per match.
 const MAX_INSERT_LEN: usize = 128;
 
+/// Extra length (in bytes) a repeat match may fall short of the best fresh
+/// match and still be accepted, on top of the offset bits it saves.
+///
+/// A repeat costs ~0 offset bits, so trading a few bytes of match length for
+/// a repeat is usually a net win: the literals exposed by the shorter repeat
+/// are themselves frequently matchable, and keeping the recent offset "live"
+/// lets downstream positions reuse it too. Larger values raise the repeat-offset
+/// hit rate (shrinking the dominant `offset_extra` bitstream) at the risk of
+/// occasionally giving up real coverage. Tuned on Silesia text.
+const REP_STABILITY_BONUS: u16 = 2;
+
+/// A non-rep0 repeat (rep1/rep2) must beat rep0's match length by at least this
+/// many bytes before we switch to it. Biasing toward rep0 keeps the most-recent
+/// offset stable so consecutive positions can keep reusing it.
+const REP_SWITCH_MARGIN: u16 = 1;
+
 /// Configuration for LzSeq encoding.
 pub struct SeqConfig {
     /// Maximum lookback window size in bytes. Must be a power of 2.
@@ -62,16 +78,26 @@ pub struct SeqConfig {
     /// Maximum match length. Default: `u16::MAX` (extended matches).
     /// Set to 258 to emulate DEFLATE constraints.
     pub max_match_len: u16,
+    /// When true, use greedy matching (take the best match at each position,
+    /// with no lazy 1-step lookahead). Faster, slightly worse ratio.
+    pub greedy: bool,
 }
 
 impl Default for SeqConfig {
     fn default() -> Self {
         SeqConfig {
-            max_window: 128 * 1024,
+            // 1 MiB default window: matches can reach far enough back to exploit
+            // long-range redundancy (paired with a 1 MiB streaming block so the
+            // window isn't block-capped). Offsets are u32-coded, so >64 KiB is
+            // safe (the `high()` preset already used 256 KiB). The hash-chain
+            // `prev` array scales with the window (~4 MiB/finder), which is
+            // negligible against this machine's memory budget.
+            max_window: 1024 * 1024,
             hash_prefix_len: 4,
             max_chain: crate::lz77::MAX_CHAIN,
             adaptive_chain: true,
             max_match_len: crate::lz77::DEFAULT_MAX_MATCH,
+            greedy: false,
         }
     }
 }
@@ -85,6 +111,7 @@ impl SeqConfig {
             max_chain: 32,
             adaptive_chain: false,
             max_match_len: crate::lz77::DEFAULT_MAX_MATCH,
+            greedy: false,
         }
     }
 
@@ -103,6 +130,7 @@ impl SeqConfig {
             max_chain: 128,
             adaptive_chain: false,
             max_match_len: crate::lz77::DEFAULT_MAX_MATCH,
+            greedy: false,
         }
     }
 }
@@ -571,13 +599,16 @@ fn select_best_match(
         check_repeat_match(input, pos, rep2, max_match_len)
     };
 
+    // Pick the longest repeat, but bias toward rep0 (the most-recent offset).
+    // Only switch to rep1/rep2 when they beat rep0 by REP_SWITCH_MARGIN, so the
+    // recency order stays stable and downstream positions can keep reusing rep0.
     let mut best_rep_offset = rep0;
     let mut best_rep_len = len0;
-    if len1 > best_rep_len {
+    if len1 > best_rep_len.saturating_add(REP_SWITCH_MARGIN) {
         best_rep_len = len1;
         best_rep_offset = rep1;
     }
-    if len2 > best_rep_len {
+    if len2 > best_rep_len.saturating_add(REP_SWITCH_MARGIN) {
         best_rep_len = len2;
         best_rep_offset = rep2;
     }
@@ -588,10 +619,16 @@ fn select_best_match(
             // No hash match — use repeat
             return (best_rep_offset, best_rep_len, true);
         }
-        // Repeat saves the full offset encoding cost (~1 code byte + extra bits).
-        // Accept a repeat match that's shorter by up to the offset savings.
+        // A repeat encodes the offset for ~free: a cheap offset code (0-2, which
+        // dominate the offset_code stream and entropy-code very small) plus zero
+        // offset_extra bits. A fresh match instead pays a rarer offset code AND
+        // `oeb` *raw* (un-entropy-coded) extra bits — the single largest output
+        // component on text. So the repeat saves ~`1 + oeb/8` bytes outright, and
+        // keeping rep0 live additionally helps future positions. Accept a repeat
+        // shorter than the fresh match by up to that savings plus a stability
+        // bonus; the literals exposed by the shorter repeat are usually matchable.
         let (_, oeb, _) = encode_offset(hash_offset);
-        let offset_savings = 1 + (oeb as u16) / 8; // bytes saved by repeat
+        let offset_savings = 1 + (oeb as u16).div_ceil(8) + REP_STABILITY_BONUS;
         if best_rep_len.saturating_add(offset_savings) >= hash_length {
             return (best_rep_offset, best_rep_len, true);
         }
@@ -802,8 +839,10 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
             MIN_MATCH
         };
 
-        // Lazy matching: check if next position has a longer match
-        if best_length >= effective_min
+        // Lazy matching: check if next position has a longer match.
+        // Skipped in greedy mode (take the best match at `pos` directly).
+        if !config.greedy
+            && best_length >= effective_min
             && best_length < LAZY_SKIP_THRESHOLD
             && pos + 1 < input.len()
         {
@@ -827,7 +866,28 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
                 MIN_MATCH
             };
 
-            if next_length >= next_effective_min && next_length > best_length {
+            // Repeat-aware lazy decision. Switching to the next position costs
+            // one extra literal and forfeits whatever match we have at `pos`.
+            //   - If the current match is a repeat (offset ~free), only defer
+            //     when the next match is enough longer to clearly pay for the
+            //     lost cheap repeat — a marginally longer *fresh* match is not
+            //     worth trading a repeat for.
+            //   - If the next match is a repeat, it is cheap, so prefer it as
+            //     long as it is not shorter than the current match (it then
+            //     saves the current fresh offset's bits despite the +1 literal).
+            // NOTE: greedy (--greedy) beats this lazy parser by ~3pp on text
+            // (cache-seeding effects), but the `>=` repeat branch below is a net
+            // win on structured data (nci), so lazy stays the safe default and
+            // making lazy >= greedy everywhere is an open follow-up.
+            let take_next = if is_repeat && !next_is_repeat {
+                next_length > best_length.saturating_add(REP_STABILITY_BONUS)
+            } else if next_is_repeat && !is_repeat {
+                next_length >= best_length
+            } else {
+                next_length > best_length
+            };
+
+            if next_length >= next_effective_min && take_next {
                 // Emit literal for current position, use the better match
                 flags_vec.push(true);
                 literals.push(input[pos]);

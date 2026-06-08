@@ -39,11 +39,11 @@ fn usage() {
     eprintln!("  -t, --threads N    Number of threads (0=auto, 1=single-threaded)");
     #[cfg(feature = "webgpu")]
     eprintln!("  -g, --gpu          Use GPU (WebGPU/wgpu) for compression and decompression");
-    eprintln!("  -O, --optimal      Use optimal parsing (best compression, slowest)");
-    eprintln!("  --lazy             Use lazy matching (good compression, default)");
-    eprintln!("  --greedy           Use greedy matching (fastest, least compression)");
-    eprintln!("  --speed            Speed mode: lazy matching (fast encode, worse ratio)");
-    eprintln!("  --quality          Quality mode: optimal parsing + deep chains (slow encode, best ratio)");
+    eprintln!("  -O, --optimal      Optimal parsing (currently falls back to the default parser)");
+    eprintln!("  --lazy             Lazy matching (the default)");
+    eprintln!("  --greedy           Greedy matching (better ratio on text, but slower encode)");
+    eprintln!("  --speed            Speed mode: lazy matching (same as default)");
+    eprintln!("  --quality          Quality mode (currently falls back to the default parser)");
     eprintln!("  --rans-interleaved Enable interleaved rANS on rANS pipelines");
     eprintln!(
         "  --rans-shared-stream Use shared-stream rANS (faster decode, implies --rans-interleaved)"
@@ -397,7 +397,7 @@ fn init_gpu(opts: &Opts) -> GpuState {
 fn build_cli_options(opts: &Opts) -> (CompressOptions, DecompressOptions) {
     let gpu = init_gpu(opts);
 
-    let mut compress_options = CompressOptions {
+    let compress_options = CompressOptions {
         backend: gpu.backend,
         threads: opts.threads,
         parse_strategy: opts.parse_strategy,
@@ -411,10 +411,9 @@ fn build_cli_options(opts: &Opts) -> (CompressOptions, DecompressOptions) {
         ..Default::default()
     };
 
-    // For --quality mode (Optimal), use a larger window for better compression
-    if opts.parse_strategy == ParseStrategy::Optimal {
-        compress_options.seq_window_size = Some(256 * 1024);
-    }
+    // Optimal mode uses the default 1 MiB window (lzseq::SeqConfig::default);
+    // the old 256 KiB override here actually *shrank* -O's reach below the
+    // lazy default once the default window grew to 1 MiB.
 
     let decompress_options = DecompressOptions {
         backend: gpu.backend,

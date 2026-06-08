@@ -516,9 +516,9 @@ fn build_suffix_array_naive(input: &[u8]) -> Vec<usize> {
 /// as the GPU BWT kernel. This eliminates the 2n+1 memory overhead.
 ///
 /// Used by the WebGPU engine as a CPU fallback for small Lyndon factors
-/// (below the GPU dispatch threshold). Not used on the main CPU encode
-/// path — SA-IS is faster despite the doubled-string allocation.
-#[cfg(any(feature = "webgpu", test))]
+/// (below the GPU dispatch threshold) and by the bijective BWT encoder, which
+/// requires the true lexicographic rotation order that the SA-IS path can
+/// mis-compute on periodic inputs.
 pub(crate) fn build_circular_suffix_array(input: &[u8]) -> Vec<usize> {
     let n = input.len();
     if n == 0 {
@@ -583,7 +583,6 @@ pub(crate) fn build_circular_suffix_array(input: &[u8]) -> Vec<usize> {
 ///
 /// This is a stable radix sort on one component of the composite key.
 /// `max_rank` is the maximum value in the rank array (for bucket count).
-#[cfg(any(feature = "webgpu", test))]
 fn radix_sort_by_key(
     src: &[usize],
     dst: &mut [usize],
@@ -709,10 +708,15 @@ pub fn encode_bijective(input: &[u8]) -> Option<(Vec<u8>, Vec<usize>)> {
             continue;
         }
 
-        // Build suffix array using SA-IS on doubled string.
-        // Circular prefix-doubling was tried (commit 21052a0) but benchmarked
-        // 2.5-3× slower due to O(n log n) vs SA-IS's O(n).
-        let sa = build_suffix_array(factor);
+        // Build the rotation suffix array via circular prefix-doubling.
+        // The faster SA-IS path (`build_suffix_array`) mis-sorts rotations on
+        // some periodic inputs, which silently corrupted bijective round-trips
+        // on large/multi-block data (>~15 MB). It only manifests for BBW, since
+        // plain BWT inverts from the BWT string alone (any consistent sort is
+        // invertible), whereas the bijective inverse depends on the *true*
+        // lexicographic rotation order (the Lyndon property). Correctness here
+        // requires that exact order, so we use the O(n log n) radix builder.
+        let sa = build_circular_suffix_array(factor);
 
         // Extract last column of sorted rotation matrix
         for &sa_val in &sa {

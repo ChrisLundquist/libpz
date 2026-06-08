@@ -427,9 +427,9 @@ fn test_wide_window_finds_distant_matches() {
 }
 
 #[test]
-fn test_default_config_uses_128kb() {
+fn test_default_config_uses_1mb() {
     let config = SeqConfig::default();
-    assert_eq!(config.max_window, 128 * 1024);
+    assert_eq!(config.max_window, 1024 * 1024);
 }
 
 #[test]
@@ -926,7 +926,7 @@ fn encoder_profitability_round_trip() {
 #[test]
 fn seq_config_presets_have_correct_windows() {
     assert_eq!(SeqConfig::fast().max_window, 64 * 1024);
-    assert_eq!(SeqConfig::default_quality().max_window, 128 * 1024);
+    assert_eq!(SeqConfig::default_quality().max_window, 1024 * 1024);
     assert_eq!(SeqConfig::high().max_window, 256 * 1024);
     assert_eq!(SeqConfig::high().hash_prefix_len, 4);
     assert_eq!(SeqConfig::high().max_chain, 128);

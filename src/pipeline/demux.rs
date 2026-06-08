@@ -177,25 +177,36 @@ impl StreamDemuxer for LzDemuxer {
                 })
             }
             LzDemuxer::LzSeq => {
-                // SortLz and Optimal strategies route through the shared
-                // tokenize() entry point, which handles GPU/CPU dispatch,
-                // SortLz match finding, and optimal parsing uniformly.
-                let use_tokenize = options.match_finder == super::MatchFinder::SortLz
-                    || options.parse_strategy == ParseStrategy::Optimal;
+                let defaults = lzseq::SeqConfig::default();
+                let config = lzseq::SeqConfig {
+                    max_window: options.seq_window_size.unwrap_or(defaults.max_window),
+                    max_match_len: options.max_match_len.unwrap_or(defaults.max_match_len),
+                    // Default = lazy, with a corrected repeat-aware deferral
+                    // (see encode_with_config). Greedy is available via --greedy
+                    // but is slower (longest-match + deep chain inserts everywhere)
+                    // and can regress structured/record data, so it is opt-in only.
+                    greedy: options.parse_strategy == ParseStrategy::Greedy,
+                    ..defaults
+                };
 
-                if use_tokenize {
+                // SortLz routes through the shared tokenize() entry point, which
+                // handles GPU/CPU dispatch and SortLz match finding (and optimal
+                // parsing when combined with -O) uniformly.
+                if options.match_finder == super::MatchFinder::SortLz {
                     let tokens = super::tokenize(input, options)?;
-                    let defaults = lzseq::SeqConfig::default();
-                    let enc = lzseq::encode_from_tokens(
-                        &tokens,
-                        &lzseq::SeqConfig {
-                            max_window: options.seq_window_size.unwrap_or(defaults.max_window),
-                            max_match_len: options.max_match_len.unwrap_or(defaults.max_match_len),
-                            ..defaults
-                        },
-                    )?;
+                    let enc = lzseq::encode_from_tokens(&tokens, &config)?;
                     return Ok(seq_encoded_to_demux(enc));
                 }
+
+                // -O / Optimal falls through to the default (lazy) path below.
+                // The backward-DP optimal parser's match finder is hardwired to a
+                // 32 KiB window (optimal::build_match_table_cpu_with_limit uses
+                // lz77::MAX_WINDOW), so it searches a 32x smaller dictionary than
+                // the 1 MiB default and loses on long-range matches. Routing -O to
+                // encode_optimal would ship a worse-than-default result; until the
+                // optimal match table uses the configured window (and choice_offset
+                // / Match.offset are widened from u16 to u32), -O aliases the
+                // default — never worse, which is the point of --quality.
 
                 // GPU path: fused match finding + demux on-device
                 #[cfg(feature = "webgpu")]
@@ -210,14 +221,8 @@ impl StreamDemuxer for LzDemuxer {
                     }
                 }
 
-                // Default CPU path: encode_with_config (tuned lazy matching
-                // with repeat-offset awareness, adaptive chain depth, hash4).
-                let defaults = lzseq::SeqConfig::default();
-                let config = lzseq::SeqConfig {
-                    max_window: options.seq_window_size.unwrap_or(defaults.max_window),
-                    max_match_len: options.max_match_len.unwrap_or(defaults.max_match_len),
-                    ..defaults
-                };
+                // Default CPU path: tuned lazy (or greedy) matching with
+                // repeat-offset awareness, adaptive chain depth, hash4.
                 let enc = lzseq::encode_with_config(input, &config)?;
                 Ok(seq_encoded_to_demux(enc))
             }
