@@ -6,6 +6,53 @@ fn test_encode_empty() {
 }
 
 #[test]
+fn test_bijective_periodic_roundtrip_regression() {
+    // Regression: the SA-IS rotation builder (`build_suffix_array`) mis-sorted
+    // periodic inputs with near-equal LMS substrings, which silently corrupted
+    // bijective BWT round-trips. It surfaced on the Silesia blob at ~15 MB, but
+    // the minimal trigger is tiny — small-input tests just never used these byte
+    // patterns. `encode_bijective` now builds rotations with the correct radix
+    // circular-SA builder; these cases pin that. (Plain BWT was unaffected: its
+    // LF-mapping inverse is self-contained, so any consistent sort inverts.)
+    let mut cases: Vec<Vec<u8>> = Vec::new();
+
+    // Minimal pathology: two near-equal 0-runs separated by sentinels.
+    let mut minimal = vec![0u8; 17];
+    minimal.push(1);
+    minimal.extend(std::iter::repeat_n(0u8, 15));
+    minimal.push(1);
+    cases.push(minimal);
+
+    // Tiled periodic with varying run lengths (~256 KiB, many small factors).
+    let mut tiled = Vec::with_capacity(256 * 1024);
+    let mut k = 17usize;
+    while tiled.len() < 256 * 1024 {
+        tiled.extend(std::iter::repeat_n(0u8, k));
+        tiled.push(1);
+        k = if k > 6 { k - 1 } else { 17 };
+    }
+    cases.push(tiled);
+
+    // A larger near-Lyndon factor (0^(n-1) 1) to exercise the big circular-SA
+    // path that the SA-IS bug corrupted at scale.
+    let mut big = vec![0u8; 512 * 1024];
+    *big.last_mut().unwrap() = 1;
+    cases.push(big);
+
+    for (i, input) in cases.iter().enumerate() {
+        let (bwt, lengths) =
+            encode_bijective(input).unwrap_or_else(|| panic!("case {i}: encode returned None"));
+        let decoded = decode_bijective(&bwt, &lengths)
+            .unwrap_or_else(|e| panic!("case {i}: decode failed: {e:?}"));
+        assert!(
+            decoded == *input,
+            "case {i}: bijective round-trip corrupted (len {})",
+            input.len()
+        );
+    }
+}
+
+#[test]
 fn test_single_byte() {
     let result = encode(b"a").unwrap();
     assert_eq!(result.data, vec![b'a']);
