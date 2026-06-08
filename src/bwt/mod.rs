@@ -40,16 +40,19 @@ pub fn encode(input: &[u8]) -> Option<BwtResult> {
 
     let n = input.len();
 
-    // Build rotation suffix array using SA-IS O(n).
+    // Build the cyclic rotation suffix array: sa[i] is the start position
+    // (in [0, n)) of the i-th smallest rotation of `input`. See
+    // build_suffix_array — it uses SA-IS over the *doubled* string
+    // (`text·text·$`), which the doubling makes a true rotation order.
     //
-    // SA-IS builds the suffix array of `text$` where `$` is a sentinel
-    // smaller than all input bytes. The suffix array has n+1 entries.
-    // Entry sa[0] == n (the sentinel suffix) is skipped.
-    // The remaining n entries give the rotation order needed for BWT.
+    // NB: the suffix array of `text$` alone is NOT the rotation order for this
+    // bzip2-style BWT (no sentinel in the output; inversion via LF-mapping +
+    // primary_index), so the doubling is required — dropping it corrupts the
+    // round-trip on real data.
     //
-    // For rotation i, the last character of the rotation is input[(i + n - 1) % n],
-    // which equals input[i - 1] for i > 0, or input[n - 1] for i == 0.
-    // The primary index is where sa[j] == 0.
+    // For rotation r = sa[i], the BWT's last character is input[(r + n - 1) % n]
+    // = input[r - 1] for r > 0, or input[n - 1] for r == 0. The primary index is
+    // the position i where sa[i] == 0.
     let sa = build_suffix_array(input);
 
     let mut bwt = Vec::with_capacity(n);
