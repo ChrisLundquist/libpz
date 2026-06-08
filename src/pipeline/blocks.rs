@@ -307,20 +307,20 @@ fn compress_block_bbw(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u
 
 /// Decompress a single Bbw block (no container header).
 fn decompress_block_bbw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    if payload.len() < 6 {
+    if payload.len() < 8 {
         return Err(PzError::InvalidInput);
     }
 
-    // Parse header: [num_factors: u16] [factor_lengths: u32 × k] [rle_len: u32]
-    let num_factors = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-    let header_len = 2 + num_factors * 4 + 4;
+    // Parse header: [num_factors: u32] [factor_lengths: u32 × k] [rle_len: u32]
+    let num_factors = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let header_len = 4 + num_factors * 4 + 4;
     if payload.len() < header_len {
         return Err(PzError::InvalidInput);
     }
 
     let mut factor_lengths = Vec::with_capacity(num_factors);
     for i in 0..num_factors {
-        let offset = 2 + i * 4;
+        let offset = 4 + i * 4;
         let fl = u32::from_le_bytes([
             payload[offset],
             payload[offset + 1],
@@ -330,7 +330,7 @@ fn decompress_block_bbw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
         factor_lengths.push(fl);
     }
 
-    let rle_offset = 2 + num_factors * 4;
+    let rle_offset = 4 + num_factors * 4;
     let rle_len = u32::from_le_bytes([
         payload[rle_offset],
         payload[rle_offset + 1],
@@ -380,4 +380,34 @@ fn compress_block_sortlz(input: &[u8], options: &CompressOptions) -> PzResult<Ve
 /// Decompress a single SortLZ block (no container header).
 fn decompress_block_sortlz(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     crate::sortlz::decompress(payload, orig_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a ~1 MiB block of highly periodic data (`0^15 1`) produces
+    /// >65535 single-char Lyndon factors. The per-block factor count was a u16
+    /// that silently truncated, producing an undecodable (corrupt) bbw block.
+    /// The count is now u32. This drives the *block* path
+    /// (`compress_block`/`decompress_block`) — the `encode_bijective`-only
+    /// regression test in `bwt/tests.rs` cannot reach this framing-layer bug.
+    #[test]
+    fn test_bbw_block_over_65535_factors_roundtrip() {
+        // ~1.05 MiB of "0^15 1" => ~65700 factors in a single block (> u16::MAX).
+        let mut input = Vec::with_capacity(1_100_000);
+        while input.len() < 1_100_000 {
+            input.extend(std::iter::repeat_n(0u8, 15));
+            input.push(1);
+        }
+        let copts = CompressOptions::default();
+        let dopts = DecompressOptions::default();
+        let payload = compress_block(&input, Pipeline::Bbw, &copts).unwrap();
+        let out = decompress_block(&payload, Pipeline::Bbw, input.len(), &dopts).unwrap();
+        assert!(
+            out == input,
+            "bbw block round-trip corrupted at >65535 factors (len {})",
+            input.len()
+        );
+    }
 }

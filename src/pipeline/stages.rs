@@ -882,7 +882,11 @@ pub(crate) fn stage_bbwt_encode(
 
 /// Bbw stage 3: FSE encoding + serialization.
 ///
-/// Format: [num_factors: u16] [factor_lengths: u32 × num_factors] [rle_len: u32] [fse_data...]
+/// Format: [num_factors: u32] [factor_lengths: u32 × num_factors] [rle_len: u32] [fse_data...]
+///
+/// `num_factors` is u32: a 1 MiB block of highly periodic data (e.g. `0^15 1`)
+/// can produce >65535 single-char Lyndon factors, which a u16 count silently
+/// truncated, corrupting the block (undecodable). See blocks.rs decoder.
 pub(crate) fn stage_fse_encode_bbw(mut block: StageBlock) -> PzResult<StageBlock> {
     let factor_lengths = block
         .metadata
@@ -896,7 +900,7 @@ pub(crate) fn stage_fse_encode_bbw(mut block: StageBlock) -> PzResult<StageBlock
     let fse_data = fse::encode_with_accuracy(&block.data, BW_ACCURACY_LOG);
 
     let mut output = Vec::new();
-    output.extend_from_slice(&(factor_lengths.len() as u16).to_le_bytes());
+    output.extend_from_slice(&(factor_lengths.len() as u32).to_le_bytes());
     for &fl in &factor_lengths {
         output.extend_from_slice(&(fl as u32).to_le_bytes());
     }
