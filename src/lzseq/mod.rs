@@ -78,6 +78,9 @@ pub struct SeqConfig {
     /// Maximum match length. Default: `u16::MAX` (extended matches).
     /// Set to 258 to emulate DEFLATE constraints.
     pub max_match_len: u16,
+    /// When true, use greedy matching (take the best match at each position,
+    /// with no lazy 1-step lookahead). Faster, slightly worse ratio.
+    pub greedy: bool,
 }
 
 impl Default for SeqConfig {
@@ -94,6 +97,7 @@ impl Default for SeqConfig {
             max_chain: crate::lz77::MAX_CHAIN,
             adaptive_chain: true,
             max_match_len: crate::lz77::DEFAULT_MAX_MATCH,
+            greedy: false,
         }
     }
 }
@@ -107,6 +111,7 @@ impl SeqConfig {
             max_chain: 32,
             adaptive_chain: false,
             max_match_len: crate::lz77::DEFAULT_MAX_MATCH,
+            greedy: false,
         }
     }
 
@@ -125,6 +130,7 @@ impl SeqConfig {
             max_chain: 128,
             adaptive_chain: false,
             max_match_len: crate::lz77::DEFAULT_MAX_MATCH,
+            greedy: false,
         }
     }
 }
@@ -833,8 +839,10 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
             MIN_MATCH
         };
 
-        // Lazy matching: check if next position has a longer match
-        if best_length >= effective_min
+        // Lazy matching: check if next position has a longer match.
+        // Skipped in greedy mode (take the best match at `pos` directly).
+        if !config.greedy
+            && best_length >= effective_min
             && best_length < LAZY_SKIP_THRESHOLD
             && pos + 1 < input.len()
         {
@@ -867,6 +875,10 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
             //   - If the next match is a repeat, it is cheap, so prefer it as
             //     long as it is not shorter than the current match (it then
             //     saves the current fresh offset's bits despite the +1 literal).
+            // NOTE: greedy (--greedy) beats this lazy parser by ~3pp on text
+            // (cache-seeding effects), but the `>=` repeat branch below is a net
+            // win on structured data (nci), so lazy stays the safe default and
+            // making lazy >= greedy everywhere is an open follow-up.
             let take_next = if is_repeat && !next_is_repeat {
                 next_length > best_length.saturating_add(REP_STABILITY_BONUS)
             } else if next_is_repeat && !is_repeat {
