@@ -574,7 +574,7 @@ impl HashChainFinder {
         }
 
         // Sort by length descending, take top K
-        found.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        found.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
         found.truncate(k);
         found
     }
