@@ -686,6 +686,35 @@ pub fn encode_with_accuracy(input: &[u8], accuracy_log: u8) -> Vec<u8> {
     output
 }
 
+/// Encode `input` with FSE, trying each accuracy_log from the minimum needed up
+/// to `MAX_ACCURACY_LOG` and returning the smallest result.
+///
+/// The chosen accuracy_log is recorded in the output header (decode reads it at
+/// `input[0]`), so this is a pure encode-side optimization — no wire-format or
+/// decoder change. It adapts table precision to each stream's distribution skew
+/// rather than to a fixed value or a slots-per-symbol heuristic, at the cost of
+/// a few extra FSE passes at encode time (encode is not the bottleneck).
+pub fn encode_best(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+    let mut freq = FrequencyTable::new();
+    freq.count(input);
+    // Lowest accuracy_log whose table can hold all distinct symbols.
+    let mut start = MIN_ACCURACY_LOG;
+    while (1u32 << start) < freq.used && start < MAX_ACCURACY_LOG {
+        start += 1;
+    }
+    let mut best = encode_with_accuracy(input, start);
+    for al in (start + 1)..=MAX_ACCURACY_LOG {
+        let candidate = encode_with_accuracy(input, al);
+        if candidate.len() < best.len() {
+            best = candidate;
+        }
+    }
+    best
+}
+
 /// Decode FSE-encoded data.
 ///
 /// `original_len` is the number of bytes in the original uncompressed data.
