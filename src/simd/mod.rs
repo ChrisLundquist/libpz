@@ -1712,10 +1712,9 @@ mod neon {
     //   byte_frequencies: vld1q_u8, vtbl1_u8 for permutation
     //   compare_bytes: vceqq_u8, vmovn_u16, vget_lane_u64
     //   sum_u32: vld1q_u32, vaddq_u32, vaddvq_u32
-
-    pub use super::scalar::byte_frequencies;
-    pub use super::scalar::compare_bytes;
-    pub use super::scalar::sum_u32;
+    //
+    // Until then there are no NEON entry points; the dispatcher falls back to
+    // the scalar implementations directly (see `resolve_*` above).
 }
 
 // ---------------------------------------------------------------------------

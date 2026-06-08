@@ -1262,7 +1262,7 @@ impl WebGpuEngine {
                 .map_err(|_| PzError::Unsupported)?;
         }
 
-        for ((idx, pending), staging_buf) in batch.into_iter().zip(staging.into_iter()) {
+        for ((idx, pending), staging_buf) in batch.into_iter().zip(staging) {
             let slice = staging_buf.slice(..);
             let mapped = slice.get_mapped_range();
             let len = pending.output_dev.len();
