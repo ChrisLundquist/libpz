@@ -125,8 +125,15 @@ pub enum QualityLevel {
     Quality,
 }
 
-/// Default block size for multi-threaded compression (256KB).
-const DEFAULT_BLOCK_SIZE: usize = 256 * 1024;
+/// Default block size for multi-threaded compression (1 MiB).
+///
+/// Raised from 256 KiB so the LZ match window (now 1 MiB, see
+/// `lzseq::SeqConfig::default`) is not capped by the block frame — matches
+/// cannot cross block boundaries in the streaming path, so the effective
+/// dictionary is `min(block_size, max_window)`. Larger blocks trade a little
+/// entropy-table adaptivity for materially longer match reach; net ratio win
+/// on Silesia. Threading stays efficient (200+ blocks on the corpus).
+const DEFAULT_BLOCK_SIZE: usize = 1024 * 1024;
 
 /// Default block size for BWT-based pipelines (512KB).
 ///
