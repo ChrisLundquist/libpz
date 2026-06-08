@@ -67,16 +67,34 @@ input → tokenize() → Vec<LzToken> → TokenEncoder::encode() → multi-strea
 
 **CLI path:** `pz` always uses `streaming::compress_stream`, not `pipeline::compress_with_options`. The streaming path uses block-by-block parallelism with bounded memory.
 
-### Silesia corpus benchmarks (211MB, CLI end-to-end, verified round-trip)
+### Silesia corpus benchmarks (202MB blob, CLI end-to-end, all cores, verified round-trip)
 
-| Method | Compress | Ratio | Comp MB/s | Decomp MB/s |
-|---------|----------|-------|-----------|-------------|
-| gzip | 4.69s | 32.2% | 45 | 225 |
-| pz lzf | 1.90s | 34.6% | 111 | 133 |
-| pz lzseqr | 1.62s | 34.4% | 131 | 154 |
-| pz lzfi | 1.70s | 46.0% | 125 | 143 |
+Measured on Apple M5 Max (6P + 12E, 128GB unified), zstd 1.5.7. These supersede
+earlier figures that were ~7x low on pz throughput (those reflected effectively
+single-threaded runs; the CLI uses all cores by default).
 
-pz compresses 2.5–7x faster than gzip with ~2pp ratio gap. Decompress is faster per-file but slower on many small files due to ~90ms per-invocation startup overhead. Criterion (pure algorithm, no I/O) measures 333–543 MB/s — the 3–4x CLI gap is in the streaming path, not the compressor.
+| Method | Ratio | Comp MB/s | Decomp MB/s |
+|---------|-------|-----------|-------------|
+| gzip -6 | 32.2% | 45 | 225 |
+| zstd -1 | 34.6% | 5900 | 1500 |
+| zstd -3 (default) | 31.2% | 2860 | 1350 |
+| zstd -9 | 27.9% | 695 | 1460 |
+| pz lzf | 34.0% | 740 | 2760 |
+| pz lzseqr | 33.8% | 930 | 3690 |
+| pz lzfi | 46.0% | 1130 | 3130 |
+| pz bw | 30.2% | 166 | 1120 |
+
+**pz's structural edge is decompression — 2.4–2.7x faster than zstd**, whose decode is
+single-threaded and flat (~1350–1500 MB/s) while pz parallelizes it (lzseqr 3690 MB/s).
+zstd -T0 compress (2.8–5.9 GB/s) is unbeatable on the compress axis, so the live Pareto
+plays are **ratio at the lzseqr operating point** and **a faster BWT** (pz bw beats zstd-9
+on x-ray/image data but is throughput-bound). Compare against zstd's frontier (`-1`/`-3`/`-6`),
+not `-19` (which runs ~50 MB/s and is not a speed competitor).
+
+_Latest (this branch, not yet folded into the table above): a 1 MiB match window +
+repeat-offset-aware parsing cut lzseqr/lzf ratio ~1.6pp (lzseqr 33.8→32.2%, now beating
+zstd-1 on xml/nci); FSE decode-only tables lifted lzf decode +72%; the silent `bbw`
+corruption is fixed._
 
 **Benchmark corpus:** `./scripts/fetch-silesia.sh` downloads the 211MB Silesia corpus to `samples/silesia/`.
 
@@ -106,7 +124,7 @@ Before optimizing GPU code paths, read this first — multiple agents have spent
 - **The CLI uses `streaming::compress_stream`, not `pipeline::compress_with_options`** — the streaming path handles GPU match-finding via a coordinator thread with adaptive backpressure that decrements on batch completion. Workers use CPU for entropy.
 - **The real GPU win (ring-buffered LZ77 batching) is already shipped** — delivers +7-17% throughput. See `docs/design-docs/gpu-strategy.md`.
 - **GPU device init time skews throughput benchmarks** — first-call GPU init adds significant overhead that `bench.sh` captures but Criterion amortizes across iterations. When comparing GPU vs CPU throughput, use Criterion (`cargo bench`) for apples-to-apples; `bench.sh` reflects real-world cold-start cost. Don't chase "GPU is slower" regressions that are really just init time.
-- **Compression ratio is limited by wire encoding overhead, not match quality** — the LZ match-finder finds good matches. The legacy Lz77Encoder (5-byte per match) was the worst offender; LzSeqEncoder (log2-coded, 6 streams) is much better but still ~2pp behind gzip on Silesia (34.4% vs 32.2%). Further ratio gains require encoding format work, not matcher tuning.
+- **Ratio is part encoding overhead, part parse/window — the old "encoding only" claim was half-right** — LzSeqEncoder's offset/length coding is already tight (baseline+extra-bits, like zstd), so the encoding-is-everything framing held for the legacy Lz77Encoder era. But the bigger lever turned out to be parse-side: the match window was too small (128KB window / 256KB block) and the repeat-offset cache was almost never used (<2% on text vs zstd's 30–50%). Raising the default window to 1 MiB (1 MiB blocks) + repeat-offset-aware parsing cut Silesia ratio ~1.6pp (lzseqr 33.8→32.2%) and now beats zstd-1 on structured files (xml, nci). Remaining encoding-side wins still open: flag-stream→literal-length sequences, order-1 literals.
 - **GPU Huffman is a dead end** — Huffman coding requires bit-level alignment, but GPU throughput depends on byte-aligned memory access patterns. This is a fundamental architectural mismatch; do not attempt to port Huffman to GPU.
 - **GPU hash tables for LZ matching don't work** — GPU atomics don't preserve insertion order, so hash chains lose recency information. Match quality collapses to ~6% vs CPU's 99.6% on repetitive data. Tried twice (global atomics + shared-memory variant), both catastrophically failed. See `docs/design-docs/experiments.md`.
 - **SSE2 rANS decode is 32% slower than scalar** — scalar 4-lane decode gets good ILP from out-of-order execution. SSE2 extract operations serialize and lose that parallelism. Proper SIMD rANS would need merged slot-indexed tables and SSE4.1+. The dispatch is disabled; don't re-enable it.
@@ -114,7 +132,7 @@ Before optimizing GPU code paths, read this first — multiple agents have spent
 - **Iterative GPU algorithms have quadratic host overhead** — Repair grammar compression hit 0.4 MB/s due to 100+ rounds of buffer alloc + readback. Avoid per-round GPU↔CPU synchronization; prefer single-dispatch or persistent-buffer designs.
 - **Window-capped suffix sorts break BWT invertibility** — FWST produced 433% ratio (massive expansion). Full suffix sort is structurally required for LF-mapping; there's no shortcut.
 
-- **Streaming path is the CLI bottleneck, not the compressor** — Criterion measures 333–543 MB/s for raw algorithms, but CLI delivers 111–131 MB/s on the same data. The 3–4x gap is in `streaming::compress_stream`, not the encoder. Pipeline-level algorithmic speed differences (e.g., Lzfi vs LzSeqR) are largely invisible at the CLI level because streaming overhead dominates.
+- **Streaming overhead is NOT a 3–4x bottleneck (corrected on M5 Max)** — earlier notes claimed a 3–4x CLI-vs-Criterion gap inside `streaming::compress_stream`. That was a measurement artifact: the "333–543 MB/s Criterion" number was all-cores on repetitive tiled data, compared against a single-threaded CLI run. Measured properly, the streaming path is within ~3% of the raw single-block compressor, and the CLI does 740–1130 MB/s compress / 2700–3700 MB/s decode (all cores, 13.4x thread scaling). The real speed limiter is the **per-core compressor** (~50–70 MB/s single-thread, ~6–9x behind zstd's per-core), driven by `find_best` hash-chain walking — an algorithmic cost, not streaming and not (per wave-2 experiments) GPU-addressable on this hardware.
 - **LzSeqR parallel encode used to route to incompatible GPU rANS** — `run_compress_stage` in `stages.rs` sent LzSeqR entropy to `stage_rans_encode_webgpu` (GPU chunked payload format), while the single-block path used standard CPU rANS. The chunked format was incompatible with all decoders. Fixed in PR #120 by routing to CPU rANS. Don't re-enable GPU rANS for LzSeqR without fixing the wire format compatibility.
 
 For detailed history of all failed experiments, see `docs/design-docs/gpu-experiments-wave2-conclusions.md` and `docs/design-docs/experiments.md`.
