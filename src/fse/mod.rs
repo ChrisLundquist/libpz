@@ -391,6 +391,31 @@ impl FseTable {
             table_size,
         }
     }
+
+    /// Build an FSE table containing ONLY the decode table.
+    ///
+    /// The decode hot paths (`fse_decode_internal`, `fse_decode_interleaved`,
+    /// the SIMD 4-way decoder, and the single-symbol fast paths) read solely
+    /// from `decode_table` and `table_size`; they never touch `encode_tables`.
+    /// Building the per-symbol encode tables on every block decode was profiled
+    /// at ~26% of lzf decompress time (a fill over up to 256 present symbols,
+    /// `table_size` entries each), so this constructor skips it entirely and
+    /// leaves `encode_tables` empty.
+    ///
+    /// Callers MUST NOT use the encode path on a table built this way — the
+    /// empty `encode_tables` would panic on indexing in `fse_encode_core` /
+    /// `fse_encode_interleaved`. Use `from_normalized` for any encode use.
+    pub(crate) fn from_normalized_decode_only(norm: &NormalizedFreqs) -> Self {
+        let table_size = 1usize << norm.accuracy_log;
+        let spread = spread_symbols(norm);
+        let decode_table = build_decode_table(norm, &spread);
+
+        FseTable {
+            decode_table,
+            encode_tables: Vec::new(),
+            table_size,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -708,7 +733,8 @@ pub fn decode(input: &[u8], original_len: usize) -> PzResult<Vec<u8>> {
 
     let bitstream = &input[header_end + 6..];
 
-    let table = FseTable::from_normalized(&norm);
+    // Decode only reads the decode table; skip building encode tables.
+    let table = FseTable::from_normalized_decode_only(&norm);
     fse_decode_internal(bitstream, total_bits, initial_state, &table, original_len)
 }
 
@@ -979,7 +1005,8 @@ pub fn decode_interleaved(input: &[u8], original_len: usize) -> PzResult<Vec<u8>
         streams.push((bitstream, initial_state, total_bits));
     }
 
-    let table = FseTable::from_normalized(&norm);
+    // Decode only reads the decode table; skip building encode tables.
+    let table = FseTable::from_normalized_decode_only(&norm);
 
     // Handle single-symbol case: all streams have total_bits == 0.
     if streams.iter().all(|(_, _, tb)| *tb == 0) && original_len > 0 {
