@@ -1,0 +1,10 @@
+# Pin the toolchain so CI and local builds use the same Rust/clippy version.
+#
+# CI uses dtolnay/rust-toolchain@stable, which auto-updates; a stable bump once
+# turned the Lint job (`cargo clippy -- -D warnings`) red on untouched code with
+# no source change (see PR #127). Pinning here makes clippy lints reproducible:
+# bump this channel deliberately and fix any new lints in the same change.
+[toolchain]
+channel = "1.96.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

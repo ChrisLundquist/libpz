@@ -79,8 +79,8 @@ single-threaded runs; the CLI uses all cores by default).
 | zstd -1 | 34.6% | 5900 | 1500 |
 | zstd -3 (default) | 31.2% | 2860 | 1350 |
 | zstd -9 | 27.9% | 695 | 1460 |
-| pz lzf | 34.0% | 740 | 2760 |
-| pz lzseqr | 33.8% | 930 | 3690 |
+| pz lzf | 32.4% | 740 | 2760 |
+| pz lzseqr | 32.2% | 930 | 3690 |
 | pz lzfi | 46.0% | 1130 | 3130 |
 | pz bw | 30.2% | 166 | 1120 |
 
@@ -91,10 +91,14 @@ plays are **ratio at the lzseqr operating point** and **a faster BWT** (pz bw be
 on x-ray/image data but is throughput-bound). Compare against zstd's frontier (`-1`/`-3`/`-6`),
 not `-19` (which runs ~50 MB/s and is not a speed competitor).
 
-_Latest (this branch, not yet folded into the table above): a 1 MiB match window +
-repeat-offset-aware parsing cut lzseqr/lzf ratio ~1.6pp (lzseqr 33.8→32.2%, now beating
-zstd-1 on xml/nci); FSE decode-only tables lifted lzf decode +72%; the silent `bbw`
-corruption is fixed._
+The pz ratios above are the **lazy default** (the shipped parser): a 1 MiB match window +
+repeat-offset-aware parsing cut lzseqr/lzf ~1.6pp from the old 33.8/34.0%, and lzseqr now
+beats zstd-1 on structured files (xml 11.8%, nci 8.1%). `--greedy` is an **opt-in** parse
+mode that trades ~0.9pp better ratio on text (lzseqr blob → 31.3%, ~tied with zstd-3) for
+~37% slower encode and a regression on structured/record data, so it is not the default;
+making lazy ≥ greedy everywhere is an open follow-up. The FSE decode-only fix also lifted
+single-thread `lzf` decode ~+72%, and two silent `bbw` corruption bugs (SA-IS rotation
+mis-sort + u16 per-block factor-count overflow) are fixed and regression-tested.
 
 **Benchmark corpus:** `./scripts/fetch-silesia.sh` downloads the 211MB Silesia corpus to `samples/silesia/`.
 
