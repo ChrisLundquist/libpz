@@ -79,6 +79,159 @@ fn test_all_pipelines_medium_text() {
     }
 }
 
+// --- Adversarial full-pipeline round-trip coverage ---
+//
+// These exercise the block-framing + entropy path (compress_with_options →
+// compress_block), not just the algorithm APIs. The two corruption bugs the
+// reviews caught — the bbw SA-IS rotation mis-sort and the bbw per-block u16
+// factor-count overflow — both lived in this path and slipped past the
+// algorithm-level round-trip tests in validation.rs / bwt::tests. A matrix like
+// this would have caught them.
+
+fn adversarial_inputs(n: usize) -> Vec<(&'static str, Vec<u8>)> {
+    let mut periodic = Vec::with_capacity(n + 16);
+    while periodic.len() < n {
+        periodic.extend(std::iter::repeat_n(0u8, 15));
+        periodic.push(1);
+    }
+    periodic.truncate(n);
+
+    // Deterministic LCG "random" bytes (no rand dependency).
+    let mut random = Vec::with_capacity(n);
+    let mut s: u32 = 0x1234_5678;
+    for _ in 0..n {
+        s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        random.push((s >> 16) as u8);
+    }
+
+    vec![
+        ("one_byte", vec![7u8]),
+        ("two_bytes", vec![0u8, 255]),
+        ("three_bytes", vec![1u8, 1, 1]),
+        ("zeros", vec![0u8; n]),
+        ("periodic_0x15_1", periodic),
+        ("alternating", (0..n).map(|i| (i % 2) as u8).collect()),
+        ("abc", b"abc".iter().copied().cycle().take(n).collect()),
+        ("random", random),
+        ("ascending", (0..n).map(|i| (i % 251) as u8).collect()),
+    ]
+}
+
+#[test]
+fn test_all_pipelines_adversarial_framing_roundtrip() {
+    let pipelines = [
+        Pipeline::Bw,
+        Pipeline::Bbw,
+        Pipeline::LzSeqR,
+        Pipeline::Lzf,
+        Pipeline::LzssR,
+        Pipeline::Lzfi,
+        Pipeline::LzSeq2R,
+        Pipeline::LzSeqH,
+        Pipeline::SortLz,
+    ];
+    // Small block size forces multi-block framing without huge test data
+    // (16 KiB blocks over 64 KiB inputs => ~4 blocks each).
+    let opts = CompressOptions {
+        block_size: 16 * 1024,
+        ..Default::default()
+    };
+    for (name, data) in adversarial_inputs(64 * 1024) {
+        for &pipeline in &pipelines {
+            let compressed = compress_with_options(&data, pipeline, &opts)
+                .unwrap_or_else(|e| panic!("{pipeline:?}/{name}: compress failed: {e:?}"));
+            let decompressed = decompress(&compressed)
+                .unwrap_or_else(|e| panic!("{pipeline:?}/{name}: decompress failed: {e:?}"));
+            assert!(
+                decompressed == data,
+                "{pipeline:?}/{name}: round-trip mismatch (len {})",
+                data.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn test_bwt_large_block_factor_overflow_roundtrip() {
+    // Pipeline-level guard for the bbw per-block Lyndon-factor count overflow: a
+    // >1 MiB block of "0^15 1" yields >65535 single-char factors. The explicit
+    // (non-default) 2 MiB block keeps it as one block (adjusted_options only
+    // rewrites the default size), reproducing the streaming-path framing the
+    // u16 count silently corrupted. Mirrors the block-level test in blocks.rs.
+    let mut data = Vec::with_capacity(1_100_000);
+    while data.len() < 1_100_000 {
+        data.extend(std::iter::repeat_n(0u8, 15));
+        data.push(1);
+    }
+    let opts = CompressOptions {
+        block_size: 2 * 1024 * 1024,
+        ..Default::default()
+    };
+    for pipeline in [Pipeline::Bbw, Pipeline::Bw] {
+        let compressed = compress_with_options(&data, pipeline, &opts).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert!(
+            decompressed == data,
+            "{pipeline:?}: >65535-factor block round-trip mismatch"
+        );
+    }
+}
+
+#[test]
+fn test_lzseqr_default_parse_is_lazy_not_greedy() {
+    // Guards against silently flipping the default parser to greedy — the design
+    // review near-miss (greedy regresses structured/record data like JSON/logs).
+    // The default (Auto) must resolve to lazy. We use a textual sample where lazy
+    // and greedy genuinely diverge, then assert the default is byte-identical to
+    // explicit --lazy (and differs from --greedy), so a default flip trips this.
+    // (A directional ratio assert "lazy < greedy" is too data-dependent to be
+    // robust — greedy wins on most synthetic data — so we guard the *default
+    // selection* itself, which is the regression's root cause.)
+    let mut data = Vec::with_capacity(220_000);
+    let mut i: u32 = 0;
+    while data.len() < 200_000 {
+        data.extend_from_slice(
+            format!(
+                "line {i:06}: the quick brown fox jumps over the lazy dog near the river \
+                 while {} mules carry {} crates of apples\n",
+                i % 13,
+                i.wrapping_mul(31) % 257
+            )
+            .as_bytes(),
+        );
+        i += 1;
+    }
+    let mk = |ps| {
+        compress_with_options(
+            &data,
+            Pipeline::LzSeqR,
+            &CompressOptions {
+                parse_strategy: ps,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let default = mk(ParseStrategy::Auto);
+    let lazy = mk(ParseStrategy::Lazy);
+    let greedy = mk(ParseStrategy::Greedy);
+    assert_ne!(
+        lazy.len(),
+        greedy.len(),
+        "test sample does not discriminate lazy vs greedy; choose a more textual sample"
+    );
+    assert_eq!(
+        default.len(),
+        lazy.len(),
+        "default LzSeqR parser is no longer lazy (default={}, lazy={}, greedy={}); do not make \
+         greedy the default without a deliberate decision — it regresses structured data",
+        default.len(),
+        lazy.len(),
+        greedy.len()
+    );
+    assert!(decompress(&default).unwrap() == data);
+}
+
 // --- Multi-block parallel compression tests ---
 
 /// Helper: compress with explicit thread count and block size.
