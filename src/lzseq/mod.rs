@@ -967,6 +967,167 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<SeqEncod
     })
 }
 
+/// Parse `input` into universal [`LzToken`]s using the same lazy + repeat-aware
+/// match selection as [`encode_with_config`], without wire-encoding them.
+///
+/// The parse decisions depend on the running [`RepeatOffsets`] state (offset
+/// selection prefers recent offsets), so this maintains the identical state
+/// trajectory the fused encoder would: every emitted match passes through
+/// `repeats.encode_offset` exactly as `emit_match` does. As a result,
+/// `encode_from_tokens(&tokenize_with_config(input, cfg)?, cfg)` produces
+/// byte-identical [`SeqEncoded`] output to `encode_with_config(input, cfg)`
+/// (asserted by `test_tokenize_matches_fused_encode`).
+///
+/// This is the parse seam for experimental wire formats (`pz2`): they get
+/// the shipped parser's match quality without duplicating its tuning.
+pub(crate) fn tokenize_with_config(
+    input: &[u8],
+    config: &SeqConfig,
+) -> PzResult<Vec<crate::lz_token::LzToken>> {
+    use crate::lz_token::LzToken;
+
+    let mut tokens: Vec<LzToken> = Vec::new();
+    if input.is_empty() {
+        return Ok(tokens);
+    }
+
+    let match_limit = config.max_match_len;
+    let mut finder = if config.hash_prefix_len == 4 {
+        HashChainFinder::with_hash4(config.max_window, match_limit, config.max_chain)
+    } else {
+        HashChainFinder::with_window_and_chain(config.max_window, match_limit, config.max_chain)
+    };
+    let mut repeats = RepeatOffsets::new();
+    let mut pos: usize = 0;
+    let max_match_len = match_limit as usize;
+
+    // Adaptive chain depth tracking — identical constants to encode_with_config.
+    let base_chain = config.max_chain;
+    let mut adapt_pos_counter: usize = 0;
+    let mut adapt_match_counter: usize = 0;
+    let adapt_check_interval: usize = 64;
+    let adapt_low_threshold: usize = 2;
+    let adapt_penalty_positions: usize = 256;
+    let mut adapt_penalty_remaining: usize = 0;
+
+    while pos < input.len() {
+        if config.adaptive_chain {
+            adapt_pos_counter += 1;
+            if adapt_penalty_remaining > 0 {
+                adapt_penalty_remaining -= 1;
+                if adapt_penalty_remaining == 0 {
+                    finder.set_max_chain(base_chain);
+                }
+            }
+            if adapt_pos_counter >= adapt_check_interval {
+                adapt_pos_counter = 0;
+                if adapt_match_counter < adapt_low_threshold {
+                    finder.set_max_chain((base_chain / 2).max(1));
+                    adapt_penalty_remaining = adapt_penalty_positions;
+                } else {
+                    finder.set_max_chain(base_chain);
+                }
+                adapt_match_counter = 0;
+            }
+        }
+
+        let m = finder.find_match_wide(input, pos);
+        finder.insert(input, pos);
+
+        let (best_offset, best_length, is_repeat) =
+            select_best_match(input, pos, m.offset, m.length, &repeats, max_match_len);
+
+        let effective_min = if best_length >= MIN_MATCH && !is_repeat {
+            min_profitable_length(best_offset)
+        } else {
+            MIN_MATCH
+        };
+
+        // Lazy matching — identical decision structure to encode_with_config.
+        if !config.greedy
+            && best_length >= effective_min
+            && best_length < LAZY_SKIP_THRESHOLD
+            && pos + 1 < input.len()
+        {
+            finder.insert(input, pos + 1);
+            let next_m = finder.find_match_wide(input, pos + 1);
+            let (next_offset, next_length, next_is_repeat) = select_best_match(
+                input,
+                pos + 1,
+                next_m.offset,
+                next_m.length,
+                &repeats,
+                max_match_len,
+            );
+            let next_effective_min = if next_length >= MIN_MATCH && !next_is_repeat {
+                if next_offset > 0 {
+                    min_profitable_length(next_offset)
+                } else {
+                    u16::MAX
+                }
+            } else {
+                MIN_MATCH
+            };
+
+            let take_next = if is_repeat && !next_is_repeat {
+                next_length > best_length.saturating_add(REP_STABILITY_BONUS)
+            } else if next_is_repeat && !is_repeat {
+                next_length >= best_length
+            } else {
+                next_length > best_length
+            };
+
+            if next_length >= next_effective_min && take_next {
+                tokens.push(LzToken::Literal(input[pos]));
+                pos += 1;
+
+                // Mirror emit_match's repeat-state update without the streams.
+                let _ = repeats.encode_offset(next_offset);
+                tokens.push(LzToken::Match {
+                    offset: next_offset,
+                    length: next_length as u32,
+                });
+
+                if config.adaptive_chain {
+                    adapt_match_counter += 1;
+                }
+
+                let advance = next_length as usize;
+                let insert_count = advance.min(input.len() - pos).min(MAX_INSERT_LEN);
+                for i in 1..insert_count {
+                    finder.insert(input, pos + i);
+                }
+                pos += advance;
+                continue;
+            }
+        }
+
+        if best_length >= effective_min {
+            let _ = repeats.encode_offset(best_offset);
+            tokens.push(LzToken::Match {
+                offset: best_offset,
+                length: best_length as u32,
+            });
+
+            if config.adaptive_chain {
+                adapt_match_counter += 1;
+            }
+
+            let advance = best_length as usize;
+            let insert_count = advance.min(input.len() - pos).min(MAX_INSERT_LEN);
+            for i in 1..insert_count {
+                finder.insert(input, pos + i);
+            }
+            pos += advance;
+        } else {
+            tokens.push(LzToken::Literal(input[pos]));
+            pos += 1;
+        }
+    }
+
+    Ok(tokens)
+}
+
 // ---------------------------------------------------------------------------
 // Decode
 // ---------------------------------------------------------------------------

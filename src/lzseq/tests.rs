@@ -1078,3 +1078,66 @@ fn test_encode_optimal_no_matches() {
     assert_eq!(encoded.num_matches, 0);
     assert_eq!(encoded.num_tokens as usize, input.len());
 }
+
+// --- Tokenizer / fused-encoder fidelity ---
+
+/// `tokenize_with_config` + `encode_from_tokens` must produce byte-identical
+/// output to the fused `encode_with_config` — this proves the tokenizer
+/// replicates the lazy + repeat-aware parse decisions exactly (including the
+/// RepeatOffsets state trajectory that feeds back into match selection).
+#[test]
+fn test_tokenize_matches_fused_encode() {
+    let mut inputs: Vec<Vec<u8>> = vec![
+        Vec::new(),
+        b"a".to_vec(),
+        b"banana banana banana banana banana".to_vec(),
+        b"The quick brown fox jumps over the lazy dog. ".repeat(64),
+        vec![0xAB; 4096],
+    ];
+    // Pseudo-random and random-walk inputs (LCG, deterministic).
+    let mut state: u32 = 0xDEADBEEF;
+    let mut rnd = vec![0u8; 32768];
+    for b in &mut rnd {
+        state = state.wrapping_mul(1103515245).wrapping_add(12345);
+        *b = (state >> 16) as u8;
+    }
+    inputs.push(rnd);
+    let mut walk = Vec::with_capacity(32768);
+    let mut v: u16 = 30000;
+    for _ in 0..16384 {
+        state = state.wrapping_mul(1103515245).wrapping_add(12345);
+        v = v.wrapping_add((((state >> 16) % 33) as i32 - 16) as u16);
+        walk.extend_from_slice(&v.to_le_bytes());
+    }
+    inputs.push(walk);
+
+    for (i, input) in inputs.iter().enumerate() {
+        let config = SeqConfig::default();
+        let fused = encode_with_config(input, &config).expect("fused encode");
+        let tokens = tokenize_with_config(input, &config).expect("tokenize");
+        let via_tokens = encode_from_tokens(&tokens, &config).expect("encode_from_tokens");
+        assert_eq!(fused.flags, via_tokens.flags, "flags differ (input {i})");
+        assert_eq!(
+            fused.literals, via_tokens.literals,
+            "literals differ (input {i})"
+        );
+        assert_eq!(
+            fused.offset_codes, via_tokens.offset_codes,
+            "offset_codes differ (input {i})"
+        );
+        assert_eq!(
+            fused.offset_extra, via_tokens.offset_extra,
+            "offset_extra differ (input {i})"
+        );
+        assert_eq!(
+            fused.length_codes, via_tokens.length_codes,
+            "length_codes differ (input {i})"
+        );
+        assert_eq!(
+            fused.length_extra, via_tokens.length_extra,
+            "length_extra differ (input {i})"
+        );
+        assert_eq!(fused.num_tokens, via_tokens.num_tokens);
+        assert_eq!(fused.num_matches, via_tokens.num_matches);
+    }
+}
