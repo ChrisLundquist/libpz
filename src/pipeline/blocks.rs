@@ -10,6 +10,7 @@ use crate::bwt;
 use crate::fse;
 use crate::mtf;
 use crate::rle;
+use crate::zrle;
 use crate::{PzError, PzResult};
 
 use super::demux::{demuxer_for_pipeline, LzDemuxer};
@@ -262,15 +263,22 @@ fn decompress_block_bw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     }
 
     let primary_index = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let rle_len = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
+    let len_field = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let zrle_used = (len_field & BW_ZRLE_FLAG) != 0;
+    let rle_len = (len_field & !BW_ZRLE_FLAG) as usize;
 
     let entropy_data = &payload[8..];
 
     // Stage 1: FSE decoder
     let rle_data = fse::decode(entropy_data, rle_len)?;
 
-    // Stage 2: RLE decode
-    let mtf_data = rle::decode(&rle_data)?;
+    // Stage 2: zero-run decode (RUNA/RUNB or legacy RLE). The MTF/BWT stream
+    // length equals the original block length.
+    let mtf_data = if zrle_used {
+        zrle::decode(&rle_data, orig_len)?
+    } else {
+        rle::decode(&rle_data)?
+    };
 
     // Stage 3: Inverse MTF
     let bwt_data = mtf::decode(&mtf_data);
@@ -331,20 +339,27 @@ fn decompress_block_bbw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     }
 
     let rle_offset = 4 + num_factors * 4;
-    let rle_len = u32::from_le_bytes([
+    let len_field = u32::from_le_bytes([
         payload[rle_offset],
         payload[rle_offset + 1],
         payload[rle_offset + 2],
         payload[rle_offset + 3],
-    ]) as usize;
+    ]);
+    let zrle_used = (len_field & BW_ZRLE_FLAG) != 0;
+    let rle_len = (len_field & !BW_ZRLE_FLAG) as usize;
 
     let entropy_data = &payload[header_len..];
 
     // Stage 1: FSE decode
     let rle_data = fse::decode(entropy_data, rle_len)?;
 
-    // Stage 2: RLE decode
-    let mtf_data = rle::decode(&rle_data)?;
+    // Stage 2: zero-run decode (RUNA/RUNB or legacy RLE). The MTF/BWT stream
+    // length equals the original block length.
+    let mtf_data = if zrle_used {
+        zrle::decode(&rle_data, orig_len)?
+    } else {
+        rle::decode(&rle_data)?
+    };
 
     // Stage 3: Inverse MTF
     let bwt_data = mtf::decode(&mtf_data);

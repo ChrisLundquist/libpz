@@ -178,6 +178,44 @@ fn test_bwt_large_block_factor_overflow_roundtrip() {
 }
 
 #[test]
+fn test_bw_zrle_path_and_fallback_roundtrip() {
+    // The Bw/Bbw zero-run stage prefers RUNA/RUNB (zrle) and falls back to the
+    // legacy rle when a block can't take the +1 alphabet shift (a byte value of
+    // 255 present after MTF). Both paths must round-trip, and the per-block flag
+    // (BW_ZRLE_FLAG, high bit of the rle_len header field) must select the
+    // matching inverse on decode.
+
+    // (a) Typical text: well under 256 distinct symbols -> RUNA/RUNB path, and
+    //     should compress to a fraction of the input.
+    let text = b"the quick brown fox jumps over the lazy dog. \
+                 the rain in spain falls mainly on the plain. "
+        .repeat(2000);
+
+    // (b) All 256 byte values present and repeated -> high MTF ranks; exercises
+    //     the alphabet boundary and (when MTF emits 255) the rle fallback path.
+    let mut allbytes = Vec::with_capacity(256 * 400);
+    for _ in 0..400 {
+        allbytes.extend(0u8..=255);
+    }
+
+    for data in [text.as_slice(), allbytes.as_slice()] {
+        for pipeline in [Pipeline::Bw, Pipeline::Bbw] {
+            let compressed = compress(data, pipeline).unwrap();
+            let decompressed = decompress(&compressed).unwrap();
+            assert!(
+                decompressed == data,
+                "{pipeline:?}: zrle/fallback round-trip mismatch (input len {})",
+                data.len()
+            );
+        }
+    }
+
+    // Sanity: the text case must actually compress (confirms the zrle path runs
+    // and isn't silently inflating).
+    assert!(compress(&text, Pipeline::Bw).unwrap().len() < text.len() / 2);
+}
+
+#[test]
 fn test_lzseqr_default_parse_is_lazy_not_greedy() {
     // Guards against silently flipping the default parser to greedy — the design
     // review near-miss (greedy regresses structured/record data like JSON/logs).

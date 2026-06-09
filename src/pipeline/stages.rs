@@ -6,6 +6,7 @@ use crate::huffman::HuffmanTree;
 use crate::mtf;
 use crate::rans;
 use crate::rle;
+use crate::zrle;
 use crate::{PzError, PzResult};
 
 use super::demux::{LzDemuxer, StreamDemuxer};
@@ -50,6 +51,10 @@ pub(crate) struct StageMetadata {
     /// Opaque metadata from the demuxer that must round-trip through the entropy container.
     /// E.g., LZSS num_tokens (4 LE bytes). Empty for formats that don't need it.
     pub demux_meta: Vec<u8>,
+    /// Bw/Bbw: whether the zero-run stage used RUNA/RUNB ([`crate::zrle`]) rather
+    /// than the legacy [`crate::rle`] fallback. Encoded into the header's rle_len
+    /// field via [`BW_ZRLE_FLAG`] so the decoder picks the matching inverse.
+    pub bw_zrle_used: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -843,9 +848,27 @@ pub(crate) fn stage_mtf_encode(mut block: StageBlock) -> PzResult<StageBlock> {
     Ok(block)
 }
 
-/// Bw stage 2: RLE encoding.
+/// High bit of the Bw/Bbw `rle_len` header field: set when the zero-run stage used
+/// RUNA/RUNB ([`crate::zrle`]) rather than the legacy [`crate::rle`]. The field
+/// itself is a block length (≪ 2^31), so the top bit is always free to repurpose.
+pub(crate) const BW_ZRLE_FLAG: u32 = 1 << 31;
+
+/// Bw stage 2: zero-run coding of the MTF output.
+///
+/// Prefers RUNA/RUNB ([`crate::zrle`]) — the big BWT ratio lever — and falls back
+/// to the legacy [`crate::rle`] only for the rare block that RUNA/RUNB can't shift
+/// (a value of 255 present). The choice is recorded in `metadata.bw_zrle_used`.
 pub(crate) fn stage_rle_encode(mut block: StageBlock) -> PzResult<StageBlock> {
-    block.data = rle::encode(&block.data);
+    match zrle::encode(&block.data) {
+        Some(encoded) => {
+            block.data = encoded;
+            block.metadata.bw_zrle_used = true;
+        }
+        None => {
+            block.data = rle::encode(&block.data);
+            block.metadata.bw_zrle_used = false;
+        }
+    }
     block.metadata.pre_entropy_len = Some(block.data.len());
     Ok(block)
 }
@@ -862,9 +885,14 @@ pub(crate) fn stage_fse_encode_bw(mut block: StageBlock) -> PzResult<StageBlock>
         .ok_or(PzError::InvalidInput)?;
     let fse_data = fse::encode_best(&block.data);
 
+    let mut len_field = rle_len as u32;
+    if block.metadata.bw_zrle_used {
+        len_field |= BW_ZRLE_FLAG;
+    }
+
     let mut output = Vec::new();
     output.extend_from_slice(&primary_index.to_le_bytes());
-    output.extend_from_slice(&(rle_len as u32).to_le_bytes());
+    output.extend_from_slice(&len_field.to_le_bytes());
     output.extend_from_slice(&fse_data);
 
     block.data = output;
@@ -905,12 +933,17 @@ pub(crate) fn stage_fse_encode_bbw(mut block: StageBlock) -> PzResult<StageBlock
         .ok_or(PzError::InvalidInput)?;
     let fse_data = fse::encode_best(&block.data);
 
+    let mut len_field = rle_len as u32;
+    if block.metadata.bw_zrle_used {
+        len_field |= BW_ZRLE_FLAG;
+    }
+
     let mut output = Vec::new();
     output.extend_from_slice(&(factor_lengths.len() as u32).to_le_bytes());
     for &fl in &factor_lengths {
         output.extend_from_slice(&(fl as u32).to_le_bytes());
     }
-    output.extend_from_slice(&(rle_len as u32).to_le_bytes());
+    output.extend_from_slice(&len_field.to_le_bytes());
     output.extend_from_slice(&fse_data);
 
     block.data = output;
