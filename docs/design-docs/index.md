@@ -139,6 +139,22 @@ Backward DP optimal parsing: algorithm, cost model, GPU top-K handoff.
 
 ---
 
+### [bwt-cm-findings.md](bwt-cm-findings.md)
+**Status:** ⚠️ Deferred (not a dead end)
+**Last reviewed:** 2026-06-09
+
+BWT + order-1 context-mixing range coder spike (roadmap #1). Code parked at
+`spike/bwt-cm` (not on master).
+
+**Key topics:**
+- Real ratio win (dickens BWT stream −9 to −12%, x-ray −17%) but ~11 MB/s/core decode
+- The logistic mixer is the per-core decode wall (not cache); no config clears both ratio + speed gates
+- CM is GPU-hostile; CPU-only block-parallel if ever pursued
+- The carry-safe `RangeEncoder`/`RangeDecoder` is the reusable substrate for future high-ratio families
+- Incidental: `DEFAULT_BW_BLOCK_SIZE` is 512 KB, not 1 MiB
+
+---
+
 ## Needed Documentation
 
 ---
