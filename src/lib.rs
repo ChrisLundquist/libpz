@@ -1,5 +1,6 @@
 pub mod analysis;
 pub mod bwt;
+pub mod bwt_cm;
 pub mod crc32;
 pub mod deflate;
 pub mod frequency;
