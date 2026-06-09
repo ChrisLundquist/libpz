@@ -15,6 +15,7 @@ pub mod numeric;
 pub mod optimal;
 pub mod pipeline;
 pub mod pqueue;
+pub mod pz2;
 pub mod rans;
 pub mod recoil;
 pub mod rle;
