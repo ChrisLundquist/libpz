@@ -4,6 +4,9 @@
 # Extracted test samples (from tar.gz archives)
 samples/cantrbry/
 samples/large/
+# Silesia corpus (downloaded by scripts/fetch-silesia.sh; may also be a symlink)
+samples/silesia/
+samples/silesia
 # Canterbury corpus files extracted directly into samples/
 samples/alice29.txt
 samples/asyoulik.txt

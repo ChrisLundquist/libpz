@@ -350,8 +350,13 @@ pub enum Pipeline {
     LzSeqH = 9,
     /// Sort-based LZ77 + FSE (deterministic GPU match finding, experimental)
     SortLz = 10,
-    // ID 11 was Parlz (parallel-parse LZ experiment) — removed as confirmed
-    // dead end (37.6% ratio gap vs serial greedy). See gpu-experiments-wave2-conclusions.md.
+    /// Numeric decorrelation: byte-plane split + per-plane gated delta/zigzag,
+    /// each plane FSE-coded separately (no LZ tokens). Targets fixed-width
+    /// numeric / record data (e.g. Silesia x-ray, sao). Opt-in via `-p num`.
+    ///
+    /// ID 11 was previously Parlz (a removed parallel-parse LZ experiment); the
+    /// slot is reused here because no on-disk Parlz stream was ever shipped.
+    Num = 11,
     /// LzSeq2 + sparse rANS (literal-run sequences, combined extra bits)
     LzSeq2R = 12,
 }
@@ -372,7 +377,7 @@ impl TryFrom<u8> for Pipeline {
             8 => Ok(Self::LzSeqR),
             9 => Ok(Self::LzSeqH),
             10 => Ok(Self::SortLz),
-            // 11 was Parlz — removed
+            11 => Ok(Self::Num),
             12 => Ok(Self::LzSeq2R),
             _ => Err(PzError::Unsupported),
         }

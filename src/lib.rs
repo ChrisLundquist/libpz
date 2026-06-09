@@ -11,6 +11,7 @@ pub(crate) mod lz_token;
 pub mod lzseq;
 pub mod lzss;
 pub mod mtf;
+pub mod numeric;
 pub mod optimal;
 pub mod pipeline;
 pub mod pqueue;

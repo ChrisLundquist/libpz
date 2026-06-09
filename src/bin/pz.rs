@@ -86,6 +86,11 @@ fn list_pipelines() {
         ("lzseqr", "8", "LzSeq + rANS (zstd-style code+extra-bits)"),
         ("lzseqh", "9", "LzSeq + Huffman (fast decode)"),
         ("sortlz", "10", "Sort-based LZ77 + FSE (GPU experiment)"),
+        (
+            "num",
+            "11",
+            "Numeric decorrelation: byte-plane split + per-plane gated FSE (x-ray/sao)",
+        ),
         ("lzseq2r", "12", "LzSeq2 + sparse rANS (lit-run sequences)"),
     ];
     for (name, id, desc) in pipelines {
@@ -248,6 +253,7 @@ fn parse_args() -> Opts {
                     "lzseqr" | "8" => Pipeline::LzSeqR,
                     "lzseqh" | "9" => Pipeline::LzSeqH,
                     "sortlz" | "10" => Pipeline::SortLz,
+                    "num" | "11" => Pipeline::Num,
                     "lzseq2r" | "12" => Pipeline::LzSeq2R,
                     other => {
                         eprintln!("pz: unknown pipeline '{other}'");
@@ -442,6 +448,7 @@ fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
                 8 => "lzseqr",
                 9 => "lzseqh",
                 10 => "sortlz",
+                11 => "num",
                 12 => "lzseq2r",
                 _ => "unknown",
             };

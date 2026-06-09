@@ -997,6 +997,7 @@ pub(crate) fn run_compress_stage(
         (Pipeline::LzSeq2R, 0) => stage_demux_compress(block, &LzDemuxer::LzSeq, options),
         (Pipeline::LzSeq2R, 1) => stage_rans_encode_sparse(block, options),
         (Pipeline::SortLz, 0) => stage_sortlz_compress(block),
+        (Pipeline::Num, 0) => stage_num_compress(block),
         _ => Err(PzError::Unsupported),
     }
 }
@@ -1008,6 +1009,16 @@ pub(crate) fn run_compress_stage(
 /// SortLZ single-stage compression: sort-based LZ77 + FSE.
 pub(crate) fn stage_sortlz_compress(mut block: StageBlock) -> PzResult<StageBlock> {
     block.data = crate::sortlz::compress(&block.data, &crate::sortlz::SortLzConfig::default())?;
+    Ok(block)
+}
+
+/// Num single-stage compression: byte-plane split + per-plane gated FSE.
+///
+/// Like SortLZ, Num is a self-contained single-stage pipeline (no demux), so the
+/// unified scheduler runs only stage 0. The decode side goes through
+/// `blocks::decompress_block` → `numeric::decode`.
+pub(crate) fn stage_num_compress(mut block: StageBlock) -> PzResult<StageBlock> {
+    block.data = crate::numeric::encode(&block.data);
     Ok(block)
 }
 

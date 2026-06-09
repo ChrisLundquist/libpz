@@ -48,6 +48,7 @@ pub(crate) fn compress_block(
             Pipeline::Bw => compress_block_bw(input, opts),
             Pipeline::Bbw => compress_block_bbw(input, opts),
             Pipeline::SortLz => compress_block_sortlz(input, opts),
+            Pipeline::Num => compress_block_num(input, opts),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -95,6 +96,7 @@ pub(crate) fn decompress_block(
             Pipeline::Bw => decompress_block_bw(payload, orig_len),
             Pipeline::Bbw => decompress_block_bbw(payload, orig_len),
             Pipeline::SortLz => decompress_block_sortlz(payload, orig_len),
+            Pipeline::Num => decompress_block_num(payload, orig_len),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -395,6 +397,24 @@ fn compress_block_sortlz(input: &[u8], options: &CompressOptions) -> PzResult<Ve
 /// Decompress a single SortLZ block (no container header).
 fn decompress_block_sortlz(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     crate::sortlz::decompress(payload, orig_len)
+}
+
+// ---------------------------------------------------------------------------
+// Num pipeline: numeric decorrelation (byte-plane split + per-plane gated FSE)
+// ---------------------------------------------------------------------------
+
+/// Compress a single block using the Num pipeline (no container header).
+///
+/// The whole stride-sweep + per-plane gating + per-plane FSE + STORE fallback
+/// lives in [`crate::numeric::encode`]; this is a thin adapter. `Num` is a pure
+/// CPU transform pipeline with no GPU path and no LZ tokens.
+fn compress_block_num(input: &[u8], _options: &CompressOptions) -> PzResult<Vec<u8>> {
+    Ok(crate::numeric::encode(input))
+}
+
+/// Decompress a single Num block (no container header).
+fn decompress_block_num(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    crate::numeric::decode(payload, orig_len)
 }
 
 #[cfg(test)]

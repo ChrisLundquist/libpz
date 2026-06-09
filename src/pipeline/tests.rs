@@ -51,6 +51,7 @@ fn test_all_pipelines_banana() {
         Pipeline::LzssR,
         Pipeline::Lzfi,
         Pipeline::LzSeq2R,
+        Pipeline::Num,
     ] {
         let compressed = compress(input, pipeline).unwrap();
         let decompressed = decompress(&compressed).unwrap();
@@ -72,6 +73,7 @@ fn test_all_pipelines_medium_text() {
         Pipeline::LzssR,
         Pipeline::Lzfi,
         Pipeline::LzSeq2R,
+        Pipeline::Num,
     ] {
         let compressed = compress(&input, pipeline).unwrap();
         let decompressed = decompress(&compressed).unwrap();
@@ -129,6 +131,7 @@ fn test_all_pipelines_adversarial_framing_roundtrip() {
         Pipeline::LzSeq2R,
         Pipeline::LzSeqH,
         Pipeline::SortLz,
+        Pipeline::Num,
     ];
     // Small block size forces multi-block framing without huge test data
     // (16 KiB blocks over 64 KiB inputs => ~4 blocks each).
@@ -345,6 +348,7 @@ fn test_multiblock_round_trip_all_pipelines() {
         Pipeline::LzSeqR,
         Pipeline::LzSeqH,
         Pipeline::LzSeq2R,
+        Pipeline::Num,
     ] {
         let compressed = compress_mt(&input, pipeline, 4, 512).unwrap();
         assert_eq!(compressed[2], VERSION, "expected V2 for {:?}", pipeline);
@@ -1336,4 +1340,139 @@ fn test_shared_stream_small_input() {
     let compressed = compress_with_options(input, Pipeline::LzSeqR, &opts).unwrap();
     let decompressed = decompress(&compressed).unwrap();
     assert_eq!(decompressed, input);
+}
+
+// --- Num pipeline (numeric decorrelation) ---
+
+/// Build a synthetic numeric blob: interleaved 16-bit LE counter + a 4-column
+/// record stream. Both have strong inter-byte structure that the byte-plane
+/// split + per-plane delta should exploit.
+fn synthetic_numeric(records: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(records * 6);
+    let mut s: u32 = 0xC0FF_EE11;
+    for i in 0..records {
+        // 16-bit LE sample: slowly ramping.
+        v.extend_from_slice(&((i as u16).wrapping_mul(3)).to_le_bytes());
+        // 4-byte record: ramp, constant, slow, pseudo-random.
+        v.push((i & 0xff) as u8);
+        v.push(0xAA);
+        v.push((i / 8) as u8);
+        s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        v.push((s >> 16) as u8);
+    }
+    v
+}
+
+#[test]
+fn test_num_pipeline_roundtrip_numeric() {
+    let data = synthetic_numeric(20_000);
+    // Single-block and multi-block (parallel + framed) paths.
+    for &threads in &[1usize, 4] {
+        for &block_size in &[64 * 1024, 1024 * 1024] {
+            let opts = CompressOptions {
+                threads,
+                block_size,
+                ..CompressOptions::default()
+            };
+            let compressed =
+                compress_with_options(&data, Pipeline::Num, &opts).unwrap_or_else(|e| {
+                    panic!("Num compress failed (t={threads}, b={block_size}): {e:?}")
+                });
+            let decompressed = decompress(&compressed).unwrap_or_else(|e| {
+                panic!("Num decompress failed (t={threads}, b={block_size}): {e:?}")
+            });
+            assert_eq!(
+                decompressed, data,
+                "Num round-trip mismatch (t={threads}, b={block_size})"
+            );
+        }
+    }
+    // The default API path must also round-trip and actually compress.
+    let compressed = compress(&data, Pipeline::Num).unwrap();
+    assert_eq!(compressed[3], Pipeline::Num as u8, "header pipeline id");
+    assert_eq!(decompress(&compressed).unwrap(), data);
+    assert!(
+        compressed.len() < data.len(),
+        "Num should compress structured numeric data ({} -> {})",
+        data.len(),
+        compressed.len()
+    );
+}
+
+#[test]
+fn test_num_pipeline_roundtrip_adversarial() {
+    // Reuse the shared adversarial corpus + a couple of numeric edge cases.
+    let opts = CompressOptions {
+        block_size: 16 * 1024,
+        ..Default::default()
+    };
+    let mut cases = adversarial_inputs(64 * 1024);
+    cases.push(("le16_counter", {
+        (0u16..30_000).flat_map(|i| i.to_le_bytes()).collect()
+    }));
+    cases.push(("rec28", {
+        let mut v = Vec::new();
+        for i in 0u32..2000 {
+            for c in 0..28u32 {
+                v.push((i.wrapping_add(c)) as u8);
+            }
+        }
+        v
+    }));
+    for (name, data) in cases {
+        let compressed = compress_with_options(&data, Pipeline::Num, &opts)
+            .unwrap_or_else(|e| panic!("Num/{name}: compress failed: {e:?}"));
+        let decompressed = decompress(&compressed)
+            .unwrap_or_else(|e| panic!("Num/{name}: decompress failed: {e:?}"));
+        assert!(
+            decompressed == data,
+            "Num/{name}: round-trip mismatch (len {})",
+            data.len()
+        );
+    }
+}
+
+#[test]
+fn test_num_pipeline_empty_input() {
+    let compressed = compress(&[], Pipeline::Num).unwrap();
+    assert_eq!(decompress(&compressed).unwrap(), Vec::<u8>::new());
+}
+
+/// Regression: the Num pipeline must hit the spike's measured ratios on the
+/// Silesia numeric files — x-ray < 50% and sao < 66% of original (spike values
+/// were 47.79% / 62.81%). Skipped when the corpus is not present.
+#[test]
+fn test_num_corpus_ratio_regression() {
+    for (path, label, threshold) in [
+        ("samples/silesia/x-ray", "x-ray", 0.50_f64),
+        ("samples/silesia/sao", "sao", 0.66_f64),
+    ] {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping Num ratio regression: {path} not present");
+                continue;
+            }
+        };
+        let compressed = compress(&data, Pipeline::Num).expect("Num compress");
+        // Verify exact round-trip on the real corpus too.
+        let decompressed = decompress(&compressed).expect("Num decompress");
+        assert_eq!(decompressed, data, "{label}: corpus round-trip mismatch");
+
+        let ratio = compressed.len() as f64 / data.len() as f64;
+        assert!(
+            ratio < threshold,
+            "{label}: Num ratio {:.2}% exceeded threshold {:.0}% (compressed {} of {} bytes)",
+            ratio * 100.0,
+            threshold * 100.0,
+            compressed.len(),
+            data.len()
+        );
+        eprintln!(
+            "Num {label}: {:.2}% ({} -> {} bytes)",
+            ratio * 100.0,
+            data.len(),
+            compressed.len()
+        );
+    }
 }

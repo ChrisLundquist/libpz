@@ -71,6 +71,9 @@ pub(crate) fn demuxer_for_pipeline(pipeline: super::Pipeline) -> Option<LzDemuxe
         super::Pipeline::LzSeq2R => Some(LzDemuxer::LzSeq),
         super::Pipeline::Bw | super::Pipeline::Bbw => None,
         super::Pipeline::SortLz => None,
+        // Num is a transform pipeline (byte-plane split + per-plane FSE), not an
+        // LZ/demux pipeline — it has no token streams.
+        super::Pipeline::Num => None,
     }
 }
 
