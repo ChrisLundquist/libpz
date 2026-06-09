@@ -216,6 +216,48 @@ fn test_bw_zrle_path_and_fallback_roundtrip() {
 }
 
 #[test]
+fn test_small_offset_long_match_roundtrip() {
+    // Highly repetitive data produces small-offset, long matches (offset 1-2,
+    // length huge) — the LZ decoders' overlapping match-copy path. Guards the
+    // exponential-doubling copy: O(log) memmoves instead of byte-at-a-time, with
+    // identical output. Covers LzSeq (lzf/lzseqr) and LZSS (lzfi/lzssr) decoders.
+    let single = vec![0x41u8; 500_000]; // offset=1, one long match
+    let mut period2 = Vec::with_capacity(500_000);
+    while period2.len() < 500_000 {
+        period2.extend_from_slice(b"AB"); // offset=2
+    }
+    // A long run embedded mid-stream so the match isn't the whole block.
+    let mut embedded = b"the quick brown fox ".repeat(50);
+    embedded.extend(std::iter::repeat_n(0x5Au8, 300_000));
+    embedded.extend_from_slice(b" and then some trailing text to finish it off");
+
+    for data in [single.as_slice(), period2.as_slice(), embedded.as_slice()] {
+        for pipeline in [
+            Pipeline::Lzf,
+            Pipeline::LzSeqR,
+            Pipeline::Lzfi,
+            Pipeline::LzssR,
+        ] {
+            let compressed = compress(data, pipeline).unwrap();
+            let decompressed = decompress(&compressed).unwrap();
+            assert!(
+                decompressed == data,
+                "{pipeline:?}: small-offset long-match round-trip mismatch (len {})",
+                data.len()
+            );
+            // Repetitive data must compress hard — confirms it really is one long
+            // match, i.e. the overlapping-copy path is exercised.
+            assert!(
+                compressed.len() < data.len() / 10,
+                "{pipeline:?}: expected strong compression on repetitive data, got {} of {}",
+                compressed.len(),
+                data.len()
+            );
+        }
+    }
+}
+
+#[test]
 fn test_lzseqr_default_parse_is_lazy_not_greedy() {
     // Guards against silently flipping the default parser to greedy — the design
     // review near-miss (greedy regresses structured/record data like JSON/logs).

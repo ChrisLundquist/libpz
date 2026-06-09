@@ -343,11 +343,24 @@ impl TokenEncoder for LzssEncoder {
                 if offset == 0 || offset > output.len() {
                     return Err(PzError::InvalidInput);
                 }
+                if output.len() + length > original_len {
+                    return Err(PzError::InvalidInput);
+                }
 
-                for _ in 0..length {
-                    let src = output.len() - offset;
-                    let b = output[src];
-                    output.push(b);
+                // Bulk match copy. Non-overlapping is one memcpy; overlapping
+                // grows the copied region exponentially (O(log) memmoves), so a
+                // small-offset long match no longer decodes byte-at-a-time.
+                let copy_start = output.len() - offset;
+                if offset >= length {
+                    output.extend_from_within(copy_start..copy_start + length);
+                } else {
+                    let mut produced = 0;
+                    while produced < length {
+                        let avail = output.len() - copy_start;
+                        let chunk = avail.min(length - produced);
+                        output.extend_from_within(copy_start..copy_start + chunk);
+                        produced += chunk;
+                    }
                 }
 
                 match_idx += 1;
