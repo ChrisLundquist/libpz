@@ -603,6 +603,15 @@ fn encode_multistream_indexed(
 // Entropy stage functions — FSE (multi-stream, LZ-based pipelines)
 // ---------------------------------------------------------------------------
 
+/// Upward accuracy_log steps the LZ FSE stage sweeps above the slots-per-symbol
+/// heuristic (see `stage_fse_encode`). A window of +2 captured most of the full
+/// `encode_best` ratio gain on Silesia (lzf 32.44% -> 32.18%) at a fraction of the
+/// encode cost, with zero decode cost. Measured gating the sweep to high-cardinality
+/// streams only (center >= 9): it lost ~0.1pp ratio for ~0 encode savings, because
+/// the FSE cost is dominated by the literal stream both versions sweep — so we
+/// sweep every stream's small window unconditionally.
+const LZ_FSE_SWEEP_STEPS: u8 = 2;
+
 /// Choose FSE accuracy_log based on the number of distinct symbols in a stream.
 ///
 /// FSE needs enough table slots to represent all active symbols with reasonable
@@ -646,8 +655,13 @@ pub(crate) fn stage_fse_encode(mut block: StageBlock) -> PzResult<StageBlock> {
         pre_entropy_len,
         &block.metadata.demux_meta,
         |stream, output| {
-            let acc = adaptive_accuracy_log(stream);
-            let fse_data = fse::encode_with_accuracy(stream, acc);
+            // Center a bounded accuracy_log sweep on the slots-per-symbol heuristic.
+            // The full sweep (`encode_best`) buys ~0.28pp on Silesia but ~tripled FSE
+            // encode work; a small upward window captures most of it (the gain lives in
+            // the high-cardinality literal stream) for a fraction of the encode cost,
+            // with no decode cost (accuracy_log is recorded per stream at byte 0).
+            let center = adaptive_accuracy_log(stream);
+            let fse_data = fse::encode_best_window(stream, center, LZ_FSE_SWEEP_STEPS);
             output.extend_from_slice(&(stream.len() as u32).to_le_bytes());
             output.extend_from_slice(&(fse_data.len() as u32).to_le_bytes());
             output.extend_from_slice(&fse_data);

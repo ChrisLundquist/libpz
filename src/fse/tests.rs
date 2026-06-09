@@ -199,6 +199,45 @@ fn test_all_accuracy_logs() {
     }
 }
 
+#[test]
+fn test_encode_best_window_roundtrips_and_no_worse_than_center() {
+    // Skewed-ish data so different accuracy_logs produce different sizes.
+    let input: Vec<u8> = (0..4000)
+        .map(|i| ((i * 31 + 7) % 64) as u8) // 64 distinct symbols
+        .collect();
+    // Window picks the smallest result in [center, center+up], which always
+    // includes `center` itself (for centers in range), so it must never be
+    // larger than encoding at `center` alone — and must always round-trip.
+    for center in MIN_ACCURACY_LOG..=MAX_ACCURACY_LOG {
+        for up in 0u8..=3 {
+            let windowed = encode_best_window(&input, center, up);
+            let decoded = decode(&windowed, input.len()).unwrap();
+            assert_eq!(decoded, input, "roundtrip failed center={center} up={up}");
+
+            let at_center = encode_with_accuracy(&input, center);
+            assert!(
+                windowed.len() <= at_center.len(),
+                "window center={center} up={up} ({}) worse than center alone ({})",
+                windowed.len(),
+                at_center.len(),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_encode_best_window_edge_cases() {
+    // Empty input.
+    assert!(encode_best_window(&[], 9, 2).is_empty());
+    // Center above MAX clamps; still round-trips.
+    let input = b"the quick brown fox jumps over the lazy dog, repeatedly and again";
+    let encoded = encode_best_window(input, 99, 2);
+    assert_eq!(decode(&encoded, input.len()).unwrap(), input);
+    // up that would overflow past MAX must not panic.
+    let encoded = encode_best_window(input, MAX_ACCURACY_LOG, 250);
+    assert_eq!(decode(&encoded, input.len()).unwrap(), input);
+}
+
 // --- Error handling ---
 
 #[test]

@@ -715,6 +715,33 @@ pub fn encode_best(input: &[u8]) -> Vec<u8> {
     best
 }
 
+/// Like [`encode_best`] but only sweeps a bounded upward window
+/// `center..=center+up` of accuracy_log values, returning the smallest result.
+///
+/// `encode_best` sweeps the whole range, which roughly tripled FSE encode work on
+/// the LZ streams for a ~0.28pp ratio gain on Silesia. That gain concentrates on
+/// high-cardinality streams (LZ literals) whose slots-per-symbol heuristic already
+/// lands near the top of the range, so a small `center..=center+up` window centered
+/// on the heuristic captures most of it at a fraction of the cost. Low-cardinality
+/// streams (offsets/lengths) gain little from higher precision, so there's no reason
+/// to sweep them far. Decode is unaffected — the chosen accuracy_log is recorded at
+/// `input[0]`, exactly as for [`encode_with_accuracy`] and [`encode_best`].
+pub fn encode_best_window(input: &[u8], center: u8, up: u8) -> Vec<u8> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+    let lo = center.clamp(MIN_ACCURACY_LOG, MAX_ACCURACY_LOG);
+    let hi = center.saturating_add(up).min(MAX_ACCURACY_LOG);
+    let mut best = encode_with_accuracy(input, lo);
+    for al in (lo + 1)..=hi {
+        let candidate = encode_with_accuracy(input, al);
+        if candidate.len() < best.len() {
+            best = candidate;
+        }
+    }
+    best
+}
+
 /// Decode FSE-encoded data.
 ///
 /// `original_len` is the number of bytes in the original uncompressed data.
