@@ -1059,13 +1059,19 @@ pub fn decode(
                 // Non-overlapping: one bulk copy (compiles to memcpy).
                 output.extend_from_within(copy_start..copy_start + length);
             } else {
-                // Overlapping: copy in offset-sized chunks to amortize.
-                let mut remaining = length;
-                while remaining > 0 {
-                    let chunk = remaining.min(offset);
-                    let start = output.len() - offset;
-                    output.extend_from_within(start..start + chunk);
-                    remaining -= chunk;
+                // Overlapping: exponentially grow the copied region. Each step
+                // copies the entire already-produced tail [copy_start..end],
+                // which doubles the available pattern, so producing `length`
+                // bytes takes O(log(length/offset)) memmoves instead of
+                // `length/offset` tiny offset-sized copies (offset=1 was a
+                // byte-at-a-time loop — the decode hot spot). LZ semantics are
+                // preserved: source bytes are always already produced.
+                let mut produced = 0;
+                while produced < length {
+                    let avail = output.len() - copy_start;
+                    let chunk = avail.min(length - produced);
+                    output.extend_from_within(copy_start..copy_start + chunk);
+                    produced += chunk;
                 }
             }
         }
