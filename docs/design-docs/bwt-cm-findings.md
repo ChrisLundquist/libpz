@@ -1,9 +1,11 @@
 # BWT + Context-Mixing Range Coder — Spike Findings (deferred)
 
 **Date:** 2026-06-09
-**Status:** ⚠️ Deferred (not a dead end). Code parked, not on master.
-**Code:** branch `spike/bwt-cm`, tag `spike/bwt-cm-2026-06-09` (SHA `112e438`).
-Retrieve with `git show spike/bwt-cm:src/bwt_cm.rs` (+ `examples/bwt_cm_eval.rs`).
+**Status:** ⚠️ Deferred (not a dead end). Code parked in history, reverted out of the tree.
+**Code:** committed then reverted (per the repo's experiment convention — see
+`89db5f3`/`60fdd86` and PR #106), so it's reachable in mainline history at commit
+`3abd8c0` (`experiment(bwt-cm): ...`). Retrieve with:
+`git show 3abd8c0:src/bwt_cm.rs` (+ `git show 3abd8c0:examples/bwt_cm_eval.rs`).
 
 ## What it tested
 
@@ -77,7 +79,7 @@ across independent blocks — which pz already does on the CPU. CM is CPU-only.
 ## The reusable asset
 
 Regardless of the CM decision, **keep the carry-safe `RangeEncoder`/`RangeDecoder`**
-(`spike/bwt-cm:src/bwt_cm.rs`). It is correct and fuzzed, and it is the load-bearing
+(`git show 3abd8c0:src/bwt_cm.rs`). It is correct and fuzzed, and it is the load-bearing
 primitive for every future high-ratio (range-coded) family — LZMA-class context
 literals, brotli-style modeling, or a full ICM-ISSE CM chain. The next high-ratio
 spike should start from this coder rather than rebuild it.

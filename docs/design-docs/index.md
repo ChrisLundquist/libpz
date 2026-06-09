@@ -143,8 +143,8 @@ Backward DP optimal parsing: algorithm, cost model, GPU top-K handoff.
 **Status:** ⚠️ Deferred (not a dead end)
 **Last reviewed:** 2026-06-09
 
-BWT + order-1 context-mixing range coder spike (roadmap #1). Code parked at
-`spike/bwt-cm` (not on master).
+BWT + order-1 context-mixing range coder spike (roadmap #1). Code parked in
+history (committed then reverted) at `3abd8c0`; not in the master tree.
 
 **Key topics:**
 - Real ratio win (dickens BWT stream −9 to −12%, x-ray −17%) but ~11 MB/s/core decode

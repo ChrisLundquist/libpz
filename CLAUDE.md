@@ -62,8 +62,11 @@ input → tokenize() → Vec<LzToken> → TokenEncoder::encode() → multi-strea
 | **LzssR** | LZSS | rANS | Dominated by Lzfi, removal candidate |
 | **SortLz** | LzSeq (internal) | FSE | Deterministic GPU radix-sort matching |
 | **Bw** / **Bbw** | — | FSE | BWT-based, no LZ tokens |
+| **Num** | — | per-plane FSE | Numeric/binary front-end (byte-plane transpose + per-plane gated delta/zigzag). Opt-in (`-p num`); for the worst numeric files — x-ray 55%→48% (beats xz/bzip2), sao 74%→63%. Block-parallel, O(n) inverse. `src/numeric.rs` |
 
 **Removed pipelines:** Deflate (#117), Lzr (#118), Lz78R (#116), Parlz (ratio loss)
+
+**Deferred (parked in history, reverted out of the tree):** BWT+CM order-1 context-mixing range coder — real ratio win (dickens BWT −9–12%, x-ray −17%) but ~11 MB/s/core decode. See `docs/design-docs/bwt-cm-findings.md` (it points to the parked commit). The carry-safe range coder there is the reusable substrate for future high-ratio families.
 
 **CLI path:** `pz` always uses `streaming::compress_stream`, not `pipeline::compress_with_options`. The streaming path uses block-by-block parallelism with bounded memory.
 
