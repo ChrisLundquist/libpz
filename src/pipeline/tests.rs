@@ -509,6 +509,32 @@ fn test_select_pipeline_random() {
 }
 
 #[test]
+fn test_select_pipeline_numeric_u16() {
+    // Random-walk u16 LE samples (the x-ray shape): high pooled byte entropy,
+    // few LZ matches, but strong stride-2 plane decorrelation → Num.
+    let mut input = Vec::with_capacity(32768);
+    let mut v: u16 = 30000;
+    let mut state: u32 = 99;
+    for _ in 0..16384 {
+        state = state.wrapping_mul(1103515245).wrapping_add(12345);
+        let step = ((state >> 16) % 65) as i32 - 32;
+        v = v.wrapping_add(step as u16);
+        input.extend_from_slice(&v.to_le_bytes());
+    }
+    let pipeline = select_pipeline(&input);
+    assert_eq!(pipeline, Pipeline::Num);
+    let compressed = compress(&input, pipeline).unwrap();
+    let decompressed = decompress(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+    assert!(
+        compressed.len() < input.len(),
+        "Num did not compress: {} >= {}",
+        compressed.len(),
+        input.len()
+    );
+}
+
+#[test]
 fn test_select_pipeline_trial_round_trip() {
     // Trial-selected pipeline must produce valid compressed output
     let pattern = b"Hello, World! This is a test pattern. ";

@@ -60,7 +60,10 @@ use crate::{PzError, PzResult};
 ///
 /// `x-ray` (16-bit samples) wins at `S=2`; `sao` (28-byte records) at `S=28`.
 /// The set spans common power-of-two widths plus 28 for the `sao` record size.
-const CANDIDATE_STRIDES: [usize; 6] = [2, 4, 8, 16, 28, 32];
+///
+/// Shared with `analysis::stride_decorrelation` so pipeline auto-selection
+/// detects exactly the strides this encoder can exploit.
+pub(crate) const CANDIDATE_STRIDES: [usize; 6] = [2, 4, 8, 16, 28, 32];
 
 /// Sentinel stride value meaning "block is stored raw" (STORE fallback).
 const STORE_STRIDE: u8 = 0;

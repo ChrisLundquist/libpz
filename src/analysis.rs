@@ -36,6 +36,13 @@ pub struct DataProfile {
     pub distinct_bytes: u32,
     /// Total input length that was analyzed (may be a sample).
     pub input_len: usize,
+    /// Entropy (bits/byte) saved by the best byte-plane split + per-plane
+    /// gated delta, over `byte_entropy`. High values indicate fixed-stride
+    /// numeric/record data (e.g. 16-bit samples, fixed-width records) that
+    /// the `Num` pipeline compresses far better than LZ or BWT.
+    pub numeric_gain: f32,
+    /// The stride that produced `numeric_gain` (0 when no stride applies).
+    pub numeric_stride: u32,
 }
 
 /// Byte value distribution shape classification.
@@ -73,6 +80,8 @@ pub fn analyze_with_sample(input: &[u8], sample_size: usize) -> DataProfile {
             distribution_shape: DistributionShape::Constant,
             distinct_bytes: 0,
             input_len: 0,
+            numeric_gain: 0.0,
+            numeric_stride: 0,
         };
     }
 
@@ -89,6 +98,7 @@ pub fn analyze_with_sample(input: &[u8], sample_size: usize) -> DataProfile {
     let run_rat = run_ratio(sample);
     let match_dens = match_density_estimate(sample);
     let shape = classify_distribution(&freq, byte_entropy);
+    let (numeric_gain, numeric_stride) = stride_decorrelation(sample, byte_entropy, distinct_bytes);
 
     DataProfile {
         byte_entropy,
@@ -98,6 +108,8 @@ pub fn analyze_with_sample(input: &[u8], sample_size: usize) -> DataProfile {
         distribution_shape: shape,
         distinct_bytes,
         input_len: sample.len(),
+        numeric_gain,
+        numeric_stride,
     }
 }
 
@@ -218,6 +230,99 @@ fn match_density_estimate(input: &[u8]) -> f32 {
 fn match_hash3(data: &[u8], pos: usize) -> usize {
     let h = (data[pos] as usize) << 10 ^ (data[pos + 1] as usize) << 5 ^ (data[pos + 2] as usize);
     h & MATCH_HASH_MASK
+}
+
+/// Minimum records per stride for the decorrelation estimate to be meaningful.
+/// Below this, per-plane histograms are too sparse for even the bias-corrected
+/// entropy estimate to be trustworthy.
+const STRIDE_MIN_RECORDS: usize = 64;
+
+/// Bias-corrected Shannon entropy (bits/symbol) of a 256-bin count histogram.
+///
+/// Applies the Miller-Madow correction `(K-1) / (2N ln 2)` (K = observed
+/// symbols, N = total count): the empirical plug-in estimate systematically
+/// *under*-estimates entropy on small samples, and a byte-plane split divides
+/// the sample by the stride — without the correction, large strides would show
+/// phantom decorrelation gains on random data.
+fn entropy_from_counts(counts: &[u32; 256], total: usize) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let n = total as f64;
+    let mut h = 0.0;
+    let mut observed = 0u32;
+    for &c in counts.iter() {
+        if c > 0 {
+            observed += 1;
+            let p = c as f64 / n;
+            h -= p * p.log2();
+        }
+    }
+    h + (observed.saturating_sub(1)) as f64 / (2.0 * n * std::f64::consts::LN_2)
+}
+
+/// Estimate how much entropy the `Num` byte-plane transform would remove.
+///
+/// For each candidate stride `S` (the same set `numeric::encode` sweeps), the
+/// sample is viewed as `S` interleaved byte-planes. Each plane is scored as
+/// `min(H(plane), H(delta(plane)))` — exactly mirroring the per-plane gated
+/// transform `Num` applies — and the length-weighted average is compared
+/// against the pooled order-0 entropy. The best (gain, stride) pair over all
+/// candidates is returned, with gain clamped to zero.
+///
+/// Fixed-stride numeric/record data (16-bit samples, fixed-width records)
+/// scores a large gain (≥1 bit/byte) because separating the planes deshuffles
+/// distinct column statistics and delta collapses smooth fields. Text, LZ-y
+/// and random data score near zero: both sides of the comparison are
+/// Miller-Madow bias-corrected (see [`entropy_from_counts`]), so the split
+/// itself does not manufacture gain out of thinner histograms.
+fn stride_decorrelation(sample: &[u8], byte_entropy: f32, distinct_bytes: u32) -> (f32, u32) {
+    let n = sample.len();
+    let mut best_gain = 0.0f64;
+    let mut best_stride = 0u32;
+
+    // Bias-correct the pooled order-0 entropy to match the per-plane side.
+    let pooled_entropy = byte_entropy as f64
+        + (distinct_bytes.saturating_sub(1)) as f64 / (2.0 * n as f64 * std::f64::consts::LN_2);
+
+    for &s in &crate::numeric::CANDIDATE_STRIDES {
+        if n < s * STRIDE_MIN_RECORDS {
+            continue;
+        }
+
+        // Per-plane raw and lag-S delta histograms, built in one pass without
+        // materializing the planes. The first record's delta is the raw byte,
+        // matching `numeric::delta_fwd` (out[0] = p[0]).
+        let mut raw = vec![[0u32; 256]; s];
+        let mut delta = vec![[0u32; 256]; s];
+        for (i, &b) in sample.iter().enumerate() {
+            let k = i % s;
+            raw[k][b as usize] += 1;
+            let d = if i >= s {
+                b.wrapping_sub(sample[i - s])
+            } else {
+                b
+            };
+            delta[k][d as usize] += 1;
+        }
+
+        // Length-weighted per-plane gated entropy, in bits/byte.
+        let mut bits = 0.0f64;
+        for k in 0..s {
+            let nk = n / s + usize::from(k < n % s);
+            let h = entropy_from_counts(&raw[k], nk).min(entropy_from_counts(&delta[k], nk));
+            bits += nk as f64 * h;
+        }
+        let plane_entropy = bits / n as f64;
+
+        let gain = pooled_entropy - plane_entropy;
+        if gain > best_gain {
+            best_gain = gain;
+            best_stride = s as u32;
+        }
+    }
+
+    (best_gain as f32, best_stride)
 }
 
 /// Classify the distribution shape from frequency data and entropy.
@@ -471,5 +576,120 @@ mod tests {
         let input = b"short";
         let profile = analyze_with_sample(input, 100000);
         assert_eq!(profile.input_len, 5);
+    }
+
+    /// Deterministic LCG byte stream (same generator as the match-density test).
+    fn lcg_stream(n: usize, mut state: u32) -> Vec<u8> {
+        let mut out = vec![0u8; n];
+        for byte in &mut out {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            *byte = (state >> 16) as u8;
+        }
+        out
+    }
+
+    /// Bounded random-walk u16 LE samples: pooled byte entropy is high (the
+    /// low bytes look near-uniform) but a stride-2 plane split + delta
+    /// collapses it — the x-ray shape.
+    fn u16_walk_samples(samples: usize) -> Vec<u8> {
+        let mut input = Vec::with_capacity(samples * 2);
+        let mut v: u16 = 30000;
+        let mut state: u32 = 99;
+        for _ in 0..samples {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            let step = ((state >> 16) % 65) as i32 - 32; // [-32, +32]
+            v = v.wrapping_add(step as u16);
+            input.extend_from_slice(&v.to_le_bytes());
+        }
+        input
+    }
+
+    #[test]
+    fn test_numeric_gain_u16_samples() {
+        let input = u16_walk_samples(16384);
+        let profile = analyze(&input);
+        assert!(
+            profile.byte_entropy > 6.0,
+            "expected high pooled entropy, got {}",
+            profile.byte_entropy
+        );
+        assert!(
+            profile.numeric_gain > 1.5,
+            "numeric_gain was {}",
+            profile.numeric_gain
+        );
+        assert_eq!(profile.numeric_stride, 2, "profile: {:?}", profile);
+    }
+
+    #[test]
+    fn test_numeric_stride_28_records() {
+        // 28-byte records: constant magic, incrementing counter, slow
+        // per-column walks, two noise columns. Only S=28 isolates the
+        // columns (every other candidate stride mixes 7+ of them).
+        let records = 2048;
+        let mut input = Vec::with_capacity(records * 28);
+        let mut counter: u16 = 0;
+        let mut cols = [128u8; 20];
+        let mut state: u32 = 7;
+        for _ in 0..records {
+            input.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+            input.extend_from_slice(&counter.to_le_bytes());
+            counter = counter.wrapping_add(7);
+            for _ in 0..2 {
+                state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                input.push((state >> 16) as u8);
+            }
+            for col in &mut cols {
+                state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                let step = ((state >> 16) % 5) as i32 - 2; // [-2, +2]
+                *col = col.wrapping_add(step as u8);
+                input.push(*col);
+            }
+        }
+        let profile = analyze(&input);
+        assert!(
+            profile.numeric_gain > 2.0,
+            "numeric_gain was {}",
+            profile.numeric_gain
+        );
+        assert_eq!(profile.numeric_stride, 28, "profile: {:?}", profile);
+    }
+
+    #[test]
+    fn test_numeric_gain_random_near_zero() {
+        // Bias-corrected estimate must not manufacture gain on random data.
+        let input = lcg_stream(65536, 12345);
+        let profile = analyze(&input);
+        assert!(
+            profile.numeric_gain < 0.3,
+            "spurious numeric_gain {} on random data",
+            profile.numeric_gain
+        );
+    }
+
+    #[test]
+    fn test_numeric_gain_text_low() {
+        // Text has no fixed-stride structure: gain stays under the routing
+        // threshold at every candidate stride.
+        let sentence = b"The quick brown fox jumps over the lazy dog. ";
+        let mut input = Vec::with_capacity(65536 + sentence.len());
+        while input.len() < 65536 {
+            input.extend_from_slice(sentence);
+        }
+        let profile = analyze(&input);
+        assert!(
+            profile.numeric_gain < 0.75,
+            "numeric_gain was {} on text",
+            profile.numeric_gain
+        );
+    }
+
+    #[test]
+    fn test_numeric_gain_short_input_skipped() {
+        // Inputs below STRIDE_MIN_RECORDS * stride produce no estimate at all
+        // rather than a noise-driven one.
+        let profile = analyze(&lcg_stream(64, 5));
+        assert_eq!(profile.numeric_gain, 0.0);
+        assert_eq!(profile.numeric_stride, 0);
     }
 }

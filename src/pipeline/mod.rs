@@ -16,6 +16,7 @@
 //! | `LzSeqR`      | LzSeq → rANS                     | zstd-style      |
 //! | `LzSeqH`      | LzSeq → Huffman                  | fast decode     |
 //! | `SortLz`      | SortLZ → FSE                     | GPU match find  |
+//! | `Num`         | byte-plane split → per-plane FSE | numeric/record  |
 //!
 //! **Match finder selection:** All LZ-based pipelines accept `MatchFinder::SortLz`
 //! as an alternative to `MatchFinder::HashChain`. When SortLz is used as a match
@@ -25,7 +26,7 @@
 //! Each compressed stream starts with a header:
 //! - Magic bytes: `PZ` (2 bytes)
 //! - Version: 2 (1 byte)
-//! - Pipeline ID: 1=Bw, 4=Lzf, 5=Lzfi, 6=LzssR, 8=LzSeqR, 9=LzSeqH, 10=SortLz (1 byte)
+//! - Pipeline ID: 1=Bw, 4=Lzf, 5=Lzfi, 6=LzssR, 8=LzSeqR, 9=LzSeqH, 10=SortLz, 11=Num, 12=LzSeq2R (1 byte)
 //! - Original length: u32 little-endian (4 bytes)
 //! - num_blocks: u32 little-endian (4 bytes)
 //! - Block table: \[compressed_len: u32, original_len: u32\] \* num_blocks
@@ -623,6 +624,22 @@ pub fn select_pipeline(input: &[u8]) -> Pipeline {
 
     let profile = analysis::analyze(input);
 
+    // Fixed-stride numeric/record data (16-bit samples, fixed-width records):
+    // high order-0 entropy makes this look near-incompressible to every other
+    // rule, but a byte-plane split + per-plane delta removes a lot of entropy
+    // — exactly what the Num pipeline does (x-ray 55→48%, sao 74→63% vs the
+    // best LZ/BWT result). Checked first: this class would otherwise fall
+    // through to the near-random or match-density rules.
+    // Thresholds from the Silesia head-64KB probe (2026-06): targets score
+    // gain 2.3-2.6 (x-ray S=2, sao S=28) while the best non-numeric file
+    // scores 0.55 (mr) — and mr/mozilla are further excluded by the entropy
+    // guard. The match guard only blocks data whose matches LZ can actually
+    // monetize: x-ray/sao sit at 0.24-0.30 (short coincidental matches, LZ
+    // still loses), so it is deliberately loose at 0.45.
+    if profile.numeric_gain >= 0.75 && profile.byte_entropy >= 6.0 && profile.match_density < 0.45 {
+        return Pipeline::Num;
+    }
+
     // Near-random data: use fastest pipeline, won't compress much
     if profile.byte_entropy > 7.5 && profile.match_density < 0.1 {
         return Pipeline::Lzf;
@@ -749,6 +766,7 @@ pub fn select_pipeline_trial(
         Pipeline::LzSeqH,
         Pipeline::LzSeq2R,
         Pipeline::SortLz,
+        Pipeline::Num,
     ];
     let mut best_pipeline = Pipeline::Lzf;
     let mut best_size = usize::MAX;
@@ -757,13 +775,16 @@ pub fn select_pipeline_trial(
     let match_finders = [MatchFinder::HashChain, MatchFinder::SortLz];
 
     for &pipeline in &candidates {
-        // SortLz pipeline has its own match finder, only test default
-        let finders: &[MatchFinder] =
-            if matches!(pipeline, Pipeline::Bw | Pipeline::Bbw | Pipeline::SortLz) {
-                &[MatchFinder::HashChain]
-            } else {
-                &match_finders
-            };
+        // SortLz has its own match finder; Bw/Bbw/Num have no LZ stage at all.
+        // Only test the default finder for these.
+        let finders: &[MatchFinder] = if matches!(
+            pipeline,
+            Pipeline::Bw | Pipeline::Bbw | Pipeline::SortLz | Pipeline::Num
+        ) {
+            &[MatchFinder::HashChain]
+        } else {
+            &match_finders
+        };
 
         for &finder in finders {
             let opts = CompressOptions {
