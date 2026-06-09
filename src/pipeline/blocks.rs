@@ -387,8 +387,8 @@ mod tests {
     use super::*;
 
     /// Regression: a ~1 MiB block of highly periodic data (`0^15 1`) produces
-    /// >65535 single-char Lyndon factors. The per-block factor count was a u16
-    /// that silently truncated, producing an undecodable (corrupt) bbw block.
+    /// more than 65535 single-char Lyndon factors. The per-block factor count was
+    /// a u16 that silently truncated, producing an undecodable (corrupt) bbw block.
     /// The count is now u32. This drives the *block* path
     /// (`compress_block`/`decompress_block`) — the `encode_bijective`-only
     /// regression test in `bwt/tests.rs` cannot reach this framing-layer bug.

@@ -49,7 +49,7 @@ jobs:
         with:
           toolchain: "1.96.0"
           components: clippy, rustfmt
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo fmt -- --check
 
   bench:
