@@ -79,17 +79,26 @@ single-threaded runs; the CLI uses all cores by default).
 | zstd -1 | 34.6% | 5900 | 1500 |
 | zstd -3 (default) | 31.2% | 2860 | 1350 |
 | zstd -9 | 27.9% | 695 | 1460 |
-| pz lzf | 32.4% | 740 | 2760 |
+| pz lzf | 32.2% | 740 | 2760 |
 | pz lzseqr | 32.2% | 930 | 3690 |
 | pz lzfi | 46.0% | 1130 | 3130 |
-| pz bw | 30.2% | 166 | 1120 |
+| pz bw | 27.8% | 166 | 1120 |
 
-**pz's structural edge is decompression — 2.4–2.7x faster than zstd**, whose decode is
-single-threaded and flat (~1350–1500 MB/s) while pz parallelizes it (lzseqr 3690 MB/s).
-zstd -T0 compress (2.8–5.9 GB/s) is unbeatable on the compress axis, so the live Pareto
-plays are **ratio at the lzseqr operating point** and **a faster BWT** (pz bw beats zstd-9
-on x-ray/image data but is throughput-bound). Compare against zstd's frontier (`-1`/`-3`/`-6`),
-not `-19` (which runs ~50 MB/s and is not a speed competitor).
+**Read the decode column carefully — it is the most misunderstood number in this repo.**
+The pz "Decomp MB/s" above is **all-cores** throughput; zstd's is **single-threaded** (the
+zstd CLI does not parallelize decode). On an apples-to-apples **single-thread** basis,
+**zstd decodes ~3.5x FASTER per core** (zstd-3 ~1500 MB/s vs pz lzf ~430 MB/s, measured),
+because zstd's entropy decoder is hand-tuned (huff0 4-stream literals + 2-state FSE + BMI2)
+and pz's FSE decode is latency-bound (4-way interleaving buys only ~1.15x on this CPU).
+So pz's genuine decode edge is **parallel/bulk throughput** (it scales across cores while
+zstd's CLI doesn't), **not** per-core speed. Do not repeat the old "2.4–2.7x faster than
+zstd" framing — it compared pz-all-cores to zstd-one-core.
+
+On ratio, **zstd-3 (31.2%) still beats the pz default (32.2%) by ~0.9pp**, and zstd-9
+(27.9%) ≈ ties pz bw (27.8%) while decoding far faster per core — so pz is **not**
+single-thread Pareto-optimal. Its defensible position is (good ratio + high parallel decode
+throughput). zstd -T0 compress (2.8–5.9 GB/s) is unbeatable on the compress axis. Compare
+against zstd's frontier (`-1`/`-3`/`-6`/`-9`), not `-19` (~50 MB/s, not a speed competitor).
 
 The pz ratios above are the **lazy default** (the shipped parser): a 1 MiB match window +
 repeat-offset-aware parsing cut lzseqr/lzf ~1.6pp from the old 33.8/34.0%, and lzseqr now
@@ -99,6 +108,16 @@ mode that trades ~0.9pp better ratio on text (lzseqr blob → 31.3%, ~tied with 
 making lazy ≥ greedy everywhere is an open follow-up. The FSE decode-only fix also lifted
 single-thread `lzf` decode ~+72%, and two silent `bbw` corruption bugs (SA-IS rotation
 mis-sort + u16 per-block factor-count overflow) are fixed and regression-tested.
+
+**Entropy/BWT ratio work (all decode-cost-free):** FSE now picks `accuracy_log` adaptively
+instead of using a fixed value — a full sweep for the BWT pipelines (bw −1.9pp, bbw −2.6pp,
+decode is inverse-BWT-bound so it's free) and a bounded `center..center+2` window for the LZ
+literal stream (lzf 32.4→32.2%). The BWT pipelines also gained **RUNA/RUNB** bzip2-style
+zero-run coding (`src/zrle.rs`): MTF zero-runs flow through the FSE model in bijective base 2,
+worth bw −0.5 to −1.4pp on text (dickens bw now 28.9%, beating zstd-9 there), with a legacy-RLE
+fallback for all-256-value blocks. Decode hardening: overlapping LZ match copies now grow
+exponentially (O(log) memmoves) instead of byte-at-a-time, so small-offset long matches no
+longer decode quadratically (8–13x faster on repetitive input; Silesia unaffected).
 
 **Benchmark corpus:** `./scripts/fetch-silesia.sh` downloads the 211MB Silesia corpus to `samples/silesia/`.
 
@@ -138,6 +157,7 @@ Before optimizing GPU code paths, read this first — multiple agents have spent
 
 - **Streaming overhead is NOT a 3–4x bottleneck (corrected on M5 Max)** — earlier notes claimed a 3–4x CLI-vs-Criterion gap inside `streaming::compress_stream`. That was a measurement artifact: the "333–543 MB/s Criterion" number was all-cores on repetitive tiled data, compared against a single-threaded CLI run. Measured properly, the streaming path is within ~3% of the raw single-block compressor, and the CLI does 740–1130 MB/s compress / 2700–3700 MB/s decode (all cores, 13.4x thread scaling). The real speed limiter is the **per-core compressor** (~50–70 MB/s single-thread, ~6–9x behind zstd's per-core), driven by `find_best` hash-chain walking — an algorithmic cost, not streaming and not (per wave-2 experiments) GPU-addressable on this hardware.
 - **LzSeqR parallel encode used to route to incompatible GPU rANS** — `run_compress_stage` in `stages.rs` sent LzSeqR entropy to `stage_rans_encode_webgpu` (GPU chunked payload format), while the single-block path used standard CPU rANS. The chunked format was incompatible with all decoders. Fixed in PR #120 by routing to CPU rANS. Don't re-enable GPU rANS for LzSeqR without fixing the wire format compatibility.
+- **No cheap per-core DECODE win exists; the gap to zstd is structural** — profiled lzf single-thread decode (samply): ~49% FSE entropy + ~47% LZ match-copy. FSE decode is **latency-bound** (~4.7 cyc/byte ≈ the `decode_table[state]` load latency); single-stream micro-opts are futile and **4-way interleaving buys only ~1.15x on the M5** (its wide OoO core already hides the latency — measured in isolation, ratio-neutral). Match-copy is already `memcpy`/`extend_from_within`. So pz decodes ~3.5x slower per core than zstd (432 vs 1513 MB/s) because zstd's entropy decoder is hand-tuned (huff0 4-stream + 2-state FSE + BMI2); closing it needs a ground-up entropy-decode rewrite, not an incremental tweak. **Profiling gotcha:** `scripts/samply-top-symbols.sh` flat `nm`/`atos` leaf mapping misattributes unsymbolized libstd copy code to the nearest exported symbol — it labeled the match-copy memmove as `std::sync::mpmc::Channel::recv`, which does NOT exist in the single-thread decode path. Trust samply's `stackTable` call chain, not the flat leaf→symbol map.
 
 For detailed history of all failed experiments, see `docs/design-docs/gpu-experiments-wave2-conclusions.md` and `docs/design-docs/experiments.md`.
 
