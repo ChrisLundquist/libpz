@@ -20,6 +20,7 @@ pub mod rle;
 pub mod simd;
 pub mod sortlz;
 pub mod streaming;
+pub mod zrle;
 
 #[cfg(feature = "webgpu")]
 mod gpu_cost;
