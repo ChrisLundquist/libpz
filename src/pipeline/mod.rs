@@ -136,12 +136,19 @@ pub enum QualityLevel {
 /// on Silesia. Threading stays efficient (200+ blocks on the corpus).
 const DEFAULT_BLOCK_SIZE: usize = 1024 * 1024;
 
-/// Default block size for BWT-based pipelines (512KB).
+/// Default block size for BWT-based pipelines (1 MiB).
 ///
-/// BWT benefits from larger blocks (better context grouping), but our FSE
-/// encoder degrades beyond ~1MB. 512KB balances BWT context quality against
-/// FSE table precision. Empirically optimal across Canterbury+Silesia corpus.
-const DEFAULT_BW_BLOCK_SIZE: usize = 512 * 1024;
+/// Raised from 512KB after the 2026-06 block-size sweep
+/// (`examples/bw_blocksize.rs`, `docs/design-docs/bw-blocksize-findings.md`):
+/// with adaptive FSE accuracy (#129) and zrle (#131), Silesia blob ratio is
+/// block-size-monotonic (512K 28.28% → 1M 27.74%), and the CLI streaming path
+/// — which never applied this constant — had already been shipping 1 MiB
+/// blocks since the global default bump, so this also unifies the library and
+/// CLI paths. 2-4 MiB was measured and rejected for the default: blob ratio
+/// saturates at 27.38% (a point zstd-12 dominates) while aggregate parallel
+/// decode halves again (concurrent inverse-BWT working sets outgrow shared
+/// cache; the old "FSE degrades beyond ~1MB" concern is obsolete since #129).
+const DEFAULT_BW_BLOCK_SIZE: usize = 1024 * 1024;
 
 /// Default block size for GPU LZ77 pipelines (128KB).
 ///
@@ -818,12 +825,14 @@ pub(crate) fn write_header(output: &mut Vec<u8>, pipeline: Pipeline, orig_len: u
 /// Return options with pipeline-optimal block size.
 ///
 /// Adjusts block size based on pipeline characteristics when the caller
-/// is using the default (256KB):
-/// - BWT pipelines (Bw, Bbw): use 512KB for better BWT context grouping
+/// is using the default (`DEFAULT_BLOCK_SIZE`, 1 MiB):
+/// - BWT pipelines (Bw, Bbw): use `DEFAULT_BW_BLOCK_SIZE` (currently equal,
+///   so this is a no-op kept for future divergence)
 /// - GPU LZ77 pipelines: use 128KB for GPU hash table quality
 ///
 /// If the caller explicitly set a non-default block size, their choice is
-/// respected.
+/// respected. Caveat: an explicit request equal to `DEFAULT_BLOCK_SIZE` is
+/// indistinguishable from "unset" and gets adjusted.
 fn adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> CompressOptions {
     if options.block_size != DEFAULT_BLOCK_SIZE {
         return options.clone();

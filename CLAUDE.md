@@ -121,6 +121,10 @@ worth bw −0.5 to −1.4pp on text (dickens bw now 28.9%, beating zstd-9 there)
 fallback for all-256-value blocks. Decode hardening: overlapping LZ match copies now grow
 exponentially (O(log) memmoves) instead of byte-at-a-time, so small-offset long matches no
 longer decode quadratically (8–13x faster on repetitive input; Silesia unaffected).
+`DEFAULT_BW_BLOCK_SIZE` is now 1 MiB, ratifying what the CLI streaming path already did
+(it never applied the old 512KB adjustment — the library path was 0.54pp worse); 2–4 MiB
+was swept and rejected (blob saturates at 27.38%, a zstd-12-dominated point, while
+aggregate decode halves — see `docs/design-docs/bw-blocksize-findings.md`).
 
 **Benchmark corpus:** `./scripts/fetch-silesia.sh` downloads the 211MB Silesia corpus to `samples/silesia/`.
 

@@ -90,3 +90,8 @@ spike should start from this coder rather than rebuild it.
 1 MiB** as some session notes claimed. This matters for any adaptive-model entropy tail:
 ratio amortizes model warm-up over the block, so it improves with larger blocks (the CM
 gate literally flips between 512 KB and 1 MiB).
+
+*Update 2026-06-09:* the constant is now **1 MiB** — and it turned out the CLI streaming
+path had been using 1 MiB all along (it never applied the 512KB adjustment). See
+[bw-blocksize-findings](bw-blocksize-findings.md). The CM precondition "(a) bump the BW
+block size to ≥1 MiB" is therefore already satisfied.
