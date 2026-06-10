@@ -136,6 +136,33 @@ pub enum QualityLevel {
 /// on Silesia. Threading stays efficient (200+ blocks on the corpus).
 const DEFAULT_BLOCK_SIZE: usize = 1024 * 1024;
 
+/// Default block size for the Pz2 pipeline: 2 MiB. Pz2's match window is
+/// block-capped, so block size is its window lever: 2 MiB buys -0.22pp
+/// (blob) to -0.36pp (dickens) over 1 MiB at near-flat decode. 4 MiB adds
+/// only ~-0.05pp more on the blob but collapses all-cores encode 279 → 50
+/// MiB/s: 18 workers each walking a 16 MiB hash-chain `prev` array thrash
+/// the shared cache (the single-thread sweep predicted 1.9x slower; e2e
+/// measured 5.5x — same cache physics as P8, encode-side). Revisit 4 MiB
+/// when encode gets GPU candidate generation or cache-aware chains.
+const DEFAULT_PZ2_BLOCK_SIZE: usize = 2 * 1024 * 1024;
+
+/// Streaming-path option resolution: ONLY the Pz2 block-size default.
+///
+/// Deliberately narrower than `adjusted_options`: the streaming (CLI) path
+/// has never inherited the other arms — the bw 512KB adjustment was ratified
+/// out in #140, and the GPU 128KB LZ block size is a library-path policy
+/// that would shrink the CLI's 1 MiB window if it leaked here.
+pub(crate) fn streaming_adjusted_options(
+    pipeline: Pipeline,
+    options: &CompressOptions,
+) -> CompressOptions {
+    let mut adjusted = options.clone();
+    if pipeline == Pipeline::Pz2 && options.block_size == DEFAULT_BLOCK_SIZE {
+        adjusted.block_size = DEFAULT_PZ2_BLOCK_SIZE;
+    }
+    adjusted
+}
+
 /// Default block size for BWT-based pipelines (1 MiB).
 ///
 /// Raised from 512KB after the 2026-06 block-size sweep
@@ -320,8 +347,17 @@ pub(crate) fn resolve_max_match_len(_pipeline: Pipeline, options: &CompressOptio
 /// so `--greedy` and window flags affect `-p pz2` identically to `-p lzf`.
 pub(crate) fn pz2_seq_config(options: &CompressOptions) -> crate::lzseq::SeqConfig {
     let defaults = crate::lzseq::SeqConfig::default();
+    // The window follows the block size (rounded up to a power of two, never
+    // below the SeqConfig default) so larger Pz2 blocks actually buy reach —
+    // a 4 MiB block with a 1 MiB window would leave the ratio win on the
+    // table. A window larger than the block is harmless: offsets never
+    // exceed the in-block position.
+    let window_from_block = options
+        .block_size
+        .next_power_of_two()
+        .max(defaults.max_window);
     crate::lzseq::SeqConfig {
-        max_window: options.seq_window_size.unwrap_or(defaults.max_window),
+        max_window: options.seq_window_size.unwrap_or(window_from_block),
         max_match_len: options.max_match_len.unwrap_or(defaults.max_match_len),
         greedy: options.parse_strategy == ParseStrategy::Greedy,
         ..defaults
@@ -867,6 +903,16 @@ fn adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> CompressOp
     if is_bw_pipeline {
         let mut adjusted = options.clone();
         adjusted.block_size = DEFAULT_BW_BLOCK_SIZE;
+        return adjusted;
+    }
+
+    // Pz2's match window is capped by the block size (blocks parse cold), so
+    // block size is its window lever; see DEFAULT_PZ2_BLOCK_SIZE for the
+    // 2026-06 sweep data and why 2 MiB (not 4) is the knee once concurrent
+    // encode cache pressure is counted.
+    if matches!(pipeline, Pipeline::Pz2) {
+        let mut adjusted = options.clone();
+        adjusted.block_size = DEFAULT_PZ2_BLOCK_SIZE;
         return adjusted;
     }
 

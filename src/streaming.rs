@@ -91,6 +91,10 @@ pub fn compress_stream<R: Read + Send, W: Write>(
     pipeline: Pipeline,
     options: &CompressOptions,
 ) -> StreamResult<u64> {
+    // Per-pipeline streaming defaults (currently just Pz2's 4 MiB block; see
+    // streaming_adjusted_options for why the library-path adjustments do NOT
+    // apply here).
+    let options = &crate::pipeline::streaming_adjusted_options(pipeline, options);
     let num_threads = resolve_thread_count(options.threads);
 
     if num_threads <= 1 {

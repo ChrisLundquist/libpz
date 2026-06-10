@@ -5,11 +5,13 @@
 prototype gate **passed at 3.45×** (target was 2×). `src/pz2.rs` decodes the
 Silesia blob at **1405 MB/s single-thread at 32.22%** vs `Lzf`'s 408 MB/s at
 32.18% — same parse, byte-identical match decisions, new wire format.
-Per-core decode is within ~3% of zstd-3 (1452 MB/s measured same-box) at
-~1pp ratio cost, while every block stays independently decodable. pz2 is now
-`Pipeline::Pz2` (`pz -p pz2`, id 13), riding the shipped streaming container
-— measured **12.1 GiB/s all-cores CLI decode** on the blob, 1.40× faster
-than `pzstd -3 -p18` (the honest competitor) at 0.8pp ratio cost. See §7-§8.
+Per-core decode is within ~3% of zstd-3 (1452 MB/s measured same-box), while
+every block stays independently decodable. pz2 is now `Pipeline::Pz2`
+(`pz -p pz2`, id 13), riding the shipped streaming container with a 2 MiB
+block default (window = block, §9): **blob 32.0% at 11.0 GiB/s all-cores CLI
+decode** — better ratio than lzf (32.2%) AND 2.3× its decode wall, 1.28×
+faster than `pzstd -3 -p18` (the honest competitor) at 0.6pp ratio cost.
+See §7-§9.
 **Method:** Derived, not invented — every choice below cites the libpz
 measurement that forces it. Receipts live in CLAUDE.md "Known dead ends",
 `gpu-experiments-wave2-conclusions.md`, `bwt-cm-findings.md`,
@@ -277,3 +279,45 @@ within this table only.
   the dickens-slice ratio 38.6% → 35.7%, round-trip verified.
 - Remaining integration gaps: no dict tier; Num-style transforms not yet
   routed per block (P5/P9 phase 2).
+
+## 9. Block-size = window sweep → 2 MiB default (2026-06-10)
+
+Pz2's window is block-capped (blocks parse cold), so block size is the
+window lever. Sweep (`examples/pz2_block_sweep.rs`, window = block size,
+ST, round-trip-verified) — ratio improves monotonically on real files;
+the blob's 8 MiB reversal is concatenation-boundary content mixing:
+
+| input | 1 MiB | 2 MiB | 4 MiB | 8 MiB |
+|---|---|---|---|---|
+| blob | 32.223 | 32.004 | 31.949 | 32.021 |
+| webster | 29.339 | 29.007 | 28.779 | 28.572 |
+| dickens | 38.852 | 38.497 | 38.291 | 38.177 |
+| mozilla | 36.226 | 35.912 | 35.729 | 35.639 |
+| samba | 23.910 | 23.653 | 23.151 | 22.978 |
+
+ST decode is size-neutral-to-better at every size (1401→1427 on the blob —
+fewer table builds; the bw 2-4 MiB decode collapse was inverse-BWT cache
+physics, and LZ's sequential-write decode confirms immunity). The decisive
+axis was **concurrent encode cache pressure**, invisible to the ST sweep:
+
+| default | blob ratio | dec wall (all-cores) | enc wall (all-cores) |
+|---|---|---|---|
+| 1 MiB | 32.22% | 16.3 ms (12.1 GiB/s) | 0.73 s (279 MiB/s) |
+| **2 MiB (shipped)** | **32.00%** | **17.9 ms (11.0 GiB/s)** | **1.89 s (107 MiB/s)** |
+| 4 MiB | 31.95% | 18.9 ms (10.4 GiB/s) | 4.0 s (50 MiB/s) |
+
+The ST sweep predicted 4 MiB encode at 1.9x slower; e2e measured **5.5x** —
+18 workers each pointer-chasing a 16 MiB hash-chain `prev` array thrash the
+shared cache (P8's lesson, encode-side). 2 MiB keeps most of the ratio
+(−0.22pp blob, −0.26 to −0.36pp files), decodes within 10% of the 1 MiB
+wall (a tail-packing artifact of the 202 MiB corpus, not per-byte cost),
+and still beats pzstd -3 decode by 1.28x. The decode-wall deltas here are
+fan-out granularity, not codec cost. Revisit 4 MiB when encode gets GPU
+candidate generation or cache-aware chain layouts; the dict tier (P2
+phase 2) is the structural fix that decouples reach from block size
+entirely.
+
+Also landed: package-merge (optimal length-limited) Huffman lengths
+replacing the halve-and-rebuild heuristic — measured only ~0.004pp (the
+heuristic was near-optimal) but it is exact, Kraft-guaranteed by
+construction, simpler, and closes the "slightly suboptimal" caveat.
