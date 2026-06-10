@@ -224,9 +224,17 @@ blob path):**
   revisit X2 without first checking lane saturation.
 
 **Honest caveats:** encode is unoptimized (~lzf-parse-bound, fine — P1);
-no dict/transform integration yet (shipped pz components); the unsafe
-splice has invariant comments + fuzz/garbage tests but should get
-`cargo fuzz` + Miri on the small suite before default-pipeline promotion.
+no dict/transform integration yet (shipped pz components). Hardening
+status: Miri is **not runnable on this box** (no nightly toolchain, rustup
+shims broken) — the compensating control is `examples/pz2_soak.rs`, a
+deterministic seed-reportable soak (round-trip fuzz over 8 input families
+incl. block-boundary sizes; bit-flip/stomp/truncate/length-field mutations
+of valid streams; pure garbage — all decodes under `catch_unwind`, wrong
+`orig_len` included). Passed 45 s debug (checked arithmetic: 5.2K round
+trips, 209K mutated + 42K garbage decodes) and 180 s release at 1 MiB
+blocks (18K round-trips, 722K mutated + 144K garbage decodes), zero
+panics. Run Miri on the unit suite when a nightly toolchain exists before
+default-pipeline promotion.
 
 ## 8. Container integration results (2026-06-09, CLI end-to-end, all cores)
 
@@ -259,6 +267,13 @@ within this table only.
 - Compress all-cores: pz2 725 ms (279 MiB/s) vs lzf 1034 ms — **1.43×
   faster encode** at equal ratio (Huffman bit-writer beats FSE encode),
   14.8× thread scaling.
-- Remaining integration gaps: `-a`/`--trial` auto-selection does not
-  consider Pz2; no dict tier; Num-style transforms not yet routed per
-  block (P5/P9 phase 2).
+- `--trial` now includes Pz2 (listed before Lzf so exact size ties go to
+  the faster decoder; verified picking pz2 on a mozilla sample). The `-a`
+  heuristic still answers Lzf for the general-LZ case — switching that
+  default to Pz2 is a deliberate follow-up decision, gated on the
+  hardening soak + a Miri pass.
+- `--greedy` / window / max-match-len flags now reach Pz2 via
+  `pz2_seq_config` (same mapping as the LzSeq demux path); greedy takes
+  the dickens-slice ratio 38.6% → 35.7%, round-trip verified.
+- Remaining integration gaps: no dict tier; Num-style transforms not yet
+  routed per block (P5/P9 phase 2).

@@ -425,11 +425,13 @@ fn decompress_block_num(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 
 /// Compress a single block using the Pz2 pipeline (no container header).
 ///
-/// The whole wire format (sequence conversion, 4-lane Huffman literals,
-/// sequence-code lanes, raw-literal fallback) lives in [`crate::pz2::encode`];
-/// this is a thin adapter like `compress_block_num`.
-fn compress_block_pz2(input: &[u8], _options: &CompressOptions) -> PzResult<Vec<u8>> {
-    crate::pz2::encode(input)
+/// The whole wire format (sequence conversion, multi-lane Huffman literals,
+/// sequence-code lanes, raw-literal fallback) lives in
+/// [`crate::pz2::encode_with_config`]; this is a thin adapter like
+/// `compress_block_num`, with the parse flags (`--greedy`, window size)
+/// mapped exactly as the LzSeq demux path maps them.
+fn compress_block_pz2(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
+    crate::pz2::encode_with_config(input, &super::pz2_seq_config(options))
 }
 
 /// Decompress a single Pz2 block (no container header).
