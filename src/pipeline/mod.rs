@@ -1149,7 +1149,13 @@ fn sortlz_tokens_with_strategy(
 }
 
 /// Run BWT encoding using the configured backend.
-fn bwt_encode_with_backend(input: &[u8], options: &CompressOptions) -> PzResult<bwt::BwtResult> {
+///
+/// Returns the BWT result plus the multi-cursor iBWT start samples
+/// (`None` when the block is outside the sampled size range).
+fn bwt_encode_with_backend(
+    input: &[u8],
+    options: &CompressOptions,
+) -> PzResult<(bwt::BwtResult, Option<Vec<u32>>)> {
     #[cfg(feature = "webgpu")]
     {
         if let Backend::WebGpu = options.backend {
@@ -1158,7 +1164,13 @@ fn bwt_encode_with_backend(input: &[u8], options: &CompressOptions) -> PzResult<
                     && input.len() >= crate::webgpu::MIN_GPU_BWT_SIZE
                     && input.len() <= engine.max_dispatch_input_size()
                 {
-                    return engine.bwt_encode(input);
+                    let result = engine.bwt_encode(input)?;
+                    // The GPU path doesn't expose the suffix array, so derive
+                    // the cursor samples with a one-off serial chase here at
+                    // encode time (decode-time derivation would defeat the
+                    // multi-cursor decoder — see ibwt-cursor-findings.md).
+                    let samples = bwt::derive_cursor_samples(&result.data, result.primary_index);
+                    return Ok((result, samples));
                 }
             }
         }
@@ -1167,7 +1179,7 @@ fn bwt_encode_with_backend(input: &[u8], options: &CompressOptions) -> PzResult<
     #[cfg(not(feature = "webgpu"))]
     let _ = options;
 
-    bwt::encode(input).ok_or(PzError::InvalidInput)
+    bwt::encode_with_cursor_samples(input).ok_or(PzError::InvalidInput)
 }
 
 /// Run bijective BWT encoding using the configured backend.
