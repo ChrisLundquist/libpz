@@ -1687,6 +1687,19 @@ pub fn spike_g32_decode_words(
     Ok(out)
 }
 
+/// Spike-only: like [`spike_g32_decode_words`] but with a pre-built flat
+/// decode table (from [`spike_g32_decode_table`]), so per-tile CPU baselines
+/// don't pay a table rebuild per call (the GPU kernel doesn't either).
+#[doc(hidden)]
+pub fn spike_g32_decode_words_with_table(
+    words: &[u8],
+    table: &[u16],
+    out: &mut [u8],
+) -> PzResult<()> {
+    let table: &[u16; 1 << MAX_CODE_LEN] = table.try_into().map_err(|_| PzError::InvalidInput)?;
+    decode_lits_g32_best(table, words, out)
+}
+
 /// Transcode a shipped pz2 block into the G32 literal layout. The Huffman
 /// table (packed code lengths) and the entire sequence section are copied
 /// verbatim; only the literal bitstream framing changes, so the size delta

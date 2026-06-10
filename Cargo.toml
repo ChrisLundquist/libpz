@@ -21,6 +21,12 @@ path = "src/bin/pz.rs"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# Spike-only (pz2-G32 stage 2/3 probes): native Metal bindings for the
+# examples/pz2_g32_metal.rs GPU decode probe. Confined to dev-dependencies —
+# NOT a backend; src/ never links Metal.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+metal = "0.32"
+
 [[bench]]
 name = "throughput_bw"
 harness = false
