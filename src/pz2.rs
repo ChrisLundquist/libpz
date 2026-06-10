@@ -683,8 +683,45 @@ pub fn encode(input: &[u8]) -> PzResult<Vec<u8>> {
 /// max match length). The wire format does not depend on the config — any
 /// pz2 stream decodes with [`decode`] regardless of parse settings.
 pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<Vec<u8>> {
-    let tokens = lzseq::tokenize_with_config(input, config)?;
-    let (seqs, lits) = build_sequences(&tokens);
+    encode_with_prefix(input, 0, config)
+}
+
+/// Encode `data[prefix_len..]` as one pz2 block whose matches may reach
+/// back into the dictionary prefix `data[..prefix_len]` (cross-block dict
+/// tier, design doc P2). The prefix itself is not emitted; the stream
+/// decodes with [`decode_with_prefix`] given the same prefix bytes.
+///
+/// With `prefix_len == 0` this is exactly [`encode_with_config`].
+pub fn encode_with_prefix(data: &[u8], prefix_len: usize, config: &SeqConfig) -> PzResult<Vec<u8>> {
+    assert!(prefix_len <= data.len());
+    let input = &data[prefix_len..];
+    // The parse runs over prefix + block so the match finder's window spans
+    // the dictionary; tokens covering the prefix are then dropped (a match
+    // straddling the boundary re-emits its in-block bytes as literals —
+    // at most one straddle per block, negligible).
+    let tokens = lzseq::tokenize_with_config(data, config)?;
+    let (seqs, lits) = if prefix_len == 0 {
+        build_sequences(&tokens)
+    } else {
+        let mut kept: Vec<LzToken> = Vec::new();
+        let mut pos = 0usize;
+        for t in &tokens {
+            let len = match *t {
+                LzToken::Literal(_) => 1,
+                LzToken::Match { length, .. } => length as usize,
+            };
+            if pos >= prefix_len {
+                kept.push(*t);
+            } else if pos + len > prefix_len {
+                // Straddling match: re-emit the in-block tail as literals.
+                for &b in &data[prefix_len..pos + len] {
+                    kept.push(LzToken::Literal(b));
+                }
+            }
+            pos += len;
+        }
+        build_sequences(&kept)
+    };
 
     let mut out = Vec::with_capacity(input.len() / 2 + 64);
     put_u32(&mut out, seqs.len() as u32);
@@ -752,6 +789,15 @@ pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<Vec<u8>>
 
 /// Decode one pz2 block. `orig_len` comes from the container block table.
 pub fn decode(data: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    decode_with_prefix(data, &[], orig_len)
+}
+
+/// Decode one pz2 block whose matches may reach into `prefix` (a stream
+/// produced by [`encode_with_prefix`] with the same prefix bytes). Returns
+/// only the block's `orig_len` bytes.
+pub fn decode_with_prefix(data: &[u8], prefix: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    let pre = prefix.len();
+    let total = pre + orig_len;
     let mut p = data;
     let seq_count = take_u32(&mut p)? as usize;
     let lit_total = take_u32(&mut p)? as usize;
@@ -786,13 +832,16 @@ pub fn decode(data: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 
     // --- Sequence splice (wildcopy discipline) ---
     // Output is FULLY INITIALIZED (zeroed) with 2*WILD slack; every copy
-    // below validates its logical bounds against `orig_len` BEFORE copying,
+    // below validates its logical bounds against `total` BEFORE copying,
     // and wild 16-byte chunks may only spill into the initialized slack
-    // (bounded by orig_len + WILD - 1 + WILD < out.len()). Garbage written
+    // (bounded by total + WILD - 1 + WILD < out.len()). Garbage written
     // to slack is either overwritten by the next sequence (which starts at
-    // the exact logical cursor) or removed by the final truncate.
-    let mut out = vec![0u8; orig_len + 2 * WILD];
-    let mut out_len = 0usize;
+    // the exact logical cursor) or removed by the final truncate. The dict
+    // prefix occupies out[..pre], so match offsets may reach into it while
+    // the cursor (out_len) starts at pre.
+    let mut out = vec![0u8; total + 2 * WILD];
+    out[..pre].copy_from_slice(prefix);
+    let mut out_len = pre;
     let mut lit_pos = 0usize;
     if seq_count > 0 {
         let mut ll_lane = CodeLane::parse(&mut p)?;
@@ -825,7 +874,7 @@ pub fn decode(data: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 
             // Validate EVERYTHING before any raw copy.
             if lit_pos + ll > lit_total
-                || out_len + ll + ml > orig_len
+                || out_len + ll + ml > total
                 || offset == 0
                 || offset > out_len + ll
             {
@@ -882,11 +931,11 @@ pub fn decode(data: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 
     // Trailing literals (exact copy, no wild spill needed).
     let trailing = lit_total - lit_pos;
-    if out_len + trailing != orig_len {
+    if out_len + trailing != total {
         return Err(PzError::InvalidInput);
     }
     // SAFETY: disjoint buffers; lit_pos + trailing == lit_total ≤ lits.len()
-    // and out_len + trailing == orig_len < out.len().
+    // and out_len + trailing == total < out.len().
     unsafe {
         std::ptr::copy_nonoverlapping(
             lits.as_ptr().add(lit_pos),
@@ -894,8 +943,11 @@ pub fn decode(data: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
             trailing,
         );
     }
-    out.truncate(orig_len);
-    Ok(out)
+    out.truncate(total);
+    if pre == 0 {
+        return Ok(out);
+    }
+    Ok(out.split_off(pre))
 }
 
 /// Wild-copy granularity: copies round up to 16-byte chunks.
@@ -1091,6 +1143,37 @@ mod tests {
             let dec = decode(&enc, input.len()).expect("decode");
             assert_eq!(dec, input, "fuzz case {case} len {}", input.len());
         }
+    }
+
+    #[test]
+    fn test_prefix_round_trip() {
+        // Block content repeats the prefix, so matches must reach into it.
+        let prefix = b"the quick brown fox jumps over the lazy dog. ".repeat(64);
+        let block = b"the quick brown fox jumps over the lazy dog! ".repeat(80);
+        let mut data = prefix.clone();
+        data.extend_from_slice(&block);
+
+        let config = SeqConfig::default();
+        let enc = encode_with_prefix(&data, prefix.len(), &config).unwrap();
+        let dec = decode_with_prefix(&enc, &prefix, block.len()).unwrap();
+        assert_eq!(dec, block);
+
+        // The dict reach must shrink the stream vs encoding the block cold.
+        let cold = encode_with_config(&block, &config).unwrap();
+        assert!(
+            enc.len() < cold.len(),
+            "prefix encode ({}) not smaller than cold ({})",
+            enc.len(),
+            cold.len()
+        );
+
+        // Decoding with the wrong prefix length must error or mismatch,
+        // never panic.
+        let _ = decode_with_prefix(&enc, &prefix[..prefix.len() / 2], block.len());
+
+        // Empty prefix delegates to the plain path.
+        let enc0 = encode_with_prefix(&block, 0, &config).unwrap();
+        assert_eq!(decode_with_prefix(&enc0, &[], block.len()).unwrap(), block);
     }
 
     #[test]
