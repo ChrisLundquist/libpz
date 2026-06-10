@@ -601,8 +601,8 @@ fn fse_spread(norm: &[u16; 32]) -> [u8; FSE_SIZE] {
     let step = (FSE_SIZE >> 1) + (FSE_SIZE >> 3) + 3;
     let mask = FSE_SIZE - 1;
     let mut pos = 0usize;
-    for s in 0..32 {
-        for _ in 0..norm[s] {
+    for (s, &n) in norm.iter().enumerate() {
+        for _ in 0..n {
             spread[pos] = s as u8;
             pos = (pos + step) & mask;
         }
@@ -759,7 +759,11 @@ enum CodeLane<'a> {
     },
     Fse {
         table: Box<[u32; FSE_SIZE]>,
-        state: u32,
+        /// `table[state]`, preloaded: each `next()` issues the FOLLOWING
+        /// symbol's table load at its end, so the load's latency overlaps
+        /// the splice copies instead of sitting on the per-sequence chain,
+        /// and the returned symbol needs no load at all.
+        entry: u32,
         data: &'a [u8],
         st: LaneState,
     },
@@ -810,9 +814,10 @@ impl<'a> CodeLane<'a> {
                 }
                 let lane_len = take_u32(p)? as usize;
                 let data = take(p, lane_len)?;
+                let entry = table[state as usize];
                 Ok(CodeLane::Fse {
                     table,
-                    state,
+                    entry,
                     data,
                     st: LaneState::default(),
                 })
@@ -848,7 +853,12 @@ impl<'a> CodeLane<'a> {
                 s.nbits -= len;
                 Ok((e >> 4) as u8)
             }
-            CodeLane::Fse { table, state, data, st } => {
+            CodeLane::Fse {
+                table,
+                entry,
+                data,
+                st,
+            } => {
                 let s = &mut *st;
                 if s.nbits < FSE_LOG {
                     if s.pos + 8 <= data.len() {
@@ -861,9 +871,7 @@ impl<'a> CodeLane<'a> {
                         }
                     }
                 }
-                // No bits feed the lookup — the state IS the index. The bits
-                // read here feed the NEXT state, mirroring Huffman's chain.
-                let e = table[*state as usize];
+                let e = *entry;
                 let nb = (e >> 16) & 0xF;
                 if nb > s.nbits {
                     return Err(PzError::InvalidInput);
@@ -871,7 +879,9 @@ impl<'a> CodeLane<'a> {
                 let bits = (s.acc & ((1u64 << nb) - 1)) as u32;
                 s.acc >>= nb;
                 s.nbits -= nb;
-                *state = (e & 0xFFFF) + bits;
+                // next state = base + bits, always < FSE_SIZE by table
+                // construction — preload its entry now (see field docs).
+                *entry = table[((e & 0xFFFF) + bits) as usize];
                 Ok((e >> 20) as u8)
             }
         }
