@@ -321,3 +321,33 @@ Also landed: package-merge (optimal length-limited) Huffman lengths
 replacing the halve-and-rebuild heuristic — measured only ~0.004pp (the
 heuristic was near-optimal) but it is exact, Kraft-guaranteed by
 construction, simpler, and closes the "slightly suboptimal" caveat.
+
+## 10. Auto-greedy parse → 31.0%, Pareto-superior to pzstd-3 (2026-06-10)
+
+The per-file probe (`examples/pz2_parse_probe.rs`, 2 MiB blocks) overturned
+the inherited "greedy regresses structured data" rule for the pz2 wire:
+**greedy ≤ lazy on 11/12 Silesia files** (dickens −3.2pp, reymont −3.0,
+sao −2.3, webster/mr −1.9; worst case mozilla +0.03pp = noise). The lazy
+deferral's win evidently belonged to the flag-stream wire and smaller
+windows, not to the parse itself at 2 MiB reach.
+
+So Pz2's `Auto` strategy now parses **greedy per block**, with one guard
+(`pz2_auto_greedy`): near-random blocks (entropy > 7.5, match density
+< 0.1 — same rule as `select_pipeline`) stay lazy since there is no ratio
+to buy. Explicit `--lazy` / `--greedy` are respected.
+
+Blob e2e (same methodology as §8):
+
+| codec | ratio | dec wall | enc wall |
+|---|---|---|---|
+| **pz pz2 (auto-greedy)** | **31.04%** | **16.8 ms (12.0 GiB/s)** | 3.15 s (64 MiB/s) |
+| pz pz2 (lazy, prior) | 32.00% | 17.9 ms | 1.89 s |
+| pzstd -3 -p18 | 31.40% | 22.9 ms | — |
+| zstd -3 (1 thread) | 31.40% | 139.2 ms | — |
+
+Decode got *faster* with greedy (fewer, longer sequences → fewer entropy
+symbols and fewer splice iterations; user CPU 181 → 172 ms). Net:
+**pz2 is now Pareto-superior to pzstd -3 on (ratio, parallel decode)** —
+0.36pp better ratio AND 1.36× faster wall — and dominates lzf on every
+axis except encode. Encode at 64 MiB/s all-cores is the P1 trade,
+recoverable later via GPU candidate generation (P6).

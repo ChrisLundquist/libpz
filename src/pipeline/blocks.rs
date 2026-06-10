@@ -431,7 +431,11 @@ fn decompress_block_num(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 /// `compress_block_num`, with the parse flags (`--greedy`, window size)
 /// mapped exactly as the LzSeq demux path maps them.
 fn compress_block_pz2(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
-    crate::pz2::encode_with_config(input, &super::pz2_seq_config(options))
+    let mut config = super::pz2_seq_config(options);
+    if options.parse_strategy == super::ParseStrategy::Auto {
+        config.greedy = super::pz2_auto_greedy(input);
+    }
+    crate::pz2::encode_with_config(input, &config)
 }
 
 /// Decompress a single Pz2 block (no container header).
