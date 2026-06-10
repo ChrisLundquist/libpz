@@ -521,3 +521,31 @@ Remaining decode headroom would need format-level changes (smaller/
 tiered dict reach, locality-sorted matches) — incremental copy
 elimination is exhausted. Encode-side concurrent inflation (§11b #2)
 is unchanged and is the next lever.
+
+### §11d — Encode: dict chain cap (DICT_CHAIN_CAP = 16), −44% wall
+
+The §11b encode lever, executed. Frozen-dict walks in `find_best` now
+get their own link budget (`lz77::DICT_CHAIN_CAP`), applied on top of
+the live walk's leftover `max_chain`. Blob e2e sweep (encode wall /
+user / ratio):
+
+| cap | enc wall | user | ratio |
+|---|---|---|---|
+| 64 (= old shared budget) | 25.0 s | 115 s | 30.475% |
+| 32 | 18.6 s | 91 s | 30.500% |
+| 24 | 16.4 s | 82 s | 30.515% |
+| **16 (shipped)** | **14.1 s** | **69 s** | **30.535%** |
+| 8 | 12.65 s | 61 s | 30.570% |
+
+No sharp knee; 16 is the judgment call — **−44% encode wall and −40%
+CPU for +0.06pp**, keeping pz2d 0.87pp under pzstd-3. Below 16 the
+returns invert (8 buys only −10% more wall for +0.035pp more). The cap
+attacks the §11b inflation at its source: the inflation IS the dict
+walk's random reads, so walking less is the fix.
+
+Decode is **neutral-to-better** on the capped parse (same-session
+hyperfine: 39.0 ms for cap-16 wire vs 40.5 ms cap-64 — fewer far-dict
+matches means fewer random dict reads). Same-session re-anchor of
+§11c's headline: master v1 44.9 ms vs arena 39.1 ms (1.15×) — the
+−13% holds; absolute walls drift ±10% with machine state, so compare
+binaries within ONE hyperfine invocation only.

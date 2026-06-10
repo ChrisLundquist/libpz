@@ -27,6 +27,15 @@ pub(crate) const HASH_MASK: usize = HASH_SIZE - 1;
 
 /// Maximum number of chain links to follow per position.
 pub(crate) const MAX_CHAIN: usize = 64;
+
+/// Chain-link budget for frozen-dictionary walks in `find_best`, applied on
+/// top of (never exceeding) the live walk's leftover `max_chain` budget.
+/// Swept on the Silesia blob (pz2d e2e encode, 2026-06-10):
+/// 64 → 25.0 s / 30.475%, 32 → 18.6 / 30.500, 24 → 16.4 / 30.515,
+/// **16 → 14.1 / 30.535**, 8 → 12.65 / 30.570. 16 is the pick: −44% encode
+/// wall for +0.06pp, decode-neutral (the capped parse decodes marginally
+/// faster — fewer far-dict matches). See clean-slate-codec.md §11d.
+pub(crate) const DICT_CHAIN_CAP: usize = 16;
 /// Reduced chain depth used by auto/speed-biased parsing on large inputs.
 const MAX_CHAIN_AUTO: usize = 48;
 
@@ -526,8 +535,13 @@ impl HashChainFinder {
         if let Some(dict) = self.dict.as_deref() {
             if pos >= dict.len && (best_length as usize) < cmp_limit && chain_count < self.max_chain
             {
+                // Dict walks are capped tighter than live walks: every link
+                // is a random read into a cold multi-MiB prev array, and
+                // with several segments encoding concurrently those misses
+                // are what inflate encode 2.9x (clean-slate-codec.md §11b).
+                let chain_limit = self.max_chain.min(chain_count + DICT_CHAIN_CAP);
                 let mut chain_pos = dict.head[h] as usize;
-                while chain_pos < dict.len && chain_pos >= min_pos && chain_count < self.max_chain {
+                while chain_pos < dict.len && chain_pos >= min_pos && chain_count < chain_limit {
                     if best_length >= MIN_MATCH as u32 {
                         let probe = best_length as usize;
                         // SAFETY: chain_pos < dict.len <= pos and probe <
