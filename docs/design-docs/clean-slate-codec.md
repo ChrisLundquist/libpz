@@ -351,3 +351,72 @@ symbols and fewer splice iterations; user CPU 181 → 172 ms). Net:
 0.36pp better ratio AND 1.36× faster wall — and dominates lzf on every
 axis except encode. Encode at 64 MiB/s all-cores is the P1 trade,
 recoverable later via GPU candidate generation (P6).
+
+## 11. Dict-tier spike PASSED — head dict captures the ceiling (2026-06-10)
+
+The roadmap's spike #2 (cross-block dictionary; previously *planned*, never
+run — P2's "as spiked" citation was aspirational) is now executed via
+`pz2::encode_with_prefix` / `decode_with_prefix` + `examples/pz2_dict_probe.rs`
+(2 MiB blocks, greedy, round-trip-verified per block). Two modes measured:
+**sliding prefix** (each block references the preceding D bytes — the
+ratio *ceiling*, decode-serializing) and **fixed head dict** (every block
+references the file's first D bytes — the parallel-friendly production
+shape: one immutable region, 2-wave decode).
+
+ratio delta vs no dict (pp):
+
+| file | sliding 4Mi | sliding 16Mi | head 4Mi | head 16Mi | head/ceiling @16Mi |
+|---|---|---|---|---|---|
+| samba | −1.234 | −1.344 | −1.036 | −1.347 | ~100% |
+| webster | −1.039 | −1.111 | −0.901 | −1.075 | 97% |
+| nci | −0.568 | −0.673 | −0.490 | −0.606 | 90% |
+| xml | −0.287 | −0.287 | −0.287 | −0.287 | 100% |
+| mozilla | −0.679 | −0.745 | −0.021 | −0.494 | 66% |
+
+**Finding 1: per-file redundancy is global, not local-recency** — a fixed
+head dict captures 66-100% of the sliding ceiling on individual files, so
+the dict tier needs NO decode serialization. (mozilla is the outlier
+wanting reach proportional to its 49 MB size; xml saturates at 4 MiB
+because the file is 5 MB.)
+
+**Finding 2: the dict must be scoped per SEGMENT, not per stream.** On the
+concatenated blob, a global head dict captures almost nothing (−0.15pp —
+the head is dickens, alien content for the samba/webster/nci blocks later
+in the stream). Scoping the dict to each 32 MiB segment's own head
+(`--seg` probe mode) recovers it:
+
+| blob (202 MiB) | dict 4Mi | dict 16Mi |
+|---|---|---|
+| global head | −0.155 | −0.138 |
+| per-32MiB-segment head | −0.310 | **−0.569 → 30.48%** |
+
+30.48% is ~0.9pp under pzstd-3 (31.40%) — and this is exactly P2's
+segment tier earning its place in the format.
+
+### Production architecture (next build)
+
+- **Format:** new pipeline id (`Pz2d`); the stream is a sequence of
+  segments (~32 MiB), each `[dict_len: u32]` + framed blocks. Within a
+  segment, blocks whose cumulative offset < dict_len are cold (they ARE
+  the dict); later blocks may reference the dict. Segments are fully
+  independent (P2's distribution unit). pz2 (id 13) streams unaffected.
+- **Decode:** wave 1 decodes the dict blocks in parallel (cold), assembles
+  one immutable `Arc<[u8]>`; wave 2 fans out the rest. Two engineering
+  paths for priming, decided by measurement: (a) worker-local arenas —
+  memcpy the dict once per WORKER (18 × 16 MiB ≈ 290 MB, one-time), splice
+  blocks into the arena tail; or (b) two-region splice (match sources with
+  offset > in-block position read from the dict slice; boundary-spanning
+  copies split). Naive per-block priming is ruled out by arithmetic:
+  94 blocks × 16 MiB ≈ 1.5 GB of memcpy ≈ +15-30 ms — would double the
+  16.8 ms decode wall.
+- **Encode (the real blocker):** the spike re-tokenizes dict+block per
+  block (9× work at 16 MiB — fine for measurement, unshippable). Production
+  needs a **frozen shared match-finder**: build hash chains over the dict
+  once (immutable, `Arc`-shared head/prev arrays in dict coordinates),
+  each worker holds a `dict‖block` arena (dict copied once per worker, so
+  frozen-table coordinates match and compares never need two-region
+  logic) and parses starting at `dict_len` — which also eliminates the
+  spike's token-skipping/straddle handling. `find_best` grows one extra
+  chain walk over the frozen tables after the block-local walk.
+- **Measured payoff (per-segment, 16 MiB dict):** blob 31.04% → **30.48%**,
+  ~0.9pp under pzstd-3 (31.4%), at unchanged decode parallelism.
