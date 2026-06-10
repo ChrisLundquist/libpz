@@ -147,3 +147,24 @@ cargo run --release --no-default-features --example ldm_census -- /tmp/rustup-on
 # bar
 zstd -3 -k -o /dev/null ... ; zstd -3 --long=30 ... ; pz -c -p pz2 ...
 ```
+
+## Postscript: reconciliation with PRs #146/#147/#148 (merged later the same day)
+
+After this census ran, #146 (segment-scoped head dict spike), #147 (`lz77::FrozenDict`
+shared match-finder), and #148 (shipped `-p pz2d` tier) landed. They implement the
+*architecture* this doc recommends — an immutable dictionary, depth-1 dependency, no
+rolling inter-block history, 2-wave parallel decode — and prove it pays on general
+corpora (blob 31.04% → 30.48%, best LZ-family ratio in pz). But their *scope* is
+segment-local: `PZ2D_SEGMENT_SIZE` is 32 MiB and the dict is the first 16 MiB of the
+**same segment**, so the maximum match offset any block can express is < 32 MiB and
+cross-segment redundancy is untouched by construction. The census's key unique finding
+is therefore still open: on the tarball-class corpora the duplicate mass sits at
+256–540 MiB offsets (rustup-one's LLVM copies ~300 MiB apart; rustup-two's
+cross-toolchain copy at ~540 MiB), which no 32 MiB-scoped dict can reach. The measured
+gap stands: pz2 hit 28.69% / 29.46% on rustup-one/-two vs zstd `--long=30`'s 25.26% /
+**12.99%** — up to 2.27x — and pz2d's segment dict cannot close the rustup-two gap at
+all. What remains is exactly this doc's routing: a whole-input-scoped census pass
+emitting coarse copy instructions in a thin container *above* the (now-existing) dict
+machinery, gated on the heavy-tail length histogram. FrozenDict + the 2-wave decode are
+the right reusable substrate for that front-end; the windowless census matcher is the
+missing piece.
