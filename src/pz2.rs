@@ -1025,7 +1025,12 @@ fn splice_into_arena(
     lit_total: usize,
     orig_len: usize,
 ) -> PzResult<()> {
-    debug_assert!(lits.len() >= lit_total + WILD);
+    // Hard requirement, not just a debug assert: the wild copies below read
+    // up to WILD-1 bytes past lit_total, so an exact-sized `lits` from a
+    // future caller would be a silent heap overread in release builds.
+    if lits.len() < lit_total + WILD {
+        return Err(PzError::InvalidInput);
+    }
     let pre = arena.len();
     let total = pre + orig_len;
     // --- Sequence splice (wildcopy discipline) ---
@@ -1154,27 +1159,17 @@ fn splice_into_arena(
 }
 
 /// Vec-returning splice for the G32 spike decoders (`decode_g32`,
-/// `decode_g32_simd`): empty-prefix convenience over [`splice_into_arena`].
+/// `decode_g32_simd`): prefix-free convenience over [`splice_into_arena`].
 fn splice(
     p: &[u8],
     seq_count: usize,
     lits: &[u8],
     lit_total: usize,
-    prefix: &[u8],
     orig_len: usize,
 ) -> PzResult<Vec<u8>> {
-    let mut arena = if prefix.is_empty() {
-        Vec::new()
-    } else {
-        let mut a = Vec::with_capacity(prefix.len() + orig_len + 2 * WILD);
-        a.extend_from_slice(prefix);
-        a
-    };
+    let mut arena = Vec::new();
     splice_into_arena(&mut arena, p, seq_count, lits, lit_total, orig_len)?;
-    if prefix.is_empty() {
-        return Ok(arena);
-    }
-    Ok(arena.split_off(prefix.len()))
+    Ok(arena)
 }
 
 /// Wild-copy granularity: copies round up to 16-byte chunks.
@@ -1625,7 +1620,7 @@ pub fn decode_g32_simd(data: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
         }
         _ => return Err(PzError::InvalidInput),
     }
-    splice(p, seq_count, &lits, lit_total, &[], orig_len)
+    splice(p, seq_count, &lits, lit_total, orig_len)
 }
 
 /// Spike-only: extract the literal-section raw materials of a SHIPPED pz2
@@ -1796,6 +1791,7 @@ pub fn spike_seq_section(block: &[u8]) -> PzResult<SpikeSeqSection> {
 /// table (packed code lengths) and the entire sequence section are copied
 /// verbatim; only the literal bitstream framing changes, so the size delta
 /// is purely the cost of the GPU-friendly layout.
+#[doc(hidden)]
 pub fn transcode_g32(block: &[u8]) -> PzResult<Vec<u8>> {
     let mut p = block;
     let seq_count = take_u32(&mut p)?;
@@ -1839,6 +1835,7 @@ pub fn transcode_g32(block: &[u8]) -> PzResult<Vec<u8>> {
 
 /// Decode a G32-transcoded block (counterpart of [`decode`] for the spike
 /// layout). `orig_len` comes from the container block table.
+#[doc(hidden)]
 pub fn decode_g32(data: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     let mut p = data;
     let seq_count = take_u32(&mut p)? as usize;
@@ -1862,7 +1859,7 @@ pub fn decode_g32(data: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
         _ => return Err(PzError::InvalidInput),
     }
 
-    splice(p, seq_count, &lits, lit_total, &[], orig_len)
+    splice(p, seq_count, &lits, lit_total, orig_len)
 }
 
 // ---------------------------------------------------------------------------

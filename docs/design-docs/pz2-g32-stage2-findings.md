@@ -8,9 +8,12 @@ This was the #1-ranked (and only unanimously endorsed) candidate from
 on Apple silicon.
 
 **Bottom line: gate 1 negative, gate 2 PASS (64.75 GB/s), gate 3 KILL
-(end-to-end GPU = 0.21x CPU all-cores). The cooperative splice is the wall,
-exactly as the research report's adversarial verifiers predicted. This closes
-the GPU-decode question on M5-class hardware with data.**
+(end-to-end GPU = 0.21x CPU all-cores at the real operating point; parity at
+best — 1.02x — under 16x synthetic saturation). The cooperative splice is
+the wall, as the research report's adversarial verifiers predicted, though
+the mechanism is occupancy/latency at dup=1 and a shared-bandwidth parity
+ceiling at saturation — not a fixed block-count cap. This closes the
+GPU-decode question on M5-class hardware with data.**
 
 ## Setup
 
@@ -34,10 +37,12 @@ in its own right**: 0.55–0.61x the shipped 8-lane literal phase
 single-thread. The shipped 8-lane layout is already the right shape for a
 CPU; 32 lanes only pay off when 32 hardware lanes execute them in lockstep.
 
-All-cores NEON on the same tiles measured 5.0 GB/s (initial run, loaded
-machine) to 16.5 GB/s (canonical run, spread 60.9% — the CPU-side numbers
-were taken on a shared machine and are indicative; the GPU comparisons below
-use the same-session CPU measurements).
+All-cores CPU numbers for this wire varied with measurement conditions:
+5.0 GB/s from the gate-1 probe (`pz2_g32_cpu_simd`, per-block pooled decode
+with per-call allocation, loaded machine), 9–10.5 GB/s same-tiles in the
+gate-2 session, 16.5 GB/s in the canonical run (spread 60.9%). CPU-side
+numbers on this shared machine are indicative; the GPU comparisons below use
+the same-session CPU measurements.
 
 ## Gate 2 — Metal literal-phase kernel: PASS
 
@@ -66,49 +71,74 @@ executes the LZ splice (literal copies + match copies in sequence order).
 | Metric | Value |
 |---|---|
 | Splice kernel | **53.43 ms = 3.97 GB/s** (spread 0.1%) |
-| — phase A alone (sequence entropy) | 20.24 ms = 38% of splice |
+| — phase A alone (sequence entropy) | 20.24 ms = 38% of splice (5 reps) |
 | End-to-end (blit + literal + splice) | **54.01 ms = 3.92 GB/s** |
-| CPU all-cores full pz2 decode (same session) | 11.59 ms = 18.28 GB/s |
-| **GPU end-to-end vs CPU all-cores** | **0.21x — KILL** |
+| CPU all-cores full pz2 decode (same session, spread 17.6%) | 11.59 ms = 18.28 GB/s |
+| **GPU end-to-end vs CPU all-cores, single corpus** | **0.21x — KILL** |
 
-### Why the splice is structural, not an optimization target
+(Phase A's "318 concurrent chains" — 3 per block — is an upper bound;
+CODES_CONST lanes carry no chain.)
 
-The arithmetic that closes the question:
+### Occupancy diagnosis: latency-bound at dup=1, parity ceiling at saturation
 
-1. **Parallelism collapses at the splice.** The literal phase exposes
-   551 tiles × 32 lanes ≈ 17,600 independent decode positions; the splice
-   exposes 106 blocks × 1 serial copy chain. Phase A is 318 concurrent
-   Huffman chains (3 per block); phase B is 106 sequential splice walks.
-   The GPU's only lever — occupancy — is capped by the format's block count.
-2. **Even a free phase A doesn't save it.** Subtracting all 20.2 ms of
-   sequence-entropy cost leaves 33.2 ms of copy loop — still 2.9x slower
-   than the *entire* CPU decode. The in-block LZ copy chain (each copy may
-   read bytes written by the previous one) is serially dependent by the
-   nature of LZ; 32 threads per block mostly wait on it.
-3. **Raising splice parallelism requires changing the format**, either
-   smaller blocks (ratio loss — stage 1's whole point was keeping the 2 MiB
-   window) or intra-block splice checkpoints — which is exactly the pz2-GA
-   candidate (#6) that the research already Pareto-rejected: pz2's own
-   iteration history measured the separated-phases design at 1.7–1.9x vs
-   the fused 3.1–3.6x, and checkpoint wire costs erase the ratio position.
+The 0.21x is NOT a fixed-throughput wall. At 106 threadgroups the splice
+kernel runs at ~5% occupancy, latency-bound on each block's serial chain —
+phase A and phase B are mostly *idle*, bounded by the longest block, so
+subtraction arithmetic between them is invalid (review-session subset runs
+showed the splice doing 8x work in +7% time going dup 1→8). The probe's
+`--dup N` flag (N independent copies of every block descriptor, distinct
+outputs) measures the saturated ceiling on the full corpus:
+
+| Config (full corpus) | Splice | End-to-end | vs CPU all-cores |
+|---|---|---|---|
+| dup=1 (106 TGs — the real operating point) | 3.97 GB/s | 3.92 GB/s | **0.21x** |
+| dup=8 (848 TGs) | 15.95 GB/s (spread 17.8%, flagged) | — | — |
+| dup=16 (1,696 TGs, 3.4 GB in flight) | 20.81 GB/s (spread 15.7%, flagged) | **19.65 GB/s** (spread 10.3%) | **1.02x** |
+
+The corrected mechanism: concurrent block sets fill the machine with zero
+format change, but the saturated ceiling lands at **parity with the CPU
+(1.02x ± ~10%), never above it** — both engines converge on the same
+shared-memory-system ceiling (~20 GB/s on this data). The GPU therefore
+offers no wall-clock win at any occupancy:
+
+1. **At the real operating point (one stream in flight), 0.21x.** A decode
+   call has 106 blocks, not 1,696; nothing in the CLI or library path keeps
+   16 corpora in flight.
+2. **At full saturation, parity at best** — which still has to pay the
+   ~13 ms device init, a Metal backend, the spike→production hardening gap,
+   and the (tiny, +0.0066pp) format tax, against a CPU path that needs none
+   of it.
+3. The honest residual: parity-at-saturation means **core-offload value
+   exists in principle** — a persistent process decoding many streams
+   concurrently could route them through the GPU at no wall-clock loss while
+   freeing 18 CPU cores. That is a product hypothesis (no such embedding
+   exists today), not a perf win; it was the research report's pre-stated
+   condition for reopening, and it now has a measured ceiling to plan
+   against.
+
+Timing-fairness note: the probe's untimed host setup (decode-table
+expansion, descriptor build, G32 word prep) would be paid by a real GPU
+decoder, while the CPU baseline pays its table builds in-region — the
+remaining asymmetries favor the GPU, so 0.21x/1.02x are upper bounds.
 
 ### Generalization
 
-Per the research report's stated value of this spike: the splice result
-generalizes to candidates #3–#6 (dietpz rANS lane, num-G, gpu-ibwt, pz2-GA)
-— every one of them either feeds this same splice or was already
-Pareto-rejected on the bandwidth-sharing argument this measurement confirms.
-**On unified-memory Apple silicon, where 18 CPU cores already convert the
-shared ~0.5 TB/s into 18+ GB/s of pz2 decode, a GPU block decoder loses
-end-to-end even with a 65 GB/s entropy kernel.** The GPU-decode question for
-libpz on this hardware class is closed — with data, not extrapolation.
+This was the #1-ranked and only unanimously-endorsed candidate from
+`gpu-path-research.md`; it failed end-to-end against the honest CPU
+denominator at every occupancy, consistent with the report's prediction that
+GDeflate-class decode would "bracket rather than clear the CPU wall."
+Candidates #3–#6 (dietpz rANS lane, num-G, gpu-ibwt, pz2-GA) were each
+already Pareto-rejected on their own grounds in that report; nothing
+measured here weakens those rejections. The GPU-decode question for libpz
+on unified-memory Apple silicon is closed — with data, not extrapolation.
 
-What would reopen it (record for the future, not a recommendation):
-a persistent-process embedding on a *discrete*-GPU machine (where the GPU has
-its own bandwidth pool and the CPU comparison is over PCIe), or a workload
-where output stays GPU-resident (decode-into-texture/buffer for rendering or
-GPU analytics) so the CPU path would have to pay an upload the GPU path
-skips. Both change the denominator, not the kernel.
+What would reopen it (record for the future, not a recommendation): a
+persistent-process embedding decoding many streams concurrently (the
+measured parity ceiling makes this a core-offload play, not a speedup); a
+*discrete*-GPU machine (own bandwidth pool, CPU comparison pays PCIe); or a
+workload where output stays GPU-resident (decode-into-texture/buffer) so the
+CPU path pays an upload the GPU path skips. All three change the
+denominator, not the kernel.
 
 ## Artifacts
 
@@ -120,8 +150,9 @@ skips. Both change the denominator, not the kernel.
 - `examples/pz2_g32_cpu_simd.rs` — gate-1 NEON/portable decoders + probe
 - `transcode_g32`/`decode_g32` in `src/pz2.rs` (stage 1, spike-only — no
   wire or default changes shipped)
-- Full-corpus log: 9 reps/config, all spreads ≤0.2% (GPU); raw per-rep times
-  in the probe output
+- Full-corpus logs: dup=1 9 reps/config (phase A 5 reps), GPU spreads ≤0.2%;
+  dup=8/16 saturation runs carry 10–18% spreads (flagged inline above); raw
+  per-rep times in the probe output
 
 ## Verdict ledger
 
@@ -129,4 +160,4 @@ skips. Both change the denominator, not the kernel.
 |---|---|---|
 | 1 | Is the 32-lane wire a CPU win via NEON? | **No** (0.55–0.61x shipped 8-lane ST) |
 | 2 | Can Metal decode the literal phase > 5 GB/s? | **PASS — 64.75 GB/s** |
-| 3 | Does end-to-end GPU block decode beat CPU all-cores? | **KILL — 0.21x** |
+| 3 | Does end-to-end GPU block decode beat CPU all-cores? | **KILL — 0.21x at dup=1; 1.02x (parity) at 16x saturation** |
