@@ -70,8 +70,8 @@ type UnifiedTask = (usize, usize);
 fn unified_stage_count(pipeline: Pipeline) -> usize {
     match pipeline {
         Pipeline::Bw | Pipeline::Bbw => 4,
-        // SortLz and Num are single self-contained transform+entropy stages.
-        Pipeline::SortLz | Pipeline::Num => 1,
+        // SortLz, Num and Pz2 are single self-contained transform+entropy stages.
+        Pipeline::SortLz | Pipeline::Num | Pipeline::Pz2 => 1,
         _ => 2,
     }
 }

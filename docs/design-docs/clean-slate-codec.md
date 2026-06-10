@@ -1,12 +1,15 @@
 # Clean-slate parallel codec design ("pz2")
 
 **Date:** 2026-06-09
-**Status:** ✅ Design validated — the §5 prototype gate **passed at 3.3×**
-(target was 2×). `src/pz2.rs` decodes the Silesia blob at **1361 MB/s
-single-thread at 32.22%** vs `Lzf`'s 409 MB/s at 32.18% — same parse,
-byte-identical match decisions, new wire format. Per-core decode is now
-within ~10% of zstd-3 (~1500 MB/s documented) at ~1pp ratio cost, while
-every block stays independently decodable. See §7 for measured results.
+**Status:** ✅ Design validated and **graduated into the container** — the §5
+prototype gate **passed at 3.45×** (target was 2×). `src/pz2.rs` decodes the
+Silesia blob at **1405 MB/s single-thread at 32.22%** vs `Lzf`'s 408 MB/s at
+32.18% — same parse, byte-identical match decisions, new wire format.
+Per-core decode is within ~3% of zstd-3 (1452 MB/s measured same-box) at
+~1pp ratio cost, while every block stays independently decodable. pz2 is now
+`Pipeline::Pz2` (`pz -p pz2`, id 13), riding the shipped streaming container
+— measured **12.1 GiB/s all-cores CLI decode** on the blob, 1.40× faster
+than `pzstd -3 -p18` (the honest competitor) at 0.8pp ratio cost. See §7-§8.
 **Method:** Derived, not invented — every choice below cites the libpz
 measurement that forces it. Receipts live in CLAUDE.md "Known dead ends",
 `gpu-experiments-wave2-conclusions.md`, `bwt-cm-findings.md`,
@@ -170,18 +173,19 @@ BWT tiers as the parallel story; window-capped suffix sorts.
 ## 7. Prototype results (2026-06-09, M5 Max, single-thread, round-trip-verified)
 
 `examples/pz2_eval.rs`, 1 MiB blocks, same parse as `Lzf` (tokenizer
-fidelity-tested byte-identical):
+fidelity-tested byte-identical). Numbers below are the tuned decoder
+(8 lanes + unchecked hot-loop stores + exponential-doubling overlap copies):
 
 | file | pz2 % | pz2 dec MB/s | lzf % | lzf dec MB/s | speedup |
 |---|---|---|---|---|---|
-| **silesia blob** | **32.221** | **1361** | 32.183 | 409 | **3.33×** |
-| dickens | 38.851 | 1012 | 38.728 | 278 | 3.64× |
-| webster | 29.337 | 1250 | 29.335 | 364 | 3.44× |
-| mozilla | 36.224 | 1182 | 36.030 | 383 | 3.08× |
-| nci | 7.907 | 3063 | 8.085 | 1237 | 2.48× |
-| xml | 11.568 | 2618 | 11.804 | 905 | 2.89× |
-| sao | 80.149 | 970 | 79.859 | 250 | 3.89× |
-| x-ray | 77.022 | 1295 | 76.753 | 243 | 5.33× |
+| **silesia blob** | **32.223** | **1405** | 32.183 | 408 | **3.45×** |
+| dickens | 38.852 | 1017 | 38.728 | 278 | 3.65× |
+| webster | 29.339 | 1255 | 29.335 | 361 | 3.48× |
+| mozilla | 36.226 | 1236 | 36.030 | 381 | 3.24× |
+| nci | 7.909 | 3112 | 8.085 | 1219 | 2.55× |
+| xml | 11.570 | 2651 | 11.804 | 911 | 2.91× |
+| sao | 80.151 | 1050 | 79.859 | 247 | 4.25× |
+| x-ray | 77.024 | 1406 | 76.753 | 241 | 5.84× |
 
 (nci/xml *improve* ratio — sequences beat per-token flag streams on
 structured data; the worst regression anywhere is +0.3pp on sao.)
@@ -199,10 +203,62 @@ blob path):**
    what matters is one pass over the sequences with all chains live in
    registers — exactly zstd's shape.
 
+**Post-gate decoder tuning (1361 → 1405 blob; sao +8%, x-ray +9%):**
+- **Lane count swept 4/6/8/12/16: 8 wins** (+7% over 4 on text; 12/16
+  regress slightly — register spill). Lane count is part of the wire, so it
+  was settled now, while the format is a day old. Ratio cost of the 4 extra
+  lane headers: +0.002-0.005pp. NUM_LANES = 8 shipped.
+- **Unchecked hot-loop stores** (raw write cursors; bound proven by
+  `rounds * 5 ≤ min_len`): +2%.
+- **Exponential-doubling overlap copies for offsets 2-15** above 32 bytes
+  (mirrors the shipped lzf fix): Silesia-neutral, removes the O(ml)
+  byte-chain worst case on periodic data.
+- **huff0-style X2 dual-symbol table: measured dead end on this core.**
+  Decoder-only change, no wire impact, full implementation measured: with 8
+  lanes live the literal loop is *execution-throughput*-bound, not
+  chain-latency-bound, so even 81% pair coverage (dickens, slot-weighted)
+  bought only +1.5%, while low-coverage data paid for the wider entries
+  (x-ray, 27-34% coverage: **−8.5%**). Reverted. Same physics as the FSE
+  "4-way interleave buys only 1.15×" finding: the M5's OoO window already
+  hides table-load latency once enough independent chains exist. Do not
+  revisit X2 without first checking lane saturation.
+
 **Honest caveats:** encode is unoptimized (~lzf-parse-bound, fine — P1);
-no container/dict/transform integration yet (all shipped pz components);
-the unsafe splice has invariant comments + fuzz/garbage tests but should get
-`cargo fuzz` + Miri on the small suite before graduating beyond an
-experiment; offsets 2-15 use a scalar overlap loop (pattern-splat is a known
-further win); blob aggregate with the proven 13-16× fan-out projects to
-**~17-20 GB/s**, to be measured when pz2 gets a container.
+no dict/transform integration yet (shipped pz components); the unsafe
+splice has invariant comments + fuzz/garbage tests but should get
+`cargo fuzz` + Miri on the small suite before default-pipeline promotion.
+
+## 8. Container integration results (2026-06-09, CLI end-to-end, all cores)
+
+pz2 graduated into the shipped streaming container as `Pipeline::Pz2`
+(id 13, `pz -p pz2`): single-stage scheduler entry like Num, decode gets
+`orig_len` from the existing block table, zero container-format changes.
+Covered by the four cross-pipeline test matrices in `pipeline/tests.rs`.
+
+Methodology: silesia blob (202.1 MiB), hyperfine (2 warmup + 5 runs, warm
+page cache), `pz -d -c -q file > /dev/null`, M5 Max (6P+12E). These numbers
+are NOT comparable to the CLAUDE.md table (different I/O mode); compare
+within this table only.
+
+| codec | comp % | decode wall | decode user CPU | aggregate |
+|---|---|---|---|---|
+| **pz pz2** | 32.22 | **16.3 ms** | 174 ms | **12.1 GiB/s** |
+| pz lzf | 32.18 | 40.5 ms | 569 ms | 4.9 GiB/s |
+| pz lzseqr | 32.16 | 48.0 ms | 687 ms | 4.1 GiB/s |
+| pzstd -3 -p18 | 31.40 | 22.9 ms | 157 ms | 8.6 GiB/s |
+| zstd -3 (1 thread) | 31.40 | 139.2 ms | 137 ms | 1.42 GiB/s |
+
+- **pz2 beats pzstd -3 by 1.40× on parallel decode wall time** at 0.8pp
+  ratio cost — and not by burning more cores: user CPU is comparable
+  (174 vs 157 ms). The §4 prediction ("pzstd as the honest competitor")
+  is settled on this machine.
+- The old §7 projection of 17-20 GB/s assumed ideal 13-16× fan-out; at
+  16 ms wall, fixed costs (process start, container parse, serial stdout
+  writer) dominate — 202 MiB is simply not enough work to saturate. The
+  per-core × cores ceiling from user CPU is ~21 GiB/s.
+- Compress all-cores: pz2 725 ms (279 MiB/s) vs lzf 1034 ms — **1.43×
+  faster encode** at equal ratio (Huffman bit-writer beats FSE encode),
+  14.8× thread scaling.
+- Remaining integration gaps: `-a`/`--trial` auto-selection does not
+  consider Pz2; no dict tier; Num-style transforms not yet routed per
+  block (P5/P9 phase 2).

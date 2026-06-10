@@ -5,14 +5,14 @@
 //! parse decisions to `Lzf`) re-expressed as zstd-style **sequences**
 //! `(literal_run_len, match_len, offset)` with:
 //!
-//! - **Literals** in a 4-lane huff0-style canonical Huffman: one shared
-//!   length-limited (≤11 bit) table, four independent LSB bitstreams decoded
+//! - **Literals** in an 8-lane huff0-style canonical Huffman: one shared
+//!   length-limited (≤11 bit) table, eight independent LSB bitstreams decoded
 //!   with a flat 2048-entry L1-resident table, interleaved for ILP. No
 //!   inter-symbol entropy state — this is the design's P3 ("shortest critical
-//!   path wins").
-//! - **Sequence codes** (literal-run / match-len / offset log2 buckets)
-//!   through the existing FSE, where per-symbol latency is amortized ~1:8
-//!   against output bytes. Offsets use the shipped `RepeatOffsets` rep-cache.
+//!   path wins"). 8 lanes measured best on the M5 (4/6/8/12/16 swept).
+//! - **Sequence codes** (literal-run / match-len / offset log2 buckets) as
+//!   three more small-alphabet Huffman lanes decoded fused with the splice.
+//!   Offsets use the shipped `RepeatOffsets` rep-cache.
 //! - **Extra bits** in one raw LSB bit lane.
 //! - Decode is splice-shaped: bulk literal-run copies from the pre-decoded
 //!   literal buffer + `extend_from_within` match copies with
@@ -35,8 +35,10 @@ const MIN_MATCH: u32 = 3;
 /// Maximum Huffman code length. 2^11-entry decode table = 4 KB (L1-resident).
 const MAX_CODE_LEN: u32 = 11;
 
-/// Number of independent literal bitstream lanes.
-const NUM_LANES: usize = 4;
+/// Number of independent literal bitstream lanes. Swept on the M5
+/// (4/6/8/12/16): 8 is the knee (+7% over 4 on text; 12/16 regress
+/// slightly from register spill). Part of the wire format.
+const NUM_LANES: usize = 8;
 
 /// Literal section modes.
 const LIT_RAW: u8 = 0;
@@ -318,7 +320,7 @@ fn build_decode_table(lengths: &[u8; 256]) -> PzResult<Box<[u16; 1 << MAX_CODE_L
 }
 
 // ---------------------------------------------------------------------------
-// 4-lane literal codec
+// Multi-lane literal codec
 // ---------------------------------------------------------------------------
 
 /// Contiguous near-equal lane lengths (first `total % NUM_LANES` lanes get
@@ -382,14 +384,22 @@ impl LaneState {
     }
 }
 
-/// Decode 4 Huffman lanes into one literal buffer.
+/// Decode NUM_LANES Huffman lanes into one literal buffer.
 ///
-/// The hot loop refills all four lanes (branchless 8-byte loads, gated by one
-/// predictable per-round bounds check against the real slices) then decodes
-/// 5 symbols per lane per round — four independent dependency chains for the
-/// OoO core to overlap (the huff0 trick). The tail finishes each lane with a
-/// fully clamped byte-wise refill, erroring (never panicking, never
-/// over-reading) on corrupt streams.
+/// The hot loop refills every lane (branchless 8-byte loads, gated by one
+/// predictable per-round check against the real slice lengths) then decodes
+/// 5 symbols per lane per round — NUM_LANES independent dependency chains
+/// for the OoO core to overlap (the huff0 trick; 8 lanes measured best on
+/// the M5, +7% over 4). The tail finishes each lane with a fully clamped
+/// byte-wise refill, erroring (never panicking, never over-reading) on
+/// corrupt streams.
+///
+/// A huff0-style dual-symbol ("X2") table was tried here and measured a dead
+/// end on this core: with 8 lanes the loop is execution-throughput-bound,
+/// not chain-latency-bound, so even 81% pair coverage (dickens) gained only
+/// ~1.5% while low-coverage data (x-ray, 27-34%) paid -8.5% for the wider
+/// entries. Same physics as the FSE "4-way interleave buys only 1.15x"
+/// finding. See clean-slate-codec.md §7.
 fn decode_lanes(
     table: &[u16; 1 << MAX_CODE_LEN],
     lanes: [&[u8]; NUM_LANES],
@@ -398,11 +408,14 @@ fn decode_lanes(
     let lit_total = out.len();
     let lens = lane_lengths(lit_total);
 
-    // Split the output into four disjoint regions.
-    let (r0, rest) = out.split_at_mut(lens[0]);
-    let (r1, rest) = rest.split_at_mut(lens[1]);
-    let (r2, r3) = rest.split_at_mut(lens[2]);
-    let mut regions: [&mut [u8]; NUM_LANES] = [r0, r1, r2, r3];
+    // Split the output into NUM_LANES disjoint regions.
+    let mut regions: [&mut [u8]; NUM_LANES] = Default::default();
+    let mut rest: &mut [u8] = out;
+    for (region, &n) in regions.iter_mut().zip(lens.iter()) {
+        let (head, tail) = std::mem::take(&mut rest).split_at_mut(n);
+        *region = head;
+        rest = tail;
+    }
 
     let mut st = [LaneState::default(); NUM_LANES];
 
@@ -411,28 +424,33 @@ fn decode_lanes(
     // lane; the remainder falls through to the tail loop.
     let min_len = lens.iter().copied().min().unwrap_or(0);
     let rounds = min_len / 5;
+    // Raw write cursors so the NUM_LANES*5 stores per round carry no bounds
+    // checks. SAFETY: each lane writes exactly 5 symbols per round, so
+    // written stays < rounds * 5 ≤ min_len ≤ regions[lane].len(); the
+    // pointers are only used inside the rounds loop, before `regions` is
+    // touched again.
+    let mut ptrs = [std::ptr::null_mut::<u8>(); NUM_LANES];
+    for (p, region) in ptrs.iter_mut().zip(regions.iter_mut()) {
+        *p = region.as_mut_ptr();
+    }
     'rounds: for _ in 0..rounds {
         for lane in 0..NUM_LANES {
             if st[lane].pos + 8 > lanes[lane].len() {
                 break 'rounds;
             }
         }
-        st[0].refill(lanes[0]);
-        st[1].refill(lanes[1]);
-        st[2].refill(lanes[2]);
-        st[3].refill(lanes[3]);
+        // Const trip counts: the compiler fully unrolls the lane loops,
+        // keeping NUM_LANES independent chains live for the OoO core.
+        for lane in 0..NUM_LANES {
+            st[lane].refill(lanes[lane]);
+        }
         for _ in 0..5 {
-            // Four independent chains; the writes' bounds checks are
-            // predictable (written < region.len() by construction:
-            // rounds * 5 <= min_len).
-            regions[0][st[0].written] = st[0].decode_one(table);
-            st[0].written += 1;
-            regions[1][st[1].written] = st[1].decode_one(table);
-            st[1].written += 1;
-            regions[2][st[2].written] = st[2].decode_one(table);
-            st[2].written += 1;
-            regions[3][st[3].written] = st[3].decode_one(table);
-            st[3].written += 1;
+            unsafe {
+                for lane in 0..NUM_LANES {
+                    *ptrs[lane].add(st[lane].written) = st[lane].decode_one(table);
+                    st[lane].written += 1;
+                }
+            }
         }
     }
 
@@ -832,11 +850,29 @@ pub fn decode(data: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
                     wild_copy(src, dst, ml);
                 } else if offset == 1 {
                     std::ptr::write_bytes(dst, *src, ml);
-                } else {
-                    // Small overlapping offsets: byte-at-a-time keeps the
-                    // period; rare on real data.
+                } else if ml <= 2 * WILD {
+                    // Short overlapping match: the byte loop beats memcpy
+                    // dispatch overhead at these sizes.
                     for k in 0..ml {
                         *dst.add(k) = *src.add(k);
+                    }
+                } else {
+                    // Long match at small offset (2..WILD): replicate the
+                    // period by exponential doubling — O(log ml) bulk copies
+                    // instead of an O(ml) byte chain (mirrors the shipped
+                    // lzf overlap fix; 8-13x on repetitive input there).
+                    //
+                    // Invariant: after copying n bytes, dst[..n] extends the
+                    // period. Each round copies cnt ≤ n bytes from dst to
+                    // dst+n (disjoint), and n is always a multiple of
+                    // `offset` when used as a copy distance, preserving
+                    // periodicity.
+                    std::ptr::copy_nonoverlapping(src, dst, offset);
+                    let mut n = offset;
+                    while n < ml {
+                        let cnt = n.min(ml - n);
+                        std::ptr::copy_nonoverlapping(dst, dst.add(n), cnt);
+                        n += cnt;
                     }
                 }
             }
@@ -976,7 +1012,7 @@ mod tests {
         let codes = canonical_codes(&lengths).unwrap();
         let table = build_decode_table(&lengths).unwrap();
         let lanes = encode_lanes(&lits, &codes);
-        let lane_refs = [&lanes[0][..], &lanes[1][..], &lanes[2][..], &lanes[3][..]];
+        let lane_refs: [&[u8]; NUM_LANES] = std::array::from_fn(|i| &lanes[i][..]);
         let mut decoded = vec![0u8; lits.len()];
         decode_lanes(&table, lane_refs, &mut decoded).unwrap();
         assert_eq!(decoded, lits);

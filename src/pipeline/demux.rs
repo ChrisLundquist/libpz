@@ -74,6 +74,9 @@ pub(crate) fn demuxer_for_pipeline(pipeline: super::Pipeline) -> Option<LzDemuxe
         // Num is a transform pipeline (byte-plane split + per-plane FSE), not an
         // LZ/demux pipeline — it has no token streams.
         super::Pipeline::Num => None,
+        // Pz2 owns its whole wire format (sequences + lane framing) in
+        // `pz2::encode`/`decode` — it does not use the shared demux streams.
+        super::Pipeline::Pz2 => None,
     }
 }
 

@@ -998,6 +998,7 @@ pub(crate) fn run_compress_stage(
         (Pipeline::LzSeq2R, 1) => stage_rans_encode_sparse(block, options),
         (Pipeline::SortLz, 0) => stage_sortlz_compress(block),
         (Pipeline::Num, 0) => stage_num_compress(block),
+        (Pipeline::Pz2, 0) => stage_pz2_compress(block),
         _ => Err(PzError::Unsupported),
     }
 }
@@ -1019,6 +1020,16 @@ pub(crate) fn stage_sortlz_compress(mut block: StageBlock) -> PzResult<StageBloc
 /// `blocks::decompress_block` → `numeric::decode`.
 pub(crate) fn stage_num_compress(mut block: StageBlock) -> PzResult<StageBlock> {
     block.data = crate::numeric::encode(&block.data);
+    Ok(block)
+}
+
+/// Pz2 single-stage compression: sequence conversion + 4-lane Huffman wire.
+///
+/// Like Num, Pz2 is a self-contained single-stage pipeline (its tokenize +
+/// wire encode are fused in `pz2::encode`). The decode side goes through
+/// `blocks::decompress_block` → `pz2::decode`.
+pub(crate) fn stage_pz2_compress(mut block: StageBlock) -> PzResult<StageBlock> {
+    block.data = crate::pz2::encode(&block.data)?;
     Ok(block)
 }
 

@@ -367,6 +367,11 @@ pub enum Pipeline {
     Num = 11,
     /// LzSeq2 + sparse rANS (literal-run sequences, combined extra bits)
     LzSeq2R = 12,
+    /// Clean-slate decode-first block codec: same LzSeq parse re-expressed as
+    /// zstd-style sequences with 4-lane Huffman literals + fused sequence
+    /// splice. ~3x single-thread decode vs Lzf at ratio parity. See
+    /// `docs/design-docs/clean-slate-codec.md` and `src/pz2.rs`.
+    Pz2 = 13,
 }
 
 impl TryFrom<u8> for Pipeline {
@@ -387,6 +392,7 @@ impl TryFrom<u8> for Pipeline {
             10 => Ok(Self::SortLz),
             11 => Ok(Self::Num),
             12 => Ok(Self::LzSeq2R),
+            13 => Ok(Self::Pz2),
             _ => Err(PzError::Unsupported),
         }
     }
