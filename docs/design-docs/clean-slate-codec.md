@@ -549,3 +549,62 @@ matches means fewer random dict reads). Same-session re-anchor of
 §11c's headline: master v1 44.9 ms vs arena 39.1 ms (1.15×) — the
 −13% holds; absolute walls drift ±10% with machine state, so compare
 binaries within ONE hyperfine invocation only.
+
+## §12 — tANS entropy probe: per-block tANS PASSES the gate; global tables and order-1 are DEAD (2026-06-10)
+
+The question (asked when the dict tier shipped): *would tANS or another
+entropy coder beat the 8-lane Huffman if we had global state tables?*
+Answered by pure entropy accounting (`examples/pz2_entropy_probe.rs` +
+`pz2::probe_lane_streams` hook) — bit-exact pricing of the shipped coder
+(package-merge lengths, real headers, CONST/RAW fallbacks) against three
+alternatives on the exact lane streams the encoder feeds its Huffman
+lanes (2 MiB blocks, greedy parse, 32 MiB segments for global scenarios):
+
+- **A** shipped per-block Huffman
+- **B** per-block tANS (Shannon ideal + A's own header — isolates the
+  fractional-bit win, which is all tANS adds over optimal Huffman)
+- **C** segment-global tANS tables (cross-entropy vs segment histogram,
+  amortized header; C' = per-block min(A,C) + mode byte)
+- **D** order-1 (prev symbol) segment-global, seq-code lanes only
+
+Results (Δpp of input vs A; negative = smaller):
+
+| input | A total | B tANS/blk | C global | C' choice | D o1/seg |
+|---|---|---|---|---|---|
+| **blob** | 20.749pp | **−0.255** | **+0.894** | −0.066 | −0.055 |
+| dickens | 13.580pp | −0.548 | −0.546 | −0.546 | −0.508 |
+| webster | 11.853pp | −0.307 | −0.310 | −0.310 | −0.299 |
+| mozilla | 28.129pp | −0.206 | +0.200 | −0.116 | −0.406 |
+| sao | 66.365pp | −0.432 | −0.386 | −0.386 | −0.467 |
+| xml | 5.100pp | −0.125 | ~0.000 | −0.083 | −0.098 |
+
+Blob lane split for B: ll −0.114, lit −0.059, ml −0.054, of −0.027 —
+the win lives in the small-alphabet sequence-code lanes, exactly the
+predicted Huffman-1-bit-floor effect (greedy parses make `lit_run = 0`
+dominate the ll lane far past p=0.5; Huffman cannot pay less than 1 bit
+for it, tANS can). The 8-lane Huffman literals are near-optimal
+(−0.06pp headroom — huff0's classic result, reconfirmed).
+
+**Verdicts:**
+
+1. **Per-block tANS passes the ratio gate: −0.25pp blob, −0.13 to
+   −0.55pp per file, no global tables needed.** Converting only the
+   three seq-code lanes nets ~−0.20pp; literals can stay Huffman.
+2. **Global tables are DEAD — the hypothesis inverted.** On the
+   heterogeneous blob, segment-global tables are +0.89pp (WORSE than
+   shipped); 2 MiB per-block histograms are already statistically
+   saturated, so sharing buys nothing on homogeneous files and actively
+   hurts on mixed segments. Same lesson as the global head dict (§11).
+3. **Order-1 segment-global seq-code modeling is DEAD at blob scope**
+   (−0.055pp < gate). One honest outlier: mozilla D = −0.41pp (real
+   order-1 structure in executable-heavy seq streams) — recorded, not
+   actionable alone.
+
+**Caveats before anyone builds it:** B prices Shannon ideal with
+Huffman-equal headers; a real tANS at 2^11-12 states with normalized-
+count headers lands ~−0.20pp on the blob, right at the gate. And the
+binding constraint is DECODE: the fused splice would swap three Huffman
+chain reads for three interleaved FSE state updates (zstd's exact
+design — proof it can be fast), but pz2's 12 GiB/s all-cores wall and
+1.4 GB/s ST must hold. A wire change only proceeds if a decode
+prototype is speed-neutral; that is its own gated task, not a rider.

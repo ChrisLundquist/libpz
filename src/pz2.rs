@@ -725,6 +725,40 @@ pub fn encode_with_prefix(data: &[u8], prefix_len: usize, config: &SeqConfig) ->
     encode_sequences(&seqs, &lits, input.len())
 }
 
+/// The four entropy-coded lane streams of one block: `(literals,
+/// lit_run_codes, offset_codes, match_len_codes)`.
+#[doc(hidden)]
+pub type LaneStreams = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// Probe hook for entropy accounting (`examples/pz2_entropy_probe.rs`):
+/// parse one block exactly like [`encode_with_config`] and return the four
+/// entropy-coded lane streams after the rep-offset transform, i.e. the
+/// exact symbol streams `encode_sequences` feeds its Huffman lanes. Not API.
+#[doc(hidden)]
+pub fn probe_lane_streams(input: &[u8], config: &SeqConfig) -> PzResult<LaneStreams> {
+    let tokens = lzseq::tokenize_with_config(input, config)?;
+    let (seqs, lits) = build_sequences(&tokens);
+    let mut ll = Vec::with_capacity(seqs.len());
+    let mut of = Vec::with_capacity(seqs.len());
+    let mut ml = Vec::with_capacity(seqs.len());
+    let mut reps = RepeatOffsets::new();
+    for s in &seqs {
+        ll.push(vcode(s.lit_run).0);
+        of.push(reps.encode_offset(s.offset).0);
+        debug_assert!(s.match_len >= MIN_MATCH);
+        ml.push(vcode(s.match_len - MIN_MATCH).0);
+    }
+    Ok((lits, ll, of, ml))
+}
+
+/// Probe hook: optimal MAX_CODE_LEN-limited Huffman lengths for a histogram
+/// (the shipped package-merge), so probes can price the shipped entropy
+/// coder without duplicating it. Requires ≥ 2 nonzero counts. Not API.
+#[doc(hidden)]
+pub fn probe_huffman_lengths(counts: &[u32; 256]) -> [u8; 256] {
+    huffman_lengths(counts)
+}
+
 /// Encode one block from a worker arena (`dict ‖ block`) using frozen
 /// dictionary chains built once via [`crate::lz77::FrozenDict::build`] and
 /// shared across workers. Unlike [`encode_with_prefix`], the dict is NOT
