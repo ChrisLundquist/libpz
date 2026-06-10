@@ -97,6 +97,11 @@ fn list_pipelines() {
             "13",
             "Decode-first sequences: 4-lane Huffman + fused splice (~3x lzf decode)",
         ),
+        (
+            "pz2d",
+            "14",
+            "Pz2 dict tier: 32 MiB segments, 16 MiB shared dict (best ratio)",
+        ),
     ];
     for (name, id, desc) in pipelines {
         println!("  {name:10} {id:>2}  {desc}");
@@ -261,6 +266,7 @@ fn parse_args() -> Opts {
                     "num" | "11" => Pipeline::Num,
                     "lzseq2r" | "12" => Pipeline::LzSeq2R,
                     "pz2" | "13" => Pipeline::Pz2,
+                    "pz2d" | "14" => Pipeline::Pz2d,
                     other => {
                         eprintln!("pz: unknown pipeline '{other}'");
                         eprintln!("pz: run 'pz --list-pipelines' to see available pipelines");
@@ -457,6 +463,7 @@ fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
                 11 => "num",
                 12 => "lzseq2r",
                 13 => "pz2",
+                14 => "pz2d",
                 _ => "unknown",
             };
             let mut orig_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);

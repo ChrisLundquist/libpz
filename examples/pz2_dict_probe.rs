@@ -51,6 +51,16 @@ fn main() {
     } else {
         false
     };
+    // --segenc: the full Pz2d segment codec (pz2::encode_segment /
+    // decode_segment): dict region = one parse split at block bounds,
+    // dicted blocks via the frozen finder. This is what the container
+    // will ship.
+    let segenc_mode = if let Some(i) = args.iter().position(|a| a == "--segenc") {
+        args.remove(i);
+        true
+    } else {
+        false
+    };
     const SEG: usize = 32 << 20;
     if args.is_empty() {
         eprintln!("usage: pz2_dict_probe [--head] <files...>");
@@ -63,7 +73,9 @@ fn main() {
         "ratio %",
         "delta",
         "enc s",
-        if frozen_mode {
+        if segenc_mode {
+            "encode_segment (Pz2d codec)"
+        } else if frozen_mode {
             "per-segment FROZEN finder"
         } else if seg_mode {
             "per-segment head dict"
@@ -88,6 +100,30 @@ fn main() {
             let t = Instant::now();
             let mut size = 0usize;
             let mut start = 0usize;
+
+            if segenc_mode {
+                for seg in data.chunks(SEG) {
+                    let blocks = pz::pz2::encode_segment(seg, BLOCK, d, &config).expect("encode");
+                    size += blocks.iter().map(|(_, w)| w.len()).sum::<usize>();
+                    let refs: Vec<(usize, &[u8])> =
+                        blocks.iter().map(|(n, w)| (*n, w.as_slice())).collect();
+                    let dec = pz::pz2::decode_segment(&refs, d).expect("decode");
+                    assert_eq!(dec, seg, "segment round-trip mismatch");
+                }
+                let pct = 100.0 * size as f64 / data.len() as f64;
+                if d == 0 {
+                    base_pct = pct;
+                }
+                println!(
+                    "{:>14} {:>5}Mi | {:>8.3} {:>+7.3} | {:>8.1}",
+                    name,
+                    d >> 20,
+                    pct,
+                    pct - base_pct,
+                    t.elapsed().as_secs_f64()
+                );
+                continue;
+            }
             // Frozen mode: build each segment's dict tables ONCE (the
             // production shape — Arc-shared across workers).
             let mut frozen: Option<(usize, std::sync::Arc<pz::lz77::FrozenDict>, usize)> = None;

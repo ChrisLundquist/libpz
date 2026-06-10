@@ -999,6 +999,7 @@ pub(crate) fn run_compress_stage(
         (Pipeline::SortLz, 0) => stage_sortlz_compress(block),
         (Pipeline::Num, 0) => stage_num_compress(block),
         (Pipeline::Pz2, 0) => stage_pz2_compress(block, options),
+        (Pipeline::Pz2d, 0) => stage_pz2d_compress(block, options),
         _ => Err(PzError::Unsupported),
     }
 }
@@ -1038,6 +1039,17 @@ pub(crate) fn stage_pz2_compress(
         config.greedy = super::pz2_auto_greedy(&block.data);
     }
     block.data = crate::pz2::encode_with_config(&block.data, &config)?;
+    Ok(block)
+}
+
+/// Pz2d single-stage compression: one segment (dict region + frozen-finder
+/// blocks + inner framing) per container block, via
+/// `blocks::compress_block`'s Pz2d path.
+pub(crate) fn stage_pz2d_compress(
+    mut block: StageBlock,
+    options: &super::CompressOptions,
+) -> PzResult<StageBlock> {
+    block.data = super::compress_block(&block.data, super::Pipeline::Pz2d, options)?;
     Ok(block)
 }
 

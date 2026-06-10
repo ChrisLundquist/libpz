@@ -50,6 +50,7 @@ pub(crate) fn compress_block(
             Pipeline::SortLz => compress_block_sortlz(input, opts),
             Pipeline::Num => compress_block_num(input, opts),
             Pipeline::Pz2 => compress_block_pz2(input, opts),
+            Pipeline::Pz2d => compress_block_pz2d(input, opts),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -99,6 +100,7 @@ pub(crate) fn decompress_block(
             Pipeline::SortLz => decompress_block_sortlz(payload, orig_len),
             Pipeline::Num => decompress_block_num(payload, orig_len),
             Pipeline::Pz2 => decompress_block_pz2(payload, orig_len),
+            Pipeline::Pz2d => decompress_block_pz2d(payload, orig_len),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -441,6 +443,136 @@ fn compress_block_pz2(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u
 /// Decompress a single Pz2 block (no container header).
 fn decompress_block_pz2(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     crate::pz2::decode(payload, orig_len)
+}
+
+// ---------------------------------------------------------------------------
+// Pz2d pipeline: Pz2 dict tier — one container block = one segment
+// ---------------------------------------------------------------------------
+//
+// Segment payload layout (inner framing, all u32 LE):
+//   [num_inner] then num_inner × [inner_orig_len][inner_comp_len],
+//   then the inner pz2 wires concatenated in order.
+// The inner structure (PZ2D_INNER_BLOCK blocks, PZ2D_DICT_SIZE dict) is a
+// format constant; the decoder only needs the frame table.
+
+/// Compress one segment with the Pz2d dict tier.
+fn compress_block_pz2d(input: &[u8], options: &CompressOptions) -> PzResult<Vec<u8>> {
+    let defaults = crate::lzseq::SeqConfig::default();
+    // The window must span dict + inner block or dict reach is lost.
+    let window = (super::PZ2D_DICT_SIZE + super::PZ2D_INNER_BLOCK)
+        .next_power_of_two()
+        .max(defaults.max_window);
+    let greedy = match options.parse_strategy {
+        super::ParseStrategy::Greedy => true,
+        super::ParseStrategy::Lazy => false,
+        // Same auto rule as Pz2, applied at segment granularity.
+        _ => super::pz2_auto_greedy(input),
+    };
+    let config = crate::lzseq::SeqConfig {
+        max_window: options.seq_window_size.unwrap_or(window),
+        max_match_len: options.max_match_len.unwrap_or(defaults.max_match_len),
+        greedy,
+        ..defaults
+    };
+    let blocks = crate::pz2::encode_segment(
+        input,
+        super::PZ2D_INNER_BLOCK,
+        super::PZ2D_DICT_SIZE,
+        &config,
+    )?;
+
+    let mut out = Vec::with_capacity(input.len() / 2 + 64);
+    out.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+    for (orig, wire) in &blocks {
+        out.extend_from_slice(&(*orig as u32).to_le_bytes());
+        out.extend_from_slice(&(wire.len() as u32).to_le_bytes());
+    }
+    for (_, wire) in &blocks {
+        out.extend_from_slice(wire);
+    }
+    Ok(out)
+}
+
+/// Decompress one Pz2d segment (no container header).
+fn decompress_block_pz2d(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    let take_u32 = |p: &mut &[u8]| -> PzResult<u32> {
+        if p.len() < 4 {
+            return Err(PzError::InvalidInput);
+        }
+        let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+        *p = &p[4..];
+        Ok(v)
+    };
+    let mut p = payload;
+    let num = take_u32(&mut p)? as usize;
+    // Sanity bound: every inner block covers ≥ 1 original byte.
+    if num > orig_len.max(1) {
+        return Err(PzError::InvalidInput);
+    }
+    let mut table = Vec::with_capacity(num);
+    let mut total_orig = 0usize;
+    for _ in 0..num {
+        let o = take_u32(&mut p)? as usize;
+        let c = take_u32(&mut p)? as usize;
+        total_orig += o;
+        table.push((o, c));
+    }
+    if total_orig != orig_len {
+        return Err(PzError::InvalidInput);
+    }
+    let mut blocks: Vec<(usize, &[u8])> = Vec::with_capacity(num);
+    for &(o, c) in &table {
+        if p.len() < c {
+            return Err(PzError::InvalidInput);
+        }
+        let (wire, rest) = p.split_at(c);
+        blocks.push((o, wire));
+        p = rest;
+    }
+
+    // 2-wave decode (clean-slate-codec.md §11): the dict region is a prefix
+    // chain (block k needs blocks 0..k) and decodes sequentially; every
+    // block after it depends only on the completed dict region, so those
+    // fan out across scoped threads. The outer scheduler already
+    // parallelizes across segments; the inner fan-out keeps a single
+    // segment's wall close to dict-chain time instead of whole-segment
+    // time.
+    let dict_len = super::PZ2D_DICT_SIZE.min(orig_len);
+    let mut out: Vec<u8> = Vec::with_capacity(orig_len);
+    let mut wave2_start = blocks.len();
+    for (i, &(o, wire)) in blocks.iter().enumerate() {
+        if out.len() >= dict_len {
+            wave2_start = i;
+            break;
+        }
+        let dec = crate::pz2::decode_with_prefix(wire, &out, o)?;
+        out.extend_from_slice(&dec);
+    }
+    if out.len() > dict_len {
+        // Inner frames must tile the dict region exactly.
+        return Err(PzError::InvalidInput);
+    }
+    let wave2 = &blocks[wave2_start.min(blocks.len())..];
+    if !wave2.is_empty() {
+        let dict: &[u8] = &out;
+        let mut results: Vec<PzResult<Vec<u8>>> = Vec::new();
+        std::thread::scope(|s| {
+            let handles: Vec<_> = wave2
+                .iter()
+                .map(|&(o, wire)| s.spawn(move || crate::pz2::decode_with_prefix(wire, dict, o)))
+                .collect();
+            for h in handles {
+                results.push(h.join().unwrap_or(Err(PzError::InvalidInput)));
+            }
+        });
+        for r in results {
+            out.extend_from_slice(&r?);
+        }
+    }
+    if out.len() != orig_len {
+        return Err(PzError::InvalidInput);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

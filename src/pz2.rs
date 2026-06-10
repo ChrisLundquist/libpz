@@ -744,6 +744,121 @@ pub fn encode_with_frozen_dict(
     encode_sequences(&seqs, &lits, arena.len() - dict_len)
 }
 
+// ---------------------------------------------------------------------------
+// Segment codec (Pz2d dict tier, clean-slate-codec.md §11)
+// ---------------------------------------------------------------------------
+
+/// Encode one segment as independent-decodable blocks sharing the segment's
+/// head as a dictionary (the Pz2d shape). Returns `(orig_len, wire)` per
+/// block, in order.
+///
+/// - Blocks inside the dict region (`seg[..dict_size]`) come from ONE parse
+///   of the whole region, split at block boundaries (matches crossing a
+///   boundary are split; each half keeps its offset, which stays valid
+///   because the second half still references earlier region content).
+///   Block `k` of the region decodes with prefix `seg[..k*block_size]`.
+/// - Blocks after the dict region parse with the frozen finder
+///   ([`encode_with_frozen_dict`]) and decode with prefix
+///   `seg[..dict_size]`.
+///
+/// `config.max_window` should cover `dict_size + block_size` or reach is
+/// left on the table. Decode with [`decode_segment`].
+pub fn encode_segment(
+    seg: &[u8],
+    block_size: usize,
+    dict_size: usize,
+    config: &SeqConfig,
+) -> PzResult<Vec<(usize, Vec<u8>)>> {
+    assert!(block_size > 0);
+    let dict_len = dict_size.min(seg.len());
+    let mut out: Vec<(usize, Vec<u8>)> = Vec::new();
+
+    // --- Dict region: one parse, split at block boundaries ---
+    if dict_len > 0 {
+        let region = &seg[..dict_len];
+        let tokens = lzseq::tokenize_with_config(region, config)?;
+        let num_blocks = dict_len.div_ceil(block_size);
+        let mut per_block: Vec<Vec<LzToken>> = vec![Vec::new(); num_blocks];
+        let mut pos = 0usize;
+        for t in &tokens {
+            match *t {
+                LzToken::Literal(b) => {
+                    per_block[pos / block_size].push(LzToken::Literal(b));
+                    pos += 1;
+                }
+                LzToken::Match { offset, length } => {
+                    let mut start = pos;
+                    let mut rem = length as usize;
+                    while rem > 0 {
+                        let blk_end = ((start / block_size) + 1) * block_size;
+                        let take = rem.min(blk_end - start);
+                        let blk = &mut per_block[start / block_size];
+                        if take >= MIN_MATCH as usize {
+                            blk.push(LzToken::Match {
+                                offset,
+                                length: take as u32,
+                            });
+                        } else {
+                            // A split remnant too short for a match: emit
+                            // the region bytes as literals.
+                            for &b in &region[start..start + take] {
+                                blk.push(LzToken::Literal(b));
+                            }
+                        }
+                        start += take;
+                        rem -= take;
+                    }
+                    pos += length as usize;
+                }
+            }
+        }
+        debug_assert_eq!(pos, dict_len);
+        for (k, blk_tokens) in per_block.iter().enumerate() {
+            let blk_len = block_size.min(dict_len - k * block_size);
+            let (seqs, lits) = build_sequences(blk_tokens);
+            out.push((blk_len, encode_sequences(&seqs, &lits, blk_len)?));
+        }
+    }
+
+    // --- Dicted blocks: frozen finder over the full dict region ---
+    if seg.len() > dict_len {
+        let frozen = std::sync::Arc::new(crate::lz77::FrozenDict::build(
+            &seg[..dict_len],
+            config.hash_prefix_len,
+        ));
+        let mut arena = Vec::with_capacity(dict_len + block_size);
+        arena.extend_from_slice(&seg[..dict_len]);
+        let mut start = dict_len;
+        while start < seg.len() {
+            let end = (start + block_size).min(seg.len());
+            arena.truncate(dict_len);
+            arena.extend_from_slice(&seg[start..end]);
+            out.push((
+                end - start,
+                encode_with_frozen_dict(&arena, &frozen, config)?,
+            ));
+            start = end;
+        }
+    }
+
+    Ok(out)
+}
+
+/// Decode a segment produced by [`encode_segment`]: blocks in order, each
+/// `(orig_len, wire)`. The container's parallel path fans the same logic out
+/// in waves (dict-region chain, then dicted blocks against the shared dict);
+/// this reference implementation is sequential.
+pub fn decode_segment(blocks: &[(usize, &[u8])], dict_size: usize) -> PzResult<Vec<u8>> {
+    let total: usize = blocks.iter().map(|&(n, _)| n).sum();
+    let mut out: Vec<u8> = Vec::with_capacity(total);
+    for &(orig_len, wire) in blocks {
+        let pref = out.len().min(dict_size);
+        let dec = decode_with_prefix(wire, &out[..pref], orig_len)?;
+        out.extend_from_slice(&dec);
+    }
+    Ok(out)
+}
+
 /// Shared wire writer: sequences + literals → the pz2 block format.
 fn encode_sequences(seqs: &[Seq], lits: &[u8], block_len: usize) -> PzResult<Vec<u8>> {
     let mut out = Vec::with_capacity(block_len / 2 + 64);
@@ -1231,6 +1346,58 @@ mod tests {
         let empty = Arc::new(FrozenDict::build(&[], config.hash_prefix_len));
         let enc0 = encode_with_frozen_dict(&block, &empty, &config).unwrap();
         assert_eq!(decode(&enc0, block.len()).unwrap(), block);
+    }
+
+    #[test]
+    fn test_segment_round_trip() {
+        // Periodic-ish text forces matches that cross every block boundary
+        // (exercising the match-splitting path) and reach into the dict.
+        let mut seg = Vec::new();
+        let mut state = 11u32;
+        while seg.len() < 400_000 {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            seg.extend_from_slice(b"the quick brown fox jumps over the lazy dog. ");
+            seg.push((state >> 16) as u8);
+        }
+
+        let config = SeqConfig::default();
+        for (block, dict) in [
+            (64 * 1024, 128 * 1024),
+            (64 * 1024, 0),
+            (100_000, 250_000),  // unaligned boundaries
+            (1 << 20, 16 << 20), // dict larger than segment
+            (37, 119),           // degenerate tiny blocks
+        ] {
+            let blocks = encode_segment(&seg, block, dict, &config).unwrap();
+            let total: usize = blocks.iter().map(|(n, _)| n).sum();
+            assert_eq!(total, seg.len());
+            let refs: Vec<(usize, &[u8])> =
+                blocks.iter().map(|(n, w)| (*n, w.as_slice())).collect();
+            let dec = decode_segment(&refs, dict).unwrap();
+            assert_eq!(dec, seg, "segment round-trip block={block} dict={dict}");
+        }
+
+        // Dict reach must beat independent cold blocks when the redundancy
+        // lives BEYOND block reach: a 100 KB pseudorandom unit tiled 4x is
+        // incompressible per 64 KB block but trivial against the dict.
+        let unit = lcg_stream(100_000, 77);
+        let mut tiled = Vec::new();
+        for _ in 0..4 {
+            tiled.extend_from_slice(&unit);
+        }
+        let cold: usize = tiled
+            .chunks(64 * 1024)
+            .map(|b| encode_with_config(b, &config).unwrap().len())
+            .sum();
+        let dicted: usize = encode_segment(&tiled, 64 * 1024, 128 * 1024, &config)
+            .unwrap()
+            .iter()
+            .map(|(_, w)| w.len())
+            .sum();
+        assert!(
+            dicted * 2 < cold,
+            "segment encode ({dicted}) should be far smaller than cold blocks ({cold})"
+        );
     }
 
     #[test]

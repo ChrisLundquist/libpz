@@ -432,3 +432,42 @@ segment tier earning its place in the format.
   segment framing (`[dict_len] +` blocks), 2-wave parallel decode with
   the `Arc`-shared dict + worker arenas, encode-side worker arenas, and
   the encode-cost tuning pass above.
+
+### §11b — Pz2d v1 SHIPPED (`-p pz2d`, id 14) and its honest ledger
+
+Landed as segment-as-container-block: one container block = one 32 MiB
+segment; payload = `[num_inner]` + inner frame table + pz2 wires. The
+segment codec (`pz2::encode_segment`/`decode_segment`) encodes the dict
+region as ONE parse split at 2 MiB boundaries (split match halves keep
+their offsets — still valid against earlier region content) — this took
+the 16 MiB-dict blob encode from 70.5 s (frozen probe, partial-dict
+rebuilds) to **38.6 s ST**. Decode in the container is 2-wave per
+segment: the dict region is a prefix chain (sequential), the remaining
+blocks fan out across scoped threads against the completed region.
+
+Blob, CLI e2e, measured:
+
+| | ratio | dec wall | enc wall |
+|---|---|---|---|
+| pz pz2 | 31.04% | 16.8 ms | 3.15 s |
+| **pz pz2d v1** | **30.48%** | 42.5 ms | 23.7 s |
+| pzstd -3 -p18 | 31.40% | 22.9 ms | — |
+| zstd -3 (1T) | 31.40% | 139 ms | — |
+
+Position: best LZ-family ratio in pz (0.92pp under pzstd-3, 0.56pp under
+pz2) at 3.3× faster decode than zstd ST — an opt-in max-ratio tier. Two
+measured bottlenecks, both predicted by this section's arithmetic:
+
+1. **Decode 42.5 ms is memory-traffic-bound, not compute-bound** (wall
+   saturates at 4 threads): wave-2 still uses naive per-block priming —
+   each block zeroes an 18 MiB buffer and memcpys the 16 MiB dict
+   (~3.3 GB total traffic). The fix is the planned arena decode
+   (`decode_into_arena`: dict stays resident per worker, splice appends)
+   or the two-region splice; either should land near pz2-class walls
+   (~17-20 ms projected from chain physics). Touches the proven unsafe
+   splice → own session + fresh soak.
+2. **Encode 23.7 s (112.8 s user vs 38.6 s ST probe — 2.9× concurrent
+   inflation)**: 7 segments encoding in parallel each walk a 16 MiB dict
+   + 64 MB frozen prev array — the 4 MiB-block cache lesson at segment
+   scale. Levers: dict chain caps, sampled dict insertion, smaller
+   dicts (4 MiB: −0.31pp at much lower walk cost).
