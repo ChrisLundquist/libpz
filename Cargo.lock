@@ -831,6 +831,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "criterion",
+ "metal",
  "pollster",
  "wgpu",
  "wgpu-profiler",
