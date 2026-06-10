@@ -243,6 +243,208 @@ fn encode_at_stride(input: &[u8], stride: usize) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Stage-0 spike (num-bitpack): vertical bit-pack + zero-word plane coder.
+//
+// ndzip-style entropy-stage replacement candidate for the per-plane FSE above:
+// each group of 32 consecutive plane bytes is bit-transposed into 8 bitplane
+// words (word `b` holds bit `b` of all 32 bytes), all-zero words are dropped,
+// and a 1-byte presence bitmap per group records which words survive.
+//
+// For byte planes this 32x8 transpose is the natural specialization of
+// ndzip's 32x32 word transpose, at the same bitmap overhead (1 bit per 32
+// payload bits = 3.125% floor) but strictly finer zero-word granularity.
+//
+// This is probe-only code: it is not wired into the wire format. See
+// `examples/num_bitpack_probe.rs` and
+// `docs/design-docs/num-bitpack-stage0-findings.md`.
+// ---------------------------------------------------------------------------
+
+pub mod bitpack {
+    //! Vertical bit-packing + zero-word elimination for byte planes (spike).
+
+    use crate::{PzError, PzResult};
+
+    /// Values per transpose group (one presence-bitmap byte per group).
+    const GROUP: usize = 32;
+
+    /// Bit-transpose up to 32 bytes into 8 bitplane words. Missing tail bytes
+    /// act as zero padding (their bits are simply never set).
+    fn transpose_fwd(group: &[u8]) -> [u32; 8] {
+        let mut words = [0u32; 8];
+        for (i, &byte) in group.iter().enumerate() {
+            let mut b = byte;
+            for w in words.iter_mut() {
+                *w |= ((b & 1) as u32) << i;
+                b >>= 1;
+            }
+        }
+        words
+    }
+
+    /// Encode one plane: per 32-byte group, a presence bitmap byte followed by
+    /// the nonzero bitplane words (LE). Worst case is 33/32 of the input.
+    pub fn encode(plane: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(plane.len() + plane.len() / GROUP + 1);
+        for group in plane.chunks(GROUP) {
+            let words = transpose_fwd(group);
+            let mut bitmap = 0u8;
+            for (b, &w) in words.iter().enumerate() {
+                if w != 0 {
+                    bitmap |= 1 << b;
+                }
+            }
+            out.push(bitmap);
+            for &w in &words {
+                if w != 0 {
+                    out.extend_from_slice(&w.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// Exact inverse of [`encode`]; `len` is the original plane length.
+    pub fn decode(data: &[u8], len: usize) -> PzResult<Vec<u8>> {
+        let groups = len.div_ceil(GROUP);
+        let mut out = Vec::with_capacity(groups * GROUP);
+        let mut pos = 0usize;
+        for _ in 0..groups {
+            if pos >= data.len() {
+                return Err(PzError::InvalidInput);
+            }
+            let bitmap = data[pos];
+            pos += 1;
+            let mut words = [0u32; 8];
+            for (b, w) in words.iter_mut().enumerate() {
+                if (bitmap >> b) & 1 == 1 {
+                    if pos + 4 > data.len() {
+                        return Err(PzError::InvalidInput);
+                    }
+                    *w = u32::from_le_bytes([
+                        data[pos],
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                    ]);
+                    pos += 4;
+                }
+            }
+            for i in 0..GROUP {
+                let mut byte = 0u8;
+                for (b, &w) in words.iter().enumerate() {
+                    byte |= (((w >> i) & 1) as u8) << b;
+                }
+                out.push(byte);
+            }
+        }
+        if pos != data.len() {
+            return Err(PzError::InvalidInput);
+        }
+        out.truncate(len);
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage-0 spike probe: per-plane FSE vs bitpack byte counts.
+// ---------------------------------------------------------------------------
+
+/// Per-plane measurement from [`probe_block`] (num-bitpack stage-0 spike).
+#[derive(Clone, Debug)]
+pub struct PlaneProbe {
+    /// Index of the plane within the chosen stride.
+    pub plane_idx: usize,
+    /// Untransformed plane length in bytes.
+    pub plane_len: usize,
+    /// Transform the shipping FSE gate chose for this plane.
+    pub fse_xf: PlaneXf,
+    /// Gated-best FSE size (exactly what ships today).
+    pub fse_bytes: usize,
+    /// Bitpack size of the FSE-chosen transform (front-end held identical).
+    pub bp_same_bytes: usize,
+    /// Bitpack size with its own transform gating (min over Raw/Delta/DeltaZigzag).
+    pub bp_gated_bytes: usize,
+    /// Transform the bitpack gate chose.
+    pub bp_gated_xf: PlaneXf,
+}
+
+/// Block-level probe result: the stride the shipping encoder would pick for
+/// this block (0 = STORE fallback, no planes), its per-plane measurements, and
+/// the raw remainder length.
+#[derive(Clone, Debug)]
+pub struct BlockProbe {
+    /// Chosen stride (0 means the block would be STORED raw).
+    pub stride: usize,
+    /// One entry per plane of the chosen stride.
+    pub planes: Vec<PlaneProbe>,
+    /// Raw remainder bytes (`len % stride`).
+    pub remainder_len: usize,
+}
+
+/// Run the Num front-end on one block exactly as [`encode`] does (stride
+/// sweep plus per-plane FSE-gated transform), then measure each plane of the
+/// winning stride under both entropy stages. Probe-only; not on the wire.
+pub fn probe_block(input: &[u8]) -> BlockProbe {
+    // Replicate encode()'s stride selection: total gated FSE body size.
+    let mut best: Option<(usize, usize)> = None; // (stride, body_len)
+    for &s in &CANDIDATE_STRIDES {
+        if s > input.len() {
+            continue;
+        }
+        let (planes, remainder) = split_planes(input, s);
+        let mut body = 1 + remainder.len();
+        for plane in &planes {
+            let (_, enc) = encode_plane_gated(plane);
+            body += 5 + enc.len();
+        }
+        if best.is_none_or(|(_, b)| body < b) {
+            best = Some((s, body));
+        }
+    }
+    let store_len = 1 + input.len();
+    let stride = match best {
+        Some((s, body)) if body < store_len => s,
+        _ => {
+            return BlockProbe {
+                stride: 0,
+                planes: Vec::new(),
+                remainder_len: input.len(),
+            };
+        }
+    };
+
+    let (planes, remainder) = split_planes(input, stride);
+    let mut probes = Vec::with_capacity(stride);
+    for (plane_idx, plane) in planes.iter().enumerate() {
+        let (fse_xf, fse_enc) = encode_plane_gated(plane);
+        let bp_same_bytes = bitpack::encode(&apply_fwd(plane, fse_xf)).len();
+        let mut bp_gated_xf = PlaneXf::Raw;
+        let mut bp_gated_bytes = usize::MAX;
+        for xf in [PlaneXf::Raw, PlaneXf::Delta, PlaneXf::DeltaZigzag] {
+            let n = bitpack::encode(&apply_fwd(plane, xf)).len();
+            if n < bp_gated_bytes {
+                bp_gated_bytes = n;
+                bp_gated_xf = xf;
+            }
+        }
+        probes.push(PlaneProbe {
+            plane_idx,
+            plane_len: plane.len(),
+            fse_xf,
+            fse_bytes: fse_enc.len(),
+            bp_same_bytes,
+            bp_gated_bytes,
+            bp_gated_xf,
+        });
+    }
+    BlockProbe {
+        stride,
+        planes: probes,
+        remainder_len: remainder.len(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public codec API
 // ---------------------------------------------------------------------------
 
@@ -618,6 +820,74 @@ mod tests {
         bad_tag2.extend_from_slice(&(1u32).to_le_bytes());
         bad_tag2.push(0);
         assert_eq!(decode(&bad_tag2, 2), Err(PzError::InvalidInput));
+    }
+
+    // -- Stage-0 spike: bitpack coder must be an exact inverse on plane data. --
+
+    #[test]
+    fn bitpack_roundtrip_adversarial_and_fuzz() {
+        let mut inputs = adversarial();
+        let mut rng = XorShift::new();
+        for _ in 0..300 {
+            let len = (rng.next() % 700) as usize;
+            // Mix of high-entropy and sparse (low-bit-only) bytes.
+            let mask = if rng.next().is_multiple_of(2) {
+                0xff
+            } else {
+                0x03
+            };
+            let v: Vec<u8> = (0..len).map(|_| (rng.next() as u8) & mask).collect();
+            inputs.push(v);
+        }
+        for data in &inputs {
+            let enc = bitpack::encode(data);
+            let dec = bitpack::decode(&enc, data.len()).expect("bitpack decode");
+            assert_eq!(&dec, data, "bitpack roundtrip FAIL len={}", data.len());
+            // Worst case per group (even a partial tail group) is one bitmap
+            // byte plus all 8 bitplane words: 33 bytes per ceil(len/32) groups.
+            assert!(enc.len() <= data.len().div_ceil(32) * 33);
+        }
+        // Malformed input must error, never panic.
+        assert_eq!(bitpack::decode(&[], 5), Err(PzError::InvalidInput));
+        assert_eq!(
+            bitpack::decode(&[0xff, 1, 2], 5),
+            Err(PzError::InvalidInput)
+        );
+        assert_eq!(bitpack::decode(&[0, 0], 5), Err(PzError::InvalidInput));
+    }
+
+    /// Round-trip on *real* plane data: run the actual Num front-end (stride
+    /// sweep + per-plane gated transform) on structured record data and check
+    /// the bitpack coder exactly inverts every transformed plane.
+    #[test]
+    fn bitpack_roundtrip_real_front_end_planes() {
+        // sao-like 28-byte records + a 16-bit LE ramp, as in the codec tests.
+        let mut rec28 = Vec::new();
+        for i in 0u32..1500 {
+            for c in 0..28u32 {
+                rec28.push(((i.wrapping_mul(c + 1)) >> (c % 5)) as u8);
+            }
+        }
+        let le16: Vec<u8> = (0u16..4000).flat_map(|i| i.to_le_bytes()).collect();
+
+        for data in [&rec28, &le16] {
+            let probe = probe_block(data);
+            assert_ne!(probe.stride, 0, "front-end should not STORE this input");
+            let (planes, _) = split_planes(data, probe.stride);
+            for (p, plane) in probe.planes.iter().zip(&planes) {
+                for xf in [PlaneXf::Raw, PlaneXf::Delta, PlaneXf::DeltaZigzag] {
+                    let t = apply_fwd(plane, xf);
+                    let enc = bitpack::encode(&t);
+                    let dec = bitpack::decode(&enc, t.len()).expect("decode");
+                    assert_eq!(dec, t, "plane {} xf {:?} roundtrip FAIL", p.plane_idx, xf);
+                }
+                // Probe sizes must match a fresh encode of the same plane.
+                assert_eq!(
+                    p.bp_same_bytes,
+                    bitpack::encode(&apply_fwd(plane, p.fse_xf)).len()
+                );
+            }
+        }
     }
 
     #[test]
