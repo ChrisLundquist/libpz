@@ -44,6 +44,10 @@ pub(crate) struct StageBlock {
 pub(crate) struct StageMetadata {
     /// BWT primary index (Bw pipeline, set by BWT stage).
     pub bwt_primary_index: Option<u32>,
+    /// Bw: multi-cursor iBWT start samples ([`crate::bwt::IBWT_WIRE_SAMPLES`]
+    /// u32s, set by the BWT stage when the block is in the sampled size range).
+    /// Serialized into the block header behind [`BW_CURSORS_FLAG`].
+    pub bwt_cursor_samples: Option<Vec<u32>>,
     /// Bijective BWT factor lengths (Bbw pipeline, set by BBWT stage).
     pub bbwt_factor_lengths: Option<Vec<usize>>,
     /// Length of data before entropy coding (RLE output for Bw/Bbw, LZ output for LZ pipelines).
@@ -836,8 +840,9 @@ pub(crate) fn stage_bwt_encode(
     mut block: StageBlock,
     options: &CompressOptions,
 ) -> PzResult<StageBlock> {
-    let bwt_result = super::bwt_encode_with_backend(&block.data, options)?;
+    let (bwt_result, cursor_samples) = super::bwt_encode_with_backend(&block.data, options)?;
     block.metadata.bwt_primary_index = Some(bwt_result.primary_index);
+    block.metadata.bwt_cursor_samples = cursor_samples;
     block.data = bwt_result.data;
     Ok(block)
 }
@@ -852,6 +857,14 @@ pub(crate) fn stage_mtf_encode(mut block: StageBlock) -> PzResult<StageBlock> {
 /// RUNA/RUNB ([`crate::zrle`]) rather than the legacy [`crate::rle`]. The field
 /// itself is a block length (≪ 2^31), so the top bit is always free to repurpose.
 pub(crate) const BW_ZRLE_FLAG: u32 = 1 << 31;
+
+/// High bit of the Bw `primary_index` header field: set when the header
+/// carries [`crate::bwt::IBWT_WIRE_SAMPLES`] u32 multi-cursor iBWT start
+/// samples between the `rle_len` field and the FSE payload. The primary index
+/// itself is a position within a block (≪ 2^31), so the top bit is always
+/// free to repurpose. Absent flag = legacy stream, decoded with the serial
+/// single-cursor chase.
+pub(crate) const BW_CURSORS_FLAG: u32 = 1 << 31;
 
 /// Bw stage 2: zero-run coding of the MTF output.
 ///
@@ -874,6 +887,9 @@ pub(crate) fn stage_rle_encode(mut block: StageBlock) -> PzResult<StageBlock> {
 }
 
 /// Bw stage 3: FSE encoding + serialization.
+///
+/// Header: `[primary_index | BW_CURSORS_FLAG?: u32] [rle_len | BW_ZRLE_FLAG?: u32]
+/// [cursor samples: u32 × IBWT_WIRE_SAMPLES, iff BW_CURSORS_FLAG] [fse_data...]`
 pub(crate) fn stage_fse_encode_bw(mut block: StageBlock) -> PzResult<StageBlock> {
     let primary_index = block
         .metadata
@@ -883,16 +899,30 @@ pub(crate) fn stage_fse_encode_bw(mut block: StageBlock) -> PzResult<StageBlock>
         .metadata
         .pre_entropy_len
         .ok_or(PzError::InvalidInput)?;
+    let cursor_samples = block
+        .metadata
+        .bwt_cursor_samples
+        .take()
+        .filter(|s| s.len() == crate::bwt::IBWT_WIRE_SAMPLES);
     let fse_data = fse::encode_best(&block.data);
 
+    let mut primary_field = primary_index;
+    if cursor_samples.is_some() {
+        primary_field |= BW_CURSORS_FLAG;
+    }
     let mut len_field = rle_len as u32;
     if block.metadata.bw_zrle_used {
         len_field |= BW_ZRLE_FLAG;
     }
 
     let mut output = Vec::new();
-    output.extend_from_slice(&primary_index.to_le_bytes());
+    output.extend_from_slice(&primary_field.to_le_bytes());
     output.extend_from_slice(&len_field.to_le_bytes());
+    if let Some(samples) = &cursor_samples {
+        for &s in samples {
+            output.extend_from_slice(&s.to_le_bytes());
+        }
+    }
     output.extend_from_slice(&fse_data);
 
     block.data = output;

@@ -268,12 +268,31 @@ fn decompress_block_bw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
         return Err(PzError::InvalidInput);
     }
 
-    let primary_index = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let primary_field = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let primary_index = primary_field & !BW_CURSORS_FLAG;
     let len_field = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
     let zrle_used = (len_field & BW_ZRLE_FLAG) != 0;
     let rle_len = (len_field & !BW_ZRLE_FLAG) as usize;
 
-    let entropy_data = &payload[8..];
+    // Multi-cursor iBWT start samples (versioned: legacy blocks lack the flag
+    // and decode through the serial single-cursor chase).
+    let mut offset = 8usize;
+    let cursor_samples = if (primary_field & BW_CURSORS_FLAG) != 0 {
+        let end = offset + 4 * bwt::IBWT_WIRE_SAMPLES;
+        if payload.len() < end {
+            return Err(PzError::InvalidInput);
+        }
+        let samples: Vec<u32> = payload[offset..end]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        offset = end;
+        Some(samples)
+    } else {
+        None
+    };
+
+    let entropy_data = &payload[offset..];
 
     // Stage 1: FSE decoder
     let rle_data = fse::decode(entropy_data, rle_len)?;
@@ -289,8 +308,11 @@ fn decompress_block_bw(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     // Stage 3: Inverse MTF
     let bwt_data = mtf::decode(&mtf_data);
 
-    // Stage 4: Inverse BWT
-    let output = bwt::decode(&bwt_data, primary_index)?;
+    // Stage 4: Inverse BWT (multi-cursor when the block carries samples).
+    let output = match &cursor_samples {
+        Some(samples) => bwt::decode_with_samples(&bwt_data, primary_index, samples)?,
+        None => bwt::decode(&bwt_data, primary_index)?,
+    };
 
     if output.len() != orig_len {
         return Err(PzError::InvalidInput);

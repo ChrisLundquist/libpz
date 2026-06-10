@@ -457,3 +457,116 @@ fn test_bijective_small_factors() {
         assert_eq!(total, input.len());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Multi-cursor inverse BWT (K=8 interleaved LF cursors)
+// ---------------------------------------------------------------------------
+
+/// Deterministic mixed-content test data: repetitive text + a periodic binary
+/// section + an LCG noise tail, sized exactly to `len`.
+fn cursor_test_data(len: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(len);
+    while data.len() < len / 2 {
+        data.extend_from_slice(b"the quick brown fox jumps over the lazy dog. ");
+    }
+    let mut state = 0x9E3779B97F4A7C15u64;
+    while data.len() < len {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        data.push((state >> 33) as u8 & 0x3F);
+    }
+    data.truncate(len);
+    data
+}
+
+#[test]
+fn test_multi_cursor_roundtrip_sizes() {
+    // Byte-exact equality of the multi-cursor decode against both the input
+    // and the serial decoder, across the size edge cases: below K, exactly K,
+    // around the sampling gate, non-divisible-by-K, and a full default block.
+    let sizes = [
+        8usize,
+        9,
+        63,
+        IBWT_MIN_CURSOR_BLOCK - 1,
+        IBWT_MIN_CURSOR_BLOCK,
+        IBWT_MIN_CURSOR_BLOCK + 1,
+        65_521, // prime: every segment boundary lands mid-byte-pattern
+        1 << 20,
+        (1 << 20) + 3,
+    ];
+    for &n in &sizes {
+        let input = cursor_test_data(n);
+        let (result, samples) = encode_with_cursor_samples(&input).unwrap();
+        if n < IBWT_MIN_CURSOR_BLOCK {
+            assert!(samples.is_none(), "n={n}: unexpected samples");
+            continue;
+        }
+        let samples = samples.unwrap_or_else(|| panic!("n={n}: missing samples"));
+        assert_eq!(samples.len(), IBWT_WIRE_SAMPLES);
+
+        let serial = decode(&result.data, result.primary_index).unwrap();
+        let multi = decode_with_samples(&result.data, result.primary_index, &samples).unwrap();
+        assert!(multi == input, "n={n}: multi-cursor decode != input");
+        assert!(serial == multi, "n={n}: serial and multi-cursor disagree");
+    }
+}
+
+#[test]
+fn test_multi_cursor_all_zeros() {
+    let input = vec![0u8; 100_000];
+    let (result, samples) = encode_with_cursor_samples(&input).unwrap();
+    let samples = samples.unwrap();
+    let decoded = decode_with_samples(&result.data, result.primary_index, &samples).unwrap();
+    assert!(decoded == input);
+}
+
+#[test]
+fn test_cursor_samples_sa_and_chase_agree() {
+    // The two encode-time derivations (suffix-array readoff for the CPU path,
+    // serial-chase for the GPU path) must produce identical samples.
+    for n in [IBWT_MIN_CURSOR_BLOCK, 65_521, 1 << 17] {
+        let input = cursor_test_data(n);
+        let (result, sa_samples) = encode_with_cursor_samples(&input).unwrap();
+        let sa_samples = sa_samples.unwrap();
+        let chase_samples = derive_cursor_samples(&result.data, result.primary_index).unwrap();
+        assert_eq!(sa_samples, chase_samples, "n={n}");
+    }
+}
+
+#[test]
+fn test_multi_cursor_invalid_samples() {
+    let input = cursor_test_data(IBWT_MIN_CURSOR_BLOCK);
+    let (result, samples) = encode_with_cursor_samples(&input).unwrap();
+    let samples = samples.unwrap();
+    let n = result.data.len();
+
+    // Wrong sample count.
+    assert!(decode_with_samples(&result.data, result.primary_index, &samples[..3]).is_err());
+    // Out-of-range sample value.
+    let mut bad = samples.clone();
+    bad[2] = n as u32;
+    assert!(decode_with_samples(&result.data, result.primary_index, &bad).is_err());
+    // Out-of-range primary index.
+    assert!(decode_with_samples(&result.data, n as u32, &samples).is_err());
+    // Empty input is fine (0 bytes written).
+    assert_eq!(
+        decode_with_samples(&[], 0, &samples).unwrap(),
+        Vec::<u8>::new()
+    );
+}
+
+#[test]
+fn test_multi_cursor_small_block_fallback() {
+    // Blocks below IBWT_CURSORS (or any block, really) must still decode
+    // correctly through decode_with_samples' serial fallback when handed
+    // syntactically valid samples — foreign streams may emit them.
+    for n in [1usize, 2, 7] {
+        let input = cursor_test_data(n.max(1));
+        let result = encode(&input).unwrap();
+        let fake = vec![0u32; IBWT_WIRE_SAMPLES];
+        let decoded = decode_with_samples(&result.data, result.primary_index, &fake).unwrap();
+        assert!(decoded == input, "n={n}");
+    }
+}

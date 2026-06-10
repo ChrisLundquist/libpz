@@ -170,6 +170,252 @@ pub fn decode_to_buf(bwt: &[u8], primary_index: u32, output: &mut [u8]) -> PzRes
     Ok(n)
 }
 
+// ---------------------------------------------------------------------------
+// Multi-cursor inverse BWT (K interleaved LF cursors)
+// ---------------------------------------------------------------------------
+//
+// The serial LF chase is latency-bound: every step is a dependent load into a
+// block-sized working set. K interleaved cursors — each decoding its own 1/K
+// output segment backwards — convert that latency into memory-level
+// parallelism for a ~5.5x chase speedup (measured on M5 Max; see
+// docs/design-docs/ibwt-cursor-findings.md). The cursor start states cannot be
+// derived cheaply at decode time (the derivation *is* a full serial chase), so
+// the encoder computes them from the suffix array — free at encode time — and
+// stores them in the block header.
+
+/// Number of interleaved LF cursors used by the multi-cursor inverse BWT.
+///
+/// K=8 is the measured sweet spot on aarch64: near-linear MLP scaling from 1
+/// to 8 cursors, with a reproducible register-spill cliff at K=16/32 (the
+/// cursor state exceeds the GPR file and every dependent step pays a
+/// store+load). Do not raise without re-measuring single-thread decode.
+pub const IBWT_CURSORS: usize = 8;
+
+/// Number of cursor start samples stored on the wire per block: one per
+/// output segment except the last, whose start state is the primary index
+/// (already in the header).
+pub const IBWT_WIRE_SAMPLES: usize = IBWT_CURSORS - 1;
+
+/// Bit position of the BWT byte in a packed LF word: `(byte << 24) | lf`.
+/// Packing makes each chase step a single dependent load instead of two.
+const LF_PACK_SHIFT: u32 = 24;
+const LF_PACK_MASK: u32 = (1 << LF_PACK_SHIFT) - 1;
+
+/// Largest block the packed-LF multi-cursor decoder supports: LF values must
+/// fit in 24 bits.
+pub const IBWT_MAX_CURSOR_BLOCK: usize = 1 << LF_PACK_SHIFT;
+
+/// Smallest block for which the encoder emits cursor samples. Below this the
+/// serial chase is cache-resident and fast, and the 28-byte wire cost is not
+/// worth carrying.
+pub const IBWT_MIN_CURSOR_BLOCK: usize = 4096;
+
+/// Whether the encoder should emit cursor samples for a block of length `n`.
+fn wants_cursor_samples(n: usize) -> bool {
+    (IBWT_MIN_CURSOR_BLOCK..=IBWT_MAX_CURSOR_BLOCK).contains(&n)
+}
+
+/// Segment end boundaries for the K-cursor chase over a block of length `n`:
+/// cursor `j` writes output range `[ends[j-1], ends[j])` (with `ends[-1]` = 0)
+/// backwards. Boundary `j` is `(j+1)*n/K`, so segment lengths differ by at
+/// most one for any `n` — no divisibility requirement.
+fn cursor_segment_ends(n: usize) -> [usize; IBWT_CURSORS] {
+    let mut ends = [0usize; IBWT_CURSORS];
+    for (j, e) in ends.iter_mut().enumerate() {
+        *e = (j + 1) * n / IBWT_CURSORS;
+    }
+    ends
+}
+
+/// Forward BWT that also derives the multi-cursor decode samples from the
+/// suffix array.
+///
+/// The serial inverse chase writes output position `t` from the BWT row `i`
+/// with `sa[i] == (t + 1) % n`, so the start state of the cursor whose segment
+/// ends at boundary `e` is the row with `sa[i] == e`. Reading that off the
+/// suffix array is free at encode time; deriving it at decode time costs a
+/// full serial chase (measured — it defeats the multi-cursor win).
+///
+/// Returns `(result, samples)`; `samples` is `None` when the block length is
+/// outside `[IBWT_MIN_CURSOR_BLOCK, IBWT_MAX_CURSOR_BLOCK]`.
+pub fn encode_with_cursor_samples(input: &[u8]) -> Option<(BwtResult, Option<Vec<u32>>)> {
+    if input.is_empty() {
+        return None;
+    }
+    let n = input.len();
+    if !wants_cursor_samples(n) {
+        return encode(input).map(|r| (r, None));
+    }
+
+    let sa = build_suffix_array(input);
+    let ends = cursor_segment_ends(n);
+    let mut samples = vec![0u32; IBWT_WIRE_SAMPLES];
+    let mut bwt = Vec::with_capacity(n);
+    let mut primary_index = 0u32;
+
+    for (i, &sa_val) in sa.iter().enumerate() {
+        if sa_val == 0 {
+            primary_index = i as u32;
+            bwt.push(input[n - 1]);
+        } else {
+            bwt.push(input[sa_val - 1]);
+        }
+        // `ends[..IBWT_WIRE_SAMPLES]` is strictly increasing for n >= K.
+        if let Ok(j) = ends[..IBWT_WIRE_SAMPLES].binary_search(&sa_val) {
+            samples[j] = i as u32;
+        }
+    }
+
+    Some((
+        BwtResult {
+            data: bwt,
+            primary_index,
+        },
+        Some(samples),
+    ))
+}
+
+/// Derive the multi-cursor samples from an already-computed BWT by running a
+/// full serial LF chase.
+///
+/// Encode-time fallback for backends that don't expose the suffix array (the
+/// GPU BWT). Never call this at decode time — the chase is exactly the serial
+/// bottleneck the cursors exist to remove.
+///
+/// Returns `None` when the block length is outside the sampled range or the
+/// primary index is invalid.
+pub fn derive_cursor_samples(bwt: &[u8], primary_index: u32) -> Option<Vec<u32>> {
+    let n = bwt.len();
+    if !wants_cursor_samples(n) || primary_index as usize >= n {
+        return None;
+    }
+
+    let mut counts = [0u32; 256];
+    for &byte in bwt {
+        counts[byte as usize] += 1;
+    }
+    let mut running = [0u32; 256];
+    let mut sum = 0u32;
+    for (c, &count) in counts.iter().enumerate() {
+        running[c] = sum;
+        sum += count;
+    }
+    let mut lf = vec![0u32; n];
+    for (i, &byte) in bwt.iter().enumerate() {
+        lf[i] = running[byte as usize];
+        running[byte as usize] += 1;
+    }
+
+    let ends = cursor_segment_ends(n);
+    let mut samples = vec![0u32; IBWT_WIRE_SAMPLES];
+    let mut idx = primary_index as usize;
+    for t in (0..n).rev() {
+        if let Ok(j) = ends[..IBWT_WIRE_SAMPLES].binary_search(&(t + 1)) {
+            samples[j] = idx as u32;
+        }
+        idx = lf[idx] as usize;
+    }
+    Some(samples)
+}
+
+/// Multi-cursor inverse BWT: like [`decode`], but uses encode-time cursor
+/// start samples to run [`IBWT_CURSORS`] interleaved LF cursors over a packed
+/// LF array (~2.6x single-thread end-to-end vs the serial chase).
+pub fn decode_with_samples(bwt: &[u8], primary_index: u32, samples: &[u32]) -> PzResult<Vec<u8>> {
+    let mut output = vec![0u8; bwt.len()];
+    decode_with_samples_to_buf(bwt, primary_index, samples, &mut output)?;
+    Ok(output)
+}
+
+/// Multi-cursor inverse BWT into a pre-allocated output buffer.
+///
+/// `samples` must hold [`IBWT_WIRE_SAMPLES`] start states (from
+/// [`encode_with_cursor_samples`] or [`derive_cursor_samples`]). Blocks
+/// outside the multi-cursor range fall back to the serial chase, which is
+/// correct for any block (the samples are ignored).
+///
+/// Returns the number of bytes written.
+pub fn decode_with_samples_to_buf(
+    bwt: &[u8],
+    primary_index: u32,
+    samples: &[u32],
+    output: &mut [u8],
+) -> PzResult<usize> {
+    if bwt.is_empty() {
+        return Ok(0);
+    }
+    let n = bwt.len();
+    if primary_index as usize >= n {
+        return Err(PzError::InvalidInput);
+    }
+    if output.len() < n {
+        return Err(PzError::BufferTooSmall);
+    }
+    if samples.len() != IBWT_WIRE_SAMPLES || samples.iter().any(|&s| s as usize >= n) {
+        return Err(PzError::InvalidInput);
+    }
+    if !(IBWT_CURSORS..=IBWT_MAX_CURSOR_BLOCK).contains(&n) {
+        // Our encoder never emits samples for such blocks, but a foreign
+        // stream might; the serial chase is always correct.
+        return decode_to_buf(bwt, primary_index, output);
+    }
+
+    // Build the packed LF array: (bwt_byte << 24) | lf, one dependent load
+    // per chase step. Valid because n <= 2^24.
+    let mut counts = [0u32; 256];
+    for &byte in bwt {
+        counts[byte as usize] += 1;
+    }
+    let mut running = [0u32; 256];
+    let mut sum = 0u32;
+    for (c, &count) in counts.iter().enumerate() {
+        running[c] = sum;
+        sum += count;
+    }
+    let mut packed = vec![0u32; n];
+    for (p, &byte) in packed.iter_mut().zip(bwt) {
+        *p = ((byte as u32) << LF_PACK_SHIFT) | running[byte as usize];
+        running[byte as usize] += 1;
+    }
+
+    let ends = cursor_segment_ends(n);
+    let mut idx = [0usize; IBWT_CURSORS];
+    for (c, &s) in idx[..IBWT_WIRE_SAMPLES].iter_mut().zip(samples) {
+        *c = s as usize;
+    }
+    idx[IBWT_CURSORS - 1] = primary_index as usize;
+
+    // Interleaved phase: every segment has at least l_min = n/K positions.
+    // The K dependent load chains run concurrently (MLP), which is the win.
+    let out = &mut output[..n];
+    let l_min = n / IBWT_CURSORS;
+    for step in 0..l_min {
+        for (j, cursor) in idx.iter_mut().enumerate() {
+            // SAFETY: every cursor value is < n — the initial values are
+            // validated above and every successor is an LF value, which is
+            // < n by construction of `packed`. The write index
+            // `ends[j] - 1 - step` stays inside segment j because
+            // step < l_min <= segment length.
+            unsafe {
+                let v = *packed.get_unchecked(*cursor);
+                *out.get_unchecked_mut(ends[j] - 1 - step) = (v >> LF_PACK_SHIFT) as u8;
+                *cursor = (v & LF_PACK_MASK) as usize;
+            }
+        }
+    }
+
+    // Ragged tail: segment lengths are l_min or l_min + 1, so at most one
+    // position per cursor remains (the segment's first output byte).
+    for j in 0..IBWT_CURSORS {
+        let start = if j == 0 { 0 } else { ends[j - 1] };
+        if ends[j] - start > l_min {
+            out[start] = (packed[idx[j]] >> LF_PACK_SHIFT) as u8;
+        }
+    }
+
+    Ok(n)
+}
+
 /// Build a rotation suffix array for the input using SA-IS.
 ///
 /// Returns an array where sa[i] is the starting position of the i-th

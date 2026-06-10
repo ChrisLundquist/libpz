@@ -1510,3 +1510,114 @@ fn test_num_corpus_ratio_regression() {
         );
     }
 }
+
+// --- Bw multi-cursor iBWT wire format (BW_CURSORS_FLAG) ---
+
+/// Regenerates the exact input that `testdata/bw-legacy-master-698193a.pz`
+/// was compressed from (deterministic integer pattern, 1.5 MiB = 2 blocks).
+fn bw_legacy_fixture_input() -> Vec<u8> {
+    (0..1_572_864usize)
+        .map(|i| ((((i % 251) * (i % 241)) >> 3) % 64 + 32) as u8)
+        .collect()
+}
+
+#[test]
+fn test_bw_legacy_container_fixture_decodes() {
+    // Backward compatibility: this container was produced by the
+    // pre-multi-cursor encoder (master @ 698193a, `pz -p bw`). Its blocks
+    // carry no BW_CURSORS_FLAG, so the decoder must take the legacy serial
+    // single-cursor path and still round-trip byte-exactly.
+    let fixture = include_bytes!("testdata/bw-legacy-master-698193a.pz");
+    let expected = bw_legacy_fixture_input();
+    let decoded = decompress(fixture).expect("legacy bw container must decode");
+    assert!(decoded == expected, "legacy bw fixture decode mismatch");
+}
+
+#[test]
+fn test_bw_legacy_block_payload_decodes() {
+    // Same compatibility guarantee at block level, without the fixture:
+    // running the encode stages with the cursor samples stripped reproduces
+    // the legacy header byte-for-byte (no flag, no samples).
+    let input = bw_legacy_fixture_input()[..200_000].to_vec();
+    let opts = CompressOptions::default();
+
+    let block = StageBlock {
+        block_index: 0,
+        original_len: input.len(),
+        data: input.clone(),
+        streams: None,
+        metadata: StageMetadata::default(),
+    };
+    let mut block = stages::stage_bwt_encode(block, &opts).unwrap();
+    assert!(block.metadata.bwt_cursor_samples.is_some());
+    block.metadata.bwt_cursor_samples = None; // what the old encoder wrote
+    let block = stages::stage_mtf_encode(block).unwrap();
+    let block = stages::stage_rle_encode(block).unwrap();
+    let block = stages::stage_fse_encode_bw(block).unwrap();
+    let payload = block.data;
+
+    // Legacy header: no cursor flag on the primary_index field.
+    assert_eq!(payload[3] & 0x80, 0, "legacy payload must not set the flag");
+    let decoded = decompress_block(
+        &payload,
+        Pipeline::Bw,
+        input.len(),
+        &DecompressOptions::default(),
+    )
+    .unwrap();
+    assert!(decoded == input, "legacy block payload decode mismatch");
+}
+
+#[test]
+fn test_bw_cursor_samples_on_wire() {
+    let input = bw_legacy_fixture_input()[..100_000].to_vec();
+    let opts = CompressOptions::default();
+    let dopts = DecompressOptions::default();
+
+    // Sampled block: flag set (high bit of the primary_index LE field),
+    // header is 28 bytes (IBWT_WIRE_SAMPLES u32s) longer, and round-trips.
+    let payload = compress_block(&input, Pipeline::Bw, &opts).unwrap();
+    assert_ne!(payload[3] & 0x80, 0, "block >= 4096 must carry samples");
+    let decoded = decompress_block(&payload, Pipeline::Bw, input.len(), &dopts).unwrap();
+    assert!(decoded == input);
+
+    // Truncating the samples must fail cleanly, not mis-decode.
+    assert!(decompress_block(&payload[..20], Pipeline::Bw, input.len(), &dopts).is_err());
+
+    // Below the gate: no flag, legacy-identical header.
+    let small = &input[..1024];
+    let payload = compress_block(small, Pipeline::Bw, &opts).unwrap();
+    assert_eq!(payload[3] & 0x80, 0, "block < 4096 must stay legacy");
+    let decoded = decompress_block(&payload, Pipeline::Bw, small.len(), &dopts).unwrap();
+    assert!(decoded == small);
+}
+
+#[test]
+fn test_bw_multicursor_edge_size_roundtrips() {
+    // Full-pipeline round-trips across the multi-cursor edge cases: tiny
+    // blocks (< K cursors), the sampling gate boundary, sizes not divisible
+    // by K, multi-block inputs, and degenerate all-zeros data.
+    let mut cases: Vec<Vec<u8>> = vec![
+        vec![b'x'],                                   // single byte
+        b"abcdefg".to_vec(),                          // n < K
+        bw_legacy_fixture_input()[..4095].to_vec(),   // just under the gate
+        bw_legacy_fixture_input()[..4096].to_vec(),   // exactly at the gate
+        bw_legacy_fixture_input()[..4097].to_vec(),   // just over, n % 8 = 1
+        bw_legacy_fixture_input()[..65_521].to_vec(), // prime length
+        vec![0u8; 1 << 20],                           // all-zeros full block
+    ];
+    // Multi-block, second block ragged: 1 MiB + 3 bytes.
+    let mut two_blocks = bw_legacy_fixture_input();
+    two_blocks.truncate((1 << 20) + 3);
+    cases.push(two_blocks);
+
+    for input in &cases {
+        let compressed = compress(input, Pipeline::Bw).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert!(
+            decompressed == *input,
+            "bw multi-cursor round-trip mismatch (len {})",
+            input.len()
+        );
+    }
+}
