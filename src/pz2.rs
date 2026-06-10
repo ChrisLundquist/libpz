@@ -1700,6 +1700,98 @@ pub fn spike_g32_decode_words_with_table(
     decode_lits_g32_best(table, words, out)
 }
 
+/// Spike-only: one parsed sequence-code lane of a pz2 block (see
+/// [`spike_seq_section`]).
+#[doc(hidden)]
+pub enum SpikeSeqLane {
+    /// CODES_CONST: every sequence uses this code.
+    Const(u8),
+    /// CODES_HUFF: flat 2048-entry decode table + the lane's bitstream.
+    Huff { table: Vec<u16>, bits: Vec<u8> },
+}
+
+/// Spike-only: the fully parsed sequence section of a pz2 block, in GPU
+/// upload form (flat tables, raw bitstreams). Lanes are [ll, of, ml].
+#[doc(hidden)]
+pub struct SpikeSeqSection {
+    pub seq_count: u32,
+    pub lit_count: u32,
+    pub lanes: [SpikeSeqLane; 3],
+    pub extras: Vec<u8>,
+}
+
+/// Spike-only: parse a SHIPPED pz2 block's sequence section into GPU upload
+/// form for the stage-3 Metal splice probe. The sequence wire is identical
+/// between pz2 and G32 blocks.
+#[doc(hidden)]
+pub fn spike_seq_section(block: &[u8]) -> PzResult<SpikeSeqSection> {
+    let mut p = block;
+    let seq_count = take_u32(&mut p)?;
+    let lit_total = take_u32(&mut p)? as usize;
+    // Skip the literal section.
+    let mode = take(&mut p, 1)?[0];
+    match mode {
+        LIT_RAW => {
+            take(&mut p, lit_total)?;
+        }
+        LIT_HUFF => {
+            take(&mut p, 128)?;
+            let mut lane_lens = [0usize; NUM_LANES];
+            for l in lane_lens.iter_mut() {
+                *l = take_u32(&mut p)? as usize;
+            }
+            for &l in lane_lens.iter() {
+                take(&mut p, l)?;
+            }
+        }
+        _ => return Err(PzError::InvalidInput),
+    }
+
+    let mut parse_lane = |p: &mut &[u8]| -> PzResult<SpikeSeqLane> {
+        let mode = take(p, 1)?[0];
+        match mode {
+            CODES_CONST => Ok(SpikeSeqLane::Const(take(p, 1)?[0])),
+            CODES_HUFF => {
+                let packed = take(p, 16)?;
+                let mut lengths = [0u8; 256];
+                for i in 0..16 {
+                    lengths[2 * i] = packed[i] & 0xF;
+                    lengths[2 * i + 1] = packed[i] >> 4;
+                }
+                let table = build_decode_table(&lengths)?.to_vec();
+                let lane_len = take_u32(p)? as usize;
+                let bits = take(p, lane_len)?.to_vec();
+                Ok(SpikeSeqLane::Huff { table, bits })
+            }
+            _ => Err(PzError::InvalidInput),
+        }
+    };
+
+    if seq_count == 0 {
+        return Ok(SpikeSeqSection {
+            seq_count,
+            lit_count: lit_total as u32,
+            lanes: [
+                SpikeSeqLane::Const(0),
+                SpikeSeqLane::Const(0),
+                SpikeSeqLane::Const(0),
+            ],
+            extras: Vec::new(),
+        });
+    }
+    let ll = parse_lane(&mut p)?;
+    let of = parse_lane(&mut p)?;
+    let ml = parse_lane(&mut p)?;
+    let extra_len = take_u32(&mut p)? as usize;
+    let extras = take(&mut p, extra_len)?.to_vec();
+    Ok(SpikeSeqSection {
+        seq_count,
+        lit_count: lit_total as u32,
+        lanes: [ll, of, ml],
+        extras,
+    })
+}
+
 /// Transcode a shipped pz2 block into the G32 literal layout. The Huffman
 /// table (packed code lengths) and the entire sequence section are copied
 /// verbatim; only the literal bitstream framing changes, so the size delta
