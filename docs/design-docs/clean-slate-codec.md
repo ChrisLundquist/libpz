@@ -409,14 +409,26 @@ segment tier earning its place in the format.
   copies split). Naive per-block priming is ruled out by arithmetic:
   94 blocks × 16 MiB ≈ 1.5 GB of memcpy ≈ +15-30 ms — would double the
   16.8 ms decode wall.
-- **Encode (the real blocker):** the spike re-tokenizes dict+block per
-  block (9× work at 16 MiB — fine for measurement, unshippable). Production
-  needs a **frozen shared match-finder**: build hash chains over the dict
-  once (immutable, `Arc`-shared head/prev arrays in dict coordinates),
-  each worker holds a `dict‖block` arena (dict copied once per worker, so
-  frozen-table coordinates match and compares never need two-region
-  logic) and parses starting at `dict_len` — which also eliminates the
-  spike's token-skipping/straddle handling. `find_best` grows one extra
-  chain walk over the frozen tables after the block-local walk.
-- **Measured payoff (per-segment, 16 MiB dict):** blob 31.04% → **30.48%**,
-  ~0.9pp under pzstd-3 (31.4%), at unchanged decode parallelism.
+- **Encode: the frozen shared match-finder is BUILT and measured**
+  (`lz77::FrozenDict` + `lzseq::tokenize_with_dict` +
+  `pz2::encode_with_frozen_dict`): dict chains built once (immutable,
+  `Arc`-shared, dict-relative coordinates), each worker holds a
+  `dict‖block` arena (so frozen coordinates match and compares read one
+  buffer) and parses starting at `dict_len` — no dict re-parse, no
+  token-skipping/straddle handling. `find_best` grows one extra chain
+  walk over the frozen tables after the block-local walk, sharing the
+  chain budget. Probe `--frozen` (per-segment, blob): **identical ratio
+  to the re-parse spike (30.475%) at 3× its encode speed** (70.5 s vs
+  208.8 s ST). Remaining encode cost is the dict chain walks themselves
+  (5.3× the no-dict baseline at 16 MiB) — a 32-byte weak-local-match
+  gate was measured and rejected (−8% time, +0.018pp: most text
+  positions have weak local matches, so the walk is inherent). Tuning
+  levers for integration: dict-specific chain caps, sampled dict
+  insertion, 4-8 MiB dicts (4 MiB: −0.31pp at 33.7 s).
+- **Measured payoff (per-segment, 16 MiB dict, frozen finder):** blob
+  31.04% → **30.48%**, ~0.9pp under pzstd-3 (31.4%), at unchanged decode
+  parallelism.
+- **What remains for shipping `Pz2d`:** container integration only —
+  segment framing (`[dict_len] +` blocks), 2-wave parallel decode with
+  the `Arc`-shared dict + worker arenas, encode-side worker arenas, and
+  the encode-cost tuning pass above.

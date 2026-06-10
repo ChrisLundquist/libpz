@@ -41,6 +41,16 @@ fn main() {
     } else {
         false
     };
+    // --frozen: per-segment head dict via the production frozen finder
+    // (FrozenDict built once per segment, parse starts at the dict
+    // boundary) instead of the spike's full dict+block re-parse. Same wire,
+    // same decoder; encode cost is the point.
+    let frozen_mode = if let Some(i) = args.iter().position(|a| a == "--frozen") {
+        args.remove(i);
+        true
+    } else {
+        false
+    };
     const SEG: usize = 32 << 20;
     if args.is_empty() {
         eprintln!("usage: pz2_dict_probe [--head] <files...>");
@@ -53,7 +63,9 @@ fn main() {
         "ratio %",
         "delta",
         "enc s",
-        if seg_mode {
+        if frozen_mode {
+            "per-segment FROZEN finder"
+        } else if seg_mode {
             "per-segment head dict"
         } else if head_mode {
             "fixed head dict"
@@ -76,9 +88,35 @@ fn main() {
             let t = Instant::now();
             let mut size = 0usize;
             let mut start = 0usize;
+            // Frozen mode: build each segment's dict tables ONCE (the
+            // production shape — Arc-shared across workers).
+            let mut frozen: Option<(usize, std::sync::Arc<pz::lz77::FrozenDict>, usize)> = None;
             while start < data.len() {
                 let end = (start + BLOCK).min(data.len());
-                let (enc, prefix): (Vec<u8>, &[u8]) = if head_mode || seg_mode {
+                let (enc, prefix): (Vec<u8>, &[u8]) = if frozen_mode {
+                    let seg_base = start - (start % SEG);
+                    let dlen = d.min(start - seg_base);
+                    let dict = &data[seg_base..seg_base + dlen];
+                    let reuse = matches!(frozen, Some((b, _, l)) if b == seg_base && l == dlen);
+                    if !reuse {
+                        frozen = Some((
+                            seg_base,
+                            std::sync::Arc::new(pz::lz77::FrozenDict::build(
+                                dict,
+                                config.hash_prefix_len,
+                            )),
+                            dlen,
+                        ));
+                    }
+                    let tables = &frozen.as_ref().unwrap().1;
+                    let mut arena = Vec::with_capacity(dlen + (end - start));
+                    arena.extend_from_slice(dict);
+                    arena.extend_from_slice(&data[start..end]);
+                    (
+                        pz::pz2::encode_with_frozen_dict(&arena, tables, &config).expect("encode"),
+                        dict,
+                    )
+                } else if head_mode || seg_mode {
                     // Dict = first min(d, start - base) bytes of the file
                     // (--head) or of the block's 32 MiB segment (--seg);
                     // blocks inside the dict region parse cold (they ARE

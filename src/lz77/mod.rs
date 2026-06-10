@@ -233,11 +233,70 @@ pub(crate) struct WideMatch {
 ///
 /// Maintains a hash table mapping 3-byte or 4-byte prefixes to positions,
 /// with chains for collision resolution. Average O(n) complexity.
+/// Immutable hash-chain tables over a dictionary prefix, built once and
+/// shared read-only (`Arc`) by many parallel block parses (the pz2 dict
+/// tier's frozen finder).
+///
+/// Positions are dict-relative (`0..len`). The parse input handed to
+/// [`HashChainFinder::find_match_wide`] MUST carry the same dict bytes at
+/// those positions (i.e. `input = dict ‖ block`), so frozen coordinates need
+/// no translation and match compares read one contiguous buffer. The walk
+/// in `find_best` additionally guards `pos >= dict.len`, so a misuse cannot
+/// read out of bounds — it just finds nothing useful.
+pub struct FrozenDict {
+    /// head[hash] = most recent dict position with this hash (0 = empty or
+    /// position 0 — the same benign ambiguity the live finder has).
+    head: Vec<u32>,
+    /// prev[pos] = previous dict position in the chain, indexed directly.
+    prev: Vec<u32>,
+    len: usize,
+    hash_prefix_len: u8,
+}
+
+impl FrozenDict {
+    /// Build chains over `dict` once. Cost is one insert per position
+    /// (no chain walks), ~hundreds of MB/s; share the result via `Arc`.
+    pub fn build(dict: &[u8], hash_prefix_len: u8) -> Self {
+        let mut head = vec![0u32; HASH_SIZE];
+        let mut prev = vec![0u32; dict.len()];
+        // Same lookahead guard as `insert`: the last 2 positions can't hash.
+        let hashable = dict.len().saturating_sub(2);
+        for (pos, slot) in prev.iter_mut().enumerate().take(hashable) {
+            let h = if hash_prefix_len == 4 {
+                hash4(dict, pos)
+            } else {
+                hash3(dict, pos)
+            };
+            *slot = head[h];
+            head[h] = pos as u32;
+        }
+        FrozenDict {
+            head,
+            prev,
+            len: dict.len(),
+            hash_prefix_len,
+        }
+    }
+
+    /// Dictionary length in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the dictionary is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 pub(crate) struct HashChainFinder {
     /// head[hash] = most recent position with this hash, or 0
     head: Vec<u32>,
     /// prev[pos % max_window] = previous position in the chain
     prev: Vec<u32>,
+    /// Optional frozen dictionary chains consulted after the live chain
+    /// (pz2 dict tier). See [`FrozenDict`] for the coordinate contract.
+    dict: Option<std::sync::Arc<FrozenDict>>,
     /// Cached SIMD dispatcher — resolved once, avoids per-call feature detection.
     dispatcher: crate::simd::Dispatcher,
     /// Maximum match length to find. Deflate pipelines use 258 (RFC 1951);
@@ -272,6 +331,7 @@ impl HashChainFinder {
         Self {
             head: vec![0; HASH_SIZE],
             prev: vec![0; MAX_WINDOW],
+            dict: None,
             dispatcher: crate::simd::Dispatcher::new(),
             max_match_len: max_match_len as usize,
             max_chain: max_chain.clamp(1, MAX_CHAIN * 4),
@@ -297,6 +357,7 @@ impl HashChainFinder {
         Self {
             head: vec![0; HASH_SIZE],
             prev: vec![0; max_window],
+            dict: None,
             dispatcher: crate::simd::Dispatcher::new(),
             max_match_len: max_match_len as usize,
             max_chain: MAX_CHAIN,
@@ -319,6 +380,7 @@ impl HashChainFinder {
         Self {
             head: vec![0; HASH_SIZE],
             prev: vec![0; max_window],
+            dict: None,
             dispatcher: crate::simd::Dispatcher::new(),
             max_match_len: max_match_len as usize,
             max_chain: max_chain.clamp(1, MAX_CHAIN * 4),
@@ -340,6 +402,7 @@ impl HashChainFinder {
         Self {
             head: vec![0; HASH_SIZE],
             prev: vec![0; max_window],
+            dict: None,
             dispatcher: crate::simd::Dispatcher::new(),
             max_match_len: max_match_len as usize,
             max_chain: max_chain.clamp(1, MAX_CHAIN * 4),
@@ -357,6 +420,17 @@ impl HashChainFinder {
         } else {
             hash3(data, pos)
         }
+    }
+
+    /// Install frozen dictionary chains, consulted by `find_best` after the
+    /// live chain. The parse input must carry the dict bytes as its prefix
+    /// (see [`FrozenDict`]).
+    pub(crate) fn set_frozen_dict(&mut self, dict: std::sync::Arc<FrozenDict>) {
+        debug_assert_eq!(
+            dict.hash_prefix_len, self.hash_prefix_len,
+            "frozen dict and finder must hash identically"
+        );
+        self.dict = Some(dict);
     }
 
     /// Dynamically adjust chain depth. Used by adaptive encoding loops.
@@ -437,6 +511,68 @@ impl HashChainFinder {
             }
             chain_pos = prev_pos;
             chain_count += 1;
+        }
+
+        // Frozen dictionary chains (pz2 dict tier): consulted after the live
+        // chain — recency first, dictionary as fallback — sharing the same
+        // chain budget. (A weak-local-match gate at 32 bytes was measured:
+        // it saves only ~8% encode for +0.018pp on the blob, because most
+        // positions on text HAVE weak local matches — the walk cost is
+        // inherent. Tune via dict-specific chain caps at integration time
+        // if needed.) The `pos >= dict.len` guard makes every read below
+        // in-bounds regardless of caller behavior: chain_pos < dict.len ≤
+        // pos, so chain_pos + probe/cmp_limit < pos + remaining =
+        // input.len().
+        if let Some(dict) = self.dict.as_deref() {
+            if pos >= dict.len && (best_length as usize) < cmp_limit && chain_count < self.max_chain
+            {
+                let mut chain_pos = dict.head[h] as usize;
+                while chain_pos < dict.len && chain_pos >= min_pos && chain_count < self.max_chain {
+                    if best_length >= MIN_MATCH as u32 {
+                        let probe = best_length as usize;
+                        // SAFETY: chain_pos < dict.len <= pos and probe <
+                        // remaining (see block comment above).
+                        let candidate_probe = unsafe { *input_ptr.add(chain_pos + probe) };
+                        if candidate_probe != best_probe_byte {
+                            let prev_pos = dict.prev[chain_pos] as usize;
+                            if prev_pos >= chain_pos || prev_pos < min_pos {
+                                break;
+                            }
+                            chain_pos = prev_pos;
+                            chain_count += 1;
+                            continue;
+                        }
+                    }
+
+                    // SAFETY: chain_pos + cmp_limit < pos + remaining (block
+                    // comment above); candidates may extend past the dict end
+                    // into the block — valid under the primed-buffer contract.
+                    let match_len = unsafe {
+                        self.dispatcher.compare_bytes_ptr(
+                            input_ptr.add(chain_pos),
+                            pos_ptr,
+                            cmp_limit,
+                        )
+                    } as u32;
+
+                    if match_len > best_length && match_len >= MIN_MATCH as u32 {
+                        best_length = match_len;
+                        best_offset = (pos - chain_pos) as u32;
+                        if best_length as usize >= cmp_limit {
+                            break;
+                        }
+                        // SAFETY: best_length < cmp_limit <= remaining.
+                        best_probe_byte = unsafe { *input_ptr.add(pos + best_length as usize) };
+                    }
+
+                    let prev_pos = dict.prev[chain_pos] as usize;
+                    if prev_pos >= chain_pos || prev_pos < min_pos {
+                        break;
+                    }
+                    chain_pos = prev_pos;
+                    chain_count += 1;
+                }
+            }
         }
 
         (best_offset, best_length)
