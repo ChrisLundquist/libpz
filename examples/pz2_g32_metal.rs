@@ -26,6 +26,10 @@
 //!   cargo run --release --no-default-features --example pz2_g32_metal -- \
 //!     [--reps N] [--inner N] [--tile-lits N] <files...>
 
+// objc's msg_send! internally tests cfg(feature = "cargo-clippy"), which this
+// crate doesn't declare.
+#![allow(unexpected_cfgs)]
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
     eprintln!("pz2_g32_metal: macOS-only probe (Metal)");
@@ -43,9 +47,7 @@ mod probe {
     use metal::foreign_types::ForeignTypeRef;
     use metal::objc::runtime::Object;
     use metal::objc::{msg_send, sel, sel_impl};
-    use metal::{
-        Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
-    };
+    use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
     use pz::lzseq::SeqConfig;
     use pz::pz2::SpikeSeqLane;
 
@@ -145,7 +147,11 @@ mod probe {
                             if *len > 0 {
                                 let enc = cmd.new_blit_command_encoder();
                                 enc.copy_from_buffer(
-                                    src, *so as u64, dst, *doff as u64, *len as u64,
+                                    src,
+                                    *so as u64,
+                                    dst,
+                                    *doff as u64,
+                                    *len as u64,
                                 );
                                 enc.end_encoding();
                             }
@@ -238,9 +244,7 @@ mod probe {
         while let Some(a) = args.next() {
             match a.as_str() {
                 "--reps" => reps = args.next().and_then(|v| v.parse().ok()).expect("--reps N"),
-                "--inner" => {
-                    inner = args.next().and_then(|v| v.parse().ok()).expect("--inner N")
-                }
+                "--inner" => inner = args.next().and_then(|v| v.parse().ok()).expect("--inner N"),
                 "--tile-lits" => {
                     tile_lits = args
                         .next()
@@ -311,7 +315,7 @@ mod probe {
                             });
                             huff_lits.extend_from_slice(chunk);
                         }
-                        while (tiles.len() - block_first_tile) % SG_PER_TG != 0 {
+                        while !(tiles.len() - block_first_tile).is_multiple_of(SG_PER_TG) {
                             tiles.push(Tile {
                                 word_off: 0,
                                 out_off: 0,
@@ -470,7 +474,10 @@ mod probe {
 
         // ---- CPU all-cores full pz2 decode (the gate-3 denominator) ----
         let work_bytes = corpus.len() * dup;
-        assert!(work_bytes < u32::MAX as usize, "--dup too large for u32 offsets");
+        assert!(
+            work_bytes < u32::MAX as usize,
+            "--dup too large for u32 offsets"
+        );
         let mut cpu_ts = Vec::with_capacity(reps);
         for _ in 0..reps {
             let t = Instant::now();
@@ -507,7 +514,10 @@ mod probe {
                 .new_compute_pipeline_state_with_function(&f)
                 .expect("pipeline")
         };
-        let lit_pipe = compile(include_str!("../kernels/pz2_g32_lit.metal"), "g32_lit_decode");
+        let lit_pipe = compile(
+            include_str!("../kernels/pz2_g32_lit.metal"),
+            "g32_lit_decode",
+        );
         let splice_pipe = compile(
             include_str!("../kernels/pz2_g32_splice.metal"),
             "g32_splice",
@@ -532,12 +542,18 @@ mod probe {
         };
         let b_words = buf(words.as_ptr() as *const _, words.len() * 4);
         let b_tables = buf(tables.as_ptr() as *const _, tables.len() * 2);
-        let b_tiles = buf(tiles.as_ptr() as *const _, std::mem::size_of_val(&tiles[..]));
+        let b_tiles = buf(
+            tiles.as_ptr() as *const _,
+            std::mem::size_of_val(&tiles[..]),
+        );
         let b_lits = device.new_buffer(lits_total.max(4) as u64, opt);
         let b_rawsrc = buf(raw_lits.as_ptr() as *const _, raw_lits.len());
         let b_seqbits = buf(seq_bits.as_ptr() as *const _, seq_bits.len());
         let b_seqtables = buf(seq_tables.as_ptr() as *const _, seq_tables.len() * 2);
-        let b_descs = buf(descs.as_ptr() as *const _, std::mem::size_of_val(&descs[..]));
+        let b_descs = buf(
+            descs.as_ptr() as *const _,
+            std::mem::size_of_val(&descs[..]),
+        );
         let b_codes = device.new_buffer(scratch_bytes.max(4) as u64, opt);
         let b_out = device.new_buffer(work_bytes as u64, opt);
         assert_eq!(std::mem::size_of::<SpliceBlockDesc>(), 80);
@@ -555,7 +571,14 @@ mod probe {
         let splice_pass = || {
             Pass::Compute(
                 &splice_pipe,
-                vec![&b_seqbits, &b_seqtables, &b_descs, &b_lits, &b_codes, &b_out],
+                vec![
+                    &b_seqbits,
+                    &b_seqtables,
+                    &b_descs,
+                    &b_lits,
+                    &b_codes,
+                    &b_out,
+                ],
                 descs.len() as u32,
                 descs.len(),
                 32,
@@ -626,7 +649,14 @@ mod probe {
         let phase_a_pass = || {
             Pass::Compute(
                 &phase_a_pipe,
-                vec![&b_seqbits, &b_seqtables, &b_descs, &b_lits, &b_codes, &b_out],
+                vec![
+                    &b_seqbits,
+                    &b_seqtables,
+                    &b_descs,
+                    &b_lits,
+                    &b_codes,
+                    &b_out,
+                ],
                 descs.len() as u32,
                 descs.len(),
                 32,
@@ -636,8 +666,11 @@ mod probe {
         let m_pa = report("splice phase A only", work_bytes, &mut ta);
 
         // ---- Gate 3: splice alone, then end-to-end ----
-        println!("\nGATE 3: cooperative splice, {} threadgroups x 32 threads", descs.len());
-        let splice_inner = inner.min(5).max(1);
+        println!(
+            "\nGATE 3: cooperative splice, {} threadgroups x 32 threads",
+            descs.len()
+        );
+        let splice_inner = inner.clamp(1, 5);
         let mut t3 = run_passes(&queue, &[splice_pass()], reps, splice_inner);
         let m_splice = report("splice kernel", work_bytes, &mut t3);
         let mut te = run_passes(

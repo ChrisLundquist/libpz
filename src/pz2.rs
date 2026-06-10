@@ -1747,7 +1747,7 @@ pub fn spike_seq_section(block: &[u8]) -> PzResult<SpikeSeqSection> {
         _ => return Err(PzError::InvalidInput),
     }
 
-    let mut parse_lane = |p: &mut &[u8]| -> PzResult<SpikeSeqLane> {
+    let parse_lane = |p: &mut &[u8]| -> PzResult<SpikeSeqLane> {
         let mode = take(p, 1)?[0];
         match mode {
             CODES_CONST => Ok(SpikeSeqLane::Const(take(p, 1)?[0])),
