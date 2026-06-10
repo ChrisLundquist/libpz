@@ -1033,7 +1033,11 @@ pub(crate) fn stage_pz2_compress(
     mut block: StageBlock,
     options: &super::CompressOptions,
 ) -> PzResult<StageBlock> {
-    block.data = crate::pz2::encode_with_config(&block.data, &super::pz2_seq_config(options))?;
+    let mut config = super::pz2_seq_config(options);
+    if options.parse_strategy == super::ParseStrategy::Auto {
+        config.greedy = super::pz2_auto_greedy(&block.data);
+    }
+    block.data = crate::pz2::encode_with_config(&block.data, &config)?;
     Ok(block)
 }
 

@@ -345,6 +345,21 @@ pub(crate) fn resolve_max_match_len(_pipeline: Pipeline, options: &CompressOptio
 /// Build the LzSeq parse config for the Pz2 pipeline from CompressOptions —
 /// the same window / match-len / greedy mapping the LzSeq demux path uses,
 /// so `--greedy` and window flags affect `-p pz2` identically to `-p lzf`.
+/// Per-block parse choice for Pz2's `Auto` strategy: greedy unless the block
+/// is near-random.
+///
+/// The 2026-06-10 probe (`examples/pz2_parse_probe.rs`, all 12 Silesia
+/// files, 2 MiB blocks) measured greedy ≤ lazy on 11/12 files (dickens
+/// -3.2pp, reymont -3.0, sao -2.3; worst "regression" mozilla +0.03pp =
+/// noise) — the old "greedy regresses structured data" finding does not
+/// hold for the pz2 sequence wire at the 2 MiB window. Greedy costs ~2x
+/// encode, which P1 spends for ratio. The near-random guard (same rule as
+/// `select_pipeline`) skips that cost where there is no ratio to buy.
+pub(crate) fn pz2_auto_greedy(block: &[u8]) -> bool {
+    let p = crate::analysis::analyze(block);
+    !(p.byte_entropy > 7.5 && p.match_density < 0.1)
+}
+
 pub(crate) fn pz2_seq_config(options: &CompressOptions) -> crate::lzseq::SeqConfig {
     let defaults = crate::lzseq::SeqConfig::default();
     // The window follows the block size (rounded up to a power of two, never

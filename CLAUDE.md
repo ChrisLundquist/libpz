@@ -63,7 +63,7 @@ input → tokenize() → Vec<LzToken> → TokenEncoder::encode() → multi-strea
 | **SortLz** | LzSeq (internal) | FSE | Deterministic GPU radix-sort matching |
 | **Bw** / **Bbw** | — | FSE | BWT-based, no LZ tokens |
 | **Num** | — | per-plane FSE | Numeric/binary front-end (byte-plane transpose + per-plane gated delta/zigzag). Opt-in (`-p num`); for the worst numeric files — x-ray 55%→48% (beats xz/bzip2), sao 74%→63%. Block-parallel, O(n) inverse. `src/numeric.rs` |
-| **Pz2** | sequences (own wire) | 8-lane Huffman | Decode-first clean-slate codec (`-p pz2`): same LzSeq parse re-expressed as zstd-style sequences, 8-lane Huffman literals + fused splice, 2 MiB blocks (window = block; the 1→2 MiB bump bought −0.22 to −0.36pp). **Beats lzf on both axes: blob 32.0% vs 32.2% at 3.45x ST decode** (1405 MB/s ST, 11.0 GiB/s all-cores; 1.28x faster than pzstd -3 wall-clock at 0.6pp ratio cost). Encode 107 MiB/s all-cores (the ratio buy; 4 MiB blocks rejected — concurrent 16 MiB chain walks collapse encode 5.5x). `src/pz2.rs`, `docs/design-docs/clean-slate-codec.md` |
+| **Pz2** | sequences (own wire) | 8-lane Huffman | Decode-first clean-slate codec (`-p pz2`): LzSeq parse re-expressed as zstd-style sequences, 8-lane Huffman literals + fused splice, 2 MiB blocks (window = block), auto-greedy parse (greedy won 11/12 Silesia files on this wire; near-random blocks stay lazy). **Pareto-superior to pzstd -3: blob 31.0% vs 31.4% at 1.36x faster all-cores decode** (16.8 ms / 12.0 GiB/s; ST 1405 MB/s = 3.45x lzf). Encode 64 MiB/s all-cores is the deliberate decode-first trade (4 MiB blocks rejected — concurrent 16 MiB chain walks collapse encode 5.5x). `src/pz2.rs`, `docs/design-docs/clean-slate-codec.md` |
 
 **Removed pipelines:** Deflate (#117), Lzr (#118), Lz78R (#116), Parlz (ratio loss)
 
@@ -87,6 +87,13 @@ single-threaded runs; the CLI uses all cores by default).
 | pz lzseqr | 32.2% | 930 | 3690 |
 | pz lzfi | 46.0% | 1130 | 3130 |
 | pz bw | 27.8% | 166 | 1120 |
+
+**pz2 is not in the table above** (different methodology: warm-cache
+hyperfine to /dev/null, 2026-06-10): blob **31.0%** at **64 MiB/s** compress /
+**12.0 GiB/s** decompress all-cores — better ratio than zstd-3 AND 1.36x
+faster parallel decode than pzstd -3, i.e. Pareto-superior to the parallel-
+zstd frontier on (ratio, decode). Encode speed is its one conceded axis.
+See `docs/design-docs/clean-slate-codec.md` §8-§10.
 
 **Read the decode column carefully — it is the most misunderstood number in this repo.**
 The pz "Decomp MB/s" above is **all-cores** throughput; zstd's is **single-threaded** (the
