@@ -47,6 +47,15 @@ const LIT_HUFF: u8 = 1;
 /// Sequence-code stream modes.
 const CODES_CONST: u8 = 0;
 const CODES_HUFF: u8 = 1;
+const CODES_FSE: u8 = 2;
+
+/// FSE (tANS) state-table log for the sequence-code lanes. 2^10 × u32 = 4 KB
+/// per lane (3 lanes = 12 KB, L1-resident next to the 4 KB literal table).
+/// The win over Huffman here is the fractional-bit floor: greedy parses push
+/// the dominant code (lit_run=0 / rep0 / short matches) past p=0.5, where
+/// Huffman is pinned at 1 bit.
+const FSE_LOG: u32 = 10;
+const FSE_SIZE: usize = 1 << FSE_LOG;
 
 /// Sequence code alphabets are small (≤ 32 symbols): literal-run and
 /// match-length log2 codes top out around 22, offset codes around 27.
@@ -550,14 +559,147 @@ fn unpack_lengths(packed: &[u8]) -> [u8; 256] {
 }
 
 // ---------------------------------------------------------------------------
-// Sequence-code streams (small-alphabet Huffman lanes, fused decode)
+// FSE (tANS) for the sequence-code lanes
+// ---------------------------------------------------------------------------
+//
+// Textbook tANS over the 32-symbol sequence-code alphabet. The encoder walks
+// the symbols in REVERSE and then writes the emitted bit groups re-reversed,
+// so the decoder reads the stream FORWARD with the same LSB-first
+// whole-byte-refill discipline as the Huffman lanes (no backward bitstream,
+// no sentinel byte). Decode state lives in [0, FSE_SIZE); the wire carries
+// the normalized histogram and the initial state.
+
+/// Normalize `counts` (only symbols 0..32 populated) to sum exactly
+/// FSE_SIZE, every present symbol ≥ 1. Drift lands on the largest symbol:
+/// with ≤ 32 symbols its floor share is ≥ FSE_SIZE/32 = 32 > the worst-case
+/// drift of 31, so it stays ≥ 1.
+fn fse_normalize(counts: &[u32; 256], total: usize) -> [u16; 32] {
+    debug_assert!(total > 0);
+    let mut norm = [0u16; 32];
+    let mut sum = 0i64;
+    let mut largest = 0usize;
+    for s in 0..32 {
+        let c = counts[s] as u64;
+        if c == 0 {
+            continue;
+        }
+        let n = ((c * FSE_SIZE as u64) / total as u64).max(1) as u16;
+        norm[s] = n;
+        sum += n as i64;
+        if n > norm[largest] {
+            largest = s;
+        }
+    }
+    norm[largest] = (norm[largest] as i64 + FSE_SIZE as i64 - sum) as u16;
+    norm
+}
+
+/// zstd-style symbol spread: odd step coprime with the power-of-two table
+/// visits every slot exactly once.
+fn fse_spread(norm: &[u16; 32]) -> [u8; FSE_SIZE] {
+    let mut spread = [0u8; FSE_SIZE];
+    let step = (FSE_SIZE >> 1) + (FSE_SIZE >> 3) + 3;
+    let mask = FSE_SIZE - 1;
+    let mut pos = 0usize;
+    for (s, &n) in norm.iter().enumerate() {
+        for _ in 0..n {
+            spread[pos] = s as u8;
+            pos = (pos + step) & mask;
+        }
+    }
+    debug_assert!(pos == 0);
+    spread
+}
+
+/// Build the decode table. Entry packing: `base` (bits 0..16) | `nbits`
+/// (16..20) | `symbol` (20..25). Decode step: read `nbits`, next state =
+/// `base + bits` — always back in [0, FSE_SIZE) by construction, so corrupt
+/// payload bits can never index out of the table.
+fn fse_decode_table(norm: &[u16; 32]) -> PzResult<Box<[u32; FSE_SIZE]>> {
+    let sum: usize = norm.iter().map(|&c| c as usize).sum();
+    if sum != FSE_SIZE || norm.iter().filter(|&&c| c > 0).count() < 2 {
+        return Err(PzError::InvalidInput);
+    }
+    let spread = fse_spread(norm);
+    let mut next = [0u32; 32];
+    for s in 0..32 {
+        next[s] = norm[s] as u32;
+    }
+    let mut table = Box::new([0u32; FSE_SIZE]);
+    for (idx, slot) in table.iter_mut().enumerate() {
+        let s = spread[idx] as usize;
+        let x = next[s];
+        next[s] += 1;
+        // x in [norm[s], 2*norm[s]): shift it up into [FSE_SIZE, 2*FSE_SIZE).
+        let nbits = FSE_LOG - x.ilog2();
+        let base = (x << nbits) - FSE_SIZE as u32;
+        *slot = base | (nbits << 16) | ((s as u32) << 20);
+    }
+    Ok(table)
+}
+
+/// Encoder transition map: for symbol `s` and pre-state `y` in
+/// [norm[s], 2*norm[s]), the table index that decodes back to `(s, y)`.
+/// Flat layout indexed by `cum[s] + (y - norm[s])`.
+fn fse_encode_states(norm: &[u16; 32]) -> (Vec<u16>, [u32; 32]) {
+    let spread = fse_spread(norm);
+    let mut cum = [0u32; 32];
+    let mut acc = 0u32;
+    for s in 0..32 {
+        cum[s] = acc;
+        acc += norm[s] as u32;
+    }
+    let mut state_of = vec![0u16; FSE_SIZE];
+    let mut next = [0u32; 32];
+    for (idx, &sym) in spread.iter().enumerate() {
+        let s = sym as usize;
+        state_of[(cum[s] + next[s]) as usize] = idx as u16;
+        next[s] += 1;
+    }
+    (state_of, cum)
+}
+
+/// tANS-encode `codes` against `norm`. Returns the decoder's initial state
+/// and the forward-readable payload.
+fn fse_encode_stream(codes: &[u8], norm: &[u16; 32]) -> (u16, Vec<u8>) {
+    let (state_of, cum) = fse_encode_states(norm);
+    let size = FSE_SIZE as u32;
+    let mut x = size; // conceptual state in [FSE_SIZE, 2*FSE_SIZE)
+    let mut groups: Vec<(u32, u8)> = Vec::with_capacity(codes.len());
+    for &sym in codes.iter().rev() {
+        let s = sym as usize;
+        let c = norm[s] as u32;
+        let mut nb = 0u8;
+        while (x >> nb) >= 2 * c {
+            nb += 1;
+        }
+        groups.push((x & ((1u32 << nb) - 1), nb));
+        let y = x >> nb;
+        x = size + state_of[(cum[s] + (y - c)) as usize] as u32;
+    }
+    let mut w = BitWriter::new();
+    for &(v, nb) in groups.iter().rev() {
+        w.write(v, nb);
+    }
+    ((x - size) as u16, w.finish())
+}
+
+// ---------------------------------------------------------------------------
+// Sequence-code streams (small-alphabet Huffman/FSE lanes, fused decode)
 // ---------------------------------------------------------------------------
 
 /// Encode one sequence-code stream (values ≤ MAX_SEQ_CODE).
 ///
-/// Wire: `[mode]` then either `[value]` (constant stream — common for offset
-/// codes when everything is rep0) or `[16B nibble lengths for syms 0..32]
-/// [lane_len: u32][lane bytes]`.
+/// Wire: `[mode]` then one of
+/// - CONST: `[value]` (constant stream — common for offset codes when
+///   everything is rep0)
+/// - HUFF:  `[16B nibble lengths for syms 0..32][lane_len: u32][lane bytes]`
+/// - FSE:   `[32 × u16 LE normalized counts][u16 init_state]
+///   [lane_len: u32][lane bytes]`
+///
+/// Both entropy candidates are built and the byte-smaller one ships, so FSE
+/// is bit-exact never-worse than the old wire (modulo nothing: HUFF stays
+/// available and CONST still wins degenerate lanes).
 fn encode_code_stream(codes: &[u8], out: &mut Vec<u8>) {
     debug_assert!(!codes.is_empty());
     debug_assert!(codes.iter().all(|&c| c <= MAX_SEQ_CODE));
@@ -572,29 +714,59 @@ fn encode_code_stream(codes: &[u8], out: &mut Vec<u8>) {
     }
     let lengths = huffman_lengths(&counts);
     let codebook = canonical_codes(&lengths).expect("own lengths are valid");
-    out.push(CODES_HUFF);
-    for i in 0..16 {
-        out.push((lengths[2 * i] & 0xF) | (lengths[2 * i + 1] << 4));
-    }
     let mut w = BitWriter::new();
     for &c in codes {
         let (code, len) = codebook[c as usize];
         w.write(code as u32, len);
     }
-    let lane = w.finish();
-    put_u32(out, lane.len() as u32);
-    out.extend_from_slice(&lane);
+    let huff_lane = w.finish();
+    let huff_size = 1 + 16 + 4 + huff_lane.len();
+
+    let norm = fse_normalize(&counts, codes.len());
+    let (init_state, fse_lane) = fse_encode_stream(codes, &norm);
+    let fse_size = 1 + 64 + 2 + 4 + fse_lane.len();
+
+    if fse_size < huff_size {
+        out.push(CODES_FSE);
+        for &n in &norm {
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        out.extend_from_slice(&init_state.to_le_bytes());
+        put_u32(out, fse_lane.len() as u32);
+        out.extend_from_slice(&fse_lane);
+    } else {
+        out.push(CODES_HUFF);
+        for i in 0..16 {
+            out.push((lengths[2 * i] & 0xF) | (lengths[2 * i + 1] << 4));
+        }
+        put_u32(out, huff_lane.len() as u32);
+        out.extend_from_slice(&huff_lane);
+    }
 }
 
-/// Decoder side of one sequence-code stream: either a constant or an
-/// independent Huffman bit lane decoded one symbol per sequence inside the
-/// splice loop (three of these run as independent chains — the same ILP
-/// trick as the literal lanes, fused with the splice).
-struct CodeLane<'a> {
-    constant: Option<u8>,
-    table: Option<Box<[u16; 1 << MAX_CODE_LEN]>>,
-    data: &'a [u8],
-    st: LaneState,
+/// Decoder side of one sequence-code stream: a constant, an independent
+/// Huffman bit lane, or an FSE (tANS) state lane — decoded one symbol per
+/// sequence inside the splice loop (three of these run as independent
+/// chains — the same ILP trick as the literal lanes, fused with the splice).
+/// Each lane's mode is fixed for the whole block, so the `match` below is a
+/// perfectly predicted branch in the hot loop.
+enum CodeLane<'a> {
+    Const(u8),
+    Huff {
+        table: Box<[u16; 1 << MAX_CODE_LEN]>,
+        data: &'a [u8],
+        st: LaneState,
+    },
+    Fse {
+        table: Box<[u32; FSE_SIZE]>,
+        /// `table[state]`, preloaded: each `next()` issues the FOLLOWING
+        /// symbol's table load at its end, so the load's latency overlaps
+        /// the splice copies instead of sitting on the per-sequence chain,
+        /// and the returned symbol needs no load at all.
+        entry: u32,
+        data: &'a [u8],
+        st: LaneState,
+    },
 }
 
 impl<'a> CodeLane<'a> {
@@ -606,12 +778,7 @@ impl<'a> CodeLane<'a> {
                 if v > MAX_SEQ_CODE {
                     return Err(PzError::InvalidInput);
                 }
-                Ok(CodeLane {
-                    constant: Some(v),
-                    table: None,
-                    data: &[],
-                    st: LaneState::default(),
-                })
+                Ok(CodeLane::Const(v))
             }
             CODES_HUFF => {
                 let packed = take(p, 16)?;
@@ -625,9 +792,32 @@ impl<'a> CodeLane<'a> {
                 let table = build_decode_table(&lengths)?;
                 let lane_len = take_u32(p)? as usize;
                 let data = take(p, lane_len)?;
-                Ok(CodeLane {
-                    constant: None,
-                    table: Some(table),
+                Ok(CodeLane::Huff {
+                    table,
+                    data,
+                    st: LaneState::default(),
+                })
+            }
+            CODES_FSE => {
+                let raw = take(p, 64)?;
+                let mut norm = [0u16; 32];
+                for (i, n) in norm.iter_mut().enumerate() {
+                    *n = u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
+                }
+                // Validates Σnorm == FSE_SIZE; symbols are ≤ 31 by
+                // construction of the 32-entry table.
+                let table = fse_decode_table(&norm)?;
+                let st_raw = take(p, 2)?;
+                let state = u16::from_le_bytes([st_raw[0], st_raw[1]]) as u32;
+                if state >= FSE_SIZE as u32 {
+                    return Err(PzError::InvalidInput);
+                }
+                let lane_len = take_u32(p)? as usize;
+                let data = take(p, lane_len)?;
+                let entry = table[state as usize];
+                Ok(CodeLane::Fse {
+                    table,
+                    entry,
                     data,
                     st: LaneState::default(),
                 })
@@ -639,30 +829,62 @@ impl<'a> CodeLane<'a> {
     /// Decode the next code. Clamped refill; errors on bit exhaustion.
     #[inline(always)]
     fn next(&mut self) -> PzResult<u8> {
-        if let Some(v) = self.constant {
-            return Ok(v);
-        }
-        let table = self.table.as_deref().expect("huff mode has table");
-        let s = &mut self.st;
-        if s.nbits < MAX_CODE_LEN {
-            if s.pos + 8 <= self.data.len() {
-                s.refill(self.data);
-            } else {
-                while s.nbits <= 56 && s.pos < self.data.len() {
-                    s.acc |= (self.data[s.pos] as u64) << s.nbits;
-                    s.pos += 1;
-                    s.nbits += 8;
+        match self {
+            CodeLane::Const(v) => Ok(*v),
+            CodeLane::Huff { table, data, st } => {
+                let s = &mut *st;
+                if s.nbits < MAX_CODE_LEN {
+                    if s.pos + 8 <= data.len() {
+                        s.refill(data);
+                    } else {
+                        while s.nbits <= 56 && s.pos < data.len() {
+                            s.acc |= (data[s.pos] as u64) << s.nbits;
+                            s.pos += 1;
+                            s.nbits += 8;
+                        }
+                    }
                 }
+                let e = table[(s.acc & ((1 << MAX_CODE_LEN) - 1)) as usize];
+                let len = (e & 0xF) as u32;
+                if len > s.nbits {
+                    return Err(PzError::InvalidInput);
+                }
+                s.acc >>= len;
+                s.nbits -= len;
+                Ok((e >> 4) as u8)
+            }
+            CodeLane::Fse {
+                table,
+                entry,
+                data,
+                st,
+            } => {
+                let s = &mut *st;
+                if s.nbits < FSE_LOG {
+                    if s.pos + 8 <= data.len() {
+                        s.refill(data);
+                    } else {
+                        while s.nbits <= 56 && s.pos < data.len() {
+                            s.acc |= (data[s.pos] as u64) << s.nbits;
+                            s.pos += 1;
+                            s.nbits += 8;
+                        }
+                    }
+                }
+                let e = *entry;
+                let nb = (e >> 16) & 0xF;
+                if nb > s.nbits {
+                    return Err(PzError::InvalidInput);
+                }
+                let bits = (s.acc & ((1u64 << nb) - 1)) as u32;
+                s.acc >>= nb;
+                s.nbits -= nb;
+                // next state = base + bits, always < FSE_SIZE by table
+                // construction — preload its entry now (see field docs).
+                *entry = table[((e & 0xFFFF) + bits) as usize];
+                Ok((e >> 20) as u8)
             }
         }
-        let e = table[(s.acc & ((1 << MAX_CODE_LEN) - 1)) as usize];
-        let len = (e & 0xF) as u32;
-        if len > s.nbits {
-            return Err(PzError::InvalidInput);
-        }
-        s.acc >>= len;
-        s.nbits -= len;
-        Ok((e >> 4) as u8)
     }
 }
 
@@ -1288,6 +1510,107 @@ mod tests {
         let mut decoded = vec![0u8; lits.len()];
         decode_lanes(&table, lane_refs, &mut decoded).unwrap();
         assert_eq!(decoded, lits);
+    }
+
+    /// Round-trip one code stream through encode_code_stream + CodeLane,
+    /// returning the mode byte that was chosen.
+    fn code_stream_round_trip(codes: &[u8]) -> u8 {
+        let mut wire = Vec::new();
+        encode_code_stream(codes, &mut wire);
+        let mode = wire[0];
+        let mut p = &wire[..];
+        let mut lane = CodeLane::parse(&mut p).expect("parse");
+        for (i, &c) in codes.iter().enumerate() {
+            assert_eq!(lane.next().expect("next"), c, "symbol {i}");
+        }
+        assert!(p.is_empty(), "trailing wire bytes");
+        mode
+    }
+
+    #[test]
+    fn test_fse_code_stream_round_trip() {
+        // Heavily skewed stream (the real shape: lit_run=0 / rep0 dominate
+        // past p=0.5) — FSE must win the size compare and round-trip.
+        let mut state = 0xBEEFu32;
+        let mut next = |m: u32| {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            (state >> 16) % m
+        };
+        let mut codes = Vec::new();
+        for _ in 0..50_000 {
+            let r = next(100);
+            codes.push(if r < 70 {
+                0
+            } else if r < 85 {
+                1
+            } else if r < 95 {
+                (2 + next(4)) as u8
+            } else {
+                (6 + next(26)) as u8
+            });
+        }
+        assert_eq!(code_stream_round_trip(&codes), CODES_FSE);
+
+        // Near-uniform 2-symbol stream: Huffman's 1 bit/sym is optimal and
+        // its header is smaller — HUFF must still be chosen and decode.
+        let flat: Vec<u8> = (0..10_000).map(|i| (i & 1) as u8).collect();
+        assert_eq!(code_stream_round_trip(&flat), CODES_HUFF);
+
+        // Tiny stream: FSE's 71-byte header can't pay for itself.
+        assert_eq!(code_stream_round_trip(&[0, 1, 0, 2, 0]), CODES_HUFF);
+
+        // Constant stream stays CONST.
+        assert_eq!(code_stream_round_trip(&[7; 1000]), CODES_CONST);
+
+        // All 32 symbols present, skewed: stresses normalization's max(1)
+        // floor + drift correction on the largest symbol.
+        let mut wide = Vec::new();
+        for s in 0..32u8 {
+            for _ in 0..(1 + 3000 / (1 + s as usize * s as usize)) {
+                wide.push(s);
+            }
+        }
+        let n = wide.len();
+        for i in (1..n).rev() {
+            let j = (next(u32::MAX) as usize) % (i + 1);
+            wide.swap(i, j);
+        }
+        code_stream_round_trip(&wide);
+    }
+
+    #[test]
+    fn test_fse_code_stream_corruption() {
+        // Build a stream that selects FSE, then corrupt every byte position
+        // one at a time: decode must error or mis-decode, never panic.
+        let codes: Vec<u8> = (0..20_000)
+            .map(|i| if i % 10 < 8 { 0u8 } else { (i % 7) as u8 })
+            .collect();
+        let mut wire = Vec::new();
+        encode_code_stream(&codes, &mut wire);
+        assert_eq!(wire[0], CODES_FSE);
+        for i in 0..wire.len().min(200) {
+            let mut bad = wire.clone();
+            bad[i] ^= 0x5A;
+            let mut p = &bad[..];
+            if let Ok(mut lane) = CodeLane::parse(&mut p) {
+                for _ in 0..codes.len() {
+                    if lane.next().is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        // Truncations of the lane payload.
+        for cut in [wire.len() - 1, wire.len() / 2, 72] {
+            let mut p = &wire[..cut];
+            if let Ok(mut lane) = CodeLane::parse(&mut p) {
+                for _ in 0..codes.len() {
+                    if lane.next().is_err() {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     #[test]

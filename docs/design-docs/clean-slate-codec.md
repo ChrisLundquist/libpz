@@ -608,3 +608,61 @@ chain reads for three interleaved FSE state updates (zstd's exact
 design — proof it can be fast), but pz2's 12 GiB/s all-cores wall and
 1.4 GB/s ST must hold. A wire change only proceeds if a decode
 prototype is speed-neutral; that is its own gated task, not a rider.
+
+## §13 — CODES_FSE shipped: per-block tANS on the seq-code lanes, −0.18/−0.19pp at decode parity (2026-06-10)
+
+The §12 candidate, built and gate-checked. The three sequence-code
+streams (ll/of/ml) gained a third wire mode alongside CONST/HUFF:
+
+- **CODES_FSE = 2**: textbook tANS, 32-symbol alphabet, `FSE_LOG = 10`
+  (1024 states; 4 KB u32 decode table per lane, 12 KB total next to the
+  4 KB literal table — comfortably L1-resident).
+- Header: 32 × u16 normalized counts (Σ = 1024) + u16 initial state +
+  u32 lane length = 71 B/lane vs Huffman's 21 B. Noise at 2 MiB blocks.
+- **Forward-readable payload**: the encoder walks symbols in reverse
+  (tANS requirement) but then writes the emitted bit groups re-reversed,
+  so the decoder reads the stream FORWARD with the same LSB-first
+  whole-byte-refill (`LaneState`) discipline as the Huffman lanes. No
+  backward bitstream, no sentinel byte, no second reader implementation.
+- **Entry prefetch is what bought decode parity**: the lane caches
+  `table[state]` and each `next()` issues the *following* symbol's table
+  load at its end, overlapping the load latency with the splice copies.
+  Without it the fused loop measured +2.4% ST / +3.5% MT; with it ST is
+  neutral-to-faster. (First version measured before/after in one
+  session: 138.8 → 137.0 ms ST vs master's 137.9.)
+- The encoder builds BOTH candidates per stream and ships the
+  byte-smaller, so the wire is bit-exact never-worse: CONST still wins
+  all-rep0 offset lanes (2 bytes), HUFF still wins near-uniform and
+  tiny streams, FSE wins the skewed bulk. Old streams decode unchanged.
+
+Measured (M5 Max, /tmp/silesia.blob, same-session hyperfine pairs):
+
+| metric | master | FSE branch | Δ |
+|---|---|---|---|
+| pz2 ratio | 31.044% | **30.863%** | **−0.181pp** |
+| pz2d ratio | 30.535% | **30.341%** | **−0.194pp** |
+| pz2 decode MT | 17.1–17.4 ms | 17.5–17.7 ms | +2–3% (≈0.4 ms; E-core side) |
+| pz2 decode ST | 137.9 ms | 137.0 ms | neutral (−0.7%) |
+| pz2d decode MT | 33.1 ms | 33.6 ms | neutral (+1.5%, within σ) |
+| pz2 encode | 3.08 s | 3.14 s | +1.9% (dual-candidate pricing) |
+
+The realized −0.18pp matches §12's quantization-adjusted prediction
+(~−0.20pp) almost exactly. The residual MT cost is order-independent
+across hyperfine runs and absent at ST on a P-core, so it is most
+likely the E-cores paying slightly more for the extra μops; at ≈0.4 ms
+on a 17 ms wall it is inside the documented ±10% machine-state drift
+band and far under the 3–5% kill line. pz2 headline becomes **blob
+30.86% at ~11.5–12 GiB/s all-cores**; pz2d becomes **30.34%** — 1.06pp
+under pzstd-3, the widest the Pareto edge has been.
+
+Validation: fresh soak after the wire change (release 180 s: 19,176
+round-trips + 767k mutated + 153k garbage decodes; debug 45 s; zero
+panics), blob round-trips verified for both pipelines, FSE-specific
+unit tests (mode selection, all-32-symbol normalization stress,
+per-byte corruption + truncation never panicking).
+
+Not pursued: FSE for the 8-lane literals (§12 measured −0.06pp
+headroom — not worth touching the proven splice's literal path), and
+interleaving the three FSE states into one bitstream (zstd's layout;
+separate lanes already decode at parity, so the only win would be
+stream-count bookkeeping, not speed).
