@@ -677,13 +677,20 @@ impl<'a> CodeLane<'a> {
 // Public block codec API
 // ---------------------------------------------------------------------------
 
-/// Encode one block with the pz2 sequence format.
+/// Encode one block with the pz2 sequence format using the default parse.
 ///
 /// Uses the shipped LzSeq lazy + repeat-aware parse (identical match
 /// decisions to `Lzf`), then re-encodes the tokens in the decode-first wire
 /// layout. The result decodes with [`decode`] given the original length.
 pub fn encode(input: &[u8]) -> PzResult<Vec<u8>> {
-    let tokens = lzseq::tokenize_with_config(input, &SeqConfig::default())?;
+    encode_with_config(input, &SeqConfig::default())
+}
+
+/// [`encode`] with an explicit parse config (window size, greedy/lazy,
+/// max match length). The wire format does not depend on the config — any
+/// pz2 stream decodes with [`decode`] regardless of parse settings.
+pub fn encode_with_config(input: &[u8], config: &SeqConfig) -> PzResult<Vec<u8>> {
+    let tokens = lzseq::tokenize_with_config(input, config)?;
     let (seqs, lits) = build_sequences(&tokens);
 
     let mut out = Vec::with_capacity(input.len() / 2 + 64);

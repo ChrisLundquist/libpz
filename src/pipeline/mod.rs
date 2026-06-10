@@ -315,6 +315,19 @@ pub(crate) fn resolve_max_match_len(_pipeline: Pipeline, options: &CompressOptio
     options.max_match_len.unwrap_or(lz77::DEFAULT_MAX_MATCH)
 }
 
+/// Build the LzSeq parse config for the Pz2 pipeline from CompressOptions —
+/// the same window / match-len / greedy mapping the LzSeq demux path uses,
+/// so `--greedy` and window flags affect `-p pz2` identically to `-p lzf`.
+pub(crate) fn pz2_seq_config(options: &CompressOptions) -> crate::lzseq::SeqConfig {
+    let defaults = crate::lzseq::SeqConfig::default();
+    crate::lzseq::SeqConfig {
+        max_window: options.seq_window_size.unwrap_or(defaults.max_window),
+        max_match_len: options.max_match_len.unwrap_or(defaults.max_match_len),
+        greedy: options.parse_strategy == ParseStrategy::Greedy,
+        ..defaults
+    }
+}
+
 /// Magic bytes for the libpz container format.
 pub(crate) const MAGIC: [u8; 2] = [b'P', b'Z'];
 /// Format version for multi-block streams.
@@ -770,8 +783,12 @@ pub fn select_pipeline_trial(
         ..options.clone()
     };
 
+    // Pz2 is listed before Lzf: identical parse and near-identical size, but
+    // ~3.4x faster single-thread decode — on an exact size tie the earlier
+    // candidate wins (strict `<` below keeps the first best).
     let candidates = [
         Pipeline::Bw,
+        Pipeline::Pz2,
         Pipeline::Lzf,
         Pipeline::Lzfi,
         Pipeline::LzssR,
@@ -790,9 +807,11 @@ pub fn select_pipeline_trial(
     for &pipeline in &candidates {
         // SortLz has its own match finder; Bw/Bbw/Num have no LZ stage at all.
         // Only test the default finder for these.
+        // Pz2 runs its own tokenize (ignores options.match_finder), so like
+        // Bw/Num there is nothing to vary on the finder axis.
         let finders: &[MatchFinder] = if matches!(
             pipeline,
-            Pipeline::Bw | Pipeline::Bbw | Pipeline::SortLz | Pipeline::Num
+            Pipeline::Bw | Pipeline::Bbw | Pipeline::SortLz | Pipeline::Num | Pipeline::Pz2
         ) {
             &[MatchFinder::HashChain]
         } else {
