@@ -146,7 +146,18 @@ const DEFAULT_BLOCK_SIZE: usize = 1024 * 1024;
 /// when encode gets GPU candidate generation or cache-aware chains.
 const DEFAULT_PZ2_BLOCK_SIZE: usize = 2 * 1024 * 1024;
 
-/// Streaming-path option resolution: ONLY the Pz2 block-size default.
+/// Pz2d format constants: a container block IS one segment; its first
+/// PZ2D_DICT_SIZE bytes double as the shared dictionary for the segment's
+/// remaining PZ2D_INNER_BLOCK-sized blocks. Baked into the format (the
+/// decoder derives the inner structure from these + the inner frame table).
+/// 32 MiB segments / 16 MiB dicts measured -0.57pp on the blob
+/// (clean-slate-codec.md §11); the working set is num_threads × ~segment,
+/// the deliberate cost of the segment tier.
+pub(crate) const PZ2D_SEGMENT_SIZE: usize = 32 * 1024 * 1024;
+pub(crate) const PZ2D_DICT_SIZE: usize = 16 * 1024 * 1024;
+pub(crate) const PZ2D_INNER_BLOCK: usize = DEFAULT_PZ2_BLOCK_SIZE;
+
+/// Streaming-path option resolution: ONLY the Pz2/Pz2d block-size defaults.
 ///
 /// Deliberately narrower than `adjusted_options`: the streaming (CLI) path
 /// has never inherited the other arms — the bw 512KB adjustment was ratified
@@ -157,8 +168,12 @@ pub(crate) fn streaming_adjusted_options(
     options: &CompressOptions,
 ) -> CompressOptions {
     let mut adjusted = options.clone();
-    if pipeline == Pipeline::Pz2 && options.block_size == DEFAULT_BLOCK_SIZE {
-        adjusted.block_size = DEFAULT_PZ2_BLOCK_SIZE;
+    if options.block_size == DEFAULT_BLOCK_SIZE {
+        if pipeline == Pipeline::Pz2 {
+            adjusted.block_size = DEFAULT_PZ2_BLOCK_SIZE;
+        } else if pipeline == Pipeline::Pz2d {
+            adjusted.block_size = PZ2D_SEGMENT_SIZE;
+        }
     }
     adjusted
 }
@@ -436,6 +451,11 @@ pub enum Pipeline {
     /// splice. ~3x single-thread decode vs Lzf at ratio parity. See
     /// `docs/design-docs/clean-slate-codec.md` and `src/pz2.rs`.
     Pz2 = 13,
+    /// Pz2 dict tier: 32 MiB segments whose first 16 MiB doubles as a shared
+    /// dictionary for the segment's remaining 2 MiB blocks (frozen-finder
+    /// encode, prefix-primed decode). Blob 30.48% vs pz2's 31.04% at the
+    /// same decode parallelism class. See clean-slate-codec.md §11.
+    Pz2d = 14,
 }
 
 impl TryFrom<u8> for Pipeline {
@@ -457,6 +477,7 @@ impl TryFrom<u8> for Pipeline {
             11 => Ok(Self::Num),
             12 => Ok(Self::LzSeq2R),
             13 => Ok(Self::Pz2),
+            14 => Ok(Self::Pz2d),
             _ => Err(PzError::Unsupported),
         }
     }
@@ -924,10 +945,15 @@ fn adjusted_options(pipeline: Pipeline, options: &CompressOptions) -> CompressOp
     // Pz2's match window is capped by the block size (blocks parse cold), so
     // block size is its window lever; see DEFAULT_PZ2_BLOCK_SIZE for the
     // 2026-06 sweep data and why 2 MiB (not 4) is the knee once concurrent
-    // encode cache pressure is counted.
-    if matches!(pipeline, Pipeline::Pz2) {
+    // encode cache pressure is counted. Pz2d's container block is a whole
+    // segment.
+    if matches!(pipeline, Pipeline::Pz2 | Pipeline::Pz2d) {
         let mut adjusted = options.clone();
-        adjusted.block_size = DEFAULT_PZ2_BLOCK_SIZE;
+        adjusted.block_size = if pipeline == Pipeline::Pz2d {
+            PZ2D_SEGMENT_SIZE
+        } else {
+            DEFAULT_PZ2_BLOCK_SIZE
+        };
         return adjusted;
     }
 
