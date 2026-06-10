@@ -977,8 +977,6 @@ pub fn decode_with_prefix(data: &[u8], prefix: &[u8], orig_len: usize) -> PzResu
 /// (and its grown capacity), paying one dict copy per worker instead of one
 /// per block.
 pub fn decode_into_arena(arena: &mut Vec<u8>, data: &[u8], orig_len: usize) -> PzResult<()> {
-    let pre = arena.len();
-    let total = pre + orig_len;
     let mut p = data;
     let seq_count = take_u32(&mut p)? as usize;
     let lit_total = take_u32(&mut p)? as usize;
@@ -1011,21 +1009,25 @@ pub fn decode_into_arena(arena: &mut Vec<u8>, data: &[u8], orig_len: usize) -> P
         _ => return Err(PzError::InvalidInput),
     }
 
-    splice(p, seq_count, &lits, lit_total, orig_len)
+    splice_into_arena(arena, p, seq_count, &lits, lit_total, orig_len)
 }
 
-/// Sequence splice shared by [`decode`] and the G32 spike decoder: consumes
-/// the sequence section (`p` points just past the literal section) and the
-/// pre-decoded literal buffer (`lits`, carrying `WILD` slack bytes past
-/// `lit_total`), producing the original block.
-fn splice(
+/// Sequence splice shared by [`decode_into_arena`] and the G32 spike
+/// decoders: consumes the sequence section (`p` points just past the literal
+/// section) and the pre-decoded literal buffer (`lits`, carrying `WILD`
+/// slack bytes past `lit_total`), appending the block to `arena` (whose
+/// current contents are the dict/prefix the block's matches may reach into).
+fn splice_into_arena(
+    arena: &mut Vec<u8>,
     mut p: &[u8],
     seq_count: usize,
     lits: &[u8],
     lit_total: usize,
     orig_len: usize,
-) -> PzResult<Vec<u8>> {
+) -> PzResult<()> {
     debug_assert!(lits.len() >= lit_total + WILD);
+    let pre = arena.len();
+    let total = pre + orig_len;
     // --- Sequence splice (wildcopy discipline) ---
     // Output is FULLY INITIALIZED with 2*WILD slack: arena[..pre] is the
     // caller's prefix (initialized by definition) and resize() zero-fills
@@ -1149,6 +1151,30 @@ fn splice(
     }
     arena.truncate(total);
     Ok(())
+}
+
+/// Vec-returning splice for the G32 spike decoders (`decode_g32`,
+/// `decode_g32_simd`): empty-prefix convenience over [`splice_into_arena`].
+fn splice(
+    p: &[u8],
+    seq_count: usize,
+    lits: &[u8],
+    lit_total: usize,
+    prefix: &[u8],
+    orig_len: usize,
+) -> PzResult<Vec<u8>> {
+    let mut arena = if prefix.is_empty() {
+        Vec::new()
+    } else {
+        let mut a = Vec::with_capacity(prefix.len() + orig_len + 2 * WILD);
+        a.extend_from_slice(prefix);
+        a
+    };
+    splice_into_arena(&mut arena, p, seq_count, lits, lit_total, orig_len)?;
+    if prefix.is_empty() {
+        return Ok(arena);
+    }
+    Ok(arena.split_off(prefix.len()))
 }
 
 /// Wild-copy granularity: copies round up to 16-byte chunks.
@@ -1299,6 +1325,368 @@ fn decode_lits_g32(table: &[u16; 1 << MAX_CODE_LEN], words: &[u8], out: &mut [u8
     Ok(())
 }
 
+/// Tail decode for the G32 layout: the final `< G32_LANES` symbols, same
+/// refill schedule as the hot rounds (lane = position within the round).
+/// Shared by the scalar, round-based, and NEON decoders.
+#[inline]
+fn decode_lits_g32_tail(
+    table: &[u16; 1 << MAX_CODE_LEN],
+    words: &[u8],
+    tail: &mut [u8],
+    acc: &mut [u64; G32_LANES],
+    nbits: &mut [u32; G32_LANES],
+    wpos: &mut usize,
+) -> PzResult<()> {
+    for (k, slot) in tail.iter_mut().enumerate() {
+        if nbits[k] < 32 {
+            if *wpos + 4 > words.len() {
+                return Err(PzError::InvalidInput);
+            }
+            let w = u32::from_le_bytes(words[*wpos..*wpos + 4].try_into().unwrap());
+            acc[k] |= (w as u64) << nbits[k];
+            nbits[k] += 32;
+            *wpos += 4;
+        }
+        let e = table[(acc[k] & ((1 << MAX_CODE_LEN) - 1)) as usize];
+        let len = (e & 0xF) as u32;
+        acc[k] >>= len;
+        nbits[k] -= len;
+        *slot = (e >> 4) as u8;
+    }
+    Ok(())
+}
+
+/// Round-based portable decoder for the G32 layout (stage-2 CPU baseline,
+/// variant "rounds"): instead of a conditional refill branch per symbol, each
+/// round (a) builds the 32-bit refill mask, (b) bounds-checks the word stream
+/// ONCE for the whole round, (c) refills only the set lanes (sparse loop),
+/// then (d) decodes 32 symbols branch-free. Identical schedule and output to
+/// [`decode_lits_g32`]; restructured for ILP.
+fn decode_lits_g32_rounds(
+    table: &[u16; 1 << MAX_CODE_LEN],
+    words: &[u8],
+    out: &mut [u8],
+) -> PzResult<()> {
+    let mut acc = [0u64; G32_LANES];
+    let mut nbits = [0u32; G32_LANES];
+    let mut wpos = 0usize;
+
+    let mut chunks = out.chunks_exact_mut(G32_LANES);
+    for round_out in chunks.by_ref() {
+        // (a) refill mask — independent compares the compiler vectorizes.
+        let mut m: u32 = 0;
+        for (k, &nb) in nbits.iter().enumerate() {
+            m |= ((nb < 32) as u32) << k;
+        }
+        // (b) one bounds check per round.
+        let need = m.count_ones() as usize;
+        if wpos + 4 * need > words.len() {
+            return Err(PzError::InvalidInput);
+        }
+        // (c) sparse refill in lane order (the wire's word order).
+        let mut mm = m;
+        while mm != 0 {
+            let k = mm.trailing_zeros() as usize;
+            let w = u32::from_le_bytes(words[wpos..wpos + 4].try_into().unwrap());
+            acc[k] |= (w as u64) << nbits[k];
+            nbits[k] += 32;
+            wpos += 4;
+            mm &= mm - 1;
+        }
+        // (d) 32 independent table lookups; no per-symbol branches. After a
+        // refill every lane holds >= 32 live bits and len <= 11, so neither
+        // acc nor nbits can underflow even on corrupt input.
+        for (k, slot) in round_out.iter_mut().enumerate() {
+            let e = table[(acc[k] & ((1 << MAX_CODE_LEN) - 1)) as usize];
+            let len = (e & 0xF) as u32;
+            acc[k] >>= len;
+            nbits[k] -= len;
+            *slot = (e >> 4) as u8;
+        }
+    }
+    decode_lits_g32_tail(
+        table,
+        words,
+        chunks.into_remainder(),
+        &mut acc,
+        &mut nbits,
+        &mut wpos,
+    )
+}
+
+/// NEON decoder for the G32 layout (aarch64, stage-2 CPU baseline, variant
+/// "neon"). Per round: the refill mask and the `nbits += 32` / `nbits -= len`
+/// updates are vector ops over two u8x16 lane-count registers (nbits <= 63
+/// fits u8); the table gather is 32 independent scalar loads (NEON has no
+/// gather) fused with the acc shift; symbol extraction (`e >> 4`) narrows
+/// four u16x8 entry vectors straight into two 16-byte output stores.
+#[cfg(target_arch = "aarch64")]
+fn decode_lits_g32_neon(
+    table: &[u16; 1 << MAX_CODE_LEN],
+    words: &[u8],
+    out: &mut [u8],
+) -> PzResult<()> {
+    use std::arch::aarch64::*;
+
+    let full_rounds = out.len() / G32_LANES;
+    let mut acc = [0u64; G32_LANES];
+    let mut wpos = 0usize;
+    let wlen = words.len();
+    let wptr = words.as_ptr();
+
+    // SAFETY: all loads/stores below are within `acc`/`e_arr`/`nbits_arr`
+    // stack arrays, `out[..full_rounds * 32]`, or `words` after the explicit
+    // per-round bounds check on `wpos + 4 * need`.
+    unsafe {
+        let mut nb0 = vdupq_n_u8(0); // lanes 0..16 live-bit counts
+        let mut nb1 = vdupq_n_u8(0); // lanes 16..32
+        let thresh = vdupq_n_u8(32);
+        const BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let wbits = vld1q_u8(BITS.as_ptr());
+        let lenmask = vdupq_n_u8(0xF);
+        let mut nbits_arr = [0u8; G32_LANES];
+        let mut e_arr = [0u16; G32_LANES];
+        let out_ptr = out.as_mut_ptr();
+
+        for r in 0..full_rounds {
+            // Refill mask: bit k set iff lane k holds < 32 live bits.
+            let lt0 = vcltq_u8(nb0, thresh);
+            let lt1 = vcltq_u8(nb1, thresh);
+            // Weights are disjoint per 8-lane group, so horizontal ADD == OR.
+            let w0 = vandq_u8(lt0, wbits);
+            let w1 = vandq_u8(lt1, wbits);
+            let m = vaddv_u8(vget_low_u8(w0)) as u32
+                | (vaddv_u8(vget_high_u8(w0)) as u32) << 8
+                | (vaddv_u8(vget_low_u8(w1)) as u32) << 16
+                | (vaddv_u8(vget_high_u8(w1)) as u32) << 24;
+
+            if m != 0 {
+                let need = m.count_ones() as usize;
+                if wpos + 4 * need > wlen {
+                    return Err(PzError::InvalidInput);
+                }
+                vst1q_u8(nbits_arr.as_mut_ptr(), nb0);
+                vst1q_u8(nbits_arr.as_mut_ptr().add(16), nb1);
+                let mut mm = m;
+                while mm != 0 {
+                    let k = mm.trailing_zeros() as usize;
+                    let w = (wptr.add(wpos) as *const u32).read_unaligned().to_le();
+                    *acc.get_unchecked_mut(k) |= (w as u64) << *nbits_arr.get_unchecked(k);
+                    wpos += 4;
+                    mm &= mm - 1;
+                }
+                nb0 = vaddq_u8(nb0, vandq_u8(lt0, thresh));
+                nb1 = vaddq_u8(nb1, vandq_u8(lt1, thresh));
+            }
+
+            // Gather (scalar — no NEON gather) fused with the acc shift.
+            // Post-refill every lane has >= 32 live bits and len <= 11, so
+            // no underflow is possible even on corrupt input.
+            for k in 0..G32_LANES {
+                let a = *acc.get_unchecked(k);
+                let e = *table.get_unchecked((a & ((1 << MAX_CODE_LEN) - 1)) as usize);
+                *acc.get_unchecked_mut(k) = a >> (e & 0xF);
+                *e_arr.get_unchecked_mut(k) = e;
+            }
+
+            // Vector epilogue: sym = e >> 4 (shift-right-narrow), len = low
+            // nibble of the truncated entry; two 16B output stores.
+            let e0 = vld1q_u16(e_arr.as_ptr());
+            let e1 = vld1q_u16(e_arr.as_ptr().add(8));
+            let e2 = vld1q_u16(e_arr.as_ptr().add(16));
+            let e3 = vld1q_u16(e_arr.as_ptr().add(24));
+            let sym01 = vcombine_u8(vshrn_n_u16(e0, 4), vshrn_n_u16(e1, 4));
+            let sym23 = vcombine_u8(vshrn_n_u16(e2, 4), vshrn_n_u16(e3, 4));
+            let len01 = vandq_u8(vcombine_u8(vmovn_u16(e0), vmovn_u16(e1)), lenmask);
+            let len23 = vandq_u8(vcombine_u8(vmovn_u16(e2), vmovn_u16(e3)), lenmask);
+            nb0 = vsubq_u8(nb0, len01);
+            nb1 = vsubq_u8(nb1, len23);
+            vst1q_u8(out_ptr.add(r * G32_LANES), sym01);
+            vst1q_u8(out_ptr.add(r * G32_LANES + 16), sym23);
+        }
+
+        // Tail: hand the vector state back to the shared scalar tail.
+        vst1q_u8(nbits_arr.as_mut_ptr(), nb0);
+        vst1q_u8(nbits_arr.as_mut_ptr().add(16), nb1);
+        let mut nbits = [0u32; G32_LANES];
+        for (dst, &src) in nbits.iter_mut().zip(nbits_arr.iter()) {
+            *dst = src as u32;
+        }
+        decode_lits_g32_tail(
+            table,
+            words,
+            &mut out[full_rounds * G32_LANES..],
+            &mut acc,
+            &mut nbits,
+            &mut wpos,
+        )
+    }
+}
+
+/// Best available CPU decoder for the G32 literal layout (NEON on aarch64,
+/// round-based portable elsewhere).
+fn decode_lits_g32_best(
+    table: &[u16; 1 << MAX_CODE_LEN],
+    words: &[u8],
+    out: &mut [u8],
+) -> PzResult<()> {
+    #[cfg(target_arch = "aarch64")]
+    return decode_lits_g32_neon(table, words, out);
+    #[cfg(not(target_arch = "aarch64"))]
+    return decode_lits_g32_rounds(table, words, out);
+}
+
+// ---------------------------------------------------------------------------
+// Spike-only probe hooks (stage 2): literal-phase benchmark entry points and
+// raw G32 literal-section access for the Metal probe. Not a shipping API.
+// ---------------------------------------------------------------------------
+
+/// Spike-only: decode just the literal section of a SHIPPED pz2 block with
+/// the production 8-lane decoder, returning the literal bytes. This is the
+/// honest CPU denominator for the G32 literal-phase comparisons.
+#[doc(hidden)]
+pub fn spike_decode_lits_pz2(block: &[u8]) -> PzResult<Vec<u8>> {
+    let mut p = block;
+    let _seq_count = take_u32(&mut p)?;
+    let lit_total = take_u32(&mut p)? as usize;
+    let mut lits = vec![0u8; lit_total];
+    let mode = take(&mut p, 1)?[0];
+    match mode {
+        LIT_RAW => lits.copy_from_slice(take(&mut p, lit_total)?),
+        LIT_HUFF => {
+            let packed = take(&mut p, 128)?;
+            let lengths = unpack_lengths(packed);
+            let table = build_decode_table(&lengths)?;
+            let mut lane_lens = [0usize; NUM_LANES];
+            for l in lane_lens.iter_mut() {
+                *l = take_u32(&mut p)? as usize;
+            }
+            let mut lanes: [&[u8]; NUM_LANES] = [&[]; NUM_LANES];
+            for (lane, &l) in lanes.iter_mut().zip(lane_lens.iter()) {
+                *lane = take(&mut p, l)?;
+            }
+            decode_lanes(&table, lanes, &mut lits)?;
+        }
+        _ => return Err(PzError::InvalidInput),
+    }
+    Ok(lits)
+}
+
+/// Spike-only: decode just the literal section of a G32-transcoded block.
+/// `variant`: 0 = scalar (stage-1), 1 = round-based portable, 2 = best
+/// (NEON on aarch64).
+#[doc(hidden)]
+pub fn spike_decode_lits_g32(block: &[u8], variant: u8) -> PzResult<Vec<u8>> {
+    let mut p = block;
+    let _seq_count = take_u32(&mut p)?;
+    let lit_total = take_u32(&mut p)? as usize;
+    let mut lits = vec![0u8; lit_total];
+    let mode = take(&mut p, 1)?[0];
+    match mode {
+        LIT_RAW => lits.copy_from_slice(take(&mut p, lit_total)?),
+        LIT_HUFF => {
+            let packed = take(&mut p, 128)?;
+            let lengths = unpack_lengths(packed);
+            let table = build_decode_table(&lengths)?;
+            let word_bytes = take_u32(&mut p)? as usize;
+            let words = take(&mut p, word_bytes)?;
+            match variant {
+                0 => decode_lits_g32(&table, words, &mut lits)?,
+                1 => decode_lits_g32_rounds(&table, words, &mut lits)?,
+                _ => decode_lits_g32_best(&table, words, &mut lits)?,
+            }
+        }
+        _ => return Err(PzError::InvalidInput),
+    }
+    Ok(lits)
+}
+
+/// Spike-only: full block decode of a G32-transcoded block using the best
+/// CPU literal decoder + the shared splice (counterpart of [`decode`]).
+#[doc(hidden)]
+pub fn decode_g32_simd(data: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    let mut p = data;
+    let seq_count = take_u32(&mut p)? as usize;
+    let lit_total = take_u32(&mut p)? as usize;
+    if lit_total > orig_len {
+        return Err(PzError::InvalidInput);
+    }
+    let mut lits = vec![0u8; lit_total + WILD];
+    let mode = take(&mut p, 1)?[0];
+    match mode {
+        LIT_RAW => lits[..lit_total].copy_from_slice(take(&mut p, lit_total)?),
+        LIT_HUFF => {
+            let packed = take(&mut p, 128)?;
+            let lengths = unpack_lengths(packed);
+            let table = build_decode_table(&lengths)?;
+            let word_bytes = take_u32(&mut p)? as usize;
+            let words = take(&mut p, word_bytes)?;
+            decode_lits_g32_best(&table, words, &mut lits[..lit_total])?;
+        }
+        _ => return Err(PzError::InvalidInput),
+    }
+    splice(p, seq_count, &lits, lit_total, &[], orig_len)
+}
+
+/// Spike-only: extract the literal-section raw materials of a SHIPPED pz2
+/// block for the Metal probe: `(code_lengths, literal_bytes)`. Returns
+/// `None` for `LIT_RAW` blocks (on GPU that phase is a plain memcpy).
+#[doc(hidden)]
+#[allow(clippy::type_complexity)]
+pub fn spike_lit_materials(block: &[u8]) -> PzResult<Option<(Box<[u8; 256]>, Vec<u8>)>> {
+    let mut p = block;
+    let _seq_count = take_u32(&mut p)?;
+    let lit_total = take_u32(&mut p)? as usize;
+    let mode = take(&mut p, 1)?[0];
+    if mode != LIT_HUFF {
+        return Ok(None);
+    }
+    let packed = take(&mut p, 128)?;
+    let lengths = unpack_lengths(packed);
+    let table = build_decode_table(&lengths)?;
+    let mut lane_lens = [0usize; NUM_LANES];
+    for l in lane_lens.iter_mut() {
+        *l = take_u32(&mut p)? as usize;
+    }
+    let mut lanes: [&[u8]; NUM_LANES] = [&[]; NUM_LANES];
+    for (lane, &l) in lanes.iter_mut().zip(lane_lens.iter()) {
+        *lane = take(&mut p, l)?;
+    }
+    let mut lits = vec![0u8; lit_total];
+    decode_lanes(&table, lanes, &mut lits)?;
+    Ok(Some((Box::new(lengths), lits)))
+}
+
+/// Spike-only: encode a literal slice into the G32 interleaved word stream
+/// with the given canonical code lengths (the Metal probe uses this to cut
+/// blocks into independent tiles).
+#[doc(hidden)]
+pub fn spike_g32_encode_words(lits: &[u8], lengths: &[u8; 256]) -> PzResult<Vec<u8>> {
+    let codes = canonical_codes(lengths)?;
+    Ok(encode_lits_g32(lits, &codes))
+}
+
+/// Spike-only: build the flat 2048-entry decode table (`sym << 4 | len`)
+/// for upload to GPU memory.
+#[doc(hidden)]
+pub fn spike_g32_decode_table(lengths: &[u8; 256]) -> PzResult<Vec<u16>> {
+    Ok(build_decode_table(lengths)?.to_vec())
+}
+
+/// Spike-only: CPU reference decode of a G32 word stream (best variant),
+/// used by the Metal probe for round-trip verification.
+#[doc(hidden)]
+pub fn spike_g32_decode_words(
+    words: &[u8],
+    lengths: &[u8; 256],
+    lit_total: usize,
+) -> PzResult<Vec<u8>> {
+    let table = build_decode_table(lengths)?;
+    let mut out = vec![0u8; lit_total];
+    decode_lits_g32_best(&table, words, &mut out)?;
+    Ok(out)
+}
+
 /// Transcode a shipped pz2 block into the G32 literal layout. The Huffman
 /// table (packed code lengths) and the entire sequence section are copied
 /// verbatim; only the literal bitstream framing changes, so the size delta
@@ -1369,7 +1757,7 @@ pub fn decode_g32(data: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
         _ => return Err(PzError::InvalidInput),
     }
 
-    splice(p, seq_count, &lits, lit_total, orig_len)
+    splice(p, seq_count, &lits, lit_total, &[], orig_len)
 }
 
 // ---------------------------------------------------------------------------
@@ -1551,6 +1939,19 @@ mod tests {
         let g32 = transcode_g32(&enc).expect("transcode");
         let dec = decode_g32(&g32, input.len()).expect("decode_g32");
         assert_eq!(dec, input, "g32 round-trip mismatch (len {})", input.len());
+        // Stage-2 variants must agree with the stage-1 scalar decoder.
+        let dec_simd = decode_g32_simd(&g32, input.len()).expect("decode_g32_simd");
+        assert_eq!(dec_simd, input, "g32 simd mismatch (len {})", input.len());
+        let l0 = spike_decode_lits_g32(&g32, 0).expect("lits scalar");
+        let l1 = spike_decode_lits_g32(&g32, 1).expect("lits rounds");
+        let l2 = spike_decode_lits_g32(&g32, 2).expect("lits best");
+        assert_eq!(l0, l1, "rounds variant lits mismatch");
+        assert_eq!(l0, l2, "best variant lits mismatch");
+        assert_eq!(
+            l0,
+            spike_decode_lits_pz2(&enc).expect("lits pz2"),
+            "8-lane vs g32 lits mismatch"
+        );
     }
 
     #[test]
@@ -1619,11 +2020,13 @@ mod tests {
         let g32 = transcode_g32(&encode(&input).unwrap()).unwrap();
         for cut in [0, 1, 4, 8, 9, g32.len() / 2, g32.len() - 1] {
             let _ = decode_g32(&g32[..cut], input.len());
+            let _ = decode_g32_simd(&g32[..cut], input.len());
         }
         for i in 0..g32.len().min(64) {
             let mut bad = g32.clone();
             bad[i] ^= 0x55;
             let _ = decode_g32(&bad, input.len());
+            let _ = decode_g32_simd(&bad, input.len());
         }
     }
 
