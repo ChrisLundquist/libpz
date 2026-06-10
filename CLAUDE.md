@@ -63,7 +63,7 @@ input → tokenize() → Vec<LzToken> → TokenEncoder::encode() → multi-strea
 | **SortLz** | LzSeq (internal) | FSE | Deterministic GPU radix-sort matching |
 | **Bw** / **Bbw** | — | FSE | BWT-based, no LZ tokens |
 | **Num** | — | per-plane FSE | Numeric/binary front-end (byte-plane transpose + per-plane gated delta/zigzag). Opt-in (`-p num`); for the worst numeric files — x-ray 55%→48% (beats xz/bzip2), sao 74%→63%. Block-parallel, O(n) inverse. `src/numeric.rs` |
-| **Pz2** | sequences (own wire) | 8-lane Huffman | Decode-first clean-slate codec (`-p pz2`): same LzSeq parse re-expressed as zstd-style sequences, 8-lane Huffman literals + fused splice. **3.45x lzf single-thread decode at ratio parity** (blob 1405 MB/s ST, 12.1 GiB/s all-cores; 1.40x faster than pzstd -3 wall-clock at 0.8pp ratio cost). Encode 1.43x faster than lzf too. `src/pz2.rs`, `docs/design-docs/clean-slate-codec.md` |
+| **Pz2** | sequences (own wire) | 8-lane Huffman | Decode-first clean-slate codec (`-p pz2`): same LzSeq parse re-expressed as zstd-style sequences, 8-lane Huffman literals + fused splice, 2 MiB blocks (window = block; the 1→2 MiB bump bought −0.22 to −0.36pp). **Beats lzf on both axes: blob 32.0% vs 32.2% at 3.45x ST decode** (1405 MB/s ST, 11.0 GiB/s all-cores; 1.28x faster than pzstd -3 wall-clock at 0.6pp ratio cost). Encode 107 MiB/s all-cores (the ratio buy; 4 MiB blocks rejected — concurrent 16 MiB chain walks collapse encode 5.5x). `src/pz2.rs`, `docs/design-docs/clean-slate-codec.md` |
 
 **Removed pipelines:** Deflate (#117), Lzr (#118), Lz78R (#116), Parlz (ratio loss)
 

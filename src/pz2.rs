@@ -182,76 +182,69 @@ fn vdecode(code: u8, extra: u32) -> u32 {
 // Length-limited canonical Huffman
 // ---------------------------------------------------------------------------
 
-/// Compute Huffman code lengths for `counts`, limited to MAX_CODE_LEN by
-/// halving counts and rebuilding until the tree fits (slightly suboptimal in
-/// rare deep-tree cases, always a valid Kraft-exact Huffman tree).
+/// Compute optimal MAX_CODE_LEN-limited Huffman code lengths for `counts`
+/// via package-merge (Larmore-Hirschberg). Replaces the old halve-and-rebuild
+/// heuristic, which distorted *all* frequencies whenever the unlimited tree
+/// ran deeper than the limit (routine on skewed 1-4 MiB literal histograms).
 ///
-/// Requires ≥ 2 symbols with nonzero count (callers fall back to raw mode).
+/// The selected items always form a full binary tree, so the lengths are
+/// Kraft-exact — required by `canonical_codes`' validator and the hole-free
+/// flat decode table.
+///
+/// Requires ≥ 2 symbols with nonzero count (callers fall back to raw /
+/// constant modes). Cost is O(alphabet × MAX_CODE_LEN) on ≤256 symbols —
+/// noise next to the parse.
 fn huffman_lengths(counts: &[u32; 256]) -> [u8; 256] {
-    let mut work: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
-    loop {
-        let lengths = heap_lengths(&work);
-        let max = lengths.iter().copied().max().unwrap_or(0);
-        if (max as u32) <= MAX_CODE_LEN {
-            let mut out = [0u8; 256];
-            out.copy_from_slice(&lengths);
-            return out;
+    // (weight, leaf syms with multiplicity). Sorted ascending by weight,
+    // ties by symbol for determinism.
+    let mut leaves: Vec<(u64, Vec<u8>)> = counts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &c)| c > 0)
+        .map(|(sym, &c)| (c as u64, vec![sym as u8]))
+        .collect();
+    leaves.sort_by_key(|&(w, ref syms)| (w, syms[0]));
+    let n = leaves.len();
+    assert!(n >= 2, "huffman_lengths requires >= 2 symbols");
+    debug_assert!(n <= 1 << MAX_CODE_LEN);
+
+    // I_1 = leaves; I_{k+1} = merge(leaves, package(I_k)). After
+    // MAX_CODE_LEN rounds, each leaf's optimal length-limited code length is
+    // its multiplicity among the first 2n-2 items of I_L.
+    let mut list = leaves.clone();
+    for _ in 1..MAX_CODE_LEN {
+        let mut packages: Vec<(u64, Vec<u8>)> = Vec::with_capacity(list.len() / 2);
+        let mut it = list.into_iter();
+        while let (Some(a), Some(b)) = (it.next(), it.next()) {
+            let mut syms = a.1;
+            syms.extend_from_slice(&b.1);
+            packages.push((a.0 + b.0, syms));
         }
-        for c in work.iter_mut() {
-            if *c > 0 {
-                *c = (*c + 1) >> 1;
+        // Merge the (sorted) packages with the (sorted) fresh leaves.
+        let mut merged = Vec::with_capacity(leaves.len() + packages.len());
+        let (mut li, mut pi) = (0, 0);
+        while li < leaves.len() || pi < packages.len() {
+            // Leaves win ties: shorter codes for real symbols over packages.
+            let take_leaf =
+                pi >= packages.len() || (li < leaves.len() && leaves[li].0 <= packages[pi].0);
+            if take_leaf {
+                merged.push(leaves[li].clone());
+                li += 1;
+            } else {
+                merged.push(std::mem::take(&mut packages[pi]));
+                pi += 1;
             }
         }
+        list = merged;
     }
-}
 
-/// Plain heap Huffman → per-symbol code lengths (0 = absent).
-fn heap_lengths(counts: &[u64]) -> Vec<u8> {
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
-
-    // Node arena: leaves for nonzero symbols, then internal nodes.
-    // parent[i] = parent node index (usize::MAX = root/none yet).
-    let mut node_count: Vec<u64> = Vec::new();
-    let mut parent: Vec<usize> = Vec::new();
-    let mut leaf_of_sym: Vec<Option<usize>> = vec![None; counts.len()];
-
-    let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::new();
-    for (sym, &c) in counts.iter().enumerate() {
-        if c > 0 {
-            let idx = node_count.len();
-            node_count.push(c);
-            parent.push(usize::MAX);
-            leaf_of_sym[sym] = Some(idx);
-            heap.push(Reverse((c, idx)));
+    let mut out = [0u8; 256];
+    for (_, syms) in list.iter().take(2 * n - 2) {
+        for &s in syms {
+            out[s as usize] += 1;
         }
     }
-    let num_leaves = node_count.len();
-    assert!(num_leaves >= 2, "huffman_lengths requires >= 2 symbols");
-
-    while heap.len() > 1 {
-        let Reverse((c1, i1)) = heap.pop().unwrap();
-        let Reverse((c2, i2)) = heap.pop().unwrap();
-        let idx = node_count.len();
-        node_count.push(c1 + c2);
-        parent.push(usize::MAX);
-        parent[i1] = idx;
-        parent[i2] = idx;
-        heap.push(Reverse((c1 + c2, idx)));
-    }
-
-    let mut lengths = vec![0u8; counts.len()];
-    for (sym, leaf) in leaf_of_sym.iter().enumerate() {
-        if let Some(mut idx) = *leaf {
-            let mut depth = 0u32;
-            while parent[idx] != usize::MAX {
-                idx = parent[idx];
-                depth += 1;
-            }
-            lengths[sym] = depth as u8;
-        }
-    }
-    lengths
+    out
 }
 
 /// Canonical code assignment shared by encoder and decoder.
