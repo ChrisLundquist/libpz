@@ -984,10 +984,24 @@ pub(crate) fn tokenize_with_config(
     input: &[u8],
     config: &SeqConfig,
 ) -> PzResult<Vec<crate::lz_token::LzToken>> {
+    tokenize_with_dict(input, 0, None, config)
+}
+
+/// [`tokenize_with_config`] generalized for the pz2 dict tier: tokens are
+/// emitted for `input[start..]` only, and an optional frozen dictionary
+/// (whose bytes must be `input[..dict.len()]`, with `start >= dict.len()`)
+/// extends the match finder's reach without re-inserting the dict — the
+/// frozen chains were built once and are shared read-only across workers.
+pub(crate) fn tokenize_with_dict(
+    input: &[u8],
+    start: usize,
+    dict: Option<std::sync::Arc<crate::lz77::FrozenDict>>,
+    config: &SeqConfig,
+) -> PzResult<Vec<crate::lz_token::LzToken>> {
     use crate::lz_token::LzToken;
 
     let mut tokens: Vec<LzToken> = Vec::new();
-    if input.is_empty() {
+    if input.len() <= start {
         return Ok(tokens);
     }
 
@@ -997,8 +1011,12 @@ pub(crate) fn tokenize_with_config(
     } else {
         HashChainFinder::with_window_and_chain(config.max_window, match_limit, config.max_chain)
     };
+    if let Some(d) = dict {
+        debug_assert!(start >= d.len(), "parse must start at/after the dict end");
+        finder.set_frozen_dict(d);
+    }
     let mut repeats = RepeatOffsets::new();
-    let mut pos: usize = 0;
+    let mut pos: usize = start;
     let max_match_len = match_limit as usize;
 
     // Adaptive chain depth tracking — identical constants to encode_with_config.

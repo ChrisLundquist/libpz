@@ -722,22 +722,45 @@ pub fn encode_with_prefix(data: &[u8], prefix_len: usize, config: &SeqConfig) ->
         }
         build_sequences(&kept)
     };
+    encode_sequences(&seqs, &lits, input.len())
+}
 
-    let mut out = Vec::with_capacity(input.len() / 2 + 64);
+/// Encode one block from a worker arena (`dict ‖ block`) using frozen
+/// dictionary chains built once via [`crate::lz77::FrozenDict::build`] and
+/// shared across workers. Unlike [`encode_with_prefix`], the dict is NOT
+/// re-parsed — the parse starts at the dict boundary and consults the
+/// frozen chains, so per-block encode cost is block-sized. The stream
+/// decodes with [`decode_with_prefix`] given the same dict bytes.
+pub fn encode_with_frozen_dict(
+    arena: &[u8],
+    dict: &std::sync::Arc<crate::lz77::FrozenDict>,
+    config: &SeqConfig,
+) -> PzResult<Vec<u8>> {
+    let dict_len = dict.len();
+    assert!(dict_len <= arena.len());
+    let tokens =
+        lzseq::tokenize_with_dict(arena, dict_len, Some(std::sync::Arc::clone(dict)), config)?;
+    let (seqs, lits) = build_sequences(&tokens);
+    encode_sequences(&seqs, &lits, arena.len() - dict_len)
+}
+
+/// Shared wire writer: sequences + literals → the pz2 block format.
+fn encode_sequences(seqs: &[Seq], lits: &[u8], block_len: usize) -> PzResult<Vec<u8>> {
+    let mut out = Vec::with_capacity(block_len / 2 + 64);
     put_u32(&mut out, seqs.len() as u32);
     put_u32(&mut out, lits.len() as u32);
 
     // --- Literal section ---
     let mut wrote_huff = false;
     let mut counts = [0u32; 256];
-    for &b in &lits {
+    for &b in lits {
         counts[b as usize] += 1;
     }
     let distinct = counts.iter().filter(|&&c| c > 0).count();
     if distinct >= 2 {
         let lengths = huffman_lengths(&counts);
         let codes = canonical_codes(&lengths)?;
-        let lanes = encode_lanes(&lits, &codes);
+        let lanes = encode_lanes(lits, &codes);
         let huff_size: usize = 1 + 128 + 4 * NUM_LANES + lanes.iter().map(Vec::len).sum::<usize>();
         if huff_size < 1 + lits.len() {
             out.push(LIT_HUFF);
@@ -753,7 +776,7 @@ pub fn encode_with_prefix(data: &[u8], prefix_len: usize, config: &SeqConfig) ->
     }
     if !wrote_huff {
         out.push(LIT_RAW);
-        out.extend_from_slice(&lits);
+        out.extend_from_slice(lits);
     }
 
     // --- Sequence section ---
@@ -764,7 +787,7 @@ pub fn encode_with_prefix(data: &[u8], prefix_len: usize, config: &SeqConfig) ->
         let mut ml_codes = Vec::with_capacity(n);
         let mut extras = BitWriter::new();
         let mut reps = RepeatOffsets::new();
-        for s in &seqs {
+        for s in seqs {
             let (c, eb, ev) = vcode(s.lit_run);
             ll_codes.push(c);
             extras.write(ev, eb);
@@ -1174,6 +1197,40 @@ mod tests {
         // Empty prefix delegates to the plain path.
         let enc0 = encode_with_prefix(&block, 0, &config).unwrap();
         assert_eq!(decode_with_prefix(&enc0, &[], block.len()).unwrap(), block);
+    }
+
+    #[test]
+    fn test_frozen_dict_round_trip() {
+        use crate::lz77::FrozenDict;
+        use std::sync::Arc;
+
+        let dict = b"the quick brown fox jumps over the lazy dog. ".repeat(64);
+        let block = b"the quick brown fox jumps over the lazy dog! ".repeat(80);
+        let mut arena = dict.clone();
+        arena.extend_from_slice(&block);
+
+        let config = SeqConfig::default();
+        let frozen = Arc::new(FrozenDict::build(&dict, config.hash_prefix_len));
+        let enc = encode_with_frozen_dict(&arena, &frozen, &config).unwrap();
+
+        // Wire-compatible with the prefix decoder.
+        let dec = decode_with_prefix(&enc, &dict, block.len()).unwrap();
+        assert_eq!(dec, block);
+
+        // The frozen chains must find the dict matches: at least as small
+        // as the cold encode, in the same family as the re-parse spike.
+        let cold = encode_with_config(&block, &config).unwrap();
+        assert!(
+            enc.len() < cold.len(),
+            "frozen-dict encode ({}) not smaller than cold ({})",
+            enc.len(),
+            cold.len()
+        );
+
+        // Empty dict behaves like a plain encode.
+        let empty = Arc::new(FrozenDict::build(&[], config.hash_prefix_len));
+        let enc0 = encode_with_frozen_dict(&block, &empty, &config).unwrap();
+        assert_eq!(decode(&enc0, block.len()).unwrap(), block);
     }
 
     #[test]
