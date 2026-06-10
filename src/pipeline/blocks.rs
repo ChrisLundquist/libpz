@@ -545,8 +545,9 @@ fn decompress_block_pz2d(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
             wave2_start = i;
             break;
         }
-        let dec = crate::pz2::decode_with_prefix(wire, &out, o)?;
-        out.extend_from_slice(&dec);
+        // Chain block's prefix is everything decoded so far: `out` is the
+        // arena, so the chain appends in place with zero prefix copies.
+        crate::pz2::decode_into_arena(&mut out, wire, o)?;
     }
     if out.len() > dict_len {
         // Inner frames must tile the dict region exactly.
@@ -554,19 +555,68 @@ fn decompress_block_pz2d(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     }
     let wave2 = &blocks[wave2_start.min(blocks.len())..];
     if !wave2.is_empty() {
-        let dict: &[u8] = &out;
-        let mut results: Vec<PzResult<Vec<u8>>> = Vec::new();
+        // wave2 non-empty implies the chain filled the dict region exactly
+        // (checked above), so out.len() == dict_len here.
+        //
+        // v1 spawned one thread per block and each decode re-zeroed an
+        // 18 MiB buffer and re-copied the 16 MiB dict — ~3.3 GB of memory
+        // traffic per segment that made decode memory-bound (§11b). Now a
+        // bounded set of workers each seed ONE arena with the dict and
+        // truncate-and-reuse it across their strided share of the blocks,
+        // decoding into per-block slices of the final output.
+        out.resize(orig_len, 0);
+        let (dict, rest) = out.split_at_mut(dict_len);
+        let dict: &[u8] = dict;
+        let mut jobs: Vec<(&[u8], &mut [u8])> = Vec::with_capacity(wave2.len());
+        let mut rem = rest;
+        for &(o, wire) in wave2 {
+            // total_orig == orig_len was validated, so the slices tile rest.
+            let (dst, tail) = rem.split_at_mut(o);
+            jobs.push((wire, dst));
+            rem = tail;
+        }
+        // Narrow fan-out: the outer scheduler already decodes segments
+        // concurrently, and each worker pays one 16 MiB dict copy — wide
+        // fan-out here would put every block on its own worker and degrade
+        // to v1's per-block dict traffic. A few workers per segment keep
+        // the wave-2 tail short relative to the sequential dict chain
+        // while the dict copy amortizes over each worker's block share.
+        let nworkers = (std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            / 4)
+        .clamp(1, jobs.len());
+        let mut shares: Vec<Vec<(&[u8], &mut [u8])>> = (0..nworkers).map(|_| Vec::new()).collect();
+        for (i, job) in jobs.into_iter().enumerate() {
+            shares[i % nworkers].push(job);
+        }
+        let mut results: Vec<PzResult<()>> = Vec::new();
         std::thread::scope(|s| {
-            let handles: Vec<_> = wave2
-                .iter()
-                .map(|&(o, wire)| s.spawn(move || crate::pz2::decode_with_prefix(wire, dict, o)))
+            let handles: Vec<_> = shares
+                .into_iter()
+                .map(|share| {
+                    s.spawn(move || -> PzResult<()> {
+                        // Reserve dict + largest block + wildcopy slack up
+                        // front so decode_into_arena's resize never
+                        // reallocates (which would re-copy the dict).
+                        let max_block = share.iter().map(|(_, dst)| dst.len()).max().unwrap_or(0);
+                        let mut arena: Vec<u8> = Vec::with_capacity(dict.len() + max_block + 64);
+                        arena.extend_from_slice(dict);
+                        for (wire, dst) in share {
+                            arena.truncate(dict.len());
+                            crate::pz2::decode_into_arena(&mut arena, wire, dst.len())?;
+                            dst.copy_from_slice(&arena[dict.len()..]);
+                        }
+                        Ok(())
+                    })
+                })
                 .collect();
             for h in handles {
                 results.push(h.join().unwrap_or(Err(PzError::InvalidInput)));
             }
         });
         for r in results {
-            out.extend_from_slice(&r?);
+            r?;
         }
     }
     if out.len() != orig_len {

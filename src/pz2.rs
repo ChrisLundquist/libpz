@@ -851,10 +851,22 @@ pub fn encode_segment(
 pub fn decode_segment(blocks: &[(usize, &[u8])], dict_size: usize) -> PzResult<Vec<u8>> {
     let total: usize = blocks.iter().map(|&(n, _)| n).sum();
     let mut out: Vec<u8> = Vec::with_capacity(total);
+    let mut arena: Vec<u8> = Vec::new();
     for &(orig_len, wire) in blocks {
-        let pref = out.len().min(dict_size);
-        let dec = decode_with_prefix(wire, &out[..pref], orig_len)?;
-        out.extend_from_slice(&dec);
+        if out.len() < dict_size {
+            // Dict-region chain: each block's prefix is everything decoded
+            // so far, so `out` itself is the arena.
+            decode_into_arena(&mut out, wire, orig_len)?;
+        } else {
+            // Dicted block: prefix is exactly the first dict_size bytes.
+            // Seed the side arena with them once, then truncate-and-reuse.
+            if arena.len() < dict_size {
+                arena.extend_from_slice(&out[arena.len()..dict_size]);
+            }
+            arena.truncate(dict_size);
+            decode_into_arena(&mut arena, wire, orig_len)?;
+            out.extend_from_slice(&arena[dict_size..]);
+        }
     }
     Ok(out)
 }
@@ -933,8 +945,39 @@ pub fn decode(data: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
 /// Decode one pz2 block whose matches may reach into `prefix` (a stream
 /// produced by [`encode_with_prefix`] with the same prefix bytes). Returns
 /// only the block's `orig_len` bytes.
+///
+/// Convenience wrapper over [`decode_into_arena`]; callers decoding many
+/// blocks against one shared dict should use the arena form directly so the
+/// dict bytes are not re-copied (and the output not re-zeroed) per block.
 pub fn decode_with_prefix(data: &[u8], prefix: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
-    let pre = prefix.len();
+    // Empty prefix keeps the arena fresh (capacity 0) so decode_into_arena
+    // takes its calloc path — pre-zeroed pages, no explicit memset.
+    let mut arena = if prefix.is_empty() {
+        Vec::new()
+    } else {
+        let mut a = Vec::with_capacity(prefix.len() + orig_len + 2 * WILD);
+        a.extend_from_slice(prefix);
+        a
+    };
+    decode_into_arena(&mut arena, data, orig_len)?;
+    if prefix.is_empty() {
+        return Ok(arena);
+    }
+    Ok(arena.split_off(prefix.len()))
+}
+
+/// Decode one pz2 block into `arena`, which on entry holds the bytes the
+/// block's matches may reach into (its dict/prefix; `arena.len()` is the
+/// prefix length). On success the arena holds `prefix ‖ block`
+/// (`arena.len()` = prefix len + `orig_len`).
+///
+/// The prefix region `arena[..pre]` is never written — every store below
+/// lands at positions ≥ `pre` — so a caller decoding many blocks against one
+/// shared dict can `truncate(dict_len)` between calls and reuse the arena
+/// (and its grown capacity), paying one dict copy per worker instead of one
+/// per block.
+pub fn decode_into_arena(arena: &mut Vec<u8>, data: &[u8], orig_len: usize) -> PzResult<()> {
+    let pre = arena.len();
     let total = pre + orig_len;
     let mut p = data;
     let seq_count = take_u32(&mut p)? as usize;
@@ -969,16 +1012,24 @@ pub fn decode_with_prefix(data: &[u8], prefix: &[u8], orig_len: usize) -> PzResu
     }
 
     // --- Sequence splice (wildcopy discipline) ---
-    // Output is FULLY INITIALIZED (zeroed) with 2*WILD slack; every copy
-    // below validates its logical bounds against `total` BEFORE copying,
-    // and wild 16-byte chunks may only spill into the initialized slack
-    // (bounded by total + WILD - 1 + WILD < out.len()). Garbage written
-    // to slack is either overwritten by the next sequence (which starts at
-    // the exact logical cursor) or removed by the final truncate. The dict
-    // prefix occupies out[..pre], so match offsets may reach into it while
-    // the cursor (out_len) starts at pre.
-    let mut out = vec![0u8; total + 2 * WILD];
-    out[..pre].copy_from_slice(prefix);
+    // Output is FULLY INITIALIZED with 2*WILD slack: arena[..pre] is the
+    // caller's prefix (initialized by definition) and resize() zero-fills
+    // [pre, total + 2*WILD). Every copy below validates its logical bounds
+    // against `total` BEFORE copying, and wild 16-byte chunks may only
+    // spill into the initialized slack (bounded by
+    // total + WILD - 1 + WILD < arena.len()). Garbage written to slack is
+    // either overwritten by the next sequence (which starts at the exact
+    // logical cursor) or removed by the final truncate. The prefix occupies
+    // arena[..pre], so match offsets may reach into it while the cursor
+    // (out_len) starts at pre — no store ever targets a position < pre.
+    if arena.capacity() == 0 {
+        // Fresh arena (pre == 0): vec![0; n] gets pre-zeroed pages straight
+        // from the allocator, skipping the explicit memset (and the double
+        // page touch) that resize() would pay on a large new buffer.
+        *arena = vec![0u8; total + 2 * WILD];
+    } else {
+        arena.resize(total + 2 * WILD, 0);
+    }
     let mut out_len = pre;
     let mut lit_pos = 0usize;
     if seq_count > 0 {
@@ -990,7 +1041,7 @@ pub fn decode_with_prefix(data: &[u8], prefix: &[u8], orig_len: usize) -> PzResu
         let mut extras = BitReader::new(extra_bytes);
         let mut reps = RepeatOffsets::new();
 
-        let out_ptr = out.as_mut_ptr();
+        let out_ptr = arena.as_mut_ptr();
         let lit_ptr = lits.as_ptr();
         for _ in 0..seq_count {
             // Three independent Huffman chains + the extras lane, fused with
@@ -1073,19 +1124,16 @@ pub fn decode_with_prefix(data: &[u8], prefix: &[u8], orig_len: usize) -> PzResu
         return Err(PzError::InvalidInput);
     }
     // SAFETY: disjoint buffers; lit_pos + trailing == lit_total ≤ lits.len()
-    // and out_len + trailing == total < out.len().
+    // and out_len + trailing == total < arena.len().
     unsafe {
         std::ptr::copy_nonoverlapping(
             lits.as_ptr().add(lit_pos),
-            out.as_mut_ptr().add(out_len),
+            arena.as_mut_ptr().add(out_len),
             trailing,
         );
     }
-    out.truncate(total);
-    if pre == 0 {
-        return Ok(out);
-    }
-    Ok(out.split_off(pre))
+    arena.truncate(total);
+    Ok(())
 }
 
 /// Wild-copy granularity: copies round up to 16-byte chunks.
@@ -1312,6 +1360,43 @@ mod tests {
         // Empty prefix delegates to the plain path.
         let enc0 = encode_with_prefix(&block, 0, &config).unwrap();
         assert_eq!(decode_with_prefix(&enc0, &[], block.len()).unwrap(), block);
+    }
+
+    #[test]
+    fn test_arena_reuse_round_trip() {
+        // Two different blocks decoded against one shared dict through a
+        // single truncate-and-reuse arena must match the wrapper path, and
+        // the dict region must come through every decode untouched.
+        let dict = b"the quick brown fox jumps over the lazy dog. ".repeat(64);
+        let block_a = b"the quick brown fox jumps over the lazy dog! ".repeat(80);
+        let block_b = lcg_stream(4000, 7);
+
+        let config = SeqConfig::default();
+        let enc = |block: &[u8]| {
+            let mut data = dict.clone();
+            data.extend_from_slice(block);
+            encode_with_prefix(&data, dict.len(), &config).unwrap()
+        };
+        let enc_a = enc(&block_a);
+        let enc_b = enc(&block_b);
+
+        let mut arena = dict.clone();
+        for (enc, block) in [(&enc_a, &block_a), (&enc_b, &block_b.clone())] {
+            arena.truncate(dict.len());
+            decode_into_arena(&mut arena, enc, block.len()).unwrap();
+            assert_eq!(&arena[..dict.len()], &dict[..], "dict region modified");
+            assert_eq!(&arena[dict.len()..], &block[..]);
+            assert_eq!(
+                decode_with_prefix(enc, &dict, block.len()).unwrap(),
+                block[..]
+            );
+        }
+
+        // Empty-prefix arena decode matches plain decode.
+        let enc0 = encode(&block_b).unwrap();
+        let mut arena0 = Vec::new();
+        decode_into_arena(&mut arena0, &enc0, block_b.len()).unwrap();
+        assert_eq!(arena0, block_b);
     }
 
     #[test]

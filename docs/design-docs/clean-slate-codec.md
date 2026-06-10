@@ -471,3 +471,53 @@ measured bottlenecks, both predicted by this section's arithmetic:
    + 64 MB frozen prev array — the 4 MiB-block cache lesson at segment
    scale. Levers: dict chain caps, sampled dict insertion, smaller
    dicts (4 MiB: −0.31pp at much lower walk cost).
+
+### §11c — Pz2d v2: arena decode SHIPPED; the traffic diagnosis was wrong
+
+The arena decode landed (`pz2::decode_into_arena`: the splice core takes
+an arena already holding the dict, never writes below it, callers
+truncate-and-reuse; `decode_with_prefix` is now a wrapper). Wave 2 uses
+a **narrow** fan-out (`available_parallelism/4` workers per segment,
+strided blocks) so each worker pays one dict copy amortized over its
+share; wave 1 decodes the chain directly into the output vec (zero
+prefix copies). One allocation gotcha cost 6 ms before being fixed:
+fresh decode buffers must come from `vec![0; n]` (calloc → pre-zeroed
+pages, lazy faulting), not `with_capacity` + `resize` (explicit memset,
+double page touch) — `decode_into_arena` takes the calloc path when the
+arena is fresh.
+
+Result: **dec wall 42.1 → 36.6 ms (−13%) at unchanged 30.48%**, user
+CPU 250 → 190 ms, sys 72 → 40 ms. pz2 (non-dict) is byte- and
+wall-identical (17.8 ms both, re-anchored same-day). Soaked (release
+180 s + 120 s, debug 45 s, zero panics).
+
+**But §11b's projection (~17-20 ms) was wrong, and the reason matters:**
+decode is **DRAM-latency-bound on the format's random dict reads, not
+traffic-bound**. Evidence:
+
+- ST per-segment decode is 16.8 ms (117.7 ms / 7 segments at `-t 1`) —
+  exactly on model. Concurrent segments inflate it 2.4×: outer-thread
+  sweep gives 71.3 ms (t=2) → 52.1 (t=4) → **40.6 (t=6) → 41.9 (t=7) →
+  46.0 (t=18)** — a hard floor near 40 ms (now 36.6 with the copies
+  gone) while aggregate decode sits at ~5 GB/s, far under the M5 Max's
+  bandwidth. Classic latency wall, not bandwidth.
+- Inner-worker sweep at the floor: W=4 → 40.8 ms, W=2 → ~64 ms (noisy),
+  W=1 → 44.4 ms. W=1 is one dict copy per segment — equivalent traffic
+  to a shared two-region splice — and it does NOT beat W=4. **The
+  two-region splice is therefore predicted to be a no-op on wall and is
+  not worth its unsafe complexity.** (Don't build it without new
+  evidence.)
+- Root cause: every match copy in a dicted/chain block is a random read
+  into a ~16-18 MiB region; 7 concurrent segments make the hot set
+  ~112-450 MiB ≫ SLC, so those reads are DRAM-latency misses. That is
+  the price of the dict reach that buys the ratio.
+- Confirmation via dict size: a 4 MiB-dict build (format const flip,
+  same code) measures **30.73% / 31.3 ms dec / 20.1 s enc** — smaller
+  hot set, shorter chain, faster wall, −0.26pp ratio. A real point on
+  the (ratio, decode) curve if a dict-size header field is ever added;
+  16 MiB stays shipped because pz2d is the max-ratio tier.
+
+Remaining decode headroom would need format-level changes (smaller/
+tiered dict reach, locality-sorted matches) — incremental copy
+elimination is exhausted. Encode-side concurrent inflation (§11b #2)
+is unchanged and is the next lever.
