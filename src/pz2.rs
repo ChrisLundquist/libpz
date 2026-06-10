@@ -1011,6 +1011,21 @@ pub fn decode_into_arena(arena: &mut Vec<u8>, data: &[u8], orig_len: usize) -> P
         _ => return Err(PzError::InvalidInput),
     }
 
+    splice(p, seq_count, &lits, lit_total, orig_len)
+}
+
+/// Sequence splice shared by [`decode`] and the G32 spike decoder: consumes
+/// the sequence section (`p` points just past the literal section) and the
+/// pre-decoded literal buffer (`lits`, carrying `WILD` slack bytes past
+/// `lit_total`), producing the original block.
+fn splice(
+    mut p: &[u8],
+    seq_count: usize,
+    lits: &[u8],
+    lit_total: usize,
+    orig_len: usize,
+) -> PzResult<Vec<u8>> {
+    debug_assert!(lits.len() >= lit_total + WILD);
     // --- Sequence splice (wildcopy discipline) ---
     // Output is FULLY INITIALIZED with 2*WILD slack: arena[..pre] is the
     // caller's prefix (initialized by definition) and resize() zero-fills
@@ -1155,6 +1170,206 @@ unsafe fn wild_copy(src: *const u8, dst: *mut u8, n: usize) {
         std::ptr::copy_nonoverlapping(src.add(i), dst.add(i), WILD);
         i += WILD;
     }
+}
+
+// ---------------------------------------------------------------------------
+// G32 spike: GDeflate-style 32-lane literal relayout (stage 1, CPU-only)
+// ---------------------------------------------------------------------------
+//
+// Stage-1 probe for the pz2-G32 candidate (gpu-path-research.md #1): re-lay
+// the literal section of a shipped pz2 block as Huffman codes across 32
+// sub-streams pinned to SIMD lanes — literal `i` belongs to lane `i % 32`,
+// so each decode round produces 32 contiguous output bytes (one simdgroup
+// per tile, 32 symbols/round on a GPU). The shared canonical table is reused
+// verbatim; only the bitstream framing changes:
+//
+// - Each lane's bits are packed LSB-first into 32-bit words.
+// - The shared word stream interleaves lane words in EXACT decode-read
+//   order, determined by simulating the decoder's refill schedule: before
+//   each symbol, a lane with < 32 live bits fetches one word. Since a
+//   literal symbol consumes ≤ MAX_CODE_LEN = 11 bits, a lane consumes at
+//   most 1 word per round — within the GDeflate ≤2-words-per-round budget
+//   (the second word is headroom for fusing extra-bits into lanes later).
+// - Lane word counts are implicit (the decoder replays the same schedule);
+//   fetches past a lane's real data are zero padding words emitted by the
+//   encoder, ≤ 2 per lane beyond `ceil(lane_bits/32)`.
+//
+// Wire (G32 block): same header as a pz2 block; the LIT_HUFF literal section
+// becomes `[128B packed lengths][word_bytes: u32][interleaved words]`.
+// Sequence section is byte-identical to shipped pz2. NOT a shipping format —
+// spike code measuring layout cost. See pz2-g32-stage1-findings.md.
+
+/// Number of literal sub-streams in the G32 layout (Metal simdgroup width).
+const G32_LANES: usize = 32;
+
+/// Encode literals into the G32 interleaved word stream (round-robin lane
+/// assignment, decode-read word order). Returns the word stream as bytes
+/// (little-endian u32 words).
+fn encode_lits_g32(lits: &[u8], codes: &[(u16, u8); 256]) -> Vec<u8> {
+    // Per-lane word buffers: lane k holds the codes of literals k, k+32, ...
+    #[derive(Default, Clone)]
+    struct LaneEnc {
+        words: Vec<u32>,
+        acc: u64,
+        nbits: u32,
+    }
+    let mut enc = vec![LaneEnc::default(); G32_LANES];
+    for (i, &b) in lits.iter().enumerate() {
+        let lane = &mut enc[i % G32_LANES];
+        let (code, len) = codes[b as usize];
+        lane.acc |= (code as u64) << lane.nbits;
+        lane.nbits += len as u32;
+        if lane.nbits >= 32 {
+            lane.words.push(lane.acc as u32);
+            lane.acc >>= 32;
+            lane.nbits -= 32;
+        }
+    }
+    for lane in &mut enc {
+        if lane.nbits > 0 {
+            lane.words.push(lane.acc as u32);
+        }
+    }
+
+    // Simulate the decoder's refill schedule to emit words in decode-read
+    // order. `live[k]` mirrors the decoder's bit count exactly.
+    let total_words: usize = enc.iter().map(|l| l.words.len()).sum();
+    let mut out = Vec::with_capacity((total_words + G32_LANES) * 4);
+    let mut wpos = [0usize; G32_LANES];
+    let mut live = [0u32; G32_LANES];
+    for (i, &b) in lits.iter().enumerate() {
+        let k = i % G32_LANES;
+        if live[k] < 32 {
+            let w = enc[k].words.get(wpos[k]).copied().unwrap_or(0);
+            wpos[k] += 1;
+            live[k] += 32;
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        live[k] -= codes[b as usize].1 as u32;
+    }
+    out
+}
+
+/// Scalar decoder for the G32 literal layout: 32 lane states, one symbol per
+/// lane per round, refill-when-below-32-bits replayed in the encoder's exact
+/// word order. Each round writes 32 contiguous output bytes.
+fn decode_lits_g32(table: &[u16; 1 << MAX_CODE_LEN], words: &[u8], out: &mut [u8]) -> PzResult<()> {
+    let mut acc = [0u64; G32_LANES];
+    let mut nbits = [0u32; G32_LANES];
+    let mut wpos = 0usize;
+
+    let mut chunks = out.chunks_exact_mut(G32_LANES);
+    for round_out in chunks.by_ref() {
+        for (k, slot) in round_out.iter_mut().enumerate() {
+            if nbits[k] < 32 {
+                if wpos + 4 > words.len() {
+                    return Err(PzError::InvalidInput);
+                }
+                let w = u32::from_le_bytes(words[wpos..wpos + 4].try_into().unwrap());
+                acc[k] |= (w as u64) << nbits[k];
+                nbits[k] += 32;
+                wpos += 4;
+            }
+            // Invariant: nbits[k] >= 32 >= MAX_CODE_LEN here, and the table
+            // is validated hole-free (len in 1..=11), so no per-symbol check.
+            let e = table[(acc[k] & ((1 << MAX_CODE_LEN) - 1)) as usize];
+            let len = (e & 0xF) as u32;
+            acc[k] >>= len;
+            nbits[k] -= len;
+            *slot = (e >> 4) as u8;
+        }
+    }
+    // Tail round (< 32 symbols), same schedule.
+    for (k, slot) in chunks.into_remainder().iter_mut().enumerate() {
+        if nbits[k] < 32 {
+            if wpos + 4 > words.len() {
+                return Err(PzError::InvalidInput);
+            }
+            let w = u32::from_le_bytes(words[wpos..wpos + 4].try_into().unwrap());
+            acc[k] |= (w as u64) << nbits[k];
+            nbits[k] += 32;
+            wpos += 4;
+        }
+        let e = table[(acc[k] & ((1 << MAX_CODE_LEN) - 1)) as usize];
+        let len = (e & 0xF) as u32;
+        acc[k] >>= len;
+        nbits[k] -= len;
+        *slot = (e >> 4) as u8;
+    }
+    Ok(())
+}
+
+/// Transcode a shipped pz2 block into the G32 literal layout. The Huffman
+/// table (packed code lengths) and the entire sequence section are copied
+/// verbatim; only the literal bitstream framing changes, so the size delta
+/// is purely the cost of the GPU-friendly layout.
+pub fn transcode_g32(block: &[u8]) -> PzResult<Vec<u8>> {
+    let mut p = block;
+    let seq_count = take_u32(&mut p)?;
+    let lit_total = take_u32(&mut p)? as usize;
+    let mode = take(&mut p, 1)?[0];
+
+    let mut out = Vec::with_capacity(block.len() + 4 * G32_LANES);
+    put_u32(&mut out, seq_count);
+    put_u32(&mut out, lit_total as u32);
+    out.push(mode);
+    match mode {
+        LIT_RAW => out.extend_from_slice(take(&mut p, lit_total)?),
+        LIT_HUFF => {
+            let packed = take(&mut p, 128)?;
+            let lengths = unpack_lengths(packed);
+            let table = build_decode_table(&lengths)?;
+            let mut lane_lens = [0usize; NUM_LANES];
+            for l in lane_lens.iter_mut() {
+                *l = take_u32(&mut p)? as usize;
+            }
+            let mut lanes: [&[u8]; NUM_LANES] = [&[]; NUM_LANES];
+            for (lane, &l) in lanes.iter_mut().zip(lane_lens.iter()) {
+                *lane = take(&mut p, l)?;
+            }
+            let mut lits = vec![0u8; lit_total];
+            decode_lanes(&table, lanes, &mut lits)?;
+
+            // Re-encode with the SAME canonical table in the 32-lane layout.
+            let codes = canonical_codes(&lengths)?;
+            let words = encode_lits_g32(&lits, &codes);
+            out.extend_from_slice(packed);
+            put_u32(&mut out, words.len() as u32);
+            out.extend_from_slice(&words);
+        }
+        _ => return Err(PzError::InvalidInput),
+    }
+    // Sequence section: byte-identical.
+    out.extend_from_slice(p);
+    Ok(out)
+}
+
+/// Decode a G32-transcoded block (counterpart of [`decode`] for the spike
+/// layout). `orig_len` comes from the container block table.
+pub fn decode_g32(data: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    let mut p = data;
+    let seq_count = take_u32(&mut p)? as usize;
+    let lit_total = take_u32(&mut p)? as usize;
+    if lit_total > orig_len {
+        return Err(PzError::InvalidInput);
+    }
+
+    let mut lits = vec![0u8; lit_total + WILD];
+    let mode = take(&mut p, 1)?[0];
+    match mode {
+        LIT_RAW => lits[..lit_total].copy_from_slice(take(&mut p, lit_total)?),
+        LIT_HUFF => {
+            let packed = take(&mut p, 128)?;
+            let lengths = unpack_lengths(packed);
+            let table = build_decode_table(&lengths)?;
+            let word_bytes = take_u32(&mut p)? as usize;
+            let words = take(&mut p, word_bytes)?;
+            decode_lits_g32(&table, words, &mut lits[..lit_total])?;
+        }
+        _ => return Err(PzError::InvalidInput),
+    }
+
+    splice(p, seq_count, &lits, lit_total, orig_len)
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,6 +1543,87 @@ mod tests {
             let enc = encode(&input).expect("encode");
             let dec = decode(&enc, input.len()).expect("decode");
             assert_eq!(dec, input, "fuzz case {case} len {}", input.len());
+        }
+    }
+
+    fn round_trip_g32(input: &[u8]) {
+        let enc = encode(input).expect("encode");
+        let g32 = transcode_g32(&enc).expect("transcode");
+        let dec = decode_g32(&g32, input.len()).expect("decode_g32");
+        assert_eq!(dec, input, "g32 round-trip mismatch (len {})", input.len());
+    }
+
+    #[test]
+    fn test_g32_round_trip_suite() {
+        round_trip_g32(b"");
+        round_trip_g32(b"a");
+        round_trip_g32(b"banana banana banana banana banana");
+        round_trip_g32(&b"The quick brown fox jumps over the lazy dog. ".repeat(200));
+        round_trip_g32(&vec![0xAB; 100_000]);
+        round_trip_g32(&lcg_stream(65536, 42)); // raw-literal mode passthrough
+        round_trip_g32(&lcg_stream(63, 1));
+        // Literal counts straddling lane-round boundaries (multiples of 32
+        // and neighbors) exercise the tail round and padding-word schedule.
+        for n in [31usize, 32, 33, 63, 64, 65, 1023, 1024, 1025] {
+            let input: Vec<u8> = (0..n).map(|i| (i % 7) as u8 + b'a').collect();
+            round_trip_g32(&input);
+        }
+        for period in 1usize..=24 {
+            let pattern: Vec<u8> = (0..period as u8).map(|b| b.wrapping_mul(37)).collect();
+            let input: Vec<u8> = pattern
+                .iter()
+                .copied()
+                .cycle()
+                .take(5000 + period)
+                .collect();
+            round_trip_g32(&input);
+        }
+    }
+
+    #[test]
+    fn test_g32_fuzz_lite() {
+        // Same splice-of-history generator as test_round_trip_fuzz_lite,
+        // routed through transcode + g32 decode.
+        let mut state = 0xBEEFu32;
+        let mut next = |m: u32| {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            (state >> 16) % m
+        };
+        for case in 0..100 {
+            let mut input: Vec<u8> = Vec::new();
+            let target = 64 + next(8192) as usize;
+            while input.len() < target {
+                if input.is_empty() || next(2) == 0 {
+                    for _ in 0..=next(16) {
+                        input.push(next(256) as u8);
+                    }
+                } else {
+                    let off = 1 + next(input.len().min(4000) as u32) as usize;
+                    let len = (1 + next(64)) as usize;
+                    for _ in 0..len {
+                        let b = input[input.len() - off];
+                        input.push(b);
+                    }
+                }
+            }
+            let enc = encode(&input).expect("encode");
+            let g32 = transcode_g32(&enc).expect("transcode");
+            let dec = decode_g32(&g32, input.len()).expect("decode_g32");
+            assert_eq!(dec, input, "g32 fuzz case {case} len {}", input.len());
+        }
+    }
+
+    #[test]
+    fn test_g32_decode_rejects_garbage() {
+        let input = b"The quick brown fox jumps over the lazy dog. ".repeat(100);
+        let g32 = transcode_g32(&encode(&input).unwrap()).unwrap();
+        for cut in [0, 1, 4, 8, 9, g32.len() / 2, g32.len() - 1] {
+            let _ = decode_g32(&g32[..cut], input.len());
+        }
+        for i in 0..g32.len().min(64) {
+            let mut bad = g32.clone();
+            bad[i] ^= 0x55;
+            let _ = decode_g32(&bad, input.len());
         }
     }
 
