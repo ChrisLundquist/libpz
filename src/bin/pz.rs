@@ -92,6 +92,11 @@ fn list_pipelines() {
             "Numeric decorrelation: byte-plane split + per-plane gated FSE (x-ray/sao)",
         ),
         ("lzseq2r", "12", "LzSeq2 + sparse rANS (lit-run sequences)"),
+        (
+            "pz2",
+            "13",
+            "Decode-first sequences: 4-lane Huffman + fused splice (~3x lzf decode)",
+        ),
     ];
     for (name, id, desc) in pipelines {
         println!("  {name:10} {id:>2}  {desc}");
@@ -255,6 +260,7 @@ fn parse_args() -> Opts {
                     "sortlz" | "10" => Pipeline::SortLz,
                     "num" | "11" => Pipeline::Num,
                     "lzseq2r" | "12" => Pipeline::LzSeq2R,
+                    "pz2" | "13" => Pipeline::Pz2,
                     other => {
                         eprintln!("pz: unknown pipeline '{other}'");
                         eprintln!("pz: run 'pz --list-pipelines' to see available pipelines");
@@ -450,6 +456,7 @@ fn list_file(path: &str, data: &[u8]) -> Result<(), String> {
                 10 => "sortlz",
                 11 => "num",
                 12 => "lzseq2r",
+                13 => "pz2",
                 _ => "unknown",
             };
             let mut orig_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);

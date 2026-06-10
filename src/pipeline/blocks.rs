@@ -49,6 +49,7 @@ pub(crate) fn compress_block(
             Pipeline::Bbw => compress_block_bbw(input, opts),
             Pipeline::SortLz => compress_block_sortlz(input, opts),
             Pipeline::Num => compress_block_num(input, opts),
+            Pipeline::Pz2 => compress_block_pz2(input, opts),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -97,6 +98,7 @@ pub(crate) fn decompress_block(
             Pipeline::Bbw => decompress_block_bbw(payload, orig_len),
             Pipeline::SortLz => decompress_block_sortlz(payload, orig_len),
             Pipeline::Num => decompress_block_num(payload, orig_len),
+            Pipeline::Pz2 => decompress_block_pz2(payload, orig_len),
             _ => Err(PzError::Unsupported),
         },
     }
@@ -415,6 +417,24 @@ fn compress_block_num(input: &[u8], _options: &CompressOptions) -> PzResult<Vec<
 /// Decompress a single Num block (no container header).
 fn decompress_block_num(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
     crate::numeric::decode(payload, orig_len)
+}
+
+// ---------------------------------------------------------------------------
+// Pz2 pipeline: decode-first sequence codec (4-lane Huffman + fused splice)
+// ---------------------------------------------------------------------------
+
+/// Compress a single block using the Pz2 pipeline (no container header).
+///
+/// The whole wire format (sequence conversion, 4-lane Huffman literals,
+/// sequence-code lanes, raw-literal fallback) lives in [`crate::pz2::encode`];
+/// this is a thin adapter like `compress_block_num`.
+fn compress_block_pz2(input: &[u8], _options: &CompressOptions) -> PzResult<Vec<u8>> {
+    crate::pz2::encode(input)
+}
+
+/// Decompress a single Pz2 block (no container header).
+fn decompress_block_pz2(payload: &[u8], orig_len: usize) -> PzResult<Vec<u8>> {
+    crate::pz2::decode(payload, orig_len)
 }
 
 #[cfg(test)]

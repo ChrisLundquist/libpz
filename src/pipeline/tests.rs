@@ -52,6 +52,7 @@ fn test_all_pipelines_banana() {
         Pipeline::Lzfi,
         Pipeline::LzSeq2R,
         Pipeline::Num,
+        Pipeline::Pz2,
     ] {
         let compressed = compress(input, pipeline).unwrap();
         let decompressed = decompress(&compressed).unwrap();
@@ -74,6 +75,7 @@ fn test_all_pipelines_medium_text() {
         Pipeline::Lzfi,
         Pipeline::LzSeq2R,
         Pipeline::Num,
+        Pipeline::Pz2,
     ] {
         let compressed = compress(&input, pipeline).unwrap();
         let decompressed = decompress(&compressed).unwrap();
@@ -132,6 +134,7 @@ fn test_all_pipelines_adversarial_framing_roundtrip() {
         Pipeline::LzSeqH,
         Pipeline::SortLz,
         Pipeline::Num,
+        Pipeline::Pz2,
     ];
     // Small block size forces multi-block framing without huge test data
     // (16 KiB blocks over 64 KiB inputs => ~4 blocks each).
@@ -349,6 +352,7 @@ fn test_multiblock_round_trip_all_pipelines() {
         Pipeline::LzSeqH,
         Pipeline::LzSeq2R,
         Pipeline::Num,
+        Pipeline::Pz2,
     ] {
         let compressed = compress_mt(&input, pipeline, 4, 512).unwrap();
         assert_eq!(compressed[2], VERSION, "expected V2 for {:?}", pipeline);
